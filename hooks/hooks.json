@@ -1,0 +1,4 @@
+{
+  "description": "session.compact: replaces compaction with an observation log carried from one compaction to the next",
+  "modules": ["./register.ts"]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "observational-memory",
+  "version": "0.1.0",
+  "description": "Compaction as Mastra's observational memory: an Observer turns older messages into a dated observation log, a Reflector condenses the log when it grows, and recent messages stay whole.",
+  "author": { "name": "Cameron Tredoux" }
+}
