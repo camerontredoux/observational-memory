@@ -155,14 +155,14 @@ describe('register', () => {
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
     expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS], cwd: '/tmp', timeoutMs: 120_000 })
     expect(seen.modelCalls).toBe(0)
-    expect(seen.logs).toContain('observational-memory: Luna observer: 9206 in, 558 out, $0.0025, 0s')
+    expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s')
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
     const text = result.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b') // untimed history: no invented times
     expect(text).toContain('<current-task>\nPrimary: b\n</current-task>')
     expect(text).toContain('AUTHORITATIVE HISTORY')
     expect(text).not.toContain('only as background')
-    expect(seen.logs.at(-1)).toMatch(/^observational-memory: observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
+    expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
   })
 
   test('when pi fails at compaction with nothing observed, the built-in compaction runs instead', async ($, on) => {
@@ -179,9 +179,9 @@ describe('register', () => {
     expect(builtin).toBe(1)
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toEqual([
-      'observational-memory: observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
-      'observational-memory: observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
-      'observational-memory: the Observer failed and nothing is observed yet; using the built-in compaction',
+      'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
+      'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
+      'the Observer failed and nothing is observed yet; using the built-in compaction',
     ])
   })
 
@@ -201,7 +201,7 @@ describe('register', () => {
 
     const failures = seen.logs.filter((l) => l.includes('at compaction failed'))
     expect(failures.length).toBeGreaterThan(0)
-    for (const line of failures) expect(line).toMatch(/^observational-memory: observation of rows (\d+)-\d+ at compaction failed \(pi exited 1: Error: network down\); kept raw$/)
+    for (const line of failures) expect(line).toMatch(/^observation of rows (\d+)-\d+ at compaction failed \(pi exited 1: Error: network down\); kept raw$/)
     expect(failures[0]).toContain('rows 3-')
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
     expect(result.messages?.slice(1)).toEqual(history.slice(3))
@@ -218,7 +218,7 @@ describe('register', () => {
     await clock.settle()
 
     const failures = seen.logs.filter((l) => l.includes('failed'))
-    expect(failures).toEqual(['observational-memory: background observation of rows 0-3 failed (pi exited 1: pi: 401 Unauthorized); it will be retried'])
+    expect(failures).toEqual(['background observation of rows 0-3 failed (pi exited 1: pi: 401 Unauthorized); it will be retried'])
     expect(seen.prompts).toHaveLength(1)
     expect(seen.modelCalls).toBe(0)
     let ledger = stored['ledger:session-1'] as Ledger
@@ -254,7 +254,7 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(1)
     expect(seen.prompts[0]).toContain('[User @ 2026-09-22 14:00]: a\n\n[Assistant @ 2026-09-22 14:00]: a\n[Read({"file_path":"/src/a.ts"})]')
     expect(seen.prompts[0]).toContain('[Assistant @ 2026-09-22 14:01]: a done\n\n[User @ 2026-09-22 14:30]: a')
-    expect(seen.logs).toContain('observational-memory: observed rows 0-7 in the background, 4 observations; watermark 7, 0 chunk(s) waiting on a gap')
+    expect(seen.logs).toContain('observed rows 0-7 in the background, 4 observations; watermark 7, 0 chunk(s) waiting on a gap')
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
     // Clamped into the chunk's times, 13:59 to 14:32 (the latest time recorded plus a minute); a line without a
     // real time gets the chunk's latest.
@@ -330,12 +330,12 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(2)
     expect(result.messages?.slice(1)).toEqual(messages.slice(3))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
-    expect(seen.logs.at(-1)).toMatch(/^observational-memory: cut at the background watermark with no Observer call, kept 9 raw messages/)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call, kept 9 raw messages/)
     history.push(...result.messages!) // the engine appends the compaction's result to the history
     open(2)
     await clock.settle()
 
-    expect(seen.logs).toContain('observational-memory: observed rows 1-5 in the background, 1 observations; watermark 5, 0 chunk(s) waiting on a gap')
+    expect(seen.logs).toContain('observed rows 1-5 in the background, 1 observations; watermark 5, 0 chunk(s) waiting on a gap')
     const ledger = stored['ledger:session-1'] as Ledger
     expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 Saw a', '🔴 2026-09-22 15:00 Saw b'])
     await runTurn($, turn('d', 'd', 8_000), at(22, 16, 0))
@@ -378,7 +378,7 @@ describe('register', () => {
       '🔴 2026-09-22 15:00 Saw b',
     ])
     expect(seen.logs).toContain(
-      'observational-memory: reflected 4000 observations (~15000 tokens) into 1 (~12 tokens) at compression level 2; 1 newer kept'.replace('15000', String(Math.ceil('* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000).trimEnd().length / 4))),
+      'reflected 4000 observations (~15000 tokens) into 1 (~12 tokens) at compression level 2; 1 newer kept'.replace('15000', String(Math.ceil('* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000).trimEnd().length / 4))),
     )
   })
 
@@ -429,7 +429,7 @@ describe('register', () => {
     expect(skillsIn(result.messages?.[0]?.text)).toBe(
       `<skill name="style">\n${'s'.repeat(8_000)}\n</skill>\n<skill name="deploy">\nDeploy steps\n</skill>\n<skill name="lint">\nLint steps\n</skill>`,
     )
-    expect(seen.logs).toContain('observational-memory: skills over the 15000-token cap, dropped: huge (~14000 tokens)')
+    expect(seen.logs).toContain('skills over the 15000-token cap, dropped: huge (~14000 tokens)')
   })
 
   test('skills carry forward through the memory message when the store has none', async ($, on) => {
@@ -513,7 +513,7 @@ describe('register', () => {
     history.splice(0, history.length, ...turn('z', 'z', CHUNK), ...turn('b', 'b', 8_000))
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
 
-    expect(seen.logs).toContain('observational-memory: the transcript changed under the observations; restarting the ledger from the memory message')
+    expect(seen.logs).toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 Saw z') // its rows were never timed
     expect(result.messages?.slice(1)).toEqual(history.slice(3))
   })

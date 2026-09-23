@@ -83,7 +83,7 @@ const estimateTokens = (text: string) => Math.ceil(text.length / 4)
 const truncate = (text: string, maxTokens: number) =>
   text.length <= maxTokens * 4 ? text : `${text.slice(0, maxTokens * 4)}\n... [truncated ~${estimateTokens(text) - maxTokens} tokens]`
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
-const log = ($: EngineInterface, text: string) => $.ui.log(`observational-memory: ${text}`)
+const log = ($: EngineInterface, text: string) => $.ui.log(text) // the engine prefixes the plugin's name
 
 // What a row says, a tool result counted once, on the user row that carries it.
 const rowText = (m: SessionMessage) =>
