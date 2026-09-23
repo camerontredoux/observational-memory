@@ -103,12 +103,15 @@ function renderInput(input: unknown) {
     .join('\n')
 }
 
+// Terminal colour and cursor codes in a command's output: noise to read, and they split the words a search looks for.
+const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
+
 function resultText(content: unknown): string {
-  if (typeof content === 'string') return content
+  if (typeof content === 'string') return content.replace(ANSI, '')
   if (Array.isArray(content))
     return content
       .map((b: { type?: string; text?: string; tool_name?: string }) =>
-        b.type === 'text' ? (b.text ?? '') : b.type === 'image' ? '[image]' : b.type === 'tool_reference' ? `[tool ${b.tool_name ?? ''}]` : `[${b.type ?? 'block'}]`,
+        b.type === 'text' ? (b.text ?? '').replace(ANSI, '') : b.type === 'image' ? '[image]' : b.type === 'tool_reference' ? `[tool ${b.tool_name ?? ''}]` : `[${b.type ?? 'block'}]`,
       )
       .join('\n')
   return content && typeof content === 'object' ? '[redacted]' : ''

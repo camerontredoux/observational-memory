@@ -220,6 +220,8 @@ describe('recall', () => {
     expect(found).toMatch(/^\d+ match\(es\) for ""Test Files" passed" in [\d,]+ blocks of 2 transcript files\./)
     expect(found).toContain('[a79f045b:1902 ')
     expect(found).toContain('[b8d50671:')
+    // vitest's colour codes are gone, so its summary line reads, and matches, as printed.
+    expect((await recall(c, { query: '"Test Files 10 passed"', to: 'b8d50671:147' })).text).toContain('  61: Test Files 10 passed (10)')
     const page = (await recall(c, { ref: 'a79f045b:73' })).text
     expect(page.split('\n')[0]).toMatch(/^\[a79f045b:73 · .* · Bash result\] lines 1-\d+ of 748 \(call: a79f045b:70\)$/)
     expect(page.split('\n').at(-1)).toMatch(/^… \d+ more lines: ask \{"mode": "read", "ref": "a79f045b:73", "lines": "\d+-\d+"\}\.$/)
