@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, SessionMessage, SessionUsage } from 'claude-code'
+import type { On, ProcessRunResult, SessionMessage } from 'claude-code'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -11,13 +11,47 @@ const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
 ]
 
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+const PI_USAGE = { input: 9206, output: 558, cacheRead: 0, cacheWrite: 0, reasoning: 31, totalTokens: 9764, cost: { input: 0.0023, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.0025108 } }
+const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low', '--system-prompt']
+const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json']
+
+// What pi 0.85.1 prints with `--mode json` for one answer: one event per line, the prompt echoed, the answer
+// streamed, then the final assistant message with its usage (as /tmp/obs-bench/pi1.jsonl, abridged).
+function piOutput(prompt: string, text: string, end: { stopReason?: string; errorMessage?: string } = { stopReason: 'stop' }) {
+  const user = { role: 'user', content: [{ type: 'text', text: prompt }], timestamp: 0 }
+  const assistant = {
+    role: 'assistant',
+    content: [{ type: 'thinking', thinking: '', thinkingSignature: '{}' }, { type: 'text', text }],
+    api: 'openai-codex-responses',
+    provider: 'openai-codex',
+    model: 'gpt-5.6-luna',
+    usage: PI_USAGE,
+    ...end,
+    timestamp: 0,
+  }
+  return [
+    { type: 'session', version: 3, id: 'pi-session', timestamp: '2026-09-23T03:51:47.144Z', cwd: '/tmp' },
+    { type: 'agent_start' },
+    { type: 'turn_start' },
+    { type: 'message_start', message: user },
+    { type: 'message_end', message: user },
+    { type: 'message_start', message: { ...assistant, content: [] } },
+    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 1, delta: text.slice(0, 20) } },
+    { type: 'message_end', message: assistant },
+    { type: 'turn_end', message: assistant, toolResults: [] },
+    { type: 'agent_end', messages: [user, assistant] },
+    { type: 'agent_settled' },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join('\n')
+}
 const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
 
 // Local time on a day of September 2026.
 const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
 
 // The main conversation's history, grown as the engine would, a store the test can read, and a context size.
-function world(on: On, tokens = 0) {
+function world(on: On) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   on('session.messages', () => ({ value: history }))
@@ -25,36 +59,50 @@ function world(on: On, tokens = 0) {
   on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
   on('store.set', ($, e) => ((stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
-  const context = { tokens }
-  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: context.tokens, window: 200_000 } } as unknown as SessionUsage }))
-  return { history, stored, context }
+  return { history, stored }
 }
 
-type Ledger = { entries: { id: string; line: string }[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
+type Ledger = { entries: { id: string; line: string }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
+type PiCall = { argv: readonly string[]; cwd?: string; timeoutMs?: number }
 
-// A model that observes by naming the prompts of its chunk, each at the time its block shows; the reflector
-// answers `reflect(n)` for its nth call. `hold` delays the nth call's answer. Prompts and ui.log lines collected.
-function model(on: On, options: { hold?: (n: number, prompt: string) => Promise<void> | undefined; reflect?: (n: number) => string; reply?: (prompt: string) => string } = {}) {
-  const seen = { prompts: [] as string[], systems: [] as string[], logs: [] as string[], inFlight: 0, maxInFlight: 0 }
+// pi on the host, as `$.process.run` runs it: it observes by naming the prompts of its chunk, each at the time
+// its block shows; the reflector answers `reflect(n)` for its nth call. `hold` delays the nth call's answer, `fail`
+// answers it with a failed run instead. `$.model.complete` is counted, and answers nothing.
+function pi(
+  on: On,
+  options: {
+    hold?: (n: number, prompt: string) => Promise<void> | undefined
+    fail?: (n: number, prompt: string) => ProcessRunResult | undefined
+    reflect?: (n: number) => string
+    reply?: (prompt: string) => string
+  } = {},
+) {
+  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0 }
   let reflections = 0
-  on('model.complete', async ($, e) => {
-    seen.prompts.push(e.prompt)
-    seen.systems.push(e.system ?? '')
+  on('process.run', async ($, e) => {
+    const prompt = e.init?.stdin ?? ''
+    seen.prompts.push(prompt)
+    seen.systems.push(e.argv[e.argv.indexOf('--system-prompt') + 1] ?? '')
+    seen.calls.push({ argv: e.argv, cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
     const n = seen.prompts.length
     seen.inFlight++
     seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight)
-    await options.hold?.(n, e.prompt)
+    await options.hold?.(n, prompt)
     seen.inFlight--
-    if (e.prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
+    const failed = options.fail?.(n, prompt)
+    if (failed) return { value: failed }
+    let text: string
+    if (prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
       reflections++
-      return { value: { isAnswered: true, text: options.reflect?.(reflections) ?? '<observations>\n* 🔴 2026-09-22 14:30 Reflected\n</observations>', usage: USAGE } }
-    }
-    const text =
-      options.reply?.(e.prompt) ??
-      `<observations>\n${[...e.prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>\n` +
-        `<current-task>\nPrimary: ${[...e.prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</current-task>`
-    return { value: { isAnswered: true, text, usage: USAGE } }
+      text = options.reflect?.(reflections) ?? '<observations>\n* 🔴 2026-09-22 14:30 Reflected\n</observations>'
+    } else
+      text =
+        options.reply?.(prompt) ??
+        `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>\n` +
+        `<current-task>\nPrimary: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</current-task>`
+    return { value: { exitCode: 0, stdout: piOutput(prompt, text), stderr: '' } }
   })
+  on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
   on('ui.log', ($, e) => (seen.logs.push(e.text), { value: undefined }))
   return seen
 }
@@ -93,7 +141,7 @@ describe('register', () => {
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
     mock.clock(on, { now: at(23, 12, 0) })
     world(on)
-    const seen = model(on)
+    const seen = pi(on)
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     const result = await $.session.compact({ trigger: 'manual', messages })
@@ -104,6 +152,9 @@ describe('register', () => {
     expect(seen.prompts[1]).toContain('[User]: b')
     expect(seen.prompts[1]).not.toContain('Saw a') // a pure mapper: no observations so far
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
+    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS], cwd: '/tmp', timeoutMs: 120_000 })
+    expect(seen.modelCalls).toBe(0)
+    expect(seen.logs).toContain('observational-memory: Luna observer: 9206 in, 558 out, $0.0025, 0s')
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
     const text = result.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b') // untimed history: no invented times
@@ -113,25 +164,76 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^observational-memory: observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
   })
 
-  test('falls back to the built-in compaction when an observer call fails', async ($, on) => {
+  test('when pi fails at compaction with nothing observed, it skips: no built-in compaction, no other model', async ($, on) => {
     mock.clock(on)
     world(on)
-    const logs: string[] = []
-    on('model.complete', () => ({ value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
-    on('ui.log', ($, e) => (logs.push(e.text), { value: undefined }))
-    const builtin: SessionMessage[] = [{ role: 'user', text: 'built-in summary', toolUses: [] }]
-    on('session.compact', () => ({ messages: builtin }))
+    const seen = pi(on, { fail: () => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' }) })
+    let builtin = 0
+    on('session.compact', () => (builtin++, { messages: [] }))
 
     const result = await $.session.compact({ trigger: 'auto', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)] })
 
-    expect(result.messages).toEqual(builtin)
-    expect(logs).toEqual(['observational-memory: model call failed: empty-reply; using the built-in compaction'])
+    expect(result).toEqual({ skip: 'observational-memory: the Observer failed and nothing is observed yet; not compacted' })
+    expect(builtin).toBe(0)
+    expect(seen.modelCalls).toBe(0)
+    expect(seen.logs).toEqual([
+      'observational-memory: observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
+      'observational-memory: observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
+    ])
+  })
+
+  test('when pi fails on a gap at compaction, the cut stays at the watermark and the gap is kept raw', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    let failing = false
+    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle() // [0, 3) observed
+    failing = true
+    history.push(...turn('c', 'c', CHUNK * 4), ...turn('d', 'd', 8_000))
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    const failures = seen.logs.filter((l) => l.includes('at compaction failed'))
+    expect(failures.length).toBeGreaterThan(0)
+    for (const line of failures) expect(line).toMatch(/^observational-memory: observation of rows (\d+)-\d+ at compaction failed \(pi exited 1: Error: network down\); kept raw$/)
+    expect(failures[0]).toContain('rows 3-')
+    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
+    expect(result.messages?.slice(1)).toEqual(history.slice(3))
+    expect(seen.modelCalls).toBe(0)
+  })
+
+  test('a failed pi call in the background leaves its chunk unobserved, logged once, and a later pass retries it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const seen = pi(on, { fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'pi: 401 Unauthorized\n' } : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    const failures = seen.logs.filter((l) => l.includes('failed'))
+    expect(failures).toEqual(['observational-memory: background observation of rows 0-3 failed (pi exited 1: pi: 401 Unauthorized); it will be retried'])
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.modelCalls).toBe(0)
+    let ledger = stored['ledger:session-1'] as Ledger
+    expect([ledger.watermark.to, ledger.entries, ledger.chunks]).toEqual([0, [], []])
+
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+    ledger = stored['ledger:session-1'] as Ledger
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.prompts[1]).toContain('[User @ 2026-09-22 14:30]: a')
+    expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 Saw a'])
+    expect(seen.modelCalls).toBe(0)
   })
 
   test('observes in the background after turn.complete, off the dispatch, with real timestamps checked against the chunk', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = model(on, {
+    const seen = pi(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
           ? '<observations>\n* 🔴 2026-09-22 14:30 User asked a\n* 🟡 2019-01-01 00:00 Too early\n* 🟢 2026-02-30 10:00 Not a date\n* ✅ Untimed\n  * -> a detail\n</observations>'
@@ -163,7 +265,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = model(on, { hold: (n) => gate(n) })
+    const seen = pi(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
@@ -185,7 +287,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    model(on, { hold: (n) => gate(n) })
+    pi(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)], at(22, 14, 30))
@@ -205,11 +307,11 @@ describe('register', () => {
     expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 Saw a', '🔴 2026-09-22 14:30 Saw b'])
   })
 
-  test('compaction cuts at the watermark with no model call; a chunk still in flight lands afterwards in the new context', async ($, on) => {
+  test('compaction cuts at the watermark at once while a pi call is in flight; the chunk lands afterwards in the new context', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = model(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
+    const seen = pi(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -221,6 +323,7 @@ describe('register', () => {
     const messages = [...history]
     const result = await $.session.compact({ trigger: 'auto', messages })
 
+    expect(seen.inFlight).toBe(1) // resolved while the held call is still running
     expect(seen.prompts).toHaveLength(2)
     expect(result.messages?.slice(1)).toEqual(messages.slice(3))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
@@ -243,7 +346,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = model(on, {
+    const seen = pi(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(100 + n) : undefined),
       reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🔴 2026-09-22 15:00 Saw b\n</observations>`),
       reflect: (n) => (n === 1 ? big : '<observations>\nDate: Sep 22, 2026\n* 🔴 (14:30) Explored the auth module\n</observations>'),
@@ -276,10 +379,39 @@ describe('register', () => {
     )
   })
 
+  test("the user's corrections are quoted in their own section above the observations and pass through the Reflector unchanged", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const correction = '🔴 2026-09-22 14:30 User: "Sorry, I meant the refresh endpoint, not login — ignore what I said about login"'
+    const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
+    const seen = pi(on, {
+      reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? `<corrections>\n* ${correction}\n</corrections>\n${big}` : `<observations>\n* 🔴 2026-09-22 15:00 Saw b\n</observations>`),
+      reflect: () => '<observations>\n* 🔴 2026-09-22 14:30 Explored the auth module\n</observations>',
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+
+    const reflections = seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
+    expect(reflections).toHaveLength(1)
+    expect(reflections[0]).not.toContain('Sorry, I meant')
+    expect((stored['ledger:session-1'] as Ledger).corrections).toEqual([correction])
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    const text = first.messages?.[0]?.text ?? ''
+    expect(text).toContain(`\n\n<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n* 🔴 2026-09-22 14:30 Explored the auth module\n</observations>`)
+    // Carried forward from the memory message itself.
+    for (const key of Object.keys(stored)) delete stored[key]
+    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)] })
+    expect(second.messages?.[0]?.text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n* 🔴 2026-09-22 14:30 Explored the auth module\n`)
+    expect(seen.modelCalls).toBe(0)
+  })
+
   test('keeps every recorded skill not in the raw tail, most recent first, within the token cap, and logs what it drops', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = model(on)
+    const seen = pi(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'old deploy steps' })
@@ -300,7 +432,7 @@ describe('register', () => {
   test('skills carry forward through the memory message when the store has none', async ($, on) => {
     mock.clock(on)
     const { stored } = world(on)
-    model(on)
+    pi(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps\n</skill> mid-text stays' })
@@ -349,29 +481,10 @@ describe('register', () => {
     expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 messages.\n[#2 Read result] export const marker = "PLUM-7731"')
   })
 
-  test('past COMPACT_AT_TOKENS turn.complete asks for a compaction once the watermark allows an instant cut', async ($, on) => {
-    const clock = mock.clock(on)
-    const { history, context } = world(on, 160_000)
-    const seen = model(on)
-    const runTurn = live(on, clock, history)
-    const commands: string[] = []
-    // The command resolves once it has run: the context then reads small.
-    on('command.run', ($, e) => (commands.push(e.command), (context.tokens = 20_000), { text: '' }))
-
-    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await clock.settle()
-    expect(seen.logs).toContain('observational-memory: context at 160000 tokens; compacting once the background observations catch up')
-    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
-    await clock.settle()
-
-    expect(seen.logs).toContain('observational-memory: context at 160000 tokens; compacting early')
-    expect(commands).toEqual(['compact'])
-  })
-
   test('/clear drops the cleared session\'s ledger, times and skills', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    model(on)
+    pi(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
     const runTurn = live(on, clock, history)
 
@@ -388,7 +501,7 @@ describe('register', () => {
   test('a rewound transcript restarts the ledger from the memory message', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = model(on)
+    const seen = pi(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -405,7 +518,7 @@ describe('register', () => {
   test("a subagent's compaction uses no stored state and records nothing", async ($, on) => {
     mock.clock(on)
     const { stored } = world(on)
-    const seen = model(on)
+    const seen = pi(on)
 
     const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
