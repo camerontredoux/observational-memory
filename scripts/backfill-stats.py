@@ -133,6 +133,8 @@ def main() -> None:
     cost = 0.0
     compactions = 0
     for sid, s in sessions.items():
+        if not s['metrics'] and not s['counts']:
+            continue  # only other log lines (a restarted ledger, a dropped skill)
         target = out / f'{sid}.json'
         if target.exists() and not json.loads(target.read_text()).get('backfilled'):
             skipped += 1

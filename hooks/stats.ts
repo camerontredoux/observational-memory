@@ -33,6 +33,7 @@ export type Compaction = {
   fellBack: boolean
   tokensBefore?: number
   tokensAfter?: number
+  estTokensAfter?: number
   syncCalls?: number
   syncMs?: number
   rowsObservedNow?: number
@@ -96,6 +97,7 @@ export function addCompaction(s: SessionStats, c: Compaction, at: number) {
   add(s, `${key}.ms`, c.ms, at)
   add(s, `${key}.tokensBefore`, c.tokensBefore, at)
   add(s, `${key}.tokensAfter`, c.tokensAfter, at)
+  add(s, `${key}.estTokensAfter`, c.estTokensAfter, at)
   add(s, `${key}.syncCalls`, c.syncCalls, at)
   add(s, `${key}.syncMs`, c.syncMs, at)
   add(s, `${key}.rowsObservedNow`, c.rowsObservedNow, at)

@@ -673,6 +673,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
     pi(on)
+    on('session.usage', () => ({ value: { context: { tokens: 90_000, window: 200_000 }, rateLimits: [] } }) as never) // the fields the hook reads
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)], at(22, 14, 30))
@@ -690,7 +691,8 @@ describe('register', () => {
     expect(file.metrics['observer.compaction.ms']?.count).toBeGreaterThan(0)
     expect(file.metrics['compaction.manual.syncCalls']?.sum).toBe(file.metrics['observer.compaction.ms']?.count)
     expect(file.metrics['compaction.manual.rowsObservedBefore']?.sum).toBe(7)
-    expect(file.metrics['compaction.manual.tokensBefore']?.sum).toBeGreaterThan(file.metrics['compaction.manual.tokensAfter']!.sum)
+    expect(file.metrics['compaction.manual.tokensBefore']?.sum).toBe(90_000)
+    expect(file.metrics['compaction.manual.estTokensAfter']?.sum).toBeLessThan(90_000)
 
     const tool = String((await $.tool.call({ tool: 'mcp__observational-memory__om_stats' })).result)
     expect(tool).toContain('## observational-memory stats, session session-1 (/work/project)')
