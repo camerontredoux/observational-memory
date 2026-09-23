@@ -1041,6 +1041,27 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^observed 6 rows now, kept 0 raw messages/)
   })
 
+  test('a memory message over the budget a small window leaves keeps its skills as lines and its user messages as the brief', async ($, on) => {
+    mock.clock(on, { now: at(22, 9, 0) })
+    world(on)
+    const seen = pi(on)
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    // (50k - 20k of system prompt and tools) / 2: a 15k-token budget, which the two skills alone fill.
+    on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
+    await $.skill.prompt({ skill: 'plan', text: 'p'.repeat(30_000) })
+    await $.skill.prompt({ skill: 'style', text: 's'.repeat(30_000) })
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'auto', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(skillsIn(text)).toBe(`<skill name="style" invoked="2026-09-22 09:00">${FINISHED}</skill>\n<skill name="plan" invoked="2026-09-22 09:00">${FINISHED}</skill>`)
+    expect(userMessagesIn(text)).toEqual(['a', '(1 omitted)'])
+    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b')
+    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: skills kept as lines, user messages as the brief$/))
+  })
+
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
     const clock = mock.clock(on)
     const { agents } = world(on)

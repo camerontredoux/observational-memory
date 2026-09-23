@@ -49,6 +49,8 @@ const STATS_TOOL = 'om_stats'
 const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
 const NEXT_STEP_MAX_TOKENS = 2_000
 const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
+const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say: the smallest in use
+const OVERHEAD_TOKENS = 20_000 // the system prompt and tool schemas every request carries beside the messages
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
 const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -469,6 +471,17 @@ function capUserMessages(messages: readonly UserMessage[]) {
   return [brief, ...(omitted ? [{ text: '', omitted }] : []), ...kept]
 }
 
+// A memory with its skills as lines and its user messages the brief alone, the rest counted.
+function briefer(memory: Memory): Memory {
+  const [brief, ...rest] = memory.userMessages
+  const omitted = rest.reduce((n, m) => n + (m.omitted ?? 1), 0)
+  return {
+    ...memory,
+    skills: memory.skills.map((s) => ({ ...s, text: '' })),
+    userMessages: brief ? [brief, ...(omitted ? [{ text: '', omitted }] : [])] : [],
+  }
+}
+
 const renderSkill = (s: Skill) => {
   const head = `<skill name="${s.skill}"${s.at === undefined ? '' : ` invoked="${stamp(s.at)}"`}>`
   return s.text ? `${head}\n${s.text}\n</skill>` : `${head}${SKILL_FINISHED}</skill>`
@@ -800,7 +813,7 @@ async function maybeReflect($: EngineInterface, loop: Loop) {
         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
         await $.store.set(ledgerKey(key), { ...ledger, entries, seq })
         record(statsIo($), sessionId, (s, at) =>
-          addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: estimateTokens(renderLines(reflected)), level: level }, at))
+          addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: estimateTokens(renderLines(reflected)), level }, at))
         log(
           $,
           `reflected ${snapshot.length} observations (~${estimateTokens(text)} tokens) into ${reflected.length} ` +
@@ -991,7 +1004,7 @@ export const register: Register = (on) => {
     // A prompt cut to its note alone quotes nothing.
     const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
     const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
-    const memory: Memory = {
+    let memory: Memory = {
       corrections: ledger.corrections,
       observations,
       currentTask: ledger.currentTask,
@@ -1005,7 +1018,22 @@ export const register: Register = (on) => {
       recentKept: tail.length > 0,
       resumeDirectly: e.trigger === 'auto',
     }
-    const message = memoryMessage(memory)
+    // The compacted context fits half the window the overhead leaves, so the session can work before compacting
+    // again. Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's
+    // measure, less the overhead, over the estimate of the same messages scales every estimate up, never down.
+    const budget = Math.floor(((usage?.context.window ?? WINDOW_TOKENS) - OVERHEAD_TOKENS) / 2)
+    const measured = main ? usage?.context.tokens : undefined
+    const density = measured === undefined ? 1 : Math.max(1, (measured - OVERHEAD_TOKENS) / Math.max(1, tokensBetween(v, 0, messages.length)))
+    const sizeOf = (m: SessionMessage) => Math.ceil((estimateTokens(m.text) + tokensBetween(v, cut, messages.length)) * density)
+    let message = memoryMessage(memory)
+    // Over it, the skills become lines and the user messages the brief alone, which om_recall can still find; the
+    // corrections, observations and next step stay whole. Still over it, the built-in compaction runs instead.
+    if (sizeOf(message) > budget) {
+      const over = sizeOf(message)
+      memory = briefer(memory)
+      message = memoryMessage(memory)
+      log($, `over the ~${budget}-token budget at ~${over} tokens: skills kept as lines, user messages as the brief`)
+    }
     log(
       $,
       (observedNow ? `observed ${observedNow} rows now, ` : 'cut at the background watermark with no Observer call, ') +
