@@ -728,4 +728,59 @@ describe('register', () => {
     expect(seen.prompts.length).toBeGreaterThan(2)
   })
 
+  // A real crewmate turn, replayed from a private transcript: /tmp/om-v043/make-fixture.py writes the module
+  // (gitignored). Without it the test has nothing to replay and passes.
+  test('replays a crewmate transcript: one long turn, observed in the background, compacted with no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
+    const fx = (await import('./fixtures/crewmate.local').catch(() => undefined)) as
+      | { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
+      | undefined
+    if (!fx) return
+    const clock = mock.clock(on, { now: fx.at[0] })
+    const { history, stored } = world(on)
+    const seen = pi(on, { hold: () => clock.sleep(12_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+    const tokens = (m: SessionMessage) =>
+      Math.ceil([m.text, ...m.toolUses.map((u) => `${u.tool} ${JSON.stringify(u.input)}`), ...(m.toolResults ?? []).map((r) => r.text)].join('\n').length / 4)
+
+    history.push(fx.rows[0]!)
+    await $.turn.start({ text: fx.brief, turnId: 't' })
+    let index = 0
+    let live = 0 // where the live context starts in the history
+    const report: { lunaAtCompaction: number; midTurnLanded: number; rawTokens: number; nextStep: boolean }[] = []
+    for (let i = 1; i < fx.rows.length; i++) {
+      await clock.set(Math.max(clock.now(), fx.at[i]!))
+      if (fx.compactions.some((c) => c.at === i)) {
+        const before = seen.prompts.length
+        const landed = seen.logs.filter((l) => l.includes('in the background')).length
+        const result = await $.session.compact({ trigger: 'auto', messages: history.slice(live) })
+        const text = result.messages?.[0]?.text ?? ''
+        const watermark = history.length - (result.messages!.length - 1)
+        report.push({
+          lunaAtCompaction: seen.prompts.length - before,
+          midTurnLanded: landed,
+          rawTokens: history.slice(watermark).reduce((n, m) => n + tokens(m), 0),
+          nextStep: text.includes('<optional-next-step>'),
+        })
+        expect(userMessagesIn(text)).toEqual([fx.brief])
+        live = history.length
+        history.push(...result.messages!)
+      }
+      if (fx.step[i]) await step($, 't', index++, history.length)
+      history.push(fx.rows[i]!)
+      await clock.settle()
+    }
+    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })
+
+    expect(report).toHaveLength(fx.compactions.length)
+    for (const r of report) {
+      expect(r.lunaAtCompaction).toBe(0)
+      expect(r.midTurnLanded).toBeGreaterThan(0)
+      expect(r.rawTokens).toBeLessThanOrEqual(6_000 + 10_000 + 2_000) // the raw tail and about one chunk, as chunks end past CHUNK_TOKENS
+      expect(r.nextStep).toBe(false)
+    }
+    const ledger = stored['ledger:session-1'] as Ledger
+    for (const e of ledger.entries) expect(e.line).toMatch(/^\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2} /)
+  })
 })
