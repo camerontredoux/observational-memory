@@ -263,7 +263,7 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const background = s.metrics['observer.background.ms']
   if (background) {
     const notes = values(s.metrics['observer.background.observations'])
-    row('Background', `${plural(background.count, 'observation')}, median ${duration(median(values(background)))} each${notes.length ? `, ~${plural(median(notes), 'note')} each` : ''}`)
+    row('Background', `${plural(background.count, 'call')}, median ${duration(median(values(background)))} each${notes.length ? `, ~${plural(median(notes), 'note')} each` : ''}`)
   }
   const failed = new Map<string, number>()
   for (const [k, n] of Object.entries(s.counts)) {

@@ -1861,7 +1861,7 @@ describe('register', () => {
 
     const summary = String((await $.tool.call({ tool: 'mcp__observational-memory__om_stats' })).result)
     expect(summary).toStartWith('observational-memory · this session (/work/project) · ')
-    expect(summary).toMatch(/^Background   2 observations,/m)
+    expect(summary).toMatch(/^Background   2 calls,/m)
     const tool = String((await $.tool.call({ tool: 'mcp__observational-memory__om_stats', full: true })).result)
     expect(tool).toContain('## observational-memory stats, session session-1 (/work/project)')
     expect(tool).toMatch(/1 compaction\(s\), \d+ Luna call\(s\) \(0 failed\)/)
