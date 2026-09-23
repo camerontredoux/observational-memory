@@ -614,7 +614,7 @@ export const register: Register = (on) => {
 
     // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
     // observed is observed now, in chunks, all at once. A chunk pi fails on stays raw: the cut is wherever the rest
-    // reaches, and with nothing observed at all there is no compaction.
+    // reaches, and with nothing observed at all the built-in compaction runs instead.
     const chunks: Chunk[] = []
     let failed = 0
     const start = tailStart(v, base)
@@ -644,7 +644,7 @@ export const register: Register = (on) => {
     }
     const ledger = persistent ? await locked(async () => settle(await loadLedger($, sessionId, v))) : await settle(initial)
     const cut = ledger.watermark.to
-    if (cut <= base && failed) return { skip: 'observational-memory: the Observer failed and nothing is observed yet; not compacted' }
+    if (cut <= base && failed) throw new Error('the Observer failed and nothing is observed yet')
     if (cut <= base) throw new Error('nothing observed and nothing to observe before the raw tail')
 
     const observations = renderLines(ledger.entries)

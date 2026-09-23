@@ -164,21 +164,23 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^observational-memory: observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
   })
 
-  test('when pi fails at compaction with nothing observed, it skips: no built-in compaction, no other model', async ($, on) => {
+  test('when pi fails at compaction with nothing observed, the built-in compaction runs instead', async ($, on) => {
     mock.clock(on)
     world(on)
     const seen = pi(on, { fail: () => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' }) })
     let builtin = 0
-    on('session.compact', () => (builtin++, { messages: [] }))
+    const summary = { role: 'user' as const, text: 'built-in summary', toolUses: [] }
+    on('session.compact', () => (builtin++, { messages: [summary] }))
 
     const result = await $.session.compact({ trigger: 'auto', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)] })
 
-    expect(result).toEqual({ skip: 'observational-memory: the Observer failed and nothing is observed yet; not compacted' })
-    expect(builtin).toBe(0)
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(builtin).toBe(1)
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toEqual([
       'observational-memory: observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
       'observational-memory: observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
+      'observational-memory: the Observer failed and nothing is observed yet; using the built-in compaction',
     ])
   })
 
