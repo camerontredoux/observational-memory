@@ -910,6 +910,27 @@ describe('register', () => {
     for (const e of ledger.entries) expect(e.line).toMatch(/^\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2} /)
   })
 
+  test('stats: a discarded background chunk counts its cost but not its observations', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, files } = world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle() // [0, 4) in flight, held
+    history.splice(0, history.length, ...turn('z', 'z', CHUNK), ...turn('b', 'b', 8_000)) // rewound
+    open(1)
+    await clock.settle()
+    await clock.advance(5_000)
+
+    expect(seen.logs).toContain('rows 0-3 were observed but no longer match the transcript; discarded')
+    const file = JSON.parse(files['/stats/session-1.json']!) as { metrics: Record<string, { count: number; sum: number }> }
+    expect(file.metrics['observer.background.cost']?.count).toBeGreaterThan(0)
+    expect(file.metrics['observer.background.observations']).toBeUndefined()
+  })
+
   test('stats: background calls and a compaction land in the session file, and om_stats and /om-stats report them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)

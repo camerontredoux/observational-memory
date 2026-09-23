@@ -327,6 +327,10 @@ async function complete($: EngineInterface, role: string, system: string, prompt
 
 type Call = { phase: LunaCall['phase']; chunkTokens?: number }
 
+// A chunk's observations count once it lands; a discarded one counts only its call.
+const noteObservations = ($: EngineInterface, sessionId: string, phase: Call['phase'], n: number) =>
+  record(statsIo($), sessionId, (s, at) => add(s, `observer.${phase}.observations`, n, at))
+
 // One chunk, read alone: the Observer never sees the observations so far.
 async function observe($: EngineInterface, v: View, from: number, to: number, phase: Call['phase']): Promise<Chunk> {
   const bounds = boundsOf(v, from, to)
@@ -341,7 +345,6 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
     throw new Error('observer answered without an <observations> block')
   }
   const lines = parseLines(observationsOf(text), bounds, !bounds)
-  void $.session.id().then((id) => record(statsIo($), id, (s, at) => add(s, `observer.${phase}.observations`, lines.length, at)), () => {})
   return {
     ...range(v, from, to),
     lines,
@@ -601,6 +604,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
     if (!at) log($, `rows ${chunk.from}-${chunk.to} were observed but no longer match the transcript; discarded`)
     const next = at ? commit({ ...ledger, chunks: [...ledger.chunks, { ...chunk, ...at }] }, now) : ledger
     await $.store.set(ledgerKey(sessionId), next)
+    if (at) noteObservations($, sessionId, 'background', chunk.lines.length)
     if (at)
       log(
         $,
@@ -825,7 +829,7 @@ export const register: Register = (on) => {
       const settled = await Promise.allSettled(gaps.map(([from, to]) => observe($, v, from, to, 'compaction')))
       sync = { calls: gaps.length, ms: (await $.clock.now()) - started }
       settled.forEach((r, i) => {
-        if (r.status === 'fulfilled') return void chunks.push(r.value)
+        if (r.status === 'fulfilled') return void (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length))
         failed++
         log($, `observation of rows ${gaps[i]![0]}-${gaps[i]![1]} at compaction failed (${errorText(r.reason)}); kept raw`)
       })
