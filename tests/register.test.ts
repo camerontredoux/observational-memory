@@ -1021,6 +1021,35 @@ describe('register', () => {
     expect(tailKeepsCalls(tail)).toBe(true)
   })
 
+  test('after a compaction, a context that groups parallel tool calls matches the tail of the longer history', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    history.push(...first.messages!)
+    const memory = first.messages![0]!
+    const block = parallel('d', 4, 10_000)
+    await runTurn($, [{ role: 'user', text: 'd', toolUses: [] }, ...block.history, { role: 'assistant', text: 'd done', toolUses: [] }], at(22, 16, 0))
+    await runTurn($, turn('e', 'e', CHUNK), at(22, 16, 30))
+    await runTurn($, turn('f', 'f', 8_000), at(22, 17, 0))
+    await clock.settle()
+    const observed = seen.prompts.length
+    const current = history.slice(history.indexOf(memory))
+    const start = current.indexOf(block.history[0]!)
+    const context = [...current.slice(0, start), ...block.context, ...current.slice(start + block.history.length)]
+    await $.session.compact({ trigger: 'auto', messages: context })
+
+    expect(history.length).toBeGreaterThan(context.length)
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+  })
+
   test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
