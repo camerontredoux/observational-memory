@@ -93,11 +93,23 @@ const stem = (path: string) => path.slice(path.lastIndexOf('/') + 1).replace(/\.
 const tagFor = (id: string) => (/^[0-9a-f]{8}[0-9a-f-]{8,}$/i.test(id) ? id.slice(0, TAG) : id)
 const dirOf = (path: string) => path.slice(0, Math.max(0, path.lastIndexOf('/'))) || '.'
 
-// A block's lines, each longer one cut every WRAP characters: the numbering search, read and paging share.
+// A block's lines, each longer one cut every WRAP characters: the numbering search, read and paging share. `starts`
+// is each display line's offset in the raw text, so a match found in the raw text can be placed back on a line.
+function splitLines(text: string) {
+  const lines: string[] = []
+  const starts: number[] = []
+  let raw = 0
+  for (const line of text.split('\n')) {
+    for (let i = 0; i === 0 || i < line.length; i += WRAP) {
+      lines.push(line.slice(i, i + WRAP))
+      starts.push(raw + i)
+    }
+    raw += line.length + 1 // the '\n' split() consumed
+  }
+  return { lines, starts }
+}
 function linesOf(text: string) {
-  const out: string[] = []
-  for (const line of text.split('\n')) for (let i = 0; i === 0 || i < line.length; i += WRAP) out.push(line.slice(i, i + WRAP))
-  return out
+  return splitLines(text).lines
 }
 
 // A tool's input, one `key: value` per field, a string as it is, so a command or a file's text reads by its lines.
@@ -134,9 +146,14 @@ type Row = {
   message?: { content?: string | Content[] }
 }
 type Content = { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean }
-// What the files of one thread share while they are read in order: the rows seen, and the calls awaiting results.
-type Seen = { uuids: Set<string>; contents: Set<string>; calls: Map<string, Block> }
-const newSeen = (): Seen => ({ uuids: new Set(), contents: new Set(), calls: new Map() })
+// What the files of one thread share while they are read in order: the rows seen, the calls awaiting results, and
+// the content kept in the model's context, matched to recognize a compaction's copy of it. `replay` is what a
+// boundary may copy (the content before it, still in context); `seg` is what has been seen since, itself replayable
+// by a later boundary. Content equality alone, unbounded, could treat a genuinely new event as a copy of an
+// unrelated older one; bounding the match to content still in context, and feeding a recognized copy back into
+// `seg`, keeps a message a second compaction copies again from being read as new.
+type Seen = { uuids: Set<string>; replay: Set<string>; seg: Set<string>; calls: Map<string, Block> }
+const newSeen = (): Seen => ({ uuids: new Set(), replay: new Set(), seg: new Set(), calls: new Map() })
 
 function pairUp(seen: Seen, b: Block, callId: string) {
   const call = seen.calls.get(callId)
@@ -180,7 +197,11 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean) {
       continue // a line still being written
     }
     if (r.type === 'continued-in' && r.continuedInSessionId) continuedIn = r.continuedInSessionId
-    if (r.type === 'system' && r.subtype === 'compact_boundary') copying = true
+    if (r.type === 'system' && r.subtype === 'compact_boundary') {
+      copying = true
+      seen.replay = seen.seg
+      seen.seg = new Set()
+    }
     if ((r.type !== 'user' && r.type !== 'assistant') || (r.isSidechain && !sidechain)) continue
     if (r.uuid) {
       if (seen.uuids.has(r.uuid)) continue
@@ -194,11 +215,11 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean) {
     if (!parts.length) continue
     const key = `${r.type}\n${parts.map((p) => p.id ?? p.tool_use_id ?? p.text ?? p.type).join('\n')}`
     const summary = r.type === 'user' && parts.some((p) => p.type === 'text' && p.text?.startsWith(COMPACT_WRAPPER))
-    if (copying && !summary && !parts.some((p) => p.type === 'text' && p.text && isMemoryText(p.text))) {
-      if (seen.contents.has(key)) continue
-      copying = false
-    }
-    seen.contents.add(key)
+    const memory = parts.some((p) => p.type === 'text' && p.text && isMemoryText(p.text))
+    const copy = copying && !summary && !memory && seen.replay.has(key)
+    if (copying && !summary && !memory && !copy) copying = false
+    seen.seg.add(key)
+    if (copy) continue
     const time = r.timestamp ? Date.parse(r.timestamp) : NaN
     const base = { ...(Number.isNaN(time) ? {} : { time }), ...(r.isMeta ? { meta: true } : {}) }
     const made: Part[] = []
@@ -215,11 +236,16 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean) {
   return { blocks, continuedIn }
 }
 
-// The newest prompt is the one that asked: search never answers with it.
+// The newest prompt is the one that asked: search never answers with it, whole, at message scope (every part of its
+// row, not only the part that decided it was the asking one, so a structured prompt's other text parts are excluded
+// too).
 function markAsking(blocks: readonly Block[]) {
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i]!
-    if (b.kind === 'user' && !b.meta && typedText(b.text) !== undefined) return void (b.asking = true)
+    if (b.kind !== 'user' || b.meta || typedText(b.text) === undefined) continue
+    const base = b.ref.replace(/\.\d+$/, '')
+    for (const x of blocks) if (x.ref === base || x.ref.startsWith(`${base}.`)) x.asking = true
+    return
   }
 }
 
@@ -474,19 +500,68 @@ function held(m: Matcher, text: string, lower = text.toLowerCase()): Held[] {
 
 type Excerpt = { text: string; best: number; lead: number; lines: number }
 
+// A phrase held only whole-block (its words fall on different display lines: a real newline, or just a display wrap
+// of one long line) is not on any single line to score or cut around. Locate it in the raw text instead, and report
+// the display lines its match spans, so the excerpt still shows it rather than falling back to a default line.
+function spanning(b: Block, starts: readonly number[], lines: readonly string[], heldPerLine: readonly Held[][], m: Matcher) {
+  const spans = new Map<number, number>() // display line index the match starts on -> how many lines it spans
+  const phrases = m.terms.filter((t, k) => t.word.includes(' ') && !heldPerLine.some((h) => h[k]))
+  if (!phrases.length) return spans
+  const raw = b.text.toLowerCase()
+  const flat: string[] = []
+  const map: number[] = [] // flat index -> raw index
+  for (let i = 0; i < raw.length; ) {
+    if (/\s/.test(raw[i]!)) {
+      const start = i
+      while (i < raw.length && /\s/.test(raw[i]!)) i++
+      flat.push(' ')
+      map.push(start)
+    } else {
+      flat.push(raw[i]!)
+      map.push(i)
+      i++
+    }
+  }
+  const flatText = flat.join('')
+  const locate = (r: number) => {
+    let lo = 0,
+      hi = starts.length - 1,
+      at = 0
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (starts[mid]! <= r) {
+        at = mid
+        lo = mid + 1
+      } else hi = mid - 1
+    }
+    return at
+  }
+  for (const t of phrases) {
+    const idx = flatText.indexOf(t.word)
+    if (idx === -1) continue
+    const s = locate(map[idx]!)
+    const e = locate(map[idx + t.word.length - 1]!)
+    spans.set(s, Math.max(spans.get(s) ?? 1, e - s + 1))
+  }
+  return spans
+}
+
 // A hit's lines to show: those holding the most terms, then the rarest in the block (on the fewest of its lines), each
 // more than SEARCH_LINE_GAP from another, the farthest from those taken on a tie. Each is cut around its rarest term.
 // `best`, the most terms one line holds, ranks the hit; `lead` is the line taken first.
 function excerpt(b: Block, m: Matcher): Excerpt {
-  const lines = linesOf(b.text)
+  const { lines, starts } = splitLines(b.text)
   const lowers = lines.map((l) => l.toLowerCase())
   const atoms = [...new Set(m.terms.flatMap((t) => [t.word, ...t.parts]))]
   const freq = new Map(atoms.map((a) => [a, lowers.filter((l) => l.includes(a)).length]))
-  type Line = { i: number; terms: number; rarity: number }
+  const heldPerLine = lines.map((l, i) => held(m, l, lowers[i]))
+  const spans = spanning(b, starts, lines, heldPerLine, m)
+  type Line = { i: number; terms: number; rarity: number; span: number }
   const scored: Line[] = lines.map((l, i) => ({
     i,
-    terms: held(m, l, lowers[i]).filter(Boolean).length,
+    terms: heldPerLine[i]!.filter(Boolean).length + (spans.has(i) ? 1 : 0),
     rarity: atoms.reduce((s, a) => s + (lowers[i]!.includes(a) ? 1 / freq.get(a)! : 0), 0),
+    span: spans.get(i) ?? 1,
   }))
   let pool = scored.filter((s) => s.terms > 0)
   if (!pool.length) pool = scored.filter((s) => s.rarity > 0) // a compound's parts on separate lines
@@ -499,18 +574,19 @@ function excerpt(b: Block, m: Matcher): Excerpt {
     taken.push(open[0]!)
   }
   const lead = taken[0]?.i ?? 0
-  const anchor = (i: number) => {
-    if (m.regex) return Math.max(0, lines[i]!.search(m.regex))
-    const rarest = atoms.filter((a) => lowers[i]!.includes(a)).sort((x, y) => freq.get(x)! - freq.get(y)! || y.length - x.length)[0]
-    return rarest ? lowers[i]!.indexOf(rarest) : 0
+  const anchor = (l: string, ll: string) => {
+    if (m.regex) return Math.max(0, l.search(m.regex))
+    const rarest = atoms.filter((a) => ll.includes(a)).sort((x, y) => freq.get(x)! - freq.get(y)! || y.length - x.length)[0]
+    return rarest ? ll.indexOf(rarest) : 0
   }
   const found = taken
     .sort((x, y) => x.i - y.i)
-    .map(({ i }) => {
-      const l = lines[i]!
-      const start = Math.max(0, Math.min(anchor(i) - 60, l.length - SEARCH_LINE_CHARS))
+    .map(({ i, span }) => {
+      const l = span > 1 ? b.text.slice(starts[i]!, starts[i + span - 1]! + lines[i + span - 1]!.length) : lines[i]!
+      const start = Math.max(0, Math.min(anchor(l, l.toLowerCase()) - 60, l.length - SEARCH_LINE_CHARS))
       const cut = l.slice(start, start + SEARCH_LINE_CHARS).replace(/\s+/g, ' ')
-      return `  ${i + 1}: ${start > 0 ? '…' : ''}${cut}${start + SEARCH_LINE_CHARS < l.length ? '…' : ''}`
+      const at = span > 1 ? `${i + 1}-${i + span}` : `${i + 1}`
+      return `  ${at}: ${start > 0 ? '…' : ''}${cut}${start + SEARCH_LINE_CHARS < l.length ? '…' : ''}`
     })
   if (!found.length) found.push(`  1: ${oneLine(lines[0] ?? '', SEARCH_LINE_CHARS)}`) // a match on the tool's name alone
   if (pool.length > taken.length) found.push(`  … ${plural(pool.length - taken.length, 'more matching line')}`)

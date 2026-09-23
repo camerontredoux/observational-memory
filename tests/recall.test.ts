@@ -110,6 +110,12 @@ describe('recall', () => {
     expect(await run({ query: '"where is NEEDLE"' })).toMatch(/^0 match/)
   })
 
+  test('the asking message is excluded whole: every part of it, not just its last block', async () => {
+    const io = memoryIo({ [`${DIR}/${NEW}.jsonl`]: msg('user', 1, [{ type: 'text', text: 'where is NEEDLE-42?' }, { type: 'text', text: 'also check GIZMO-7' }]) })
+    expect(await run({ query: 'NEEDLE-42' }, io)).toMatch(/^0 match/)
+    expect(await run({ query: 'GIZMO-7' }, io)).toMatch(/^0 match/)
+  })
+
   test('regex and quoted phrases', async () => {
     expect(await run({ query: '/needle-\\d+/' })).toMatch(/^1 match\(es\) for \/needle-\\d\+\/ in .*\n\[aaaaaaaa:3 [^\n]*\n  250: row 250 has the NEEDLE-42 marker/)
     expect(await run({ query: '/NEEDLE-4[0-9]/' })).toContain('250: row 250')
@@ -126,6 +132,37 @@ describe('recall', () => {
     msg('assistant', m, [{ type: 'tool_use', id, name: 'Bash', input: { command: `run ${id}` } }]),
     msg('user', m, [{ type: 'tool_result', tool_use_id: id, content: text }]),
   ]
+  const boundary = (id: string) => JSON.stringify({ type: 'system', subtype: 'compact_boundary', uuid: id })
+  const memory = (m: number) => msg('user', m, `${MEMORY_HEADER}\n\n<observations>\n* noted\n</observations>`)
+
+  test('replay is recognized by content still in the model’s context, not by matching anywhere in the session', async () => {
+    // A later, genuinely new message repeats an earlier one's exact text. It is not the compaction's copy of it (the
+    // content between the two boundaries holds no such copy), so content equality alone must not delete it.
+    const newEvent = [
+      msg('user', 1, 'the MANGO plan is set'),
+      boundary('b-1'),
+      memory(2),
+      msg('assistant', 3, 'noted'),
+      boundary('b-2'),
+      memory(4),
+      msg('user', 5, 'the MANGO plan is set'),
+    ]
+    expect(await run({ query: 'MANGO' }, session(newEvent))).toMatch(/^2 match/)
+
+    // A message kept across two compactions: the second boundary's copy of it is still the same one event.
+    const keptTwice = [
+      msg('user', 1, 'the KIWI plan is set'),
+      boundary('c-1'),
+      memory(2),
+      msg('user', 1, 'the KIWI plan is set'), // the first boundary's copy
+      msg('assistant', 3, 'noted'),
+      boundary('c-2'),
+      memory(4),
+      msg('user', 1, 'the KIWI plan is set'), // the second boundary's copy of the still-kept message
+      msg('assistant', 3, 'noted'), // the second boundary's copy of the still-kept reply
+    ]
+    expect(await run({ query: 'KIWI' }, session(keptTwice))).toMatch(/^1 match/)
+  })
 
   test('search shows the lines holding the most and rarest terms, spread apart, cut around the rarest', async () => {
     const out = Array.from({ length: 300 }, (_, i) => {
@@ -175,6 +212,23 @@ describe('recall', () => {
     expect(await run({ query: '"Test Files 10 passed"' }, io())).toMatch(/^1 match\(es\) for "Test Files 10 passed" in [^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}1: {2}Test Files 10 passed \(10\)\n/)
     expect(await run({ query: '"tests   110\tpassed"' }, io())).toMatch(/^1 match\(es\)[^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}2: {2}Tests 110 passed \(110\)\n/)
     expect(await run({ query: '"Files 10passed"' }, io())).toMatch(/^0 match/)
+  })
+
+  test('a phrase across a newline, or split only by the display wrap, is excerpted at its real location', async () => {
+    // The phrase is one real event, written across two lines; the excerpt must show where it actually is, not a
+    // default first line.
+    const io = session([msg('assistant', 20, 'preface\nthe ALPHA\nplan is set\ntrailer')])
+    const across = await run({ query: '"ALPHA plan"' }, io)
+    expect(across).toMatch(/^1 match/)
+    expect(across).toContain('2-3: the ALPHA plan is set')
+
+    // A single long line, wrapped only for display at WRAP characters, with the phrase straddling that cut.
+    const long = `${'A'.repeat(990)} ALPHA plan ${'B'.repeat(50)}`
+    const wrapped = await run({ query: '"ALPHA plan"' }, session([msg('assistant', 20, long)]))
+    expect(wrapped).toMatch(/^1 match/)
+    expect(wrapped).toContain('1-2: ')
+    expect(wrapped).toContain('ALPHA plan')
+    expect(wrapped).not.toMatch(/1: {2}A{100}/) // not a default cut from the line's own start
   })
 
   test('with no block holding every term, rare terms outrank common ones, and absent terms are named', async () => {
