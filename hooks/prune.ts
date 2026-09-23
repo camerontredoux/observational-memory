@@ -29,7 +29,7 @@ async function sessions($: EngineInterface, withSizes: boolean) {
     if (at < 1) continue
     const kind = key.slice(0, at)
     if (!KINDS.includes(kind)) continue
-    const id = key.slice(at + 1)
+    const id = key.slice(at + 1).split('/')[0]! // a subagent's keys, `<kind>:<session>/<agent>`, go with its session
     const s = all.get(id) ?? all.set(id, { id, keys: [], bytes: 0, times: [] }).get(id)!
     s.keys.push(key)
     if (!withSizes && kind !== 'times' && kind !== 'seen') continue

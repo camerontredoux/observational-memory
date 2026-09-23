@@ -51,12 +51,17 @@ const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k
 // Local time on a day of September 2026.
 const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
 
-// The main conversation's history, grown as the engine would, a store the test can read, and a context size.
-function world(on: On, options: { failWrites?: boolean } = {}) {
+// The main conversation's history, grown as the engine would, each listed subagent's under `agents` (any other id
+// is denied), a store the test can read, and a context size.
+function world(on: On, options: { failWrites?: boolean; unreadable?: string[] } = {}) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
-  on('session.messages', () => ({ value: history }))
+  const agents: Record<string, SessionMessage[]> = {}
+  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? history : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
+  const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
+  on('agent.list', () => ({ value: listed().map((id) => ({ id, description: id, type: 'general-purpose', status: 'running' })) }))
   const stored: Record<string, unknown> = {}
+  on('store.keys', () => ({ value: Object.keys(stored) }))
   on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
   on('store.set', ($, e) => ((stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
@@ -76,7 +81,7 @@ function world(on: On, options: { failWrites?: boolean } = {}) {
   on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, isLink: false })) }))
   on('session.cwd', () => ({ value: '/work/project' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  return { history, stored, files, reads }
+  return { history, agents, stored, files, reads }
 }
 
 type Ledger = { entries: { id: string; line: string }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
@@ -216,6 +221,15 @@ const call = (n: number, size: number): SessionMessage[] => [
   { role: 'assistant', text: '', toolUses: [{ tool_use_id: `c${n}`, tool: 'Read', input: { file_path: `/src/f${n}.ts` } }] },
   { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `c${n}`, text: 'x'.repeat(size), isError: false }] },
 ]
+
+// One tool call of a subagent `agent` (or the main loop's): it reads `/src/<agent>-<n>.ts`.
+const agentCall = (agent: string, n: number, size: number): SessionMessage[] => [
+  { role: 'assistant', text: '', toolUses: [{ tool_use_id: `${agent}-c${n}`, tool: 'Read', input: { file_path: `/src/${agent}-${n}.ts` } }] },
+  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `${agent}-c${n}`, text: 'x'.repeat(size), isError: false }] },
+]
+// An Observer that names the files its chunk read.
+const readsIn = (prompt: string) => `<observations>\n* 🟡 Read ${[...prompt.matchAll(/"file_path":"\/src\/([\w-]+)\.ts"/g)].map((m) => m[1]).join(', ')}\n</observations>`
+const readers = (text: string) => new Set([...text.matchAll(/\b(main|one|two)-\d+/g)].map((m) => m[1]))
 
 describe('register', () => {
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
@@ -748,7 +762,7 @@ describe('register', () => {
     expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 messages.\n[#2 Read result] export const marker = "PLUM-7731"')
   })
 
-  test('/clear drops the cleared session\'s ledger, times, skills and seen stamp', async ($, on) => {
+  test('/clear drops the cleared session\'s ledger, times, skills and seen stamp, its subagents\' too', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     pi(on)
@@ -761,6 +775,7 @@ describe('register', () => {
     await clock.settle()
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1', 'skills:session-1', 'times:session-1', 'turns:session-1'])
     stored['seen:session-1'] = 1 // the pruner's stamp
+    stored['ledger:session-1/agent-1'] = { entries: [] } // a subagent's left behind
     await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
 
     expect(stored).toEqual({})
@@ -783,16 +798,153 @@ describe('register', () => {
     expect(result.messages?.slice(1)).toEqual(history.slice(3))
   })
 
-  test("a subagent's compaction uses no stored state and records nothing", async ($, on) => {
-    mock.clock(on)
-    const { stored } = world(on)
+  test('a subagent whose history the session cannot read is observed at compaction from its context alone, and its steps store nothing', async ($, on) => {
+    const clock = mock.clock(on)
+    const { stored } = world(on, { unreadable: ['agent-1'] })
     const seen = pi(on)
+    const step = steps(on)
 
+    await step($, 's', 0, 3, 'agent-1')
+    await clock.settle()
     const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
     expect(seen.prompts).toHaveLength(1)
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 Saw a')
     expect(stored).toEqual({})
+    expect(seen.logs).toContain("subagent agent-1's history is unreadable (no agent agent-1 in this session)")
+    expect(seen.logs).toContain("subagent agent-1's history is unreadable (no agent agent-1 in this session); observing its context on the spot")
+    expect(seen.screen).toEqual(['Compacted subagent in 0 ms · observed 3 messages on the spot · memory 1 note'])
+  })
+
+  test('main and two subagents observe in the background side by side, each under its own keys, four Observer calls in flight across them', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, agents, stored } = world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await clock.set(at(23, 9, 0))
+    history.push({ role: 'user', text: 'main brief', toolUses: [] })
+    await $.turn.start({ text: 'main brief', turnId: 't' })
+    agents['agent-1'] = [{ role: 'user', text: 'first brief', toolUses: [] }]
+    agents['agent-2'] = [{ role: 'user', text: 'second brief', toolUses: [] }]
+
+    for (let n = 0; n < 10; n++) {
+      await clock.set(at(23, 9, n + 1))
+      history.push(...agentCall('main', n, 16_000))
+      await step($, 't', n, history.length)
+      agents['agent-1'].push(...agentCall('one', n, 16_000))
+      await step($, 's1', n, agents['agent-1'].length, 'agent-1')
+      agents['agent-2'].push(...agentCall('two', n, 16_000))
+      await step($, 's2', n, agents['agent-2'].length, 'agent-2')
+      await clock.settle()
+    }
+    expect(seen.inFlight).toBe(4)
+    for (let n = 1; n <= 20; n++) open(n)
+    await clock.settle()
+
+    expect(seen.maxInFlight).toBe(4)
+    // Every call read one loop's rows, and a loop left short of a slot got the next one free.
+    for (const prompt of seen.prompts) expect(readers(prompt).size).toBe(1)
+    const ledgers = { main: 'ledger:session-1', one: 'ledger:session-1/agent-1', two: 'ledger:session-1/agent-2' }
+    for (const [who, key] of Object.entries(ledgers)) {
+      const ledger = stored[key] as Ledger
+      expect([...readers(ledger.entries.map((e) => e.line).join('\n'))]).toEqual([who])
+      expect(ledger.watermark.to).toBe(19) // each loop observed up to its own raw tail, its newest call
+      expect(ledger.chunks).toEqual([])
+    }
+    expect(Object.keys(stored).sort()).toEqual([
+      'ledger:session-1', 'ledger:session-1/agent-1', 'ledger:session-1/agent-2',
+      'times:session-1', 'times:session-1/agent-1', 'times:session-1/agent-2', 'turns:session-1',
+    ])
+    // A step from a loop the session lists no agent for (an engine fork) observes nothing.
+    const calls = seen.prompts.length
+    await step($, 'f', 0, 3, 'fork-1')
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(calls)
+    expect(Object.keys(stored).filter((k) => k.includes('fork'))).toEqual([])
+  })
+
+  test("a subagent's compaction cuts at its own background watermark with no Observer call, its brief quoted, counted as a subagent's", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents, stored, files } = world(on)
+    const seen = pi(on, { reply: readsIn })
+    const step = steps(on)
+    const brief = 'Prototype the change in the worktree, then report back.'
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: brief, toolUses: [] }])
+    const run = async (from: number, to: number) => {
+      for (let n = from; n < to; n++) {
+        await clock.set(at(23, 9, n + 1))
+        rows.push(...agentCall('one', n, 16_000))
+        await step($, 's', n, rows.length, 'agent-1')
+        await clock.settle()
+      }
+    }
+
+    await run(0, 10)
+    let calls = seen.prompts.length
+    expect(calls).toBeGreaterThan(0)
+    const first = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
+    expect(seen.prompts).toHaveLength(calls)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    const text = first.messages?.[0]?.text ?? ''
+    expect(userMessagesIn(text)).toEqual([brief])
+    expect(text).not.toContain('<optional-next-step>')
+    expect(observationsIn(text)).toMatch(/^\* 🟡 2026-09-23 09:0\d Read one-0, one-1, one-2/)
+
+    // The engine writes the compaction's result after the history; the next compaction starts at the ledger installed there.
+    const live = rows.length
+    rows.push(...first.messages!)
+    await run(10, 20)
+    calls = seen.prompts.length
+    const second = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: rows.slice(live) })
+    await clock.advance(5_000)
+
+    expect(seen.prompts).toHaveLength(calls)
+    expect(userMessagesIn(second.messages?.[0]?.text)).toEqual([brief])
+    expect(observationsIn(second.messages?.[0]?.text)).toContain('one-10')
+    expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
+    expect(seen.screen.filter((l) => l.startsWith('Compacted'))).toEqual([expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/), expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)])
+    const file = JSON.parse(files['/stats/session-1.json']!) as { metrics: Record<string, { count: number; sum: number }> }
+    expect(file.metrics['compaction.subagent.syncCalls']).toMatchObject({ count: 2, sum: 0 })
+    expect(file.metrics['compaction.auto.ms']).toBeUndefined()
+    expect(stored['ledger:session-1']).toBeUndefined()
+  })
+
+  test("a finished subagent's keys are dropped, a chunk landing after it is discarded, and session end sweeps any left", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, agents, stored } = world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => (n === 1 ? undefined : gate(n)), reply: readsIn })
+    const step = steps(on)
+    const runTurn = live(on, clock, history)
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0))
+    await clock.settle()
+    agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 10; n++) {
+      await clock.set(at(23, 10, n))
+      agents['agent-1'].push(...agentCall('one', n, 16_000))
+      await step($, 's', n, agents['agent-1'].length, 'agent-1')
+      await clock.settle()
+    }
+    expect(stored['ledger:session-1/agent-1']).toBeDefined()
+    expect(seen.inFlight).toBeGreaterThan(0)
+
+    await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    expect(Object.keys(stored).filter((k) => k.includes('/'))).toEqual([])
+    for (let n = 2; n <= 10; n++) open(n)
+    await clock.settle()
+
+    expect(Object.keys(stored).filter((k) => k.includes('/'))).toEqual([])
+    expect(seen.logs).toContain('a background chunk landed after its loop ended; discarded')
+    expect((stored['ledger:session-1'] as Ledger).entries.length).toBeGreaterThan(0) // the main conversation's stays
+
+    // A subagent that never finished (killed, or the process died) leaves keys the session's end sweeps.
+    stored['ledger:session-1/agent-7'] = { entries: [] }
+    stored['times:session-1/agent-7'] = []
+    stored['ledger:session-2/agent-7'] = { entries: [] }
+    await $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
+    expect(Object.keys(stored).sort()).toEqual(['ledger:session-1', 'ledger:session-2/agent-7', 'times:session-1', 'turns:session-1'])
   })
 
   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
@@ -1027,12 +1179,6 @@ describe('register', () => {
     ])
     // The rows' times come from the steps that brought them, not only the prompt's.
     expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 09:03 Read a file', '🟡 2026-09-23 09:06 Read a file'])
-
-    // A subagent's steps schedule nothing, however far the history grew.
-    history.push(...call(8, 16_000), ...call(9, 16_000), ...call(10, 16_000))
-    await step($, 'sub', 0, history.length, 'agent-1')
-    await clock.settle()
-    expect(seen.prompts).toHaveLength(2)
   })
 
   test("a crewmate's launch brief, its only prompt, is quoted in full across compactions and never offered as the next step", async ($, on) => {
@@ -1108,6 +1254,60 @@ describe('register', () => {
     }
     const ledger = stored['ledger:session-1'] as Ledger
     for (const e of ledger.entries) expect(e.line).toMatch(/^\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2} /)
+  })
+
+  // A real subagent's run, replayed from a private transcript: /tmp/om-sub/make-fixture.py writes the module
+  // (gitignored). Its session compacted it three times at ~157-160k tokens, observing everything before the raw tail on
+  // the spot (22.4 s, 15.4 s, 13.0 s). Here each Observer call takes 15 s of the replay's clock. Without the module the
+  // test has nothing to replay and passes.
+  test('replays a subagent transcript: its own steps observe it in the background, and each compaction makes no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
+    const fx = (await import('./fixtures/subagent.local').catch(() => undefined)) as
+      | { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
+      | undefined
+    if (!fx) return
+    const clock = mock.clock(on, { now: fx.at[0] })
+    const { agents, stored } = world(on)
+    const seen = pi(on, { hold: () => clock.sleep(15_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    const rows: SessionMessage[] = (agents['agent-1'] = [fx.rows[0]!])
+    const tokens = (m: SessionMessage) =>
+      Math.ceil([m.text, ...m.toolUses.map((u) => `${u.tool} ${JSON.stringify(u.input)}`), ...(m.toolResults ?? []).map((r) => r.text)].join('\n').length / 4)
+
+    let index = 0
+    let live = 0 // where the live context starts in the subagent's history
+    const report: { lunaAtCompaction: number; landed: number; rawTokens: number; nextStep: boolean }[] = []
+    for (let i = 1; i < fx.rows.length; i++) {
+      await clock.set(Math.max(clock.now(), fx.at[i]!))
+      if (fx.compactions.some((c) => c.at === i)) {
+        const before = seen.prompts.length
+        const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: rows.slice(live) })
+        const text = result.messages?.[0]?.text ?? ''
+        report.push({
+          lunaAtCompaction: seen.prompts.length - before,
+          landed: seen.logs.filter((l) => l.includes('in the background')).length,
+          rawTokens: result.messages!.slice(1).reduce((n, m) => n + tokens(m), 0),
+          nextStep: text.includes('<optional-next-step>'),
+        })
+        expect(userMessagesIn(text)).toEqual([fx.brief])
+        live = rows.length
+        rows.push(...result.messages!)
+      }
+      if (fx.step[i]) await step($, 's', index++, rows.length, 'agent-1')
+      rows.push(fx.rows[i]!)
+      await clock.settle()
+    }
+    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+
+    expect(report).toHaveLength(fx.compactions.length)
+    for (const r of report) {
+      expect(r.lunaAtCompaction).toBe(0)
+      expect(r.landed).toBeGreaterThan(0)
+      expect(r.rawTokens).toBeLessThanOrEqual(6_000 + 5_000 + 10_000) // the raw tail, a scheduling interval, a chunk in flight
+      expect(r.nextStep).toBe(false)
+    }
+    expect(seen.screen.filter((l) => l.startsWith('Compacted'))).toEqual(fx.compactions.map(() => expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)))
+    expect(Object.keys(stored)).toEqual([]) // the finished subagent's keys are gone
   })
 
   // A real firstmate stretch, replayed from a private transcript: /tmp/om-stall/work/make-fixture.ts writes the
@@ -1317,7 +1517,7 @@ describe('register', () => {
     const changed = [...history]
     changed[2] = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't-a', text: '[Old tool result content cleared]', isError: false }] }
     await $.session.compact({ trigger: 'auto', messages: changed })
-    await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: changed }) // a subagent's never matches: no line
+    await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: changed }) // a subagent's history it cannot read: no line
     await clock.advance(5_000)
 
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([

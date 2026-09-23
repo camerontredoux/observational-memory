@@ -71,6 +71,17 @@ describe('register', () => {
     expect(w.screen).toEqual([])
   })
 
+  test("a subagent's keys belong to its session: pruned with an old one, kept with the current one and under the cap", async ($, on) => {
+    const big = 'y'.repeat(1_500_000)
+    const w = world(on, { ...session('old', NOW - 31 * DAY), ...session('old/agent-1', NOW - 31 * DAY), ...session('a', NOW - DAY, big), ...session('session-1/agent-2', NOW - 40 * DAY, big) })
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    await w.start($)
+    expect(w.logs).toEqual(['pruned 1 session(s) untouched for 30 days: old (6 keys)'])
+    await $.skill.prompt({ skill: 'huge', text: big })
+    expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:session-1/agent-2'])
+    expect(w.logs[1]).toMatch(/^pruned 1 session\(s\) to fit the store under its size cap: a \(3 keys, ~\d+ KiB\)$/)
+  })
+
   test('a session with no times is stamped when first seen and pruned 30 days later; the pruner runs at most once a day', async ($, on) => {
     const w = world(on, { 'skills:legacy': [], 'transcript:legacy': '/t.jsonl' })
     await w.start($)

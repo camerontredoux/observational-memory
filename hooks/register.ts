@@ -28,7 +28,7 @@ const PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'l
 const PI_ISOLATION = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
 const PI_CWD = '/tmp'
 const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
-const MAX_PARALLEL = 4 // background Observer calls in flight at once
+const MAX_PARALLEL = 4 // background Observer calls in flight at once, across the main loop and every subagent's
 const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
 const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
 const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
@@ -91,13 +91,16 @@ type Memory = {
   recentKept: boolean
   resumeDirectly: boolean
 }
-type Job = { sessionId: string; range: Range }
+// A model loop whose history is observed: the main conversation, or a subagent's under `<sessionId>/<agentId>`.
+type Loop = { sessionId: string; agentId?: string; key: string }
+type Job = { loop: Loop; range: Range }
 type Bounds = { lo: number; hi: number; latest: number } | undefined
 
 let running: Job[] = [] // background Observer calls in flight
 let lock: Promise<unknown> = Promise.resolve()
 const reflecting = new Set<string>()
 const sinceScheduled = new Map<string, { rows: number; tokens: number }>() // history seen by the last step, and its growth since a pass
+const waiting = new Map<string, Loop>() // loops a pass left short of a slot, first in line when one frees
 
 // Ledger reads and writes one at a time: Observer calls land out of order.
 function locked<T>(fn: () => Promise<T>): Promise<T> {
@@ -560,6 +563,7 @@ function reconcile($: EngineInterface, stored: Ledger | undefined, v: View): Led
   return commit({ ...stored, corrections: stored.corrections ?? [], chunks }, v) // a v0.4.0 ledger has none
 }
 
+const loopOf = (sessionId: string, agentId?: string): Loop => ({ sessionId, agentId, key: agentId === undefined ? sessionId : `${sessionId}/${agentId}` })
 const ledgerKey = (sessionId: string) => `ledger:${sessionId}`
 const timesKey = (sessionId: string) => `times:${sessionId}`
 const liveKey = (sessionId: string) => `live:${sessionId}`
@@ -568,35 +572,55 @@ const turnsKey = (sessionId: string) => `turns:${sessionId}` // the main loop's 
 const transcriptKey = (sessionId: string) => `transcript:${sessionId}`
 const seenKey = (sessionId: string) => `seen:${sessionId}` // the pruner's stamp
 
+// The kinds a subagent's loop keeps: dropped when it finishes.
+const LOOP_KEYS = [ledgerKey, timesKey, liveKey]
+
+// Forgets a loop: its calls in flight land discarded, and its keys go.
+function dropLoop($: EngineInterface, key: string) {
+  running = running.filter((j) => j.loop.key !== key)
+  sinceScheduled.delete(key)
+  waiting.delete(key)
+  return Promise.all(LOOP_KEYS.map((k) => $.store.delete(k(key))))
+}
+
 const loadMarks = async ($: EngineInterface, sessionId: string) => ((await $.store.get(timesKey(sessionId))) as Mark[] | undefined) ?? []
 const loadLedger = async ($: EngineInterface, sessionId: string, v: View) =>
   reconcile($, (await $.store.get(ledgerKey(sessionId))) as Ledger | undefined, v)
 
+// A loop's history: the main conversation's, or a subagent's, which the session may not be able to read.
+async function historyOf($: EngineInterface, agentId?: string) {
+  if (agentId === undefined) return $.session.messages()
+  const rows = await $.session.messages({ agentId })
+  if (!Array.isArray(rows)) throw new Error(`subagent ${agentId}'s history is unreadable (${rows.deny})`)
+  return rows
+}
+
 // `$.session.messages()` is the whole history, each compaction's result appended to it: the live context starts
 // at the last memory message, or where a built-in compaction left it.
-async function liveStart($: EngineInterface, sessionId: string, rows: readonly SessionMessage[]) {
+async function liveStart($: EngineInterface, key: string, rows: readonly SessionMessage[]) {
   let i = rows.length - 1
   while (i > 0 && !isMemory(rows[i]!)) i--
-  const floor = (await $.store.get(liveKey(sessionId))) as number | undefined
+  const floor = (await $.store.get(liveKey(key))) as number | undefined
   return Math.max(i, floor !== undefined && floor < rows.length ? floor : 0)
 }
 
-async function liveView($: EngineInterface, sessionId: string) {
-  const [rows, marks] = await Promise.all([$.session.messages(), loadMarks($, sessionId)])
-  const offset = await liveStart($, sessionId, rows)
+async function liveView($: EngineInterface, loop: Loop) {
+  const [rows, marks] = await Promise.all([historyOf($, loop.agentId), loadMarks($, loop.key)])
+  const offset = await liveStart($, loop.key, rows)
   return view(inCallOrder(rows.slice(offset)), marks, offset)
 }
 
 // Records the time against the newest row: the prompt at turn.start, a tool result at each step, the answer at
 // turn.complete.
-async function markTime($: EngineInterface, onlyPrompt: boolean) {
-  const [rows, sessionId, now] = await Promise.all([$.session.messages(), $.session.id(), $.clock.now()])
+async function markTime($: EngineInterface, onlyPrompt: boolean, agentId?: string) {
+  const [rows, sessionId, now] = await Promise.all([historyOf($, agentId), $.session.id(), $.clock.now()])
+  const loop = loopOf(sessionId, agentId)
   const hashes = new Set(rows.map(rowHash))
   const i = rows.length - 1
-  const marks = (await loadMarks($, sessionId)).filter((k) => k.i !== i && hashes.has(k.hash))
+  const marks = (await loadMarks($, loop.key)).filter((k) => k.i !== i && hashes.has(k.hash))
   if (i >= 0 && (!onlyPrompt || isPrompt(rows[i]!))) marks.push({ i, hash: rowHash(rows[i]!), at: now })
-  await $.store.set(timesKey(sessionId), marks.slice(-MAX_MARKS))
-  return { sessionId, rows }
+  await $.store.set(timesKey(loop.key), marks.slice(-MAX_MARKS))
+  return { loop, rows }
 }
 
 async function markTurn($: EngineInterface) {
@@ -605,30 +629,34 @@ async function markTurn($: EngineInterface) {
   await $.store.set(turnsKey(sessionId), [...turns, now].slice(-SKILLS_WHOLE_TURNS))
 }
 
-// A model step of the main loop: its time, and a scheduling pass once STEP_SCHEDULE_TOKENS more history has come
-// in, so a long turn is observed while it runs (a crewmate's whole session is one turn).
-async function onStep($: EngineInterface) {
-  const { sessionId, rows } = await markTime($, false)
-  const last = sinceScheduled.get(sessionId)
+// A model step of the main loop or a subagent's: its time, and a scheduling pass once STEP_SCHEDULE_TOKENS more
+// history has come in, so a long turn is observed while it runs (a crewmate's whole session is one turn, a subagent's
+// whole run too). A loop no listed agent runs (an engine fork) is left alone.
+async function onStep($: EngineInterface, agentId?: string) {
+  if (agentId !== undefined && !(await $.agent.list()).some((a) => a.id === agentId && a.status === 'running')) return
+  const { loop, rows } = await markTime($, false, agentId)
+  const last = sinceScheduled.get(loop.key)
   const from = last && last.rows <= rows.length ? last.rows : 0
   let tokens = from ? last!.tokens : 0
   for (let i = from; i < rows.length; i++) tokens += estimateTokens(rowText(rows[i]!))
   const due = tokens >= STEP_SCHEDULE_TOKENS
-  sinceScheduled.set(sessionId, { rows: rows.length, tokens: due ? 0 : tokens })
-  if (due) await schedule($, sessionId)
+  sinceScheduled.set(loop.key, { rows: rows.length, tokens: due ? 0 : tokens })
+  if (due) await schedule($, loop)
 }
 
-// Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight: gaps a failed call left
-// first, then whole chunks at the frontier, which stops KEEP_RAW_TOKENS short of the end.
-function schedule($: EngineInterface, sessionId: string) {
+// Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight across every loop: gaps a failed
+// call left first, then whole chunks at the frontier, which stops KEEP_RAW_TOKENS short of the end. A loop left short
+// of a slot waits for the next one to free.
+function schedule($: EngineInterface, loop: Loop) {
   return locked(async () => {
-    const v = await liveView($, sessionId)
-    const ledger = await loadLedger($, sessionId, v)
-    await $.store.set(ledgerKey(sessionId), ledger)
-    const mine = running.filter((j) => j.sessionId === sessionId)
+    const v = await liveView($, loop)
+    const ledger = await loadLedger($, loop.key, v)
+    await $.store.set(ledgerKey(loop.key), ledger)
+    const mine = running.filter((j) => j.loop.key === loop.key)
     const covered: Range[] = [ledger.watermark, ...ledger.chunks, ...mine.flatMap((j) => locate(v, j.range, ledger.watermark.to) ?? [])]
     const limit = tailStart(v, v.base)
-    for (let slots = MAX_PARALLEL - mine.length; slots > 0; slots--) {
+    let slots = MAX_PARALLEL - running.length
+    for (; slots > 0; slots--) {
       covered.sort((a, b) => a.from - b.from)
       let from = ledger.watermark.to
       let next = limit
@@ -642,16 +670,19 @@ function schedule($: EngineInterface, sessionId: string) {
       if (from >= next) break
       const to = chunkEnd(v, from, next, next === limit)
       if (to === undefined) break
-      const job: Job = { sessionId, range: range(v, from, to) }
+      const job: Job = { loop, range: range(v, from, to) }
       running.push(job)
       covered.push(job.range)
       $.clock.after(0, () => void runJob($, job, v))
     }
+    if (slots > 0) waiting.delete(loop.key)
+    else waiting.set(loop.key, loop)
   })
 }
 
 async function runJob($: EngineInterface, job: Job, v: View) {
-  const { sessionId } = job
+  const { loop } = job
+  const { sessionId } = loop
   let chunk: Chunk | undefined
   const started = await $.clock.now()
   try {
@@ -663,17 +694,17 @@ async function runJob($: EngineInterface, job: Job, v: View) {
   const ms = (await $.clock.now()) - started
   const landed = await locked(async () => {
     if (!running.includes(job)) {
-      if (chunk) log($, 'a background chunk landed after its session was cleared; discarded')
+      if (chunk) log($, 'a background chunk landed after its loop ended; discarded')
       return false
     }
     running = running.filter((j) => j !== job)
     if (!chunk) return false
-    const now = await liveView($, sessionId)
-    const ledger = await loadLedger($, sessionId, now)
+    const now = await liveView($, loop)
+    const ledger = await loadLedger($, loop.key, now)
     const at = locate(now, chunk, ledger.watermark.to)
     if (!at) log($, `rows ${chunk.from}-${chunk.to} were observed but no longer match the transcript; discarded`)
     const next = at ? commit({ ...ledger, chunks: [...ledger.chunks, { ...chunk, ...at }] }, now) : ledger
-    await $.store.set(ledgerKey(sessionId), next)
+    await $.store.set(ledgerKey(loop.key), next)
     if (at) noteObservations($, sessionId, 'background', chunk.lines.length)
     if (at)
       log(
@@ -688,21 +719,23 @@ async function runJob($: EngineInterface, job: Job, v: View) {
       )
     return !!at
   }).catch((error) => (log($, errorText(error)), false))
-  if (!landed) return
-  await Promise.all([maybeReflect($, sessionId), schedule($, sessionId)]).catch((error) => log($, errorText(error)))
+  // The slot it held goes to a loop waiting for one first.
+  const next = [...waiting.values(), ...(landed ? [loop] : [])].filter((l, i, all) => all.findIndex((o) => o.key === l.key) === i)
+  await Promise.all([landed && maybeReflect($, loop), ...next.map((l) => schedule($, l))]).catch((error) => log($, errorText(error)))
 }
 
 // Mastra's reflector over a snapshot of the entries, in the background: each attempt re-sends the snapshot with
 // stronger guidance until the result comes under REFLECT_TARGET_TOKENS (the last non-empty one stands). The
 // snapshot's entries are then replaced in place, so entries committed while it ran survive. The corrections are
 // never sent: they pass through as quoted.
-async function maybeReflect($: EngineInterface, sessionId: string) {
-  if (reflecting.has(sessionId)) return
-  const stored = (await $.store.get(ledgerKey(sessionId))) as Ledger | undefined
+async function maybeReflect($: EngineInterface, loop: Loop) {
+  const { sessionId, key } = loop
+  if (reflecting.has(key)) return
+  const stored = (await $.store.get(ledgerKey(key))) as Ledger | undefined
   const snapshot = stored?.entries ?? []
   const text = renderLines(snapshot)
   if (estimateTokens(text) < REFLECT_AT_TOKENS) return
-  reflecting.add(sessionId)
+  reflecting.add(key)
   $.clock.after(0, () => {
     const run = async () => {
       const started = await $.clock.now()
@@ -726,7 +759,7 @@ async function maybeReflect($: EngineInterface, sessionId: string) {
       }
       if (!lines.length) throw new Error('the reflector produced no observations at any compression level')
       await locked(async () => {
-        const ledger = (await $.store.get(ledgerKey(sessionId))) as Ledger | undefined
+        const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
         const ids = new Set(snapshot.map((e) => e.id))
         const at = ledger?.entries.findIndex((e) => ids.has(e.id)) ?? -1
         if (!ledger || at < 0 || ledger.entries.filter((e) => ids.has(e.id)).length !== ids.size) {
@@ -737,7 +770,7 @@ async function maybeReflect($: EngineInterface, sessionId: string) {
         const reflected = lines.map((line) => ({ id: `o${seq++}`, line }))
         const rest = ledger.entries.filter((e) => !ids.has(e.id))
         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
-        await $.store.set(ledgerKey(sessionId), { ...ledger, entries, seq })
+        await $.store.set(ledgerKey(key), { ...ledger, entries, seq })
         record(statsIo($), sessionId, (s, at) =>
           addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: estimateTokens(renderLines(reflected)), level: Math.min(level, 4) }, at))
         log(
@@ -754,7 +787,7 @@ async function maybeReflect($: EngineInterface, sessionId: string) {
         log($, `reflection failed (${errorText(error)})`)
         show($, `Condensing failed (${reason(error, REFLECTOR_TIMEOUT_MS)}) and will retry later`)
       })
-      .finally(() => reflecting.delete(sessionId))
+      .finally(() => reflecting.delete(key))
   })
 }
 
@@ -881,7 +914,7 @@ async function noteTranscript($: EngineInterface, e: { session_id: string; trans
   await $.store.set(transcriptKey(e.session_id), e.transcript_path).catch((error) => log($, `could not record the transcript path (${errorText(error)})`))
 }
 
-// Why a main compaction's context is not the tail of the history, by shape alone (no content): logged and counted.
+// Why a compaction's context is not the tail of its loop's history, by shape alone (no content): logged and counted.
 function notPersistent($: EngineInterface, sessionId: string, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
   const shape = (m: SessionMessage) => `${m.role}, ${rowText(m).length} chars, ${m.toolUses.length} tool uses, ${m.toolResults?.length ?? 0} tool results`
   const i = offset < 0 ? -1 : messages.findIndex((m, i) => rowHash(m) !== rowHash(rows[offset + i]!))
@@ -902,16 +935,17 @@ export const register: Register = (on) => {
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
     const [sessionId, started, usage] = await Promise.all([$.session.id(), $.clock.now(), $.session.usage().catch(() => undefined)])
-    // `e.messages` is the live context: the last rows of the main conversation's history. Anything else (a
-    // subagent's, or a context that does not match) is compacted with no stored state.
-    const history = main ? await $.session.messages() : []
-    const offset = history.length - messages.length
-    const rows = offset < 0 ? history : [...history.slice(0, offset), ...inCallOrder(history.slice(offset))]
-    const persistent = main && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
-    if (main && !persistent) notPersistent($, sessionId, messages, rows, offset)
-    const v = view(messages, persistent ? await loadMarks($, sessionId) : [], persistent ? offset : undefined)
+    const loop = loopOf(sessionId, e.agentId)
+    // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
+    // the session cannot read, or a context that does not match) is compacted with no stored state.
+    const history = await historyOf($, e.agentId).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
+    const offset = (history?.length ?? 0) - messages.length
+    const rows = !history || offset < 0 ? (history ?? []) : [...history.slice(0, offset), ...inCallOrder(history.slice(offset))]
+    const persistent = !!history && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
+    if (history && !persistent) notPersistent($, sessionId, messages, rows, offset)
+    const v = view(messages, persistent ? await loadMarks($, loop.key) : [], persistent ? offset : undefined)
     const base = v.base
-    const initial = persistent ? await locked(() => loadLedger($, sessionId, v)) : fresh(v)
+    const initial = persistent ? await locked(() => loadLedger($, loop.key, v)) : fresh(v)
     const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
 
     // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
@@ -954,11 +988,11 @@ export const register: Register = (on) => {
       const ledger = commit({ ...l, chunks: [...l.chunks, ...chunks] }, v)
       if (persistent && ledger.watermark.to > base) {
         const installed = { ...ledger, anchor: hash(renderLines(ledger.entries)), watermark: { from: 1, to: 1, hash: hash(''), head: '' } }
-        await $.store.set(ledgerKey(sessionId), installs ? installed : ledger)
+        await $.store.set(ledgerKey(loop.key), installs ? installed : ledger)
       }
       return ledger
     }
-    const ledger = persistent ? await locked(async () => settle(await loadLedger($, sessionId, v))) : await settle(initial)
+    const ledger = persistent ? await locked(async () => settle(await loadLedger($, loop.key, v))) : await settle(initial)
     const cut = ledger.watermark.to
     if (cut <= base && failed) throw new Error('the Observer failed and nothing is observed yet')
     if (cut <= base) throw new Error('nothing observed and nothing to observe before the raw tail')
@@ -1023,7 +1057,7 @@ export const register: Register = (on) => {
       observations: ledger.entries.length,
     }
     record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
-    if (persistent && installs) void maybeReflect($, sessionId).catch((error) => log($, errorText(error)))
+    if (persistent && installs) void maybeReflect($, loop).catch((error) => log($, errorText(error)))
     // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
     // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
     // In the context's own order.
@@ -1034,8 +1068,8 @@ export const register: Register = (on) => {
     log($, `${next.error.message}; using the built-in compaction`)
     show($, 'Observation failed. Using built-in compaction')
     // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
-    const main = e.agentId === undefined && e.trigger !== 'precompute'
-    const [rows, sessionId, started] = await Promise.all([main ? $.session.messages() : undefined, $.session.id(), $.clock.now()]).catch(() => [])
+    const installs = e.trigger !== 'precompute'
+    const [rows, sessionId, started] = await Promise.all([installs ? historyOf($, e.agentId).catch(() => undefined) : undefined, $.session.id(), $.clock.now()]).catch(() => [])
     const fellBack = (r: Awaited<ReturnType<typeof next>>) => (
       sessionId !== undefined &&
         started !== undefined &&
@@ -1044,10 +1078,9 @@ export const register: Register = (on) => {
         ),
       r
     )
-    if (!main) return fellBack(await next(e))
     // Its summary carries no memory message, so where the live context now starts is recorded instead.
     const r = fellBack(await next(e))
-    if (r.messages && rows && sessionId !== undefined) await $.store.set(liveKey(sessionId), rows.length)
+    if (r.messages && rows && sessionId !== undefined) await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), rows.length)
     return r
   })
 
@@ -1127,32 +1160,39 @@ export const register: Register = (on) => {
     return next(e)
   })
 
-  // Each model request of the main loop, the previous step's tool results in the history: off the request's path.
+  // Each model request of the main loop or a subagent's, the previous step's tool results in the history: off the
+  // request's path.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined) $.clock.after(0, () => void onStep($).catch((error) => log($, errorText(error))))
+    $.clock.after(0, () => void onStep($, e.agentId).catch((error) => log($, errorText(error))))
     return yield* next(e)
   })
 
+  // A subagent's is its answer: its loop is done, and what it stored goes.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (e.agentId !== undefined) return r
     try {
-      const { sessionId } = await markTime($, false)
-      await schedule($, sessionId)
+      if (e.agentId !== undefined) await dropLoop($, loopOf(await $.session.id(), e.agentId).key)
+      else await schedule($, (await markTime($, false)).loop)
     } catch (error) {
       log($, errorText(error))
     }
     return r
   })
 
+  // A subagent that never answered (killed, or its session ended first) leaves keys the session's end sweeps; /clear
+  // drops the main conversation's too.
   on('session.end', async ($, e, next) => {
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
-    if (e.reason !== 'clear') return next(e)
-    running = running.filter((j) => j.sessionId !== e.sessionId)
-    sinceScheduled.delete(e.sessionId)
-    await Promise.all([ledgerKey, timesKey, liveKey, skillsKey, turnsKey, transcriptKey, seenKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
-      log($, `could not drop the cleared session's state (${errorText(error)})`),
-    )
+    const cleared = e.reason === 'clear'
+    const ends = (key: string) => key.startsWith(`${e.sessionId}/`) || (cleared && key === e.sessionId)
+    running = running.filter((j) => !ends(j.loop.key))
+    for (const key of [...sinceScheduled.keys(), ...waiting.keys()]) if (ends(key)) (sinceScheduled.delete(key), waiting.delete(key))
+    const kinds = cleared ? [ledgerKey, timesKey, liveKey, skillsKey, turnsKey, transcriptKey, seenKey] : []
+    await $.store
+      .keys()
+      .then((keys) => keys.filter((k) => LOOP_KEYS.some((kind) => k.startsWith(kind(`${e.sessionId}/`)))))
+      .then((subagents) => Promise.all([...subagents, ...kinds.map((kind) => kind(e.sessionId))].map((key) => $.store.delete(key))))
+      .catch((error) => log($, `could not drop the ended session's state (${errorText(error)})`))
     return next(e)
   })
 
