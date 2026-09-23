@@ -1041,23 +1041,32 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^observed 6 rows now, kept 0 raw messages/)
   })
 
-  test('a memory message over the budget a small window leaves keeps its skills as lines and its user messages as the brief', async ($, on) => {
+  test('a memory message over the budget a small window leaves keeps its skills as lines and its user messages as the brief, and the rest whole', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     world(on)
-    const seen = pi(on)
+    const correction = '🔴 User: "Keep the public API unchanged"'
+    const seen = pi(on, {
+      reply: (prompt) => {
+        const name = prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]
+        return `${name === 'a' ? `<corrections>\n* ${correction}\n</corrections>\n` : ''}<observations>\n* 🔴 Saw ${name}\n</observations>\n<current-task>\nPrimary: ${name}\n</current-task>`
+      },
+    })
     on('skill.prompt', ($, e) => ({ text: e.text }))
     // (50k - 20k of system prompt and tools) / 2: a 15k-token budget, which the two skills alone fill.
     on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
     await $.skill.prompt({ skill: 'plan', text: 'p'.repeat(30_000) })
     await $.skill.prompt({ skill: 'style', text: 's'.repeat(30_000) })
-    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000)]
 
     const result = await $.session.compact({ trigger: 'auto', messages })
 
     const text = result.messages?.[0]?.text ?? ''
     expect(skillsIn(text)).toBe(`<skill name="style" invoked="2026-09-22 09:00">${FINISHED}</skill>\n<skill name="plan" invoked="2026-09-22 09:00">${FINISHED}</skill>`)
     expect(userMessagesIn(text)).toEqual(['a', '(1 omitted)'])
+    expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>`)
     expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b')
+    expect(text).toContain('<current-task>\nPrimary: b\n</current-task>')
+    expect(nextStepIn(text)).toBe('b')
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
     expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: skills kept as lines, user messages as the brief$/))
   })
@@ -1089,6 +1098,23 @@ describe('register', () => {
     expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
     open(0)
     await clock.settle()
+  })
+
+  test('a memory over its budget with chunks observed on the spot falls back and stores them committed, not installed', async ($, on) => {
+    mock.clock(on)
+    const { history, stored } = world(on)
+    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_000)}</observations>` })
+    // A 15k-token budget, under the ~20k of observations the two chunks bring even with the skills and prompts cut.
+    on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
+    const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
+    expect([ledger.watermark.to, ledger.entries.length, ledger.anchor]).toEqual([7, 2_000, undefined])
   })
 
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
