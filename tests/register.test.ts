@@ -481,8 +481,10 @@ describe('register', () => {
 
     expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ required: ['query'] }) })])
     const text = String(found.result)
-    expect(text).toMatch(/^31 match\(es\) for "plum-7731" in 35 messages; showing the last 20\.\n\[#15 user\] note 10: the PLUM-7731 marker y+…\n/)
-    expect(text).toContain('[#34 user] note 29: the PLUM-7731 marker')
+    // The newest prompt, note 29, is the one that asked: it is never a match.
+    expect(text).toMatch(/^30 match\(es\) for "plum-7731" in 35 messages; showing the last 20\.\n\[#14 user\] note 9: the PLUM-7731 marker y+…\n/)
+    expect(text).toContain('[#33 user] note 28: the PLUM-7731 marker')
+    expect(text).not.toContain('note 29')
     expect(text.split('\n')).toHaveLength(21)
     expect(text.length).toBeLessThan(10_000)
     expect(String(loose.result)).toBe('1 match(es) for "auth.ts nothing-like-this" in 35 messages.\n[#1 assistant called Read] {"file_path":"/src/auth.ts"}')
@@ -617,5 +619,37 @@ describe('register', () => {
     expect(result.messages?.[0]?.text).not.toContain('I meant the other file')
     expect(seen.systems[0]).toContain("🔴 reserved for the user's decisions and constraints")
     expect(seen.systems[0]).not.toContain('suggested-response')
+  })
+
+  test('om_recall after a resume reads the transcript file for the history before the compaction', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    on('classic.Stop', () => ({}))
+    const read: string[] = []
+    const jsonl = [
+      { type: 'user', timestamp: '2026-09-22T12:00:00.000Z', message: { role: 'user', content: 'remember the KIWI-42 marker' } },
+      { type: 'assistant', timestamp: '2026-09-22T12:01:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'noted' }, { type: 'tool_use', id: 'u1', name: 'Bash', input: { command: 'echo KIWI-42' } }] } },
+      { type: 'user', timestamp: '2026-09-22T12:01:10.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'u1', content: 'KIWI-42', is_error: false }] } },
+      { type: 'system', subtype: 'compact_boundary' },
+      { type: 'user', isSidechain: true, message: { role: 'user', content: 'KIWI-42 in a subagent' } },
+      { type: 'user', timestamp: '2026-09-22T13:00:00.000Z', message: { role: 'user', content: 'where is KIWI-42?' } },
+    ]
+    on('fs.read', ($, e) => (read.push(e.path), { value: jsonl.map((r) => JSON.stringify(r)).join('\n') + '\n{"type":"user","mess' }))
+    // What `$.session.messages()` answers after --resume: rows since the compaction only.
+    history.push(
+      { role: 'user', text: 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nold', toolUses: [] },
+      { role: 'user', text: 'where is KIWI-42?', toolUses: [] },
+    )
+
+    await $.classic.Stop({ session_id: 'session-1', transcript_path: '/t/session-1.jsonl', stop_hook_active: false })
+    const found = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'KIWI-42' })).result)
+
+    expect(read).toEqual(['/t/session-1.jsonl'])
+    expect(found).toBe(
+      '3 match(es) for "KIWI-42" in 4 messages.\n' +
+        `[#0 user ${stampOf('2026-09-22T12:00:00.000Z')}] remember the KIWI-42 marker\n` +
+        `[#1 assistant ${stampOf('2026-09-22T12:01:00.000Z')} called Bash] {"command":"echo KIWI-42"}\n` +
+        `[#2 Bash result ${stampOf('2026-09-22T12:01:10.000Z')}] KIWI-42`,
+    )
   })
 })

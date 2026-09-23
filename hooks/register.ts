@@ -630,17 +630,57 @@ function skillsInUse($: EngineInterface, skills: readonly Skill[], tail: readonl
   return kept
 }
 
-// om_recall: every row part that holds all the query's words (any, when none holds all), newest last.
-function recall(rows: readonly SessionMessage[], marks: readonly Mark[], query: string, limit: number) {
+type TranscriptRow = {
+  type?: string
+  isSidechain?: boolean
+  timestamp?: string
+  message?: { content?: string | { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean }[] }
+}
+
+// The transcript file's main-chain user and assistant rows as `$.session.messages()` rows, each with its time.
+function transcriptRows(jsonl: string) {
+  const rows: SessionMessage[] = []
+  const at: (number | undefined)[] = []
+  for (const line of jsonl.split('\n')) {
+    let r: TranscriptRow
+    try {
+      r = JSON.parse(line) as TranscriptRow
+    } catch {
+      continue // a line still being written
+    }
+    if ((r.type !== 'user' && r.type !== 'assistant') || r.isSidechain) continue
+    const content = r.message?.content
+    const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : (content ?? [])
+    const resultText = (c: unknown): string =>
+      typeof c === 'string' ? c : Array.isArray(c) ? c.map((b: { text?: string }) => b.text ?? '').join('\n') : ''
+    const m: SessionMessage = {
+      role: r.type,
+      text: blocks.flatMap((b) => (b.type === 'text' && b.text ? [b.text] : [])).join('\n'),
+      toolUses: blocks.flatMap((b) => (b.type === 'tool_use' ? [{ tool_use_id: b.id ?? '', tool: b.name ?? '', input: (b.input ?? {}) as Record<string, unknown> }] : [])),
+    }
+    const results = blocks.flatMap((b) => (b.type === 'tool_result' ? [{ tool_use_id: b.tool_use_id ?? '', text: resultText(b.content), isError: !!b.is_error }] : []))
+    if (results.length) m.toolResults = results
+    if (!m.text && !m.toolUses.length && !results.length) continue
+    rows.push(m)
+    const time = r.timestamp ? Date.parse(r.timestamp) : NaN
+    at.push(Number.isNaN(time) ? undefined : time)
+  }
+  return { rows, at }
+}
+
+// om_recall: every row part that holds all the query's words (any, when none holds all), newest last. The newest
+// prompt is the one that asked, never a match.
+function recall(rows: readonly SessionMessage[], times: readonly (number | undefined)[], query: string, limit: number, capped: boolean) {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean)
   if (!words.length) return 'om_recall: give a query.'
-  const v = view(rows, marks, 0)
+  let asking = rows.length - 1
+  while (asking >= 0 && typed(rows[asking]!, []) === undefined) asking--
   const names = new Map<string, string>()
   const parts: { i: number; label: string; text: string }[] = []
   rows.forEach((m, i) => {
     if (isMemory(m)) return
-    const when = v.at[i] === undefined ? '' : ` ${stamp(v.at[i]!)}`
-    if (m.text) parts.push({ i, label: `${m.role}${when}`, text: m.text })
+    const when = times[i] === undefined ? '' : ` ${stamp(times[i]!)}`
+    if (m.text && i !== asking) parts.push({ i, label: `${m.role}${when}`, text: m.text })
     for (const u of m.toolUses) {
       names.set(u.tool_use_id, u.tool)
       if (!u.tool.endsWith(`__${RECALL_TOOL}`)) parts.push({ i, label: `assistant${when} called ${u.tool}`, text: JSON.stringify(u.input) })
@@ -655,7 +695,7 @@ function recall(rows: readonly SessionMessage[], marks: readonly Mark[], query: 
   if (!hits.length) hits = parts.filter((p) => score(p.text) > 0).sort((a, b) => score(b.text) - score(a.text) || a.i - b.i)
   const shown = hits.slice(-limit).sort((a, b) => a.i - b.i)
   const out = [
-    `${hits.length} match(es) for "${query}" in ${rows.length} messages${rows.length >= ROWS_CAP ? ` (only the newest ${ROWS_CAP} are searchable)` : ''}` +
+    `${hits.length} match(es) for "${query}" in ${rows.length} messages${capped ? ` (only the newest ${ROWS_CAP} are searchable)` : ''}` +
       `${hits.length > shown.length ? `; showing the last ${shown.length}` : ''}.`,
   ]
   for (const p of shown) {
@@ -793,11 +833,22 @@ export const register: Register = (on) => {
     return next(e)
   })
 
+  // After --resume `$.session.messages()` starts at the last compaction; the transcript file still has the rest.
   on('tool.call', { tool: 'mcp__observational-memory__om_recall' }, async ($, e) => {
     const { query, limit } = e
     const [rows, sessionId] = await Promise.all([$.session.messages(), $.session.id()])
     const most = typeof limit === 'number' && limit >= 1 ? Math.min(Math.floor(limit), RECALL_MAX_HITS) : RECALL_MAX_HITS
-    return { result: recall(rows, await loadMarks($, sessionId), typeof query === 'string' ? query : '', most) }
+    const text = typeof query === 'string' ? query : ''
+    const path = isSummary(rows[0]) ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
+    if (path) {
+      try {
+        const file = transcriptRows(String(await $.fs.read(path)))
+        if (file.rows.length > rows.length) return { result: recall(file.rows, file.at, text, most, false) }
+      } catch (error) {
+        log($, `could not read the transcript for om_recall (${errorText(error)}); searching the live history`)
+      }
+    }
+    return { result: recall(rows, view(rows, await loadMarks($, sessionId), 0).at, text, most, rows.length >= ROWS_CAP) }
   })
 
   // Where the transcript file is, for om_recall and the memory message: known at start and after every turn.
