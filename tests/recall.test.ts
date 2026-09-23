@@ -65,6 +65,13 @@ const chain = (extra: Record<string, string> = {}) =>
   memoryIo({ [`${DIR}/${OLD}.jsonl`]: oldFile, [`${DIR}/${NEW}.jsonl`]: newFile, [`${DIR}/cccccccc-3333-4333-8333-333333333333.jsonl`]: 'unrelated', ...extra })
 const run = async (input: RecallInput, io = chain(), path = `${DIR}/${NEW}.jsonl`) => (await recall(await loadTranscript(io, path, { asking: true }), input)).text
 
+// The test runner prints what a test file logs; the hooks module's own globals have no console.
+declare const console: { warn: (message: string) => void }
+const realChain = await import('./fixtures/recall-chain.local').then(
+  (m: { files: Record<string, string> }) => m.files,
+  (error: unknown) => (String(error).includes('no such file') ? undefined : error instanceof Error ? error : new Error(String(error))),
+)
+
 describe('recall', () => {
   test('follows the continued-in chain back from the new file, and forward from the old one', async () => {
     const io = chain()
@@ -161,6 +168,13 @@ describe('recall', () => {
     expect(await run({ query: 'PEAR', limit: 2 }, alike)).toMatch(
       /^3 match\(es\) for "PEAR" in 6 blocks of 1 transcript file; showing 2, the newest\.\n[\s\S]*\n1 older match not shown; only if none above answers, repeat with "to": "bbbbbbbb:3"\.\n/,
     )
+  })
+
+  test('a quoted phrase matches across any run of whitespace, as aligned command output spaces its words', async () => {
+    const io = () => session([...result(20, 'v', ' Test Files  10 passed (10)\n      Tests  110 passed (110)')])
+    expect(await run({ query: '"Test Files 10 passed"' }, io())).toMatch(/^1 match\(es\) for "Test Files 10 passed" in [^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}1: {2}Test Files 10 passed \(10\)\n/)
+    expect(await run({ query: '"tests   110\tpassed"' }, io())).toMatch(/^1 match\(es\)[^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}2: {2}Tests 110 passed \(110\)\n/)
+    expect(await run({ query: '"Files 10passed"' }, io())).toMatch(/^0 match/)
   })
 
   test('with no block holding every term, rare terms outrank common ones, and absent terms are named', async () => {
@@ -311,12 +325,14 @@ describe('recall', () => {
     expect(legacyRecall(oldFile, 'plan alpha')).toMatch(/^1 match\(es\) for "plan alpha" in \d+ messages\.\n\[#\d+ assistant [\d-]+ [\d:]+\] After compaction, the plan is ALPHA\.$/)
   })
 
-  // The real chain Claude Code moved a crewmate session across, copied to /tmp/om-recall/chain and turned into a
-  // gitignored module by scripts/make-recall-fixture.ts. Without it the test has nothing to read and passes.
-  test('a real moved session: both files, compaction replays read once, blocks readable in full', { timeoutMs: 60_000 }, async () => {
-    const fx = (await import('./fixtures/recall-chain.local').catch(() => undefined)) as { files: Record<string, string> } | undefined
-    if (!fx) return
-    const io = memoryIo(Object.fromEntries(Object.entries(fx.files).map(([k, v]) => [`/c/${k}`, v])))
+  // The real chain Claude Code moved a crewmate session across, copied to /tmp/om-recall/chain and cut down to the rows
+  // this test reads, in a gitignored module, by scripts/make-recall-fixture.ts. Without it the test is skipped, saying
+  // so; a module the harness will not import fails it.
+  const REAL = 'a real moved session: both files, compaction replays read once, blocks readable in full'
+  if (!realChain) console.warn(`SKIP recall > ${REAL}: no tests/fixtures/recall-chain.local.ts; bun scripts/make-recall-fixture.ts writes it`)
+  else test(REAL, { timeoutMs: 60_000 }, async () => {
+    if (realChain instanceof Error) throw realChain
+    const io = memoryIo(Object.fromEntries(Object.entries(realChain).map(([k, v]) => [`/c/${k}`, v])))
     const c = await loadTranscript(io, '/c/b8d50671-d9df-4001-9679-8d1ba9ec834c.jsonl', { asking: true })
     const outline = (await recall(c, { mode: 'outline', from: 'a79f045b:2108', to: 'b8d50671:65' })).text
     expect(outline).toMatch(/^Outline of 2 transcript files \(a79f045b → b8d50671\): [\d,]+ entries,.*; 1 subagent transcript \(af4c8dc0\)\./)
@@ -330,7 +346,7 @@ describe('recall', () => {
     expect(found).toContain('[a79f045b:1902 ')
     expect(found).toContain('[b8d50671:')
     // vitest's colour codes are gone, so its summary line reads, and matches, as printed.
-    expect((await recall(c, { query: '"Test Files 10 passed"', to: 'b8d50671:147' })).text).toContain('  61: Test Files 10 passed (10)')
+    expect((await recall(c, { query: '"Test Files 10 passed"', to: 'b8d50671:147' })).text).toContain('  61:  Test Files 10 passed (10)')
     const page = (await recall(c, { ref: 'a79f045b:73' })).text
     expect(page.split('\n')[0]).toMatch(/^\[a79f045b:73 · .* · Bash result\] lines 1-\d+ of 748 \(call: a79f045b:70\)$/)
     expect(page.split('\n').at(-1)).toMatch(/^… \d+ more lines \([\d,]+ characters\); only if you still need them: \{"mode": "read", "ref": "a79f045b:73", "lines": "\d+-\d+"\}\.$/)

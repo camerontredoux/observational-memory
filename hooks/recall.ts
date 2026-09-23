@@ -456,7 +456,7 @@ function matcher(query: string): Matcher | string {
   }
   const terms: Term[] = []
   for (const q of query.matchAll(/"([^"]+)"|(\S+)/g)) {
-    const word = (q[1] ?? q[2]!).toLowerCase()
+    const word = (q[1] ?? q[2]!).toLowerCase().replace(/\s+/g, ' ')
     const parts = q[1] === undefined ? word.split(/[_-]+/).filter((p) => p.length > 1) : []
     if (!terms.some((t) => t.word === word)) terms.push({ word, parts: parts.length > 1 ? parts : [] })
   }
@@ -464,10 +464,12 @@ function matcher(query: string): Matcher | string {
   return { terms, shown: /^".*"$/.test(query.trim()) ? query.trim() : `"${query}"` }
 }
 
-// How a text holds each term (a regex is one): whole, by a compound's parts alone, or not.
+// How a text holds each term (a regex is one): whole, by a compound's parts alone, or not. A phrase matches across any
+// run of whitespace, as a command's aligned output spaces its words.
 function held(m: Matcher, text: string, lower = text.toLowerCase()): Held[] {
   if (m.regex) return [m.regex.test(text) ? 'whole' : undefined]
-  return m.terms.map((t) => (lower.includes(t.word) ? 'whole' : t.parts.length && t.parts.every((p) => lower.includes(p)) ? 'parts' : undefined))
+  const flat = lower.replace(/\s+/g, ' ')
+  return m.terms.map((t) => (flat.includes(t.word) ? 'whole' : t.parts.length && t.parts.every((p) => lower.includes(p)) ? 'parts' : undefined))
 }
 
 type Excerpt = { text: string; best: number; lead: number; lines: number }
