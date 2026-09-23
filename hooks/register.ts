@@ -495,6 +495,7 @@ const timesKey = (sessionId: string) => `times:${sessionId}`
 const liveKey = (sessionId: string) => `live:${sessionId}`
 const skillsKey = (sessionId: string) => `skills:${sessionId}`
 const transcriptKey = (sessionId: string) => `transcript:${sessionId}`
+const seenKey = (sessionId: string) => `seen:${sessionId}` // the pruner's stamp
 
 const loadMarks = async ($: EngineInterface, sessionId: string) => ((await $.store.get(timesKey(sessionId))) as Mark[] | undefined) ?? []
 const loadLedger = async ($: EngineInterface, sessionId: string, v: View) =>
@@ -1001,7 +1002,7 @@ export const register: Register = (on) => {
     if (e.reason !== 'clear') return next(e)
     running = running.filter((j) => j.sessionId !== e.sessionId)
     sinceScheduled.delete(e.sessionId)
-    await Promise.all([ledgerKey, timesKey, liveKey, skillsKey, transcriptKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
+    await Promise.all([ledgerKey, timesKey, liveKey, skillsKey, transcriptKey, seenKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
       log($, `could not drop the cleared session's state (${errorText(error)})`),
     )
     return next(e)

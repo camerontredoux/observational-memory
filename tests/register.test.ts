@@ -551,7 +551,7 @@ describe('register', () => {
     expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 messages.\n[#2 Read result] export const marker = "PLUM-7731"')
   })
 
-  test('/clear drops the cleared session\'s ledger, times and skills', async ($, on) => {
+  test('/clear drops the cleared session\'s ledger, times, skills and seen stamp', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     pi(on)
@@ -563,6 +563,7 @@ describe('register', () => {
     await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
     await clock.settle()
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1', 'skills:session-1', 'times:session-1'])
+    stored['seen:session-1'] = 1 // the pruner's stamp
     await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
 
     expect(stored).toEqual({})
