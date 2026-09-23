@@ -152,6 +152,24 @@ const stampOf = (iso: string) => {
 }
 const skillsIn = (text?: string) => text?.match(/<skills-in-use>\n([\s\S]*?)\n<\/skills-in-use>/)?.[1]
 
+// The engine's model requests inside a turn: each answered at once beneath the plugin, read to its end.
+function steps(on: On) {
+  on('turn.step', async function* ($, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
+  })
+  return async ($: Engine, turnId: string, index: number, messageCount: number, agentId?: string) => {
+    const stream = $.turn.step({ turnId, index, model: 'claude', messageCount, ...(agentId ? { agentId } : {}) })
+    for await (const _ of stream);
+    return stream.result
+  }
+}
+
+// One tool call of a long turn: the call and its result of `size` characters.
+const call = (n: number, size: number): SessionMessage[] => [
+  { role: 'assistant', text: '', toolUses: [{ tool_use_id: `c${n}`, tool: 'Read', input: { file_path: `/src/f${n}.ts` } }] },
+  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `c${n}`, text: 'x'.repeat(size), isError: false }] },
+]
+
 describe('register', () => {
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
     mock.clock(on, { now: at(23, 12, 0) })
@@ -652,4 +670,43 @@ describe('register', () => {
         `[#2 Bash result ${stampOf('2026-09-22T12:01:10.000Z')}] KIWI-42`,
     )
   })
+
+  test('observes in the background mid-turn, after the model steps of one long turn, with the times of the rows it read', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await clock.set(at(23, 9, 0))
+    history.push({ role: 'user', text: 'brief', toolUses: [] })
+    await $.turn.start({ text: 'brief', turnId: 't' })
+    await step($, 't', 0, history.length)
+
+    // Each step resolves with the first Observer call still held: nothing waits on it.
+    for (let n = 0; n < 8; n++) {
+      await clock.set(at(23, 9, n + 1))
+      history.push(...call(n, 16_000))
+      await step($, 't', n + 1, history.length)
+      await clock.settle()
+    }
+    expect(seen.inFlight).toBe(1)
+    open(1)
+    await clock.settle()
+
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(seen.logs.filter((l) => l.includes('in the background'))).toEqual([
+      'observed rows 7-13 in the background, 1 observations; watermark 0, 1 chunk(s) waiting on a gap',
+      'observed rows 0-7 in the background, 1 observations; watermark 13, 0 chunk(s) waiting on a gap',
+    ])
+    // The rows' times come from the steps that brought them, not only the prompt's.
+    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 09:03 Read a file', '🟡 2026-09-23 09:06 Read a file'])
+
+    // A subagent's steps schedule nothing, however far the history grew.
+    history.push(...call(8, 16_000), ...call(9, 16_000), ...call(10, 16_000))
+    await step($, 'sub', 0, history.length, 'agent-1')
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(2)
+  })
+
 })

@@ -26,6 +26,7 @@ const PI_CWD = '/tmp'
 const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
 const MAX_PARALLEL = 4 // background Observer calls in flight at once
 const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
+const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
 const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
 const REFLECT_AT_TOKENS = 40_000
 const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so the next chunk does not reflect again
@@ -87,6 +88,7 @@ type Bounds = { lo: number; hi: number; latest: number } | undefined
 let running: Job[] = [] // background Observer calls in flight
 let lock: Promise<unknown> = Promise.resolve()
 const reflecting = new Set<string>()
+const sinceScheduled = new Map<string, { rows: number; tokens: number }>() // history seen by the last step, and its growth since a pass
 
 // Ledger reads and writes one at a time: Observer calls land out of order.
 function locked<T>(fn: () => Promise<T>): Promise<T> {
@@ -466,7 +468,8 @@ async function liveView($: EngineInterface, sessionId: string) {
   return view(rows.slice(offset), marks, offset)
 }
 
-// Records the time against the newest row: the prompt at turn.start, the answer at turn.complete.
+// Records the time against the newest row: the prompt at turn.start, a tool result at each step, the answer at
+// turn.complete.
 async function markTime($: EngineInterface, onlyPrompt: boolean) {
   const [rows, sessionId, now] = await Promise.all([$.session.messages(), $.session.id(), $.clock.now()])
   const hashes = new Set(rows.map(rowHash))
@@ -474,7 +477,20 @@ async function markTime($: EngineInterface, onlyPrompt: boolean) {
   const marks = (await loadMarks($, sessionId)).filter((k) => k.i !== i && hashes.has(k.hash))
   if (i >= 0 && (!onlyPrompt || isPrompt(rows[i]!))) marks.push({ i, hash: rowHash(rows[i]!), at: now })
   await $.store.set(timesKey(sessionId), marks.slice(-MAX_MARKS))
-  return sessionId
+  return { sessionId, rows }
+}
+
+// A model step of the main loop: its time, and a scheduling pass once STEP_SCHEDULE_TOKENS more history has come
+// in, so a long turn is observed while it runs (a crewmate's whole session is one turn).
+async function onStep($: EngineInterface) {
+  const { sessionId, rows } = await markTime($, false)
+  const last = sinceScheduled.get(sessionId)
+  const from = last && last.rows <= rows.length ? last.rows : 0
+  let tokens = from ? last!.tokens : 0
+  for (let i = from; i < rows.length; i++) tokens += estimateTokens(rowText(rows[i]!))
+  const due = tokens >= STEP_SCHEDULE_TOKENS
+  sinceScheduled.set(sessionId, { rows: rows.length, tokens: due ? 0 : tokens })
+  if (due) await schedule($, sessionId)
 }
 
 // Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight: gaps a failed call left
@@ -861,11 +877,17 @@ export const register: Register = (on) => {
     return next(e)
   })
 
+  // Each model request of the main loop, the previous step's tool results in the history: off the request's path.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined) $.clock.after(0, () => void onStep($).catch((error) => log($, errorText(error))))
+    return yield* next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId !== undefined) return r
     try {
-      const sessionId = await markTime($, false)
+      const { sessionId } = await markTime($, false)
       await schedule($, sessionId)
     } catch (error) {
       log($, errorText(error))
@@ -876,6 +898,7 @@ export const register: Register = (on) => {
   on('session.end', async ($, e, next) => {
     if (e.reason !== 'clear') return next(e)
     running = running.filter((j) => j.sessionId !== e.sessionId)
+    sinceScheduled.delete(e.sessionId)
     await Promise.all([ledgerKey, timesKey, liveKey, skillsKey, transcriptKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
       log($, `could not drop the cleared session's state (${errorText(error)})`),
     )
