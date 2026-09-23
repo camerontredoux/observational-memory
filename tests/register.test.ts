@@ -1312,6 +1312,48 @@ describe('register', () => {
     expect(observationsIn(second.messages?.[0]?.text)).toContain('main-10')
   })
 
+  test('a compaction request with explicit instructions delegates to the built-in compactor unchanged, and a later compaction still finds the live context', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    let received: { instructions?: string; messages: readonly SessionMessage[] } | undefined
+    on('session.compact', ($, e) => ((received = e), { messages: [SUMMARY, ...e.messages.slice(-2)] }))
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await clock.set(at(23, 9, 0))
+    history.push({ role: 'user', text: 'Read the files, then report.', toolUses: [] })
+    await $.turn.start({ text: 'Read the files, then report.', turnId: 't' })
+    history.push(...turn('a', 'a', CHUNK))
+
+    const result = await $.session.compact({ trigger: 'manual', instructions: 'Focus on the auth bug only', messages: [...history] })
+
+    expect(result.messages?.[0]).toEqual(SUMMARY)
+    expect(received?.instructions).toBe('Focus on the auth bug only') // forwarded unchanged
+    expect(received?.messages).toEqual(history)
+    expect(seen.prompts).toEqual([]) // no Observer call: nothing observed
+    expect(seen.modelCalls).toBe(0)
+    expect(seen.screen).toEqual(['Compaction instructions given. Using the built-in compactor.'])
+
+    // Ordinary compaction remains available without explicit instructions, and stays persistent across the delegated one.
+    history.splice(0, history.length, ...result.messages!)
+    history.push(...turn('b', 'b', CHUNK))
+    const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(observationsIn(second.messages?.[0]?.text)).toContain('Saw b')
+  })
+
+  test('a compaction request with blank instructions is treated as ordinary compaction, not delegated', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    let builtinCalls = 0
+    on('session.compact', () => (builtinCalls++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+
+    await $.session.compact({ trigger: 'manual', instructions: '   ', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+
+    expect(builtinCalls).toBe(0)
+    expect(seen.prompts).toHaveLength(2)
+  })
+
   test("a finished subagent's keys are dropped, a chunk landing after it is discarded, and session end sweeps any left", async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)

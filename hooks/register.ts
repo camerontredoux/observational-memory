@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, SessionMessage } from 'claude-code'
+import type { EngineInterface, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 import {
   COMPACT_RECENT,
   COMPACT_RESUME_DIRECTLY,
@@ -921,9 +921,35 @@ function notPersistent($: EngineInterface, sessionId: string, messages: readonly
   record(statsIo($), sessionId, (s) => count(s, 'compaction.notPersistent'))
 }
 
+// Delegates this compaction to the built-in compactor unchanged (`e` passed on as received), and records the live
+// key so a compaction after it can still find the context it kept (see `arrange`). `fellBack` marks a genuine
+// fallback (something failed here) for stats; an intentional delegation (explicit `/compact` instructions) is not
+// a fallback and is not counted as one.
+async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, next: (e: SessionCompactInput) => Promise<SessionCompactResult>, fellBack: boolean) {
+  const installs = e.trigger !== 'precompute'
+  const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
+  const r = await next(e)
+  if (fellBack && sessionId !== undefined && started !== undefined)
+    record(statsIo($), sessionId, (s, at) =>
+      addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack: true, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
+    )
+  const [summary, ...kept] = r.messages ?? []
+  if (installs && summary && sessionId !== undefined) {
+    const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
+    await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
+  }
+  return r
+}
+
 export const register: Register = (on) => {
   registerPrune(on)
   on('session.compact', async ($, e, next) => {
+    // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
+    // compactor honors them, background observation cannot. Ordinary compaction stays available without them.
+    if (e.instructions?.trim()) {
+      show($, 'Compaction instructions given. Using the built-in compactor.', e.agentId)
+      return delegateToBuiltin($, e, next, false)
+    }
     const order = callOrder(e.messages)
     const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
@@ -1096,24 +1122,8 @@ export const register: Register = (on) => {
     log($, `${next.error.message}; using the built-in compaction`)
     show($, next.error.message?.startsWith(OVER_BUDGET) ? 'Memory over its budget. Using built-in compaction' : 'Observation failed. Using built-in compaction', e.agentId)
     // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
-    const installs = e.trigger !== 'precompute'
-    const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
-    const fellBack = (r: Awaited<ReturnType<typeof next>>) => (
-      sessionId !== undefined &&
-        started !== undefined &&
-        record(statsIo($), sessionId, (s, at) =>
-          addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack: true, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
-        ),
-      r
-    )
     // Its summary is no memory message: what it kept is recorded, to find the live context in the history by.
-    const r = fellBack(await next(e))
-    const [summary, ...kept] = r.messages ?? []
-    if (installs && summary && sessionId !== undefined) {
-      const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
-      await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
-    }
-    return r
+    return delegateToBuiltin($, e, next, true)
   })
 
   on('session.start', async ($, e, next) => {
