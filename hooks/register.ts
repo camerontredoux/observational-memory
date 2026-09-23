@@ -231,14 +231,18 @@ function tailStart(v: View, from: number) {
 }
 
 // A chunk from `from`: rows until the next would pass CHUNK_TOKENS and may start a chunk. At the frontier it
-// waits for a whole chunk; inside a gap it closes at the gap's end.
+// waits for a whole chunk; inside a gap it closes at the gap's end. When the raw tail is one call whose results pass
+// KEEP_RAW_TOKENS on their own, joining it would take the chunk well past CHUNK_TOKENS, so half a chunk is whole.
 function chunkEnd(v: View, from: number, end: number, frontier: boolean) {
   let tokens = 0
   for (let i = from; i < end; i++) {
     if (i > from && tokens + v.tokens[i]! > CHUNK_TOKENS && isCut(v.messages[i]!)) return i
     tokens += v.tokens[i]!
   }
-  return !frontier || tokens >= CHUNK_TOKENS ? end : undefined
+  if (!frontier || tokens >= CHUNK_TOKENS) return end
+  let call = v.tokens[end] ?? 0
+  for (let i = end + 1; i < v.messages.length && !isCut(v.messages[i]!); i++) call += v.tokens[i]!
+  return call > KEEP_RAW_TOKENS && tokens >= CHUNK_TOKENS / 2 ? end : undefined
 }
 
 // pi's serialization: one block per row, its time, tool calls inline, results capped.

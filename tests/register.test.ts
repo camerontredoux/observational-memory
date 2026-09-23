@@ -987,6 +987,63 @@ describe('register', () => {
     expect(result.messages?.slice(-2)).toEqual(agentCall('one', 7, 36_000))
   })
 
+  // As the v0.4.12 smokes (/tmp/om-tail/runs/smokeC, smokeD): the main thread reads 37.6 KB chapters (~9.4k tokens
+  // each), sleeping 20 s after each, and its 60k window (the text ~2 characters a token) compacts on every second read
+  // after the first, keeping only that read. The rows between the kept read and the next one come to just short of a
+  // chunk, and the read after them is the next compaction's. Each Observer call takes 10 s.
+  test('main-thread reads that each pass the raw tail budget, in a window of about three, make no Observer call at compaction', { timeoutMs: 60_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: at(23, 18, 44) })
+    const { history } = world(on)
+    const seen = pi(on, { hold: () => clock.sleep(10_000), reply: readsIn })
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    const tokens = (rows: SessionMessage[]) =>
+      rows.reduce((n, m) => n + Math.ceil([m.text, ...m.toolUses.map((u) => `${u.tool} ${JSON.stringify(u.input)}`), ...(m.toolResults ?? []).map((r) => r.text)].join('\n').length / 4), 0)
+    history.push({ role: 'user', text: 'Read the chapters in order, sleeping 20 s after each.', toolUses: [] })
+    await $.turn.start({ text: history[0]!.text, turnId: 't' })
+
+    let index = 0
+    let live = 0 // where the live context starts in the history
+    const atCompaction: number[] = []
+    // A model request: a compaction first once the live context holds three reads, the main thread waiting on it.
+    const request = async () => {
+      if (tokens(history.slice(live)) > 25_000) {
+        const before = seen.prompts.length
+        let result: { messages?: readonly SessionMessage[] } | undefined
+        void $.session.compact({ trigger: 'auto', messages: history.slice(live) }).then((r) => (result = r))
+        for (await clock.settle(); !result; ) await clock.advance(1_000)
+        atCompaction.push(seen.prompts.length - before)
+        live = history.length
+        history.push(...result.messages!)
+      }
+      await step($, 't', index++, history.length)
+      await clock.settle()
+    }
+    for (let n = 1; n <= 12; n++) {
+      const [read, chapter] = agentCall('main', n, 37_600)
+      await request()
+      await clock.advance(2_600)
+      history.push(read!)
+      await clock.advance(150)
+      history.push(chapter!)
+      await request()
+      await clock.advance(3_000)
+      history.push({ role: 'assistant', text: `Chapter ${n} read.`, toolUses: [] })
+      history.push({ role: 'assistant', text: '', toolUses: [{ tool_use_id: `sleep-${n}`, tool: 'Bash', input: { command: 'sleep 20' } }] })
+      await clock.advance(20_000)
+      history.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `sleep-${n}`, text: '', isError: false }] })
+    }
+
+    // Before, each compaction observed about two chunks on the spot; now each cuts at the background watermark, and as
+    // that keeps more raw, compactions come on every read.
+    expect(atCompaction.length).toBeGreaterThanOrEqual(5)
+    expect(atCompaction).toEqual(atCompaction.map(() => 0))
+    expect(seen.logs.filter((l) => l.startsWith('cut at the background watermark'))).toHaveLength(atCompaction.length)
+    // One Observer call a chapter at most, each landing.
+    expect(seen.prompts.length).toBeLessThanOrEqual(12)
+    expect(seen.logs.filter((l) => l.includes('discarded'))).toEqual([])
+  })
+
   // What a built-in compaction hands back: its summary, then the newest call and result it keeps, with their handles.
   const SUMMARY: SessionMessage = {
     role: 'user',

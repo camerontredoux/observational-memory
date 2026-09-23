@@ -1,6 +1,6 @@
 {
   "name": "observational-memory",
-  "version": "0.4.13",
+  "version": "0.4.14",
   "description": "Compaction as observational memory: in the background, after each turn and during a long one, an Observer (GPT-5.6 Luna through pi) turns each ~10k-token chunk of the conversation into timestamped, prioritized observations (up to four chunks at once), quoting the user's decisions and constraints verbatim, a Reflector condenses the other observations when they grow, and compaction itself cuts at the observed watermark with no model call, keeping recent messages whole, with the first user message (the standing brief) always quoted verbatim, the newest after it, and the latest as the next step unless it is the first, framed as the built-in summary is. Skills in use are carried across compactions, and an om_recall tool searches, reads and outlines the full transcript, following a session across moved transcript files, with bounded replies; om_stats and /om-stats report usage per session, and sessions untouched for 30 days are pruned from the store.",
   "author": {
     "name": "Cameron Tredoux"
