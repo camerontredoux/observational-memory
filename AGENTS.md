@@ -9,6 +9,7 @@ A Claude Code function-hooks plugin that replaces compaction with observational 
 - `hooks/prompts.ts` holds the model prompts and the compaction texts. Its header names the prompts copied from other sources. Regenerate the generated ones from their source rather than editing them.
 - `.claude/types/` holds the plugin API types. Claude Code writes these files. Do not edit them.
 - `scripts/` holds developer tools. They are not part of the plugin. Each file's header gives its usage.
+- `tests/eval/runner.ts` replays one scenario through the four configurations built-in, built-in+recall, om, and om+recall compaction, and records reproducible, machine-readable measurements of what each cost (not how good its output was: that is the continuation-quality benchmark). Its header gives its usage and the live-transport limitation.
 
 ### Code rules
 
