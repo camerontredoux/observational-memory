@@ -1954,4 +1954,63 @@ describe('register', () => {
     expect(seen.screen).toEqual([])
     expect(seen.logs.at(-1)).toBe('Compacted subagent in 0 ms · memory brief only')
   })
+
+  test('OM_VCC_ONLY keeps a newest tool result past the raw tail budget raw with its call, or nothing raw past RAW_MAX_TOKENS, and briefs the rest', async ($, on) => {
+    mock.clock(on)
+    const { history, agents } = world(on, { env: { OM_VCC_ONLY: '1' } })
+    const seen = pi(on)
+    history.push(...turn('a', 'a', CHUNK), ...edit('src/a.ts'), ...turn('b', 'b', 8_000), ...call(1, 36_000))
+    agents['agent-1'] = [...history]
+
+    for (const agentId of [undefined, 'agent-1']) {
+      const result = await $.session.compact({ trigger: 'auto', ...(agentId ? { agentId } : {}), messages: [...history] })
+      expect(result.messages?.slice(1)).toEqual(call(1, 36_000))
+      expect(briefIn(result.messages?.[0]?.text)).toContain('- Modified: src/a.ts')
+    }
+    const huge = await $.session.compact({ trigger: 'auto', messages: [...turn('a', 'a', CHUNK), ...edit('src/a.ts'), ...call(1, 200_000)] })
+    expect(huge.messages).toHaveLength(1)
+    expect(briefIn(huge.messages?.[0]?.text)).toContain('- Modified: src/a.ts')
+    expect(seen.prompts).toHaveLength(0)
+    expect(seen.logs.filter((l) => l.includes('built-in'))).toEqual([])
+  })
+
+  test("after a subagent's built-in fallback, its next compaction matches its history and carries a brief of the span since", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents } = world(on)
+    let failing = true
+    const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'Read the files, then report.', toolUses: [] }])
+    const run = async (from: number, to: number) => {
+      for (let n = from; n < to; n++) {
+        await clock.set(at(23, 9, n + 1))
+        rows.push(...agentCall('one', n, 16_000))
+        await step($, 's', n, rows.length, 'agent-1')
+        await clock.settle()
+      }
+    }
+
+    await run(0, 10)
+    const first = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
+    expect(first.messages?.[0]).toEqual(SUMMARY)
+    // The engine appends the summary after the rows it kept, which stay where they were.
+    const kept = first.messages!.slice(1)
+    rows.push(SUMMARY)
+    const live = rows.length
+    rows.push(...edit('src/after.ts'))
+    failing = false
+    await run(10, 20)
+
+    const second = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [SUMMARY, ...kept, ...rows.slice(live)] })
+
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
+    const text = second.messages?.[0]?.text ?? ''
+    expect(observationsIn(text)).toContain('one-10')
+    expect(briefIn(text)).toContain('- Modified: src/after.ts')
+    expect(text.match(/<session-brief>/g)).toHaveLength(1)
+    expect(seen.screen).toEqual([])
+  })
 })
