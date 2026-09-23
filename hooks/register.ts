@@ -25,7 +25,7 @@ declare module 'claude-code' {
 
 // Every model call: pi with GPT-5.6 Luna, the prompt on stdin, run from a neutral directory.
 const PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low']
-const PI_ISOLATION = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json']
+const PI_ISOLATION = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
 const PI_CWD = '/tmp'
 const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
 const MAX_PARALLEL = 4 // background Observer calls in flight at once

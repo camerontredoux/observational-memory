@@ -13,7 +13,7 @@ const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
 const PI_USAGE = { input: 9206, output: 558, cacheRead: 0, cacheWrite: 0, reasoning: 31, totalTokens: 9764, cost: { input: 0.0023, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.0025108 } }
 const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low', '--system-prompt']
-const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json']
+const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
 
 // What pi 0.85.1 prints with `--mode json` for one answer: one event per line, the prompt echoed, the answer
 // streamed, then the final assistant message with its usage (as /tmp/obs-bench/pi1.jsonl, abridged).
@@ -453,6 +453,7 @@ describe('register', () => {
     expect(reflections[1]).toContain('## AGGRESSIVE COMPRESSION REQUIRED')
     expect(reflections[0]).not.toContain('Saw b')
     expect(seen.systems.at(-1)).toContain('memory consciousness')
+    expect(seen.calls.at(-1)!.argv).toEqual([...PI_ARGV, seen.systems.at(-1), ...PI_FLAGS])
     expect((stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)).toEqual([
       '🔴 2026-09-22 14:30 Explored the auth module',
       '🔴 2026-09-22 15:00 Saw b',
