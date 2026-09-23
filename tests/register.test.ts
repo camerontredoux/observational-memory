@@ -342,6 +342,40 @@ describe('register', () => {
     expect(seen.modelCalls).toBe(0)
   })
 
+  test('a reply that leaves <observations> unclosed before its next section is observed, the section kept apart', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on, {
+      reply: (prompt) => {
+        const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
+        return `<corrections>\n* 🔴 Keep ${name}\n</corrections>\n<observations>\n* 🔴 Saw ${name}\n<current-task>\nPrimary: ${name}\n</current-task>`
+      },
+    })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+
+    expect(seen.prompts).toHaveLength(2)
+    const text = result.messages?.[0]?.text ?? ''
+    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b')
+    expect(text).toContain('<current-task>\nPrimary: b\n</current-task>')
+    expect(text).toContain('* 🔴 Keep a')
+  })
+
+  test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const reply = `<observations>\nNothing worth noting.\n${'x'.repeat(600)}`
+    const seen = pi(on, { reply: () => reply })
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    const rejected = seen.logs.filter((l) => l.startsWith('observer reply without observations'))
+    expect(rejected).toHaveLength(2) // the call and its retry
+    expect(rejected[0]).toBe(`observer reply without observations (${reply.length} chars), began: ${JSON.stringify(reply.slice(0, 500))}`)
+  })
+
   test('at compaction, a chunk whose pi call timed out is not observed again', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
