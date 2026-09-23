@@ -89,6 +89,77 @@ describe('recall', () => {
     expect(await run({ mode: 'outline' }, chain(), `${DIR}/${OLD}.jsonl`)).toContain('bbbbbbbb:3')
   })
 
+  // A chain of N files, each continuing into the next; io.reads records only the files actually read.
+  const forwardChain = (n: number) => {
+    const ids = Array.from({ length: n }, (_, i) => `f${i}`)
+    const files: Record<string, string> = {}
+    ids.forEach((id, i) => {
+      const rows = [msg('user', i, `chunk ${id}`)]
+      if (i < n - 1) rows.push(JSON.stringify({ type: 'continued-in', sessionId: id, continuedInSessionId: ids[i + 1] }))
+      files[`${DIR}/${id}.jsonl`] = rows.join('\n')
+    })
+    return { io: memoryIo(files), path: `${DIR}/${ids[0]}.jsonl`, ids }
+  }
+
+  test('a chain longer than the file cap is read only up to the cap, and the coverage gap is reported', async () => {
+    const { io, path } = forwardChain(50) // comfortably longer than any reasonable cap
+    const corpus = await loadTranscript(io, path, { asking: true })
+    // Only files actually read are counted; the count matches the reads made, short of the whole chain.
+    expect(corpus.files.length).toBeLessThan(50)
+    expect(io.reads.length).toBe(corpus.files.length)
+    expect(corpus.note).toMatch(new RegExp(`${corpus.files.length}`))
+    const found = await recall(corpus, { mode: 'search', query: 'chunk', subagents: false })
+    expect(found.text).toContain(`(${corpus.note})`)
+    const outlined = await recall(corpus, { mode: 'outline' })
+    expect(outlined.text).toContain(`(${corpus.note})`)
+  })
+
+  test('a chain within the cap has no coverage note', async () => {
+    const { io, path } = forwardChain(3)
+    const corpus = await loadTranscript(io, path, { asking: true })
+    expect(corpus.files.length).toBe(3)
+    expect(corpus.note).toBeUndefined()
+  })
+
+  test('a chain file that fails to read stops the chain there, without losing what was already read', async () => {
+    const { io: inner, ids } = forwardChain(3)
+    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith(`${ids[2]}.jsonl`) ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
+    const corpus = await loadTranscript(io, `${DIR}/${ids[0]}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual([ids[0], ids[1]])
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[0]}`)).toBe(true)
+    expect(corpus.note).toMatch(/could not (be )?read/)
+  })
+
+  test('an unreadable predecessor leaves a gap behind it, but the requested file and anything after it still load', async () => {
+    const { io: inner, ids } = forwardChain(3)
+    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith(`${ids[0]}.jsonl`) ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
+    // f0 -> f1 -> f2, requested from the middle file f1: f0 is an older predecessor, unreadable.
+    const corpus = await loadTranscript(io, `${DIR}/${ids[1]}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual([ids[1], ids[2]])
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[1]}`)).toBe(true)
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[2]}`)).toBe(true)
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[0]}`)).toBe(false)
+    expect(corpus.note).toMatch(/could not (be )?read/)
+  })
+
+  test('a failure discovering a predecessor, not just reading one, is also reported as an unreadable link', async () => {
+    const { io: inner, ids } = forwardChain(3)
+    const io: RecallIo = { ...inner, continuing: async () => Promise.reject(new Error('EACCES')) }
+    // Requested from the newest file: looking back for its predecessor fails before any file content is unreadable.
+    const corpus = await loadTranscript(io, `${DIR}/${ids[2]}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual([ids[2]])
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[2]}`)).toBe(true)
+    expect(corpus.note).toMatch(/could not (be )?read/)
+  })
+
+  test('a directory that cannot be listed reports that chain discovery failed', async () => {
+    const inner = chain()
+    const io: RecallIo = { ...inner, list: async () => Promise.reject(new Error('EACCES')) }
+    const corpus = await loadTranscript(io, `${DIR}/${NEW}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual(['bbbbbbbb'])
+    expect(corpus.note).toMatch(/discover|list/)
+  })
+
   test('a query alone searches, as before; a ref alone reads; nothing outlines', async () => {
     expect(parseInput({ query: 'x' })).toMatchObject({ mode: 'search', query: 'x' })
     expect(parseInput({ ref: 'aaaaaaaa:3' })).toMatchObject({ mode: 'read', ref: 'aaaaaaaa:3' })
@@ -110,6 +181,12 @@ describe('recall', () => {
     expect(await run({ query: '"where is NEEDLE"' })).toMatch(/^0 match/)
   })
 
+  test('the asking message is excluded whole: every part of it, not just its last block', async () => {
+    const io = memoryIo({ [`${DIR}/${NEW}.jsonl`]: msg('user', 1, [{ type: 'text', text: 'where is NEEDLE-42?' }, { type: 'text', text: 'also check GIZMO-7' }]) })
+    expect(await run({ query: 'NEEDLE-42' }, io)).toMatch(/^0 match/)
+    expect(await run({ query: 'GIZMO-7' }, io)).toMatch(/^0 match/)
+  })
+
   test('regex and quoted phrases', async () => {
     expect(await run({ query: '/needle-\\d+/' })).toMatch(/^1 match\(es\) for \/needle-\\d\+\/ in .*\n\[aaaaaaaa:3 [^\n]*\n  250: row 250 has the NEEDLE-42 marker/)
     expect(await run({ query: '/NEEDLE-4[0-9]/' })).toContain('250: row 250')
@@ -126,6 +203,37 @@ describe('recall', () => {
     msg('assistant', m, [{ type: 'tool_use', id, name: 'Bash', input: { command: `run ${id}` } }]),
     msg('user', m, [{ type: 'tool_result', tool_use_id: id, content: text }]),
   ]
+  const boundary = (id: string) => JSON.stringify({ type: 'system', subtype: 'compact_boundary', uuid: id })
+  const memory = (m: number) => msg('user', m, `${MEMORY_HEADER}\n\n<observations>\n* noted\n</observations>`)
+
+  test('replay is recognized by content still in the model’s context, not by matching anywhere in the session', async () => {
+    // A later, genuinely new message repeats an earlier one's exact text. It is not the compaction's copy of it (the
+    // content between the two boundaries holds no such copy), so content equality alone must not delete it.
+    const newEvent = [
+      msg('user', 1, 'the MANGO plan is set'),
+      boundary('b-1'),
+      memory(2),
+      msg('assistant', 3, 'noted'),
+      boundary('b-2'),
+      memory(4),
+      msg('user', 5, 'the MANGO plan is set'),
+    ]
+    expect(await run({ query: 'MANGO' }, session(newEvent))).toMatch(/^2 match/)
+
+    // A message kept across two compactions: the second boundary's copy of it is still the same one event.
+    const keptTwice = [
+      msg('user', 1, 'the KIWI plan is set'),
+      boundary('c-1'),
+      memory(2),
+      msg('user', 1, 'the KIWI plan is set'), // the first boundary's copy
+      msg('assistant', 3, 'noted'),
+      boundary('c-2'),
+      memory(4),
+      msg('user', 1, 'the KIWI plan is set'), // the second boundary's copy of the still-kept message
+      msg('assistant', 3, 'noted'), // the second boundary's copy of the still-kept reply
+    ]
+    expect(await run({ query: 'KIWI' }, session(keptTwice))).toMatch(/^1 match/)
+  })
 
   test('search shows the lines holding the most and rarest terms, spread apart, cut around the rarest', async () => {
     const out = Array.from({ length: 300 }, (_, i) => {
@@ -175,6 +283,23 @@ describe('recall', () => {
     expect(await run({ query: '"Test Files 10 passed"' }, io())).toMatch(/^1 match\(es\) for "Test Files 10 passed" in [^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}1: {2}Test Files 10 passed \(10\)\n/)
     expect(await run({ query: '"tests   110\tpassed"' }, io())).toMatch(/^1 match\(es\)[^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}2: {2}Tests 110 passed \(110\)\n/)
     expect(await run({ query: '"Files 10passed"' }, io())).toMatch(/^0 match/)
+  })
+
+  test('a phrase across a newline, or split only by the display wrap, is excerpted at its real location', async () => {
+    // The phrase is one real event, written across two lines; the excerpt must show where it actually is, not a
+    // default first line.
+    const io = session([msg('assistant', 20, 'preface\nthe ALPHA\nplan is set\ntrailer')])
+    const across = await run({ query: '"ALPHA plan"' }, io)
+    expect(across).toMatch(/^1 match/)
+    expect(across).toContain('2-3: the ALPHA plan is set')
+
+    // A single long line, wrapped only for display at WRAP characters, with the phrase straddling that cut.
+    const long = `${'A'.repeat(990)} ALPHA plan ${'B'.repeat(50)}`
+    const wrapped = await run({ query: '"ALPHA plan"' }, session([msg('assistant', 20, long)]))
+    expect(wrapped).toMatch(/^1 match/)
+    expect(wrapped).toContain('1-2: ')
+    expect(wrapped).toContain('ALPHA plan')
+    expect(wrapped).not.toMatch(/1: {2}A{100}/) // not a default cut from the line's own start
   })
 
   test('with no block holding every term, rare terms outrank common ones, and absent terms are named', async () => {
@@ -290,7 +415,11 @@ describe('recall', () => {
     const sub = `${DIR}/${OLD}/subagents`
     const io = () =>
       chain({ [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: subagent, [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: JSON.stringify({ agentType: 'Explore', description: 'find config', toolUseId: 'u1' }) })
-    expect(await run({ query: 'GRAPE-9' }, io())).toBe('0 match(es) for "GRAPE-9" in 6 blocks of 2 transcript files.\n1 subagent transcript not searched: repeat with "subagents": true.')
+    expect(await run({ query: 'GRAPE-9' }, io())).toBe(
+      '0 match(es) for "GRAPE-9" in 6 blocks of 2 transcript files.\n' +
+        'No occurrences in the main transcript of: grape-9.\n' +
+        '1 subagent transcript not searched: repeat with "subagents": true.',
+    )
     const found = await run({ query: 'GRAPE-9', subagents: true }, io())
     expect(found).toContain('2 match(es) for "GRAPE-9" in 8 blocks of 2 transcript files and 1 subagent transcript.')
     expect(found).toContain('[a1b2c3d4:2 ')
@@ -300,6 +429,20 @@ describe('recall', () => {
     // A reference bound in the main thread bounds a subagent's by time: up to the block after it, not at it.
     expect(await run({ query: 'GRAPE-9', subagents: true, to: 'aaaaaaaa:3' }, io())).toMatch(/^2 match/)
     expect(await run({ query: 'GRAPE-9', subagents: true, to: 'aaaaaaaa:2.2' }, io())).toMatch(/^0 match/)
+    // Subagents are excluded whether or not the main transcript alone found something: a match there is not proof
+    // there is nothing more in the transcripts left unsearched.
+    const foundInMain = await run({ query: '"plan is ALPHA"' }, io())
+    expect(foundInMain).toContain('1 subagent transcript not searched: repeat with "subagents": true.')
+  })
+
+  test('an absent term gets a scoped statement even alone, naming what was excluded, not proof the event never happened', async () => {
+    // GRAPE-9 exists only in the excluded subagent transcript: the statement must not read as a claim it never
+    // happened anywhere, only that it was not found in what this search actually covered.
+    const sub = `${DIR}/${OLD}/subagents`
+    const io = chain({ [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: subagent, [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: JSON.stringify({ agentType: 'Explore', toolUseId: 'u1' }) })
+    const found = await run({ query: 'GRAPE-9' }, io)
+    expect(found).toContain('No occurrences in the main transcript of: grape-9.')
+    expect(found).toContain('subagent transcript not searched')
   })
 
   test('the live history, with no file: rows addressed by index', async () => {
