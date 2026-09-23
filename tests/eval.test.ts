@@ -73,6 +73,28 @@ describe('eval runner', () => {
     expect(result!.continuation.latencyMs).toEqual(measured(10))
   })
 
+  test('cost combines every compaction and the continuation, unavailable if any part is, else estimated if any part is', async () => {
+    const [okResult] = await runComparison(scenario(), ['om'], () => fakeIo('om'))
+    expect(okResult!.cost).toEqual(measured(0.01 + 0.01 + 0.02)) // two compactions plus the continuation
+
+    const [noCompactionCost] = await runComparison(scenario(), ['om'], () => {
+      const io = fakeIo('om')
+      const compact = io.compact
+      io.compact = async (point, messagesSoFar) => ({ ...(await compact(point, messagesSoFar)), cost: undefined })
+      return io
+    })
+    expect(noCompactionCost!.cost.status).toBe('unavailable')
+
+    const [estimatedResult] = await runComparison(scenario(), ['om'], () => {
+      const io = fakeIo('om')
+      const compact = io.compact
+      let n = 0
+      io.compact = async (point, messagesSoFar) => ({ ...(await compact(point, messagesSoFar)), cost: ++n === 1 ? estimated(0.01) : measured(0.01) })
+      return io
+    })
+    expect(estimatedResult!.cost).toEqual(estimated(0.01 + 0.01 + 0.02))
+  })
+
   test('recall calls and tokens are counted only for +recall configurations, zero for the others', async () => {
     const results = await runComparison(scenario(), CONFIGURATIONS, (config) => fakeIo(config))
     const byConfig = Object.fromEntries(results.map((r) => [r.configuration, r]))
@@ -119,15 +141,44 @@ describe('eval runner', () => {
     expect(results.map((r) => r.configuration)).toEqual(['builtin', 'om', 'builtin', 'om'])
   })
 
+  test('two invocations of runComparison get disjoint run ids; a caller-supplied invocationId makes them reproducible instead', async () => {
+    const [a] = await runComparison(scenario(), ['om'], () => fakeIo('om'))
+    const [b] = await runComparison(scenario(), ['om'], () => fakeIo('om'))
+    expect(a!.runId).not.toBe(b!.runId)
+
+    const [c] = await runComparison(scenario(), ['om'], () => fakeIo('om'), { invocationId: 'fixed' })
+    const [d] = await runComparison(scenario(), ['om'], () => fakeIo('om'), { invocationId: 'fixed' })
+    expect(c!.runId).toBe(d!.runId)
+    expect(c!.invocationId).toBe('fixed')
+  })
+
   test('a live run without explicit, positive caps is refused before anything runs', async () => {
     await expect(runComparison(scenario(), ['om'], () => fakeIo('om'), { live: true })).rejects.toThrow(/caps/)
     await expect(runComparison(scenario(), ['om'], () => fakeIo('om'), { live: true, caps: { maxRuns: 0, maxModelCalls: 1 } })).rejects.toThrow(/caps/)
   })
 
-  test('an opted-in live run with valid caps reports unavailable with the reason, since this runner bundles no live transport', async () => {
-    const [result] = await runComparison(scenario(), ['om'], () => fakeIo('om'), { live: true, caps: { maxRuns: 1, maxModelCalls: 10 } })
-    expect(result!.status).toBe('unavailable')
-    expect(result!.reason).toMatch(/real Claude Code session/)
+  test('an Io marked live is refused unless options.live is set, before anything runs', async () => {
+    let called = false
+    const liveIo: Io = { ...fakeIo('om'), live: true, compact: async (...args) => ((called = true), fakeIo('om').compact(...args)) }
+    await expect(runComparison(scenario(), ['om'], () => liveIo)).rejects.toThrow(/live Io/)
+    expect(called).toBe(false)
+  })
+
+  test('options.runs may not exceed caps.maxRuns for a live run', async () => {
+    await expect(runComparison(scenario(), ['om'], () => ({ ...fakeIo('om'), live: true }), { live: true, caps: { maxRuns: 1, maxModelCalls: 10 }, runs: 2 })).rejects.toThrow(/maxRuns/)
+  })
+
+  test('a live run spends caps.maxModelCalls across compaction and continuation, failing the rest of the run once exhausted', async () => {
+    const io: Io = { ...fakeIo('om'), live: true }
+    const [result] = await runComparison(scenario(), ['om'], () => io, { live: true, caps: { maxRuns: 1, maxModelCalls: 1 } })
+    expect(result!.status).toBe('failed')
+    expect(result!.error).toMatch(/maxModelCalls/)
+    expect(result!.compactions).toHaveLength(1) // the one call the cap allowed
+  })
+
+  test('configurations compared together must share the same assistant model', async () => {
+    const io = (config: string, assistant?: string): Io => ({ ...fakeIo(config), model: { assistant } })
+    await expect(runComparison(scenario(), ['builtin', 'om'], (config) => io(config, config === 'om' ? 'model-b' : 'model-a'))).rejects.toThrow(/assistant/)
   })
 
   test('fixtures and budgets supplied by the caller are carried onto every result, for reproducibility', async () => {
