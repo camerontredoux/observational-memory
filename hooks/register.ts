@@ -51,6 +51,7 @@ const NEXT_STEP_MAX_TOKENS = 2_000
 const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
 const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say: the smallest in use
 const OVERHEAD_TOKENS = 20_000 // the system prompt and tool schemas every request carries beside the messages
+const MEMORY_HEADROOM = 1.25 // the memory message's estimate scaled up: the Observer's prose runs near it, quoted skills and prompts may not
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
 const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -990,7 +991,7 @@ export const register: Register = (on) => {
     const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
     // The compacted context fits half the window the overhead leaves, so the session can work before compacting
     // again. Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's
-    // measure, less the overhead, over the estimate of the same messages scales every estimate up, never down.
+    // measure, less the overhead, over the estimate of the same messages scales the raw tail's up, never down.
     const budget = Math.floor(((usage?.context.window ?? WINDOW_TOKENS) - OVERHEAD_TOKENS) / 2)
     const measured = main ? usage?.context.tokens : undefined
     const density = measured === undefined ? 1 : Math.max(1, (measured - OVERHEAD_TOKENS) / Math.max(1, tokensBetween(v, 0, messages.length)))
@@ -1015,7 +1016,7 @@ export const register: Register = (on) => {
         recentKept: tail.length > 0,
         resumeDirectly: e.trigger === 'auto',
       }
-      const sizeOf = (m: SessionMessage) => Math.ceil((estimateTokens(m.text) + tokensBetween(v, cut, messages.length)) * density)
+      const sizeOf = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tokensBetween(v, cut, messages.length) * density)
       let message = memoryMessage(memory)
       // Over the budget, the skills become lines and the user messages the brief alone, which om_recall can still
       // find; the corrections, observations and next step stay whole. Still over it, the built-in compaction runs.

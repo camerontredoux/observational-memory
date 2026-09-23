@@ -1069,13 +1069,14 @@ describe('register', () => {
     const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
     const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
     const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
-    // Dense text: the last response measured 120k tokens where the characters estimate ~12k of messages.
-    on('session.usage', () => ({ value: { context: { tokens: 120_000, window: 200_000 }, rateLimits: [] } }) as never)
+    // Dense text: the last response measured 150k tokens where the characters estimate ~15k of messages, so the raw
+    // tail's ~5k count ~43k beside ~64k of memory, over the 90k budget.
+    on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await runTurn($, turn('b', 'b', 20_000), at(22, 15, 0))
     await clock.settle() // [0, 3) observed: its ~51k tokens of observations start a reflection, held
     expect(seen.prompts.at(-1)).toMatch(/^## OBSERVATIONS/)
     const before = stored['ledger:session-1'] as Ledger
