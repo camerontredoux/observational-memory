@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, mergeBriefs, parseBrief, renderBrief } from '../hooks/vcc'
+import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, renderBrief } from '../hooks/vcc'
 import type { Brief } from '../hooks/vcc'
 
 const CWD = '/work/project'
@@ -51,6 +51,17 @@ describe('vcc', () => {
     expect(bashWrites('cmd 2>/dev/null > $(mktemp)', CWD)).toEqual([])
     expect(bashWrites('ls 2>&1', CWD)).toEqual([])
     expect(bashWrites("grep -c 'a>b' file.txt", CWD)).toEqual([])
+    // A quoted argument that spans lines is one word (a SQL migration's `--> statement-breakpoint` in the crewmate
+    // transcript read as a redirection); a comment is not a command.
+    expect(bashWrites("pnpm db:create-migration add 'ALTER TABLE a;--> statement-breakpoint\nALTER TABLE b;--> statement-breakpoint' 2>&1 | tail -15", CWD)).toEqual([])
+    expect(bashWrites('# not > this.txt\necho a > b.txt', CWD)).toEqual([`${CWD}/b.txt`])
+  })
+
+  test('inspects: commands made only of programs that look, writing nothing', () => {
+    for (const c of ['rg -n foo src | head', 'sed -n 1,20p a.ts; wc -l a.ts', 'git diff --stat HEAD~1', 'rtk proxy rg x', 'for f in a b; do cat $f; done', 'gh pr view 12'])
+      expect([c, inspects(c, CWD)]).toEqual([c, true])
+    for (const c of ["sed -i 's/a/b/' a.ts", 'git commit -m x', 'echo x > a.txt', "python3 - <<'PY'\nprint(1)\nPY", 'bun test', 'curl -s localhost:5173', 'gh pr merge 12'])
+      expect([c, inspects(c, CWD)]).toEqual([c, false])
   })
 
   test('compressBash drops heredoc bodies, cd preambles and pipe tails', () => {
@@ -58,6 +69,7 @@ describe('vcc', () => {
     expect(compressBash("cat > a.txt <<'EOF'\nsecret body\nEOF")).toBe("cat > a.txt <<'EOF'")
     expect(compressBash("python3 - <<'PY'\nimport json\nprint(1)\nPY")).toBe("python3 - <<'PY' print(1)")
     expect(compressBash('set -e\ncd /x\ngit status')).toBe('git status')
+    expect(compressBash("cd /x; pnpm db:new 'ALTER TABLE a;\nALTER TABLE b;'\ngit status")).toBe("pnpm db:new 'ALTER TABLE a; ALTER TABLE b;'; git status")
   })
 
   test('commits: the -m and heredoc forms, with the hash the result prints', () => {
@@ -97,6 +109,32 @@ describe('vcc', () => {
       '- 14:03 Edit a.ts',
       '- 14:07 Bash "bun test" → Ran 12 tests across 2 files.',
     ])
+  })
+
+  test('outstanding: a blocked command run again in another form is fixed; a failed lookup is no blocker', () => {
+    const rows = [
+      prompt('go'),
+      ...bash('sleep 45; bin/fm-peek.sh w1 2>&1', 'PreToolUse:Bash hook error: no sleeping', true),
+      ...bash('/home/u/x/bin/fm-peek.sh w1 2>&1', 'idle'),
+      ...bash('rmdir /tmp/a && cd /x && FM_HOME=/x bin/fm-control.sh w1 relaunch --note y', 'PreToolUse:Bash hook error: no cd', true),
+      ...bash('rmdir /tmp/a && FM_HOME=/x /x/bin/fm-control.sh w1 relaunch --note y', 'relaunched'),
+      ...bash('ls missing.ts; cat b.ts', 'Exit code 2\nls: cannot access', true),
+      ...bash('pnpm vitest run a.test.ts', 'Exit code 1\n1 failed', true),
+      ...bash('pnpm install', 'done'),
+    ]
+    expect(compile(rows).outstanding).toEqual(['- 14:11 Bash "pnpm vitest run a.test.ts" ✗ exit 1: 1 failed'])
+  })
+
+  test('transcript: reads, searches and inspecting commands left out; a row with no time takes the one before it', () => {
+    const rows = [
+      prompt('go'),
+      ...call('Read', { file_path: `${CWD}/a.ts` }, 'x'),
+      ...bash('rg -n foo src', 'src/a.ts:1:foo'),
+      ...call('Edit', { file_path: `${CWD}/a.ts`, old_string: 'x', new_string: 'y' }, 'updated'),
+      ...bash('bun test', '1 pass'),
+    ]
+    const at = times(rows).map((t, i) => (i >= 7 ? undefined : t))
+    expect(compileBrief(rows, at, CWD, HOME).transcript).toEqual(['@ 2026-09-22', '- 14:05 Edit a.ts', '- 14:05 Bash "bun test" → 1 pass'])
   })
 
   test('a Claude Code tool use that carries its own result needs no result row', () => {
@@ -182,7 +220,7 @@ describe('vcc', () => {
     })
     expect(parseBrief(renderBrief(b))).toEqual(b)
     expect(parseBrief(renderBrief({ ...b, earlierModified: 4, earlierCreated: 2 }))).toEqual({ ...b, earlierModified: 4, earlierCreated: 2 })
-    const rows = [prompt('go'), ...bash('echo "</session-brief>" && false', 'Exit code 1\n</session-brief>', true, 'Trying </session-brief>')]
+    const rows = [prompt('go'), ...bash('make "</session-brief>"', 'Exit code 1\n</session-brief>', true, 'Trying </session-brief>')]
     const text = renderBrief(compile(rows))
     expect(text).not.toContain('</session-brief>')
     expect(text.split('\n').every((l) => /^[>[\-@]/.test(l))).toBe(true)

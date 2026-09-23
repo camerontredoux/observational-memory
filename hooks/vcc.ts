@@ -79,6 +79,9 @@ function normalize(rows: readonly SessionMessage[], at: readonly (number | undef
       blocks.push(call)
     }
   })
+  // A row with no known time (one a compaction kept raw) takes the time before it, or failing that the one after.
+  let last = blocks.find((b) => b.at !== undefined)?.at
+  for (const b of blocks) last = b.at ??= last
   return blocks
 }
 
@@ -107,7 +110,7 @@ function splitHeredocs(command: string) {
   return { shell, bodies }
 }
 
-// Words of one shell line, quotes removed, operators as their own words.
+// Words of shell text, quotes removed (a quoted string may span lines), operators and line ends as their own words.
 function words(line: string) {
   const out: string[] = []
   let cur: string | undefined
@@ -118,7 +121,13 @@ function words(line: string) {
       cur = (cur ?? '') + line.slice(i + 1, end < 0 ? line.length : end)
       i = end < 0 ? line.length : end
     } else if (c === '\\' && i + 1 < line.length) cur = (cur ?? '') + line[++i]
-    else if (/\s/.test(c)) {
+    else if (c === '\n') {
+      if (cur !== undefined) out.push(cur)
+      cur = undefined
+      out.push(';')
+    } else if (c === '#' && cur === undefined) {
+      while (i + 1 < line.length && line[i + 1] !== '\n') i++ // a comment, to the line's end
+    } else if (/\s/.test(c)) {
       if (cur !== undefined) out.push(cur)
       cur = undefined
     } else if (';&|()<>'.includes(c)) {
@@ -170,32 +179,31 @@ export function bashWrites(command: string, cwd: string, home?: string) {
     if (!SCRATCH.test(p)) out.push(p)
   }
   const { shell, bodies } = splitHeredocs(command)
-  for (const line of shell)
-    for (const seg of segments(words(line))) {
-      let s = seg
-      while (s.length && /^\w+=/.test(s[0]!) && !s[0]!.includes('$(')) {
-        const [name, ...value] = s[0]!.split('=')
-        vars.set(name!, expand(value.join('=')))
-        s = s.slice(1)
-      }
-      if (s[0] === 'export') s = s.slice(1)
-      if (!s.length) continue
-      if (s[0] === 'cd' && s[1]) dir = resolvePath(expand(s[1]), dir, home)
-      for (let k = 0; k < s.length - 1; k++) if (s[k] === '>' || s[k] === '>>' || s[k] === '&>' || s[k] === '1>' || s[k] === '>|') add(s[k + 1]!)
-      const args = s.filter((w, k) => !/^(?:\d?>>?|&>|<|<<-?|>\|)$/.test(w) && !(k > 0 && /^(?:\d?>>?|&>|<|<<-?|>\|)$/.test(s[k - 1]!)))
-      const cmd = args[0]
-      if (cmd === 'tee') args.slice(1).filter((w) => !w.startsWith('-')).forEach(add)
-      if (cmd === 'sed' && args.some((w) => /^-i/.test(w) || w === '--in-place')) {
-        const rest = args.slice(1)
-        const scriptGiven = rest.some((w) => w === '-e' || w === '-f')
-        const operands = rest.filter((w, k) => !w.startsWith('-') && !(k > 0 && (rest[k - 1] === '-e' || rest[k - 1] === '-f')))
-        operands.slice(scriptGiven ? 0 : 1).forEach(add)
-      }
-      if (cmd === 'sd') {
-        const operands = args.slice(1).filter((w) => !w.startsWith('-'))
-        operands.slice(2).forEach(add)
-      }
+  for (const seg of segments(words(shell.join('\n')))) {
+    let s = seg
+    while (s.length && /^\w+=/.test(s[0]!) && !s[0]!.includes('$(')) {
+      const [name, ...value] = s[0]!.split('=')
+      vars.set(name!, expand(value.join('=')))
+      s = s.slice(1)
     }
+    if (s[0] === 'export') s = s.slice(1)
+    if (!s.length) continue
+    if (s[0] === 'cd' && s[1]) dir = resolvePath(expand(s[1]), dir, home)
+    for (let k = 0; k < s.length - 1; k++) if (s[k] === '>' || s[k] === '>>' || s[k] === '&>' || s[k] === '1>' || s[k] === '>|') add(s[k + 1]!)
+    const args = s.filter((w, k) => !/^(?:\d?>>?|&>|<|<<-?|>\|)$/.test(w) && !(k > 0 && /^(?:\d?>>?|&>|<|<<-?|>\|)$/.test(s[k - 1]!)))
+    const cmd = args[0]
+    if (cmd === 'tee') args.slice(1).filter((w) => !w.startsWith('-')).forEach(add)
+    if (cmd === 'sed' && args.some((w) => /^-i/.test(w) || w === '--in-place')) {
+      const rest = args.slice(1)
+      const scriptGiven = rest.some((w) => w === '-e' || w === '-f')
+      const operands = rest.filter((w, k) => !w.startsWith('-') && !(k > 0 && (rest[k - 1] === '-e' || rest[k - 1] === '-f')))
+      operands.slice(scriptGiven ? 0 : 1).forEach(add)
+    }
+    if (cmd === 'sd') {
+      const operands = args.slice(1).filter((w) => !w.startsWith('-'))
+      operands.slice(2).forEach(add)
+    }
+  }
   for (const { opener, body } of bodies) {
     if (!/\bpython3?\b|\buv run\b/.test(opener)) continue
     const text = body.join('\n')
@@ -214,17 +222,87 @@ export function bashWrites(command: string, cwd: string, home?: string) {
   return [...new Set(out)]
 }
 
+// Each simple command of a Bash command as [program, ...args]: assignments, `rtk`/`rtk proxy`, `env`, `time` and
+// shell keywords stripped from its front; heredoc bodies apart.
+const KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', '{', '}', 'time', 'env', 'command', 'exec'])
+function commands(command: string) {
+  const out: string[][] = []
+  for (let s of segments(words(splitHeredocs(command).shell.join('\n')))) {
+    for (let prev = -1; prev !== s.length; ) {
+      prev = s.length
+      while (s.length && (/^\w+=/.test(s[0]!) || KEYWORDS.has(s[0]!))) s = s.slice(1)
+      if (s[0] === 'rtk') s = s.slice(s[1] === 'proxy' ? 2 : 1)
+    }
+    if (s.length) out.push(s)
+  }
+  return out
+}
+const programOf = (c: readonly string[]) => c[0]!.split('/').at(-1)!
+const REDIRECT = /^(?:\d?>>?&?|&>>?|<|<<-?|>\|)$/
+
+// Programs that only look: a command made of nothing else (and writing no file) inspects, and its line in the brief
+// would say only that something was read; om_recall has what it showed.
+const LOOKS = new Set(
+  (
+    'rg grep egrep fgrep ffgrep cat bat head tail wc ls eza tree find fdfind fd jq yq stat du df file which type echo printf pwd date ' +
+    'diff cmp readlink realpath basename dirname sort uniq cut awk tr column xxd od nl less more sleep true false test [ ps ss pgrep ' +
+    'id whoami uname hostname for done fi esac in cd export set source . ast-grep lsof tput'
+  ).split(' '),
+)
+const GIT_LOOKS = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'remote', 'ls-files', 'blame', 'grep', 'rev-list', 'describe', 'shortlog', 'reflog', 'cat-file', 'config'])
+export function inspects(command: string, cwd: string, home?: string) {
+  if (splitHeredocs(command).bodies.length || bashWrites(command, cwd, home).length) return false
+  const cs = commands(command)
+  return (
+    cs.length > 0 &&
+    cs.every((c) => {
+      const p = programOf(c)
+      if (p === 'sed') return !c.some((w) => /^-i/.test(w) || w === '--in-place')
+      if (p === 'git') return GIT_LOOKS.has(c.find((w, k) => k > 0 && !w.startsWith('-') && !(k > 1 && c[k - 1] === '-C')) ?? 'status')
+      if (p === 'gh') return /^(?:view|list|status|diff|checks)$/.test(c[2] ?? '') || c[1] === 'api'
+      return LOOKS.has(p)
+    })
+  )
+}
+// What a Bash command runs that matters, one key each: a program with its first two operands (`pnpm vitest run`,
+// `fm-peek.sh opie`), the programs that only look or set up left out. A failure is fixed by a later success that
+// runs all of its keys.
+function runKeys(command: string) {
+  return commands(command)
+    .filter((c) => !LOOKS.has(programOf(c)) && !['rm', 'rmdir', 'mkdir', 'cp', 'mv', 'touch', 'chmod'].includes(programOf(c)))
+    .map((c) => {
+      const operands = c.slice(1).filter((w, k) => !w.startsWith('-') && !REDIRECT.test(w) && !(k > 0 && REDIRECT.test(c[k]!)))
+      return [programOf(c), ...operands.slice(0, 2)].join(' ')
+    })
+}
+
 // pi-vcc's compressBash: heredoc bodies dropped (a one-line preview for an interpreter's), preamble and `cd`/variable
 // segments dropped, pipe tails stripped, lines joined with `; ` and capped.
 const TRIVIAL_LINE = /^(?:set\s+[-+]|cd\s+\S+$|export\s+\w+=|(?:source|\.)\s+\S+|pwd$|true$|:$|#)/
 const PIPE_TAIL = /\s*\|\s*(?:head|tail|sort|wc|column|tr|cut|awk|uniq|rtk proxy grep|grep|rg)(?:\s[^|]*)?$/
 const FILE_WRITER_HEREDOC = /(?:^|[|&;]\s*)(?:cat|tee|dd)\b/
 const BODY_NOISE = /^(?:import\s|from\s+\S+\s+import|require\(|const\s+\w+\s*=\s*require|#|\/\/|"""|'''|"use strict")/
+// Whether a shell line ends inside a quote.
+function openQuote(line: string) {
+  let q: string | undefined
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!
+    if (q) {
+      if (c === q) q = undefined
+      else if (c === '\\' && q === '"') i++
+    } else if (c === "'" || c === '"') q = c
+    else if (c === '\\') i++
+    else if (c === '#' && (i === 0 || /\s/.test(line[i - 1]!))) break
+  }
+  return q !== undefined
+}
 export function compressBash(raw: string) {
   const rawLines = raw.split('\n')
   const lines: string[] = []
   for (let i = 0; i < rawLines.length; i++) {
     let line = rawLines[i]!
+    // A quoted argument that spans lines stays part of its command line.
+    while (openQuote(line) && i + 1 < rawLines.length) line += ` ${rawLines[++i]!.trim()}`
     const close = heredocClose(rawLines, i)
     if (close >= 0) {
       if (!FILE_WRITER_HEREDOC.test(line)) {
@@ -390,16 +468,32 @@ const dedupKey = (b: Block) => {
   return undefined
 }
 
-// Failures near the end of the span that no later call in it repeated successfully, then the assistant's own
-// lines there that name something failing or blocked (pi-vcc's blocker lines, the user's left out: they are quoted
-// in full elsewhere).
+// A read, a search or a Bash command that only inspects: its line would say only what was looked at.
+const isLook = (b: Block, cwd: string, home?: string) => {
+  if (b.kind !== 'tool') return false
+  if (/^(?:Read|Glob|Grep|LS)$/.test(b.name)) return true
+  const command = commandOf(b)
+  return command !== undefined && inspects(command, cwd, home)
+}
+
+// Failures near the end of the span, lookups apart, that no later call in it repeated or ran again successfully,
+// then the assistant's own lines there that name something failing or blocked (pi-vcc's blocker lines, the user's
+// left out: they are quoted in full elsewhere).
 function extractOutstanding(blocks: readonly Block[], cwd: string, home?: string) {
   const tail = blocks.slice(-OUTSTANDING_TAIL)
   const items: string[] = []
+  const ok = (later: Block) => later.kind === 'tool' && later.result !== undefined && !later.result.isError
   tail.forEach((b, k) => {
-    if (b.kind !== 'tool' || !b.result?.isError) return
+    if (b.kind !== 'tool' || !b.result?.isError || isLook(b, cwd, home)) return
     const key = dedupKey(b)
-    const fixed = tail.slice(k + 1).some((later) => later.kind === 'tool' && later.result && !later.result.isError && key !== undefined && dedupKey(later) === key)
+    const command = commandOf(b)
+    const keys = command === undefined ? [] : runKeys(command)
+    const fixed = tail.slice(k + 1).some((later) => {
+      if (!ok(later)) return false
+      if (key !== undefined && dedupKey(later) === key) return true
+      const done = commandOf(later)
+      return keys.length > 0 && done !== undefined && keys.every((x) => runKeys(done).includes(x))
+    })
     if (!fixed) items.push(eventLine(b, cwd, home))
   })
   for (const b of tail) {
@@ -469,7 +563,7 @@ function selectKey(b: Block) {
 function selectTranscript(blocks: readonly Block[], modified: ReadonlySet<string>, maxChars: number, cwd: string, home?: string) {
   const events = rank(blocks, modified, cwd, home)
     .map((r, k) => ({ ...r, k }))
-    .filter((r) => r.b.kind !== 'user')
+    .filter((r) => r.b.kind !== 'user' && !isLook(r.b, cwd, home))
   const lines = events.map((r) => eventLine(r.b, cwd, home))
   const selected = new Set<number>()
   const seen = new Set<string>()
