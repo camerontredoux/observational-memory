@@ -356,8 +356,9 @@ function piMessage(stdout: string) {
   return message
 }
 
-// One completion through pi. A failure throws, saying how pi ended but never what it was sent; nothing retries it
-// on another model.
+// One completion through pi, accepted only when pi says it finished (`stop`): a reply cut at the token limit, errored,
+// aborted or ending in any other way is partial. A failure throws, saying how pi ended but never what it was sent;
+// nothing retries it on another model.
 async function complete($: EngineInterface, role: string, system: string, prompt: string, timeoutMs: number, call: Call) {
   const started = await $.clock.now()
   const kind = role.startsWith('reflector') ? 'reflector' : 'observer'
@@ -370,8 +371,8 @@ async function complete($: EngineInterface, role: string, system: string, prompt
   const message = piMessage(r.stdout)
   if (r.exitCode !== 0) throw await fail(new Error(`pi exited ${r.exitCode}: ${truncate(r.stderr.trim().split('\n').at(-1) ?? '', 50)}`))
   if (!message) throw await fail(new Error('pi exited 0 with no assistant message'))
-  if (message.stopReason === 'error' || message.stopReason === 'aborted')
-    throw await fail(new Error(`pi exited 0, stopReason ${message.stopReason}: ${truncate(message.errorMessage ?? '', 50)}`))
+  if (message.stopReason !== 'stop')
+    throw await fail(new Error(`pi exited 0, stopReason ${message.stopReason ?? 'none'}: ${truncate(message.errorMessage ?? '', 50)}`))
   const u = message.usage
   await note({ input: u?.input, output: u?.output, cost: u?.cost?.total })
   log(

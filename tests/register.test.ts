@@ -481,6 +481,27 @@ describe('register', () => {
     expect(seen.modelCalls).toBe(0)
   })
 
+  test('a reply pi did not finish (token-limited, or ending in a way pi does not name) leaves its chunk unobserved', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const partial = '<observations>\n* 🔴 2026-09-22 14:30 Saw a\n* 🟡 2026-09-22 14:31 Read /src/a.ts and fou'
+    const ends = [{ stopReason: 'length' }, {}]
+    const seen = pi(on, { fail: (n) => (n <= ends.length ? { exitCode: 0, stdout: piOutput('', partial, ends[n - 1]), stderr: '' } : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+    await runTurn($, turn('b', 'b', 100), at(22, 14, 40))
+    await clock.settle()
+
+    expect(seen.logs.filter((l) => l.startsWith('background observation'))).toEqual([
+      'background observation of rows 0-3 failed (pi exited 0, stopReason length: ); it will be retried',
+      'background observation of rows 0-3 failed (pi exited 0, stopReason none: ); it will be retried',
+    ])
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect([ledger.watermark.to, ledger.entries, ledger.chunks]).toEqual([0, [], []])
+  })
+
   test('observes in the background after turn.complete, off the dispatch, with real timestamps checked against the chunk', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
