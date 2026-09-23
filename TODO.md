@@ -6,6 +6,10 @@ OM estimates tokens as characters ÷ 4. Dense text (the v0.4.12 smoke chapters i
 were ~2 characters per token) makes the kept raw tail about twice its estimate, so compactions come more often than
 intended.
 
+The compaction's final budget check scales its estimate by the last response's measured density, so a result too
+big for the window falls back to the built-in compaction; the scheduling thresholds (`CHUNK_TOKENS`, `KEEP_RAW_TOKENS`,
+`RAW_MAX_TOKENS`) still use the plain estimate.
+
 ## Not fixing: on-the-spot observation after a compaction keeps only an oversized read
 
 Seen only with a small window (the smokeC/smokeD runs: 60k window, 36 KB reads). When a compaction keeps only the
