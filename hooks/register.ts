@@ -14,6 +14,7 @@ import {
 } from './prompts'
 import { add, addCompaction, count, addLuna, addRecall, addReflection, failureClass, flush, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
+import { registerPrune } from './prune'
 
 declare module 'claude-code' {
   interface McpToolInputs {
@@ -783,6 +784,7 @@ async function noteTranscript($: EngineInterface, e: { session_id: string; trans
 }
 
 export const register: Register = (on) => {
+  registerPrune(on)
   on('session.compact', async ($, e, next) => {
     const { messages } = e
     const main = e.agentId === undefined
