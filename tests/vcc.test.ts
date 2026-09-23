@@ -71,6 +71,7 @@ describe('vcc', () => {
     expect(compressBash('set -e\ncd /x\ngit status')).toBe('git status')
     expect(compressBash("cd /x; pnpm db:new 'ALTER TABLE a;\nALTER TABLE b;'\ngit status")).toBe("pnpm db:new 'ALTER TABLE a; ALTER TABLE b;'; git status")
     expect(compressBash("cat m.sql | head -20; pnpm db:new 'ALTER TABLE a;\nALTER TABLE b;'")).toBe("cat m.sql; pnpm db:new 'ALTER TABLE a; ALTER TABLE b;'")
+    expect(compressBash('ls d | tail -3; cat d/$(ls d | tail -1)/m.sql')).toBe('ls d; cat d/$(ls d | tail -1)/m.sql')
   })
 
   test('commits: the -m and heredoc forms, with the hash the result prints', () => {

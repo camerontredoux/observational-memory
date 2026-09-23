@@ -279,7 +279,7 @@ function runKeys(command: string) {
 // pi-vcc's compressBash: heredoc bodies dropped (a one-line preview for an interpreter's), preamble and `cd`/variable
 // segments dropped, pipe tails stripped, lines joined with `; ` and capped.
 const TRIVIAL_LINE = /^(?:set\s+[-+]|cd\s+\S+$|export\s+\w+=|(?:source|\.)\s+\S+|pwd$|true$|:$|#)/
-const PIPE_TAIL = /\s*\|\s*(?:head|tail|sort|wc|column|tr|cut|awk|uniq|rtk proxy grep|grep|rg)(?:\s[^|;&]*)?(?=$|;|&&)/
+const PIPE_TAIL = /\s*\|\s*(?:head|tail|sort|wc|column|tr|cut|awk|uniq|rtk proxy grep|grep|rg)(?:\s[^|;&)]*)?(?=$|;|&&)/
 const FILE_WRITER_HEREDOC = /(?:^|[|&;]\s*)(?:cat|tee|dd)\b/
 const BODY_NOISE = /^(?:import\s|from\s+\S+\s+import|require\(|const\s+\w+\s*=\s*require|#|\/\/|"""|'''|"use strict")/
 // Whether a shell line ends inside a quote.
