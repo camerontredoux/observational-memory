@@ -49,8 +49,8 @@ const STATS_TOOL = 'om_stats'
 const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
 const NEXT_STEP_MAX_TOKENS = 2_000
 const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
-const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say: the smallest in use
-const OVERHEAD_TOKENS = 20_000 // the system prompt and tool schemas every request carries beside the messages
+const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say, or for a subagent's model: the smallest in use
+const OVERHEAD_TOKENS = 20_000 // the system prompt and built-in tool schemas every request carries beside the messages
 const MEMORY_HEADROOM = 1.25 // the memory message's estimate scaled up: the Observer's prose runs near it, quoted skills and prompts may not
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
 const MARKERS = ['🔴', '🟡', '🟢', '✅']
@@ -409,7 +409,7 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
   const lines = parseLines(observed, bounds, !bounds)
   const corrections = parseLines(correctionsOf(text), bounds, !bounds).filter((l) => l.startsWith('🔴'))
   // A marker or a time alone is no observation. With none, the reply counts only when it says so: an empty block,
-  // or corrections with nothing else outside them.
+  // or corrections and no observations.
   const saysNothingNew = !observed.trim() && (corrections.length > 0 || EMPTY_OBSERVATIONS.test(text))
   if (!lines.length && !saysNothingNew) {
     log($, `observer reply without observations (${text.length} chars), began: ${JSON.stringify(text.slice(0, 500))}`)
@@ -470,24 +470,24 @@ function capUserMessages(messages: readonly UserMessage[]) {
     kept.unshift(m)
     left -= t
   }
-  const omitted = rest.slice(0, rest.length - kept.length).reduce((n, m) => n + (m.omitted ?? 1), 0)
-  return [brief, ...(omitted ? [{ text: '', omitted }] : []), ...kept]
+  return [...withOmitted(brief, rest.slice(0, rest.length - kept.length)), ...kept]
+}
+
+// The brief, then one line counting the messages dropped after it.
+function withOmitted(brief: UserMessage, dropped: readonly UserMessage[]): UserMessage[] {
+  const omitted = dropped.reduce((n, m) => n + (m.omitted ?? 1), 0)
+  return [brief, ...(omitted ? [{ text: '', omitted }] : [])]
 }
 
 // A memory message that would not fit the compacted context's budget: the built-in compaction runs instead. The
 // fallback reads it by its message, as the engine hands a hook's error on rewrapped.
-const overBudget = (tokens: number, budget: number) => `the compacted context, ~${tokens} tokens, is over its ~${budget}-token budget`
-const OVER_BUDGET = /^the compacted context, ~\d+ tokens, is over its ~\d+-token budget$/
+const OVER_BUDGET = 'the compacted context is over its budget'
+const overBudget = (tokens: number, budget: number) => `${OVER_BUDGET}: ~${tokens} tokens, ~${budget} allowed`
 
 // A memory with its skills as lines and its user messages the brief alone, the rest counted.
 function briefer(memory: Memory): Memory {
   const [brief, ...rest] = memory.userMessages
-  const omitted = rest.reduce((n, m) => n + (m.omitted ?? 1), 0)
-  return {
-    ...memory,
-    skills: memory.skills.map((s) => ({ ...s, text: '' })),
-    userMessages: brief ? [brief, ...(omitted ? [{ text: '', omitted }] : [])] : [],
-  }
+  return { ...memory, skills: memory.skills.map((s) => ({ ...s, text: '' })), userMessages: brief ? withOmitted(brief, rest) : [] }
 }
 
 const renderSkill = (s: Skill) => {
@@ -928,7 +928,7 @@ export const register: Register = (on) => {
     const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
-    const [sessionId, started, usage] = await Promise.all([$.session.id(), $.clock.now(), $.session.usage().catch(() => undefined)])
+    const [sessionId, started, usage] = await Promise.all([$.session.id(), $.clock.now(), $.session.usage({ breakdown: 'summary' }).catch(() => undefined)])
     const loop = loopOf(sessionId, e.agentId)
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
     // the session cannot read, or a context that does not match) is compacted with no stored state.
@@ -991,12 +991,18 @@ export const register: Register = (on) => {
     // A prompt cut to its note alone quotes nothing.
     const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
     const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
-    // The compacted context fits half the window the overhead leaves, so the session can work before compacting
-    // again. Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's
-    // measure, less the overhead, over the estimate of the same messages scales the raw tail's up, never down.
-    const budget = Math.floor(((usage?.context.window ?? WINDOW_TOKENS) - OVERHEAD_TOKENS) / 2)
+    // The compacted context fits half the room the overhead leaves below the point auto-compaction runs at, so the
+    // session can work before compacting again. The session's figures are its main model's: a subagent's model may
+    // have a smaller window. The overhead grows by what the breakdown lists beside the system prompt and built-in tools.
+    // Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's measure,
+    // less the overhead, over the estimate of the same messages scales the raw tail's up, never down.
+    const breakdown = usage?.context.breakdown
+    const limit = breakdown?.autoCompactThreshold ?? breakdown?.rawMaxTokens ?? usage?.context.window ?? WINDOW_TOKENS
+    const listed = [...(breakdown?.mcpTools.filter((t) => t.isLoaded) ?? []), ...(breakdown?.memoryFiles ?? []), ...(breakdown?.agents ?? []), breakdown?.skills, breakdown?.slashCommands]
+    const overhead = OVERHEAD_TOKENS + listed.reduce((n, l) => n + (l?.tokens ?? 0), 0)
+    const budget = Math.floor(((main ? limit : Math.min(limit, WINDOW_TOKENS)) - overhead) / 2)
     const measured = main ? usage?.context.tokens : undefined
-    const density = measured === undefined ? 1 : Math.max(1, (measured - OVERHEAD_TOKENS) / Math.max(1, tokensBetween(v, 0, messages.length)))
+    const density = measured === undefined ? 1 : Math.max(1, (measured - overhead) / Math.max(1, tokensBetween(v, 0, messages.length)))
 
     // The memory message from the ledger once this compaction's chunks commit.
     const build = (ledger: Ledger) => {
@@ -1018,46 +1024,46 @@ export const register: Register = (on) => {
         recentKept: tail.length > 0,
         resumeDirectly: e.trigger === 'auto',
       }
-      const sizeOf = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tokensBetween(v, cut, messages.length) * density)
+      // The compacted context: the memory message with its margin, and the raw tail at its density.
+      const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tokensBetween(v, cut, messages.length) * density)
       let message = memoryMessage(memory)
       // Over the budget, the skills become lines and the user messages the brief alone, which om_recall can still
       // find; the corrections, observations and next step stay whole. Still over it, the built-in compaction runs.
-      if (sizeOf(message) > budget) {
-        const over = sizeOf(message)
+      const over = contextTokens(message)
+      if (over > budget) {
         memory = briefer(memory)
         message = memoryMessage(memory)
-        if (sizeOf(message) > budget) throw new Error(overBudget(sizeOf(message), budget))
+        const shortened = contextTokens(message)
+        if (shortened > budget) throw new Error(overBudget(shortened, budget))
         log($, `over the ~${budget}-token budget at ~${over} tokens: skills kept as lines, user messages as the brief`)
       }
-      return { ledger, cut, tail, memory, message }
+      return { ledger, cut, memory, message }
     }
     // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
     // message that stands; once installed, the watermark restarts after the memory message, and the chunks past
     // it are found again there. One that does not stand leaves the chunks committed, not installed.
     const settle = async (l: Ledger) => {
       const ledger = commit({ ...l, chunks: [...l.chunks, ...chunks] }, v)
-      const store = (installed: boolean) =>
-        persistent && ledger.watermark.to > base
-          ? $.store.set(ledgerKey(loop.key), installed ? { ...ledger, anchor: hash(renderLines(ledger.entries)), watermark: { from: 1, to: 1, hash: hash(''), head: '' } } : ledger)
-          : undefined
+      const stores = persistent && ledger.watermark.to > base
       let built
       try {
         built = build(ledger)
       } catch (error) {
-        if (chunks.length) await store(false)
+        if (stores && chunks.length) await $.store.set(ledgerKey(loop.key), ledger)
         throw error
       }
-      await store(installs)
+      if (stores && !installs) await $.store.set(ledgerKey(loop.key), ledger)
+      if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(renderLines(ledger.entries)), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
       return built
     }
-    const { ledger, cut, tail, memory, message } = persistent ? await locked(async () => settle(await loadLedger($, loop.key, v))) : await settle(initial)
+    const { ledger, cut, memory, message } = persistent ? await locked(async () => settle(await loadLedger($, loop.key, v))) : await settle(initial)
     for (const line of keptInFull) show($, line, e.agentId)
     const kept = new Set(order.slice(cut))
     const observedNow = chunks.reduce((n, c) => n + c.to - c.from, 0)
     log(
       $,
       (observedNow ? `observed ${observedNow} rows now, ` : 'cut at the background watermark with no Observer call, ') +
-        `kept ${tail.length} raw messages (~${tokensBetween(v, cut, messages.length)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
+        `kept ${messages.length - cut} raw messages (~${tokensBetween(v, cut, messages.length)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
         `${ledger.entries.length} observations, ${memory.skills.length} skill(s)`,
     )
     show(
@@ -1088,7 +1094,7 @@ export const register: Register = (on) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     log($, `${next.error.message}; using the built-in compaction`)
-    show($, OVER_BUDGET.test(next.error.message ?? '') ? 'Memory over its budget. Using built-in compaction' : 'Observation failed. Using built-in compaction', e.agentId)
+    show($, next.error.message?.startsWith(OVER_BUDGET) ? 'Memory over its budget. Using built-in compaction' : 'Observation failed. Using built-in compaction', e.agentId)
     // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
     const installs = e.trigger !== 'precompute'
     const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])

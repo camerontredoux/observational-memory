@@ -694,6 +694,27 @@ describe('register', () => {
     expect(ledger.entries).toHaveLength(4_000)
   })
 
+  test('a reflection pi did not finish replaces nothing, though what it holds parses under the target', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const line = '🟡 2026-09-22 14:30 read a file with a long name'
+    const short = '<observations>\n* 🔴 2026-09-22 14:30 Reflected\n</observations>'
+    const seen = pi(on, {
+      reply: () => `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`,
+      fail: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? { exitCode: 0, stdout: piOutput('', short, { stopReason: 'length' }), stderr: '' } : undefined),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
+    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual(['reflection failed (pi exited 0, stopReason length: )'])
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
+    expect(ledger.entries).toHaveLength(4_000)
+  })
+
   test("the user's corrections are quoted in their own section above the observations and pass through the Reflector unchanged", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
@@ -909,6 +930,21 @@ describe('register', () => {
     expect(seen.logs).toContain('Compacted subagent in 0 ms · observed 3 messages on the spot · memory 1 note')
   })
 
+  test("a subagent's budget takes the smallest window, not the main model's million", async ($, on) => {
+    mock.clock(on)
+    world(on, { unreadable: ['agent-1'] })
+    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(6_000)}</observations>` })
+    // ~100k tokens of observations: under the main model's (1M - 20k) / 2, over a 200k window's 90k.
+    on('session.usage', () => ({ value: { context: { window: 1_000_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })
+
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~90000 allowed; using the built-in compaction$/))
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+  })
+
   test('main and two subagents observe in the background side by side, each under its own keys, four Observer calls in flight across them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
@@ -1094,7 +1130,7 @@ describe('register', () => {
     expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
     expect(stored['ledger:session-1']).toEqual(before)
     expect(before.corrections).toEqual([correction])
-    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context, ~\d+ tokens, is over its ~\d+-token budget; using the built-in compaction$/))
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~90000 allowed; using the built-in compaction$/))
     expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
     open(0)
     await clock.settle()
@@ -1115,6 +1151,51 @@ describe('register', () => {
     expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
     const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
     expect([ledger.watermark.to, ledger.entries.length, ledger.anchor]).toEqual([7, 2_000, undefined])
+  })
+
+  test('a memory whose corrections alone are over its budget falls back rather than drop any', async ($, on) => {
+    mock.clock(on)
+    const { history, stored } = world(on)
+    const corrections = Array.from({ length: 2_000 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
+    const seen = pi(on, {
+      reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
+    })
+    // A 15k-token budget, under the ~20k the corrections alone take.
+    on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
+    expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
+  })
+
+  test("the budget is half the room below the auto-compaction threshold, less the overhead the session's breakdown lists", async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(2_000)}</observations>` })
+    // (100k to auto-compaction - 20k - 10k of a loaded MCP tool - 10k of memory files) / 2: a 30k-token budget,
+    // under the ~34k of observations the two chunks bring. A deferred tool is outside the window.
+    const breakdown = {
+      autoCompactThreshold: 100_000,
+      rawMaxTokens: 200_000,
+      mcpTools: [
+        { name: 'mcp__big__loaded', serverName: 'big', tokens: 10_000, isLoaded: true },
+        { name: 'mcp__big__deferred', serverName: 'big', tokens: 50_000, isLoaded: false },
+      ],
+      memoryFiles: [{ path: '/work/project/CLAUDE.md', type: 'Project', tokens: 10_000 }],
+      agents: [],
+    }
+    on('session.usage', ($, e) => ({ value: { context: { window: 200_000, ...(e.breakdown === 'summary' ? { breakdown } : {}) }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~30000 allowed; using the built-in compaction$/))
   })
 
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
