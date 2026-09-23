@@ -1055,6 +1055,58 @@ describe('register', () => {
     for (const e of ledger.entries) expect(e.line).toMatch(/^\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2} /)
   })
 
+  // A real firstmate stretch, replayed from a private transcript: /tmp/om-stall/work/make-fixture.ts writes the
+  // module (gitignored). From the context the 14:31 compaction left to the 15:11 compaction: short turns, many opened
+  // by a task notification, with a parallel block that compaction wrote back grouped. Without it the test has nothing
+  // to replay and passes.
+  test('replays a firstmate transcript: short turns are observed in the background, and compaction cuts at the watermark', { timeoutMs: 120_000 }, async ($, on) => {
+    const fx = (await import('./fixtures/firstmate.local').catch(() => undefined)) as
+      | { rows: SessionMessage[]; at: number[]; start: number; live: number; events: { kind: 'start' | 'step' | 'complete' | 'reload' | 'compact'; rows: number; at: number }[] }
+      | undefined
+    if (!fx) return
+    const clock = mock.clock(on, { now: fx.at[0] })
+    const { history } = world(on)
+    const seen = pi(on, { hold: () => clock.sleep(16_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+
+    history.push(...fx.rows.slice(0, fx.start))
+    let turn = 0
+    let index = 0
+    let atCompaction = -1
+    for (const e of fx.events) {
+      while (history.length < e.rows) {
+        await clock.set(Math.max(clock.now(), fx.at[history.length]!))
+        history.push(fx.rows[history.length]!)
+        await clock.settle()
+      }
+      await clock.set(Math.max(clock.now(), e.at))
+      if (e.kind === 'start') {
+        turn++
+        index = 0
+        await $.turn.start({ text: history.at(-1)!.text, turnId: `t${turn}` })
+      } else if (e.kind === 'step') await step($, `t${turn}`, index++, history.length)
+      else if (e.kind === 'complete') await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: `t${turn}`, reason: 'answer' })
+      else if (e.kind === 'compact') {
+        const before = seen.prompts.length
+        await $.session.compact({ trigger: 'auto', messages: history.slice(fx.live) })
+        atCompaction = seen.prompts.length - before
+      }
+      await clock.settle()
+    }
+
+    // As the session logged: rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail
+    // until the turn that ended at 15:08:26.
+    expect(seen.logs.filter((l) => l.includes('in the background'))).toEqual([
+      'observed rows 1-56 in the background, 1 observations; watermark 56, 0 chunk(s) waiting on a gap',
+      'observed rows 56-139 in the background, 1 observations; watermark 139, 0 chunk(s) waiting on a gap',
+    ])
+    expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
+    expect(atCompaction).toBe(0)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+  })
+
   test('stats: a discarded background chunk counts its cost but not its observations', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
@@ -1162,6 +1214,39 @@ describe('register', () => {
 
     expect(history.length).toBeGreaterThan(context.length)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+  })
+
+  // A compaction writes its kept tail back in the context's order, so the history then holds a parallel block
+  // grouped. The background ledger and the next compaction must read it in the same order, or the watermark over
+  // it looks changed and the whole backlog is observed on the spot (a firstmate session, upgraded mid-way to 0.4.5).
+  test('a parallel block a compaction wrote back grouped, under the watermark, still cuts there with no Observer call', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    const block = parallel('c', 2, 2_000)
+    history.push({ role: 'user', text: 'c', toolUses: [] }, ...block.history)
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'auto', messages: [...history.slice(0, -block.history.length), ...block.context] })
+    const memory = first.messages![0]!
+    expect(first.messages!.slice(-block.context.length)).toEqual(block.context)
+    history.push(...first.messages!)
+    await runTurn($, turn('d', 'd', CHUNK), at(22, 16, 0))
+    await runTurn($, turn('e', 'e', CHUNK), at(22, 16, 30))
+    await runTurn($, turn('f', 'f', 8_000), at(22, 17, 0))
+    await clock.settle()
+    const observed = seen.prompts.length
+    const ledger = stored['ledger:session-1'] as Ledger
+    const current = history.slice(history.lastIndexOf(memory))
+    expect(ledger.watermark.to).toBeGreaterThan(current.indexOf(block.context.at(-1)!))
+    await $.session.compact({ trigger: 'auto', messages: current })
+
+    expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(seen.prompts).toHaveLength(observed)
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
   })
