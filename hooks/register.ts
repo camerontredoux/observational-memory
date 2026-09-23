@@ -904,17 +904,21 @@ export const register: Register = (on) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     log($, `${next.error.message}; using the built-in compaction`)
-    const [rows, sessionId, started] = await Promise.all([$.session.messages(), $.session.id(), $.clock.now()])
+    // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
+    const main = e.agentId === undefined && e.trigger !== 'precompute'
+    const [rows, sessionId, started] = await Promise.all([main ? $.session.messages() : undefined, $.session.id(), $.clock.now()]).catch(() => [])
     const fellBack = (r: Awaited<ReturnType<typeof next>>) => (
-      record(statsIo($), sessionId, (s, at) =>
-        addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack: true, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
-      ),
+      sessionId !== undefined &&
+        started !== undefined &&
+        record(statsIo($), sessionId, (s, at) =>
+          addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack: true, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
+        ),
       r
     )
-    if (e.agentId !== undefined || e.trigger === 'precompute') return fellBack(await next(e))
+    if (!main) return fellBack(await next(e))
     // Its summary carries no memory message, so where the live context now starts is recorded instead.
     const r = fellBack(await next(e))
-    if (r.messages) await $.store.set(liveKey(sessionId), rows.length)
+    if (r.messages && rows && sessionId !== undefined) await $.store.set(liveKey(sessionId), rows.length)
     return r
   })
 

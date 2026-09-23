@@ -253,6 +253,17 @@ describe('register', () => {
     ])
   })
 
+  test("a subagent's or precompute's fallback does not depend on the session's id, messages or clock", async ($, on) => {
+    pi(on) // and no session.id, session.messages or clock: each call rejects
+    const summary = { role: 'user' as const, text: 'built-in summary', toolUses: [] }
+    on('session.compact', () => ({ messages: [summary] }))
+
+    for (const e of [{ trigger: 'auto' as const, agentId: 'agent-1' }, { trigger: 'precompute' as const }]) {
+      const result = await $.session.compact({ ...e, messages: turn('a', 'a', 8_000) })
+      expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    }
+  })
+
   test('when pi fails on a gap at compaction, the cut stays at the watermark and the gap is kept raw', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
