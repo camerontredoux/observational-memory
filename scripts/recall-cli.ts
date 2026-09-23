@@ -3,7 +3,8 @@
 // `tsc -p .` (it uses Bun's Node APIs); run it with bun.
 import { readFileSync, readdirSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { legacyRecall, loadTranscript, recall, SEARCH_MAX_HITS } from '../hooks/recall'
+import { loadTranscript, recall, SEARCH_MAX_HITS } from '../hooks/recall'
+import { legacyRecall } from '../tests/eval/legacy-recall'
 import type { RecallInput, RecallIo } from '../hooks/recall'
 
 const USAGE = `Usage: bun scripts/recall-cli.ts <transcript.jsonl> [options] [query words...]

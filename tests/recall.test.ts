@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { MEMORY_HEADER } from '../hooks/prompts'
-import { legacyRecall, liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
+import { legacyRecall } from './eval/legacy-recall'
+import { liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
 import type { RecallInput, RecallIo } from '../hooks/recall'
 
 const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
