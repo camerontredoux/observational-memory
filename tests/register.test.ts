@@ -247,6 +247,7 @@ describe('register', () => {
     expect(builtin).toBe(1)
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toEqual([
+      'compaction not persistent: the context has 8 messages, the history 0',
       'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
       'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
       'the Observer failed and nothing is observed yet; using the built-in compaction',
@@ -929,6 +930,28 @@ describe('register', () => {
     const file = JSON.parse(files['/stats/session-1.json']!) as { metrics: Record<string, { count: number; sum: number }> }
     expect(file.metrics['observer.background.cost']?.count).toBeGreaterThan(0)
     expect(file.metrics['observer.background.observations']).toBeUndefined()
+  })
+
+  test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, files } = world(on)
+    const seen = pi(on)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000))
+    await $.session.compact({ trigger: 'auto', messages: [...history, { role: 'user', text: 'not yet in the history', toolUses: [] }] })
+    const changed = [...history]
+    changed[2] = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't-a', text: '[Old tool result content cleared]', isError: false }] }
+    await $.session.compact({ trigger: 'auto', messages: changed })
+    await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: changed }) // a subagent's never matches: no line
+    await clock.advance(5_000)
+
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([
+      'compaction not persistent: the context has 9 messages, the history 8',
+      'compaction not persistent: context message 2 differs from history row 2 (context user, 34 chars, 0 tool uses, 1 tool results; history user, 40001 chars, 0 tool uses, 1 tool results)',
+    ])
+    const file = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
+    expect(file.counts['compaction.notPersistent']).toBe(2)
   })
 
   test('stats: background calls and a compaction land in the session file, and om_stats and /om-stats report them', async ($, on) => {

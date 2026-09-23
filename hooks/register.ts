@@ -795,6 +795,19 @@ async function noteTranscript($: EngineInterface, e: { session_id: string; trans
   await $.store.set(transcriptKey(e.session_id), e.transcript_path).catch((error) => log($, `could not record the transcript path (${errorText(error)})`))
 }
 
+// Why a main compaction's context is not the tail of the history, by shape alone (no content): logged and counted.
+function notPersistent($: EngineInterface, sessionId: string, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
+  const shape = (m: SessionMessage) => `${m.role}, ${rowText(m).length} chars, ${m.toolUses.length} tool uses, ${m.toolResults?.length ?? 0} tool results`
+  const i = offset < 0 ? -1 : messages.findIndex((m, i) => rowHash(m) !== rowHash(rows[offset + i]!))
+  log(
+    $,
+    offset < 0
+      ? `compaction not persistent: the context has ${messages.length} messages, the history ${rows.length}`
+      : `compaction not persistent: context message ${i} differs from history row ${offset + i} (context ${shape(messages[i]!)}; history ${shape(rows[offset + i]!)})`,
+  )
+  record(statsIo($), sessionId, (s) => count(s, 'compaction.notPersistent'))
+}
+
 export const register: Register = (on) => {
   registerPrune(on)
   on('session.compact', async ($, e, next) => {
@@ -807,6 +820,7 @@ export const register: Register = (on) => {
     const rows = main ? await $.session.messages() : []
     const offset = rows.length - messages.length
     const persistent = main && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
+    if (main && !persistent) notPersistent($, sessionId, messages, rows, offset)
     const v = view(messages, persistent ? await loadMarks($, sessionId) : [], persistent ? offset : undefined)
     const base = v.base
     const initial = persistent ? await locked(() => loadLedger($, sessionId, v)) : fresh(v)
