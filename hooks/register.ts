@@ -35,6 +35,7 @@ const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark,
 const REFLECT_AT_TOKENS = 40_000
 const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so the next chunk does not reflect again
 const SKILLS_MAX_TOKENS = 15_000
+const SKILLS_WHOLE_TURNS = 3 // a skill invoked in the last this many main-thread turns, the running one counted, keeps its text
 const TOOL_ARGS_MAX_TOKENS = 2_000
 const TOOL_RESULT_MAX_TOKENS = 5_000
 const OBSERVER_TIMEOUT_MS = 120_000 // a ~10k-token chunk takes Luna about 15 s
@@ -51,9 +52,11 @@ const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from th
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
 const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-const SKILL_BLOCK = /<skill name="([^"]*)">\n([\s\S]*?)\n<\/skill>(?=\n<skill name="|\n<\/skills-in-use>)/g
+const SKILL_FINISHED = '(finished; invoke it again to reread its text, or om_recall to find where it loaded)'
+// A skill in full, or finished: one line, its text gone. An old memory message gives no time.
+const SKILL_BLOCK = /<skill name="([^"]*)"(?: invoked="([\d-]+ [\d:]+)")?>(?:\n([\s\S]*?)\n<\/skill>|\(finished;[^\n]*<\/skill>)(?=\n<skill name="|\n<\/skills-in-use>)/g
 
-type Skill = { skill: string; text: string }
+type Skill = { skill: string; text: string; at?: number } // `at`: when it was invoked; no text: finished, kept as a line
 type Mark = { i: number; hash: string; at: number } // when row `i` of `$.session.messages()` was written
 // Rows [from, to) of the live context, known again by their hashes wherever they sit later.
 type Range = { from: number; to: number; hash: string; head: string }
@@ -187,6 +190,7 @@ const stamp = (ms: number) => {
   const d = new Date(ms)
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
+const minute = (ms: number) => Math.floor(ms / 60_000) // a time read back from its stamp compares by the minute
 
 // Each row's time: its own mark, a mark on a row that reads the same (a compaction's copy), or the row before's.
 function view(messages: readonly SessionMessage[], marks: readonly Mark[], offset?: number): View {
@@ -437,12 +441,22 @@ function capUserMessages(messages: readonly UserMessage[]) {
   return [brief, ...(omitted ? [{ text: '', omitted }] : []), ...kept]
 }
 
+const renderSkill = (s: Skill) => {
+  const head = `<skill name="${s.skill}"${s.at === undefined ? '' : ` invoked="${stamp(s.at)}"`}>`
+  return s.text ? `${head}\n${s.text}\n</skill>` : `${head}${SKILL_FINISHED}</skill>`
+}
+
+function unstamp(text: string) {
+  const m = text.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/)
+  return m ? realTime(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])) : undefined
+}
+
 // Built as the built-in summary is framed: its wrapper first, the memory, then its notes after the summary.
 function memoryMessage(memory: Memory): SessionMessage {
   const text =
     `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
     section('current-task', memory.currentTask) +
-    section('skills-in-use', memory.skills.map((s) => `<skill name="${s.skill}">\n${s.text}\n</skill>`).join('\n')) +
+    section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
     renderUserMessages(memory.userMessages) +
     (memory.nextStep
       ? `${NEXT_STEP}Continue with the user's most recent request, quoted verbatim:\n"${truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)}"\n</optional-next-step>`
@@ -465,7 +479,7 @@ function parseMemory(first: SessionMessage) {
   const start = head.indexOf('<observations>\n')
   const end = head.lastIndexOf('\n</observations>')
   const observations = start < 0 || end < start ? '' : head.slice(start + '<observations>\n'.length, end)
-  const skills = skillsAt < 0 ? [] : [...own.slice(skillsAt).matchAll(SKILL_BLOCK)].map((m) => ({ skill: m[1]!, text: m[2]! }))
+  const skills = skillsAt < 0 ? [] : [...own.slice(skillsAt).matchAll(SKILL_BLOCK)].map((m): Skill => ({ skill: m[1]!, text: m[3] ?? '', at: m[2] ? unstamp(m[2]) : undefined }))
   return {
     corrections: start < 0 ? [] : parseLines(tag(head.slice(0, start), 'corrections') ?? '', undefined).filter((l) => l.startsWith('🔴')),
     observations,
@@ -533,6 +547,7 @@ const ledgerKey = (sessionId: string) => `ledger:${sessionId}`
 const timesKey = (sessionId: string) => `times:${sessionId}`
 const liveKey = (sessionId: string) => `live:${sessionId}`
 const skillsKey = (sessionId: string) => `skills:${sessionId}`
+const turnsKey = (sessionId: string) => `turns:${sessionId}` // the main loop's newest turn starts
 const transcriptKey = (sessionId: string) => `transcript:${sessionId}`
 const seenKey = (sessionId: string) => `seen:${sessionId}` // the pruner's stamp
 
@@ -565,6 +580,12 @@ async function markTime($: EngineInterface, onlyPrompt: boolean) {
   if (i >= 0 && (!onlyPrompt || isPrompt(rows[i]!))) marks.push({ i, hash: rowHash(rows[i]!), at: now })
   await $.store.set(timesKey(sessionId), marks.slice(-MAX_MARKS))
   return { sessionId, rows }
+}
+
+async function markTurn($: EngineInterface) {
+  const [sessionId, now] = await Promise.all([$.session.id(), $.clock.now()])
+  const turns = ((await $.store.get(turnsKey(sessionId))) as number[] | undefined) ?? []
+  await $.store.set(turnsKey(sessionId), [...turns, now].slice(-SKILLS_WHOLE_TURNS))
 }
 
 // A model step of the main loop: its time, and a scheduling pass once STEP_SCHEDULE_TOKENS more history has come
@@ -730,21 +751,28 @@ function mergeSkills(...lists: readonly Skill[][]) {
   return [...byName.values()]
 }
 
-// Every skill not already in the raw tail, most recent first, verbatim, within SKILLS_MAX_TOKENS.
-function skillsInUse($: EngineInterface, skills: readonly Skill[], tail: readonly SessionMessage[]) {
+// Every skill not already in the raw tail, most recent first: verbatim within SKILLS_MAX_TOKENS when invoked in the
+// last SKILLS_WHOLE_TURNS turns, else one line. A skill with no time predates them. Without `turns` (a subagent's), all verbatim.
+function skillsInUse($: EngineInterface, skills: readonly Skill[], tail: readonly SessionMessage[], turns?: readonly number[]) {
   const tailText = tail.map(rowText).join('\n')
+  const since = turns && turns.length >= SKILLS_WHOLE_TURNS ? minute(turns.at(-SKILLS_WHOLE_TURNS)!) : -Infinity
   const kept: Skill[] = []
+  const finished: string[] = []
   const dropped: string[] = []
   let tokens = 0
   for (const s of [...skills].reverse()) {
-    if (tailText.includes(s.text.trim())) continue
+    if (s.text && tailText.includes(s.text.trim())) continue
     const t = estimateTokens(s.text)
-    if (tokens + t > SKILLS_MAX_TOKENS) dropped.push(`${s.skill} (~${t} tokens)`)
+    if (!s.text || (turns && (s.at === undefined || minute(s.at) < since))) {
+      if (s.text) finished.push(`${s.skill} (~${t} tokens)`)
+      kept.push({ ...s, text: '' })
+    } else if (tokens + t > SKILLS_MAX_TOKENS) dropped.push(`${s.skill} (~${t} tokens)`)
     else {
       kept.push(s)
       tokens += t
     }
   }
+  if (finished.length) log($, `skills not invoked in the last ${SKILLS_WHOLE_TURNS} turns, kept as a line each: ${finished.join(', ')}`)
   if (dropped.length) log($, `skills over the ${SKILLS_MAX_TOKENS}-token cap, dropped: ${dropped.join(', ')}`)
   return kept
 }
@@ -927,6 +955,7 @@ export const register: Register = (on) => {
     const prior = priorMemory?.skills ?? []
     // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
+    const turns = main ? (((await $.store.get(turnsKey(sessionId))) as number[] | undefined) ?? []) : undefined
     const known = mergeSkills(prior, recorded)
     // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
     const prompts = messages.flatMap((m, i) => {
@@ -942,7 +971,7 @@ export const register: Register = (on) => {
       corrections: ledger.corrections,
       observations,
       currentTask: ledger.currentTask,
-      skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail),
+      skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
       userMessages,
       // The session's first prompt, a crewmate's whole brief, is quoted above; as the next step it would send the
       // agent back to the top of its brief.
@@ -1077,6 +1106,7 @@ export const register: Register = (on) => {
   // Subagents raise no turn.start, so each is the main conversation's prompt.
   on('turn.start', async ($, e, next) => {
     await markTime($, true).catch((error) => log($, `could not record the prompt's time (${errorText(error)})`))
+    await markTurn($).catch((error) => log($, `could not record the turn's start (${errorText(error)})`))
     return next(e)
   })
 
@@ -1103,7 +1133,7 @@ export const register: Register = (on) => {
     if (e.reason !== 'clear') return next(e)
     running = running.filter((j) => j.sessionId !== e.sessionId)
     sinceScheduled.delete(e.sessionId)
-    await Promise.all([ledgerKey, timesKey, liveKey, skillsKey, transcriptKey, seenKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
+    await Promise.all([ledgerKey, timesKey, liveKey, skillsKey, turnsKey, transcriptKey, seenKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
       log($, `could not drop the cleared session's state (${errorText(error)})`),
     )
     return next(e)
@@ -1112,10 +1142,11 @@ export const register: Register = (on) => {
   // Subagent preloads fire here too; the event does not say which loop the skill loads into.
   on('skill.prompt', async ($, e, next) => {
     const r = await next(e)
-    const key = skillsKey(await $.session.id())
+    const [sessionId, at] = await Promise.all([$.session.id(), $.clock.now()])
+    const key = skillsKey(sessionId)
     const recorded = ((await $.store.get(key)) as Skill[] | undefined) ?? []
     await $.store
-      .set(key, mergeSkills(recorded, [{ skill: e.skill, text: r.text }]))
+      .set(key, mergeSkills(recorded, [{ skill: e.skill, text: r.text, at }]))
       .catch((error) => log($, `could not record skill ${e.skill} (${errorText(error)})`))
     return r
   })

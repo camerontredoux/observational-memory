@@ -101,7 +101,7 @@ describe('register', () => {
     on('skill.prompt', ($, e) => ({ text: e.text }))
     await $.skill.prompt({ skill: 'huge', text: big })
     expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:c', 'ledger:session-1'])
-    expect(w.stored['skills:session-1']).toEqual([{ skill: 'huge', text: big }])
+    expect(w.stored['skills:session-1']).toEqual([{ skill: 'huge', text: big, at: NOW }])
     expect(w.logs).toHaveLength(1)
     expect(w.logs[0]).toMatch(/^pruned 2 session\(s\) to fit the store under its size cap: a, b \(6 keys, ~\d+ KiB\)$/)
   })

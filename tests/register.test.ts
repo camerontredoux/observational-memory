@@ -174,6 +174,30 @@ const stampOf = (iso: string) => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 const skillsIn = (text?: string) => text?.match(/<skills-in-use>\n([\s\S]*?)\n<\/skills-in-use>/)?.[1]
+const FINISHED = '(finished; invoke it again to reread its text, or om_recall to find where it loaded)'
+
+// Turns a to c of a live session, then turn d still running: `old` is loaded in turn a, `mid` in b, `now` in d.
+async function fourTurns($: Engine, on: On) {
+  const clock = mock.clock(on)
+  const { history, stored } = world(on)
+  const seen = pi(on)
+  on('skill.prompt', ($, e) => ({ text: e.text }))
+  const runTurn = live(on, clock, history)
+  await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 0))
+  await $.skill.prompt({ skill: 'old', text: 'Old steps' })
+  await runTurn($, turn('b', 'b', 100), at(22, 14, 10))
+  await $.skill.prompt({ skill: 'mid', text: 'Mid steps' })
+  await runTurn($, turn('c', 'c', 100), at(22, 14, 20))
+  await clock.set(at(22, 14, 30))
+  history.push({ role: 'user', text: 'd', toolUses: [] })
+  await $.turn.start({ text: 'd', turnId: 'turn-d' })
+  await clock.advance(30_000)
+  await $.skill.prompt({ skill: 'now', text: 'Now steps' })
+  history.push(...work('d', 8_000))
+  await clock.settle()
+  const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+  return { clock, history, stored, seen, runTurn, first }
+}
 
 // The engine's model requests inside a turn: each answered at once beneath the plugin, read to its end.
 function steps(on: On) {
@@ -548,7 +572,7 @@ describe('register', () => {
   })
 
   test('keeps every recorded skill not in the raw tail, most recent first, within the token cap, and logs what it drops', async ($, on) => {
-    mock.clock(on)
+    mock.clock(on, { now: at(22, 9, 0) })
     world(on)
     const seen = pi(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
@@ -563,13 +587,14 @@ describe('register', () => {
     const result = await $.session.compact({ trigger: 'auto', messages: [...turn('a', 'a', CHUNK), ...recent] })
 
     expect(skillsIn(result.messages?.[0]?.text)).toBe(
-      `<skill name="style">\n${'s'.repeat(8_000)}\n</skill>\n<skill name="deploy">\nDeploy steps\n</skill>\n<skill name="lint">\nLint steps\n</skill>`,
+      `<skill name="style" invoked="2026-09-22 09:00">\n${'s'.repeat(8_000)}\n</skill>\n<skill name="deploy" invoked="2026-09-22 09:00">\nDeploy steps\n</skill>\n` +
+        '<skill name="lint" invoked="2026-09-22 09:00">\nLint steps\n</skill>',
     )
     expect(seen.logs).toContain('skills over the 15000-token cap, dropped: huge (~14000 tokens)')
   })
 
   test('skills carry forward through the memory message when the store has none', async ($, on) => {
-    mock.clock(on)
+    mock.clock(on, { now: at(22, 9, 0) })
     const { stored } = world(on)
     pi(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
@@ -579,8 +604,54 @@ describe('register', () => {
     for (const key of Object.keys(stored)) delete stored[key]
     const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)] })
 
-    expect(skillsIn(second.messages?.[0]?.text)).toBe('<skill name="deploy">\nDeploy steps\n</skill> mid-text stays\n</skill>')
+    expect(skillsIn(second.messages?.[0]?.text)).toBe('<skill name="deploy" invoked="2026-09-22 09:00">\nDeploy steps\n</skill> mid-text stays\n</skill>')
     expect(observationsIn(second.messages?.[0]?.text)).toBe('* 🔴 Saw a\n* 🔴 Saw b\n* 🔴 Saw c')
+  })
+
+  test('a skill keeps its text through the last three turns, the running one included; an older one becomes a line with its time', async ($, on) => {
+    const { seen, first } = await fourTurns($, on)
+
+    expect(skillsIn(first.messages?.[0]?.text)).toBe(
+      '<skill name="now" invoked="2026-09-22 14:30">\nNow steps\n</skill>\n<skill name="mid" invoked="2026-09-22 14:11">\nMid steps\n</skill>\n' +
+        `<skill name="old" invoked="2026-09-22 14:01">${FINISHED}</skill>`,
+    )
+    expect(seen.logs).toContain('skills not invoked in the last 3 turns, kept as a line each: old (~3 tokens)')
+  })
+
+  test('a finished skill stays a line at later compactions, with or without its text in the store, and a whole one keeps its time', async ($, on) => {
+    const { stored, runTurn, first } = await fourTurns($, on)
+    await runTurn($, turn('e', 'e', 100), at(22, 14, 40))
+    await runTurn($, turn('f', 'f', 100), at(22, 14, 50))
+    const later = [...first.messages!, ...turn('e', 'e', CHUNK), ...turn('f', 'f', 8_000)]
+    const second = await $.session.compact({ trigger: 'auto', messages: later })
+    for (const key of Object.keys(stored)) delete stored[key]
+    const third = await $.session.compact({ trigger: 'auto', messages: [...second.messages!, ...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000)] })
+
+    const expected =
+      '<skill name="now" invoked="2026-09-22 14:30">\nNow steps\n</skill>\n' +
+      `<skill name="mid" invoked="2026-09-22 14:11">${FINISHED}</skill>\n<skill name="old" invoked="2026-09-22 14:01">${FINISHED}</skill>`
+    expect(skillsIn(second.messages?.[0]?.text)).toBe(expected)
+    expect(skillsIn(third.messages?.[0]?.text)).toBe(expected)
+  })
+
+  test('a memory message from before skill times still parses: its skills become lines, but stay whole in a subagent', async ($, on) => {
+    mock.clock(on, { now: at(22, 9, 0) })
+    const { stored } = world(on)
+    pi(on)
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+
+    await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps' })
+    const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+    const old = { ...first.messages![0]!, text: first.messages![0]!.text.replace(/ invoked="[^"]*"/g, '') }
+    expect(skillsIn(old.text)).toBe('<skill name="deploy">\nDeploy steps\n</skill>')
+    for (const key of Object.keys(stored)) delete stored[key]
+    const messages = [old, ...first.messages!.slice(1), ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)]
+    const main = await $.session.compact({ trigger: 'auto', messages })
+    const subagent = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })
+
+    expect(skillsIn(main.messages?.[0]?.text)).toBe(`<skill name="deploy">${FINISHED}</skill>`)
+    expect(observationsIn(main.messages?.[0]?.text)).toBe('* 🔴 Saw a\n* 🔴 Saw b\n* 🔴 Saw c')
+    expect(skillsIn(subagent.messages?.[0]?.text)).toBe('<skill name="deploy">\nDeploy steps\n</skill>')
   })
 
   test('om_recall is registered at session.start and searches the whole transcript with bounded output', async ($, on) => {
@@ -633,7 +704,7 @@ describe('register', () => {
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
     await clock.settle()
-    expect(Object.keys(stored).sort()).toEqual(['ledger:session-1', 'skills:session-1', 'times:session-1'])
+    expect(Object.keys(stored).sort()).toEqual(['ledger:session-1', 'skills:session-1', 'times:session-1', 'turns:session-1'])
     stored['seen:session-1'] = 1 // the pruner's stamp
     await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
 
