@@ -34,6 +34,7 @@ function world(on: On, entries: Record<string, unknown> = {}, keys = true, alive
   on('fs.exists', ($, e) => ({ value: e.path in files || dirs().has(e.path) }))
   const stored: Record<string, unknown> = { ...entries }
   const logs: string[] = []
+  const screen: string[] = []
   const bytes = () => Object.entries(stored).reduce((n, [k, v]) => n + k.length + JSON.stringify(v).length, 0)
   on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
   on('store.set', ($, e) => {
@@ -51,13 +52,13 @@ function world(on: On, entries: Record<string, unknown> = {}, keys = true, alive
     return { value: Object.keys(stored) }
   })
   on('session.id', () => ({ value: o.id?.() ?? 'session-1' }))
-  on('ui.log', ($, e) => (logs.push(e.text), { value: undefined }))
+  on('ui.log', ($, e) => ((e.to === 'debug' ? logs : screen).push(e.text), { value: undefined }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__observational-memory__` } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   // Starts a session and lets the background pruner run to its end.
   const start = async ($: Engine) => (await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false }), await clock.settle())
-  return { clock, stored, logs, start, files }
+  return { clock, stored, logs, screen, start, files }
 }
 
 describe('register', () => {
@@ -67,6 +68,7 @@ describe('register', () => {
     expect(Object.keys(w.stored).sort()).toEqual(['ledger:recent', 'ledger:session-1', 'live:recent', 'live:session-1', 'other', 'prune:last', 'times:recent', 'times:session-1'])
     expect(w.logs).toHaveLength(1)
     expect(w.logs[0]).toMatch(/^pruned 1 session\(s\) untouched for 30 days: old \(3 keys\)$/)
+    expect(w.screen).toEqual([])
   })
 
   test('a session with no times is stamped when first seen and pruned 30 days later; the pruner runs at most once a day', async ($, on) => {
@@ -108,6 +110,7 @@ describe('register', () => {
     const w = world(on, session('old', NOW - 31 * DAY), false)
     await w.start($)
     expect(w.logs).toEqual(['could not prune old sessions (no implementation for store.keys)'])
+    expect(w.screen).toEqual(['Cleanup failed (no implementation for store.keys) and will retry tomorrow'])
     expect(w.stored['ledger:old']).toBeDefined()
   })
   test('a session whose process is alive is kept however old; a reused pid does not keep it', async ($, on) => {

@@ -162,9 +162,11 @@ export function merge(files: readonly SessionStats[], since?: number) {
   return { stats: out, sessions, approximate }
 }
 
-const grouped = (n: number) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+export const grouped = (n: number) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 const num = (n: number) => (Math.abs(n) >= 100 || Number.isInteger(n) ? grouped(n) : n >= 1 ? n.toFixed(1) : n.toFixed(2))
-const duration = (ms: number) => {
+// A failure's message cut to a short line for the screen.
+export const brief = (text: string) => (text.length > 60 ? `${text.slice(0, 59)}…` : text)
+export const duration = (ms: number) => {
   if (ms < 1000) return `${Math.round(ms)} ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
   const s = Math.round(ms / 1000)
@@ -219,7 +221,8 @@ export type Io = {
   write: (path: string, text: string) => Promise<void>
   list: (path: string) => Promise<{ name: string; kind: string }[]>
   after: (ms: number, fn: () => void) => { cancel: () => void }
-  log: (text: string) => void
+  log: (text: string) => void // the debug log only
+  show: (text: string) => void // on screen too
 }
 
 // The sessions this process has touched, each loaded once and written after a pause.
@@ -230,7 +233,9 @@ let warned = false
 function warn(io: Io, error: unknown) {
   if (warned) return
   warned = true
-  io.log(`stats not saved (${error instanceof Error ? error.message : String(error)}); carrying on without them`)
+  const message = error instanceof Error ? error.message : String(error)
+  io.log(`stats not saved (${message}); carrying on without them`)
+  io.show(`Stats failed (${brief(message)}) and will keep retrying quietly`)
 }
 
 export async function statsDir(io: Io) {

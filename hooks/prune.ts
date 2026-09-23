@@ -1,4 +1,5 @@
 import type { EngineInterface, On, SessionStartInput, SessionStartResult } from 'claude-code'
+import { brief } from './stats'
 
 // `$.store` is one JSON file capped at 4 MiB, and each session leaves its keys (`<kind>:<sessionId>`) behind.
 const PRUNE_AFTER_DAYS = 30
@@ -81,6 +82,7 @@ async function drop($: EngineInterface, gone: Session[], why: string, stale: (s:
     $.ui.log(
       `pruned ${dropped.length} session(s) ${why}: ${dropped.map((s) => s.id).join(', ')} ` +
         `(${dropped.reduce((n, s) => n + s.keys.length, 0)} keys${why.includes('cap') ? `, ~${Math.round(dropped.reduce((n, s) => n + s.bytes, 0) / 1024)} KiB` : ''})`,
+      { to: 'debug' },
     )
 }
 
@@ -105,7 +107,10 @@ async function start($: EngineInterface, e: SessionStartInput, next: (e: Session
     if (valid(last).length && now - (last as number) < DAY) return
     await $.store.set(LAST_RUN, now)
     await prune($, await $.session.id())
-  })().catch((error) => $.ui.log(`could not prune old sessions (${errorText(error)})`))
+  })().catch((error) => {
+    $.ui.log(`could not prune old sessions (${errorText(error)})`, { to: 'debug' })
+    $.ui.log(`Cleanup failed (${brief(errorText(error))}) and will retry tomorrow`)
+  })
   return next(e)
 }
 
