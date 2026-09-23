@@ -180,6 +180,22 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
   })
 
+  test('the current task comes from the newest chunk alone: one without it leaves the section out', async ($, on) => {
+    mock.clock(on, { now: at(23, 12, 0) })
+    world(on)
+    pi(on, {
+      reply: (prompt) =>
+        `<observations>\n* 🟡 Saw ${prompt.includes('[User]: b') ? 'b' : 'a'}\n</observations>` +
+        (prompt.includes('[User]: b') ? '' : '\n<current-task>\nPrimary: a\n</current-task>'),
+    })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(observationsIn(text)).toBe('* 🟡 Saw a\n* 🟡 Saw b')
+    expect(text).not.toContain('<current-task>')
+  })
+
   test('the Observer records what happened, never what a chunk lacks', async ($, on) => {
     mock.clock(on)
     world(on)

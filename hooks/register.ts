@@ -413,7 +413,7 @@ function commit(ledger: Ledger, v: View): Ledger {
     entries = [...entries, ...c.lines.map((line) => ({ id: `o${seq++}`, line }))]
     corrections = [...corrections, ...c.corrections]
     watermark = range(v, watermark.from, c.to)
-    currentTask = c.currentTask ?? currentTask
+    currentTask = c.currentTask // the newest chunk's alone: an older one's would be stale
   }
   return { ...ledger, watermark, entries, corrections, seq, currentTask, chunks: waiting.filter((c) => c.from >= watermark.to) }
 }
