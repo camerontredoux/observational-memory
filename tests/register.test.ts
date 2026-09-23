@@ -419,6 +419,27 @@ describe('register', () => {
     expect(result.messages?.slice(1)).toEqual(messages.slice(5))
   })
 
+  test('an empty <observations> block and corrections alone are valid replies; marker-only and timestamp-only lines are not', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const correction = '🔴 User: "Never touch the migrations folder"'
+    const replies: Record<string, string> = {
+      a: '<observations></observations>',
+      b: `<corrections>\n* ${correction}\n</corrections>\n<observations>\n</observations>`,
+      c: '<observations>\n* 🔴\n* 🟡 2026-09-22 14:30\n</observations>',
+    }
+    const seen = pi(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)$/m)![1]!] })
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([expect.stringMatching(/^retrying rows 7-11 /)])
+    expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer answered without an <observations> block); kept raw')
+    const text = result.messages?.[0]?.text ?? ''
+    expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n\n</observations>`)
+    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+  })
+
   test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
     mock.clock(on)
     world(on)
