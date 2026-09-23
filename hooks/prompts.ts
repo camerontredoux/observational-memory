@@ -97,7 +97,11 @@ export const OBSERVER_FACTS_PROMPT = [
   ['What to observe:\n', `What to observe:\n${FACTS_RECORDED}\n`],
   [
     '- Always record which files were read, created or edited (full paths) and which commands ran, with what outcome: the assistant may later be asked what it did.',
-    '- Record what a command or edit meant, not that it happened: "the migration failed because the users table already had the column; dropped the duplicate ALTER", not "ran pnpm db:migrate".',
+    '- Record what a command or edit meant, not that it happened: "the migration failed because the users table already had the column; dropped the duplicate ALTER", not "ran pnpm db:migrate".\n- Say where every finding is: a note about code, config or docs names the file it came from by its full path, with the line when known. "refreshToken() never checks expiry (src/auth/refresh.ts:45)", not "refreshToken() never checks expiry". A function, class or component name alone is not a location.',
+  ],
+  [
+    '- File/location: full path + line number when relevant (src/auth.ts:45, not "the auth file").',
+    '- File/location: full path + line number when relevant (src/auth.ts:45, not "the auth file"), on every note about code, including one that names a function or component.',
   ],
 ].reduce((text, [from, to]) => swap(text, from!, to!), OBSERVER_SYSTEM_PROMPT)
 
