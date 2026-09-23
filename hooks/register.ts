@@ -884,8 +884,18 @@ export const register: Register = (on) => {
         for (let to; from < Math.min(c.from, start); from = to) gaps.push([from, (to = chunkEnd(v, from, Math.min(c.from, start), false)!)])
         from = Math.max(from, c.to)
       }
-      const settled = await Promise.allSettled(gaps.map(([from, to]) => observe($, v, from, to, 'compaction')))
-      sync = { calls: gaps.length, ms: (await $.clock.now()) - started }
+      // A chunk that failed fast (a bad reply, a pi error) is observed again once: a chunk left raw holds back every
+      // chunk after it. A timeout is not, as it would hold the compaction for another timeout.
+      let retries = 0
+      const once = (from: number, to: number) =>
+        observe($, v, from, to, 'compaction').catch((error) => {
+          if (failureClass(errorText(error)) === 'timeout') throw error
+          retries++
+          log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
+          return observe($, v, from, to, 'compaction')
+        })
+      const settled = await Promise.allSettled(gaps.map(([from, to]) => once(from, to)))
+      sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - started }
       settled.forEach((r, i) => {
         if (r.status === 'fulfilled') return void (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length))
         failed++

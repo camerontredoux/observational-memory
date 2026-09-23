@@ -91,7 +91,7 @@ function pi(
     hold?: (n: number, prompt: string) => Promise<void> | undefined
     fail?: (n: number, prompt: string) => ProcessRunResult | undefined
     reflect?: (n: number) => string
-    reply?: (prompt: string) => string
+    reply?: (prompt: string) => string | undefined
   } = {},
 ) {
   const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0 }
@@ -249,6 +249,8 @@ describe('register', () => {
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toEqual([
       'compaction not persistent: the context has 8 messages, the history 0',
+      'retrying rows 0-3 at compaction once (pi exited 0, stopReason error: Codex error: overloaded)',
+      'retrying rows 3-7 at compaction once (pi exited 0, stopReason error: Codex error: overloaded)',
       'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
       'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
       'the Observer failed and nothing is observed yet; using the built-in compaction',
@@ -292,6 +294,49 @@ describe('register', () => {
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
     expect(result.messages?.slice(1)).toEqual(history.slice(3))
     expect(seen.modelCalls).toBe(0)
+  })
+
+  test('at compaction, a chunk pi answers without observations is observed again once before it stays raw', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    let spoil = 0
+    const seen = pi(on, { reply: () => (spoil > 0 ? (spoil--, 'I cannot help with that.') : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle() // [0, 3) observed
+    spoil = 1
+    history.push(...turn('c', 'c', CHUNK * 4), ...turn('d', 'd', 8_000))
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(spoil).toBe(0)
+    expect(seen.logs.filter((l) => l.includes('at compaction failed'))).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toHaveLength(1)
+    expect(seen.screen.filter((l) => l.startsWith('Observation failed'))).toEqual([])
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('Saw c')
+    expect(seen.modelCalls).toBe(0)
+  })
+
+  test('at compaction, a chunk whose pi call timed out is not observed again', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    let failing = false
+    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: request timed out' } : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+    const before = seen.prompts.length
+    failing = true
+    history.push(...turn('c', 'c', CHUNK * 4), ...turn('d', 'd', 8_000))
+    await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    const failures = seen.logs.filter((l) => l.includes('at compaction failed'))
+    expect(failures.length).toBeGreaterThan(0)
+    expect(seen.prompts.length - before).toBe(failures.length)
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
   })
 
   test('a failed pi call in the background leaves its chunk unobserved, logged once, and a later pass retries it', async ($, on) => {
