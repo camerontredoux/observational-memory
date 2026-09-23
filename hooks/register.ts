@@ -8,6 +8,10 @@ import {
   REFLECTOR_OUTPUT_SECTIONS,
   REFLECTOR_SYSTEM_PROMPT,
 } from './prompts'
+import { compact } from './jev/compact'
+import { buildJevRequest, noulAnswer, parseJevResponse } from './jev/request'
+import { estimateTokens as jevTokens } from './jev/state'
+import type { JevAsker, JevQuestions, Message } from './jev/types'
 
 const MODEL = 'sonnet'
 const KEEP_RAW_TOKENS = 6_000 // Mastra keeps 20% of its 30k observe threshold raw
@@ -16,9 +20,15 @@ const TOOL_ARGS_MAX_TOKENS = 2_000
 const TOOL_RESULT_MAX_TOKENS = 5_000
 const MAX_OUTPUT_TOKENS = 32_000
 const TIMEOUT_MS = 5 * 60_000
+const JEV_STATE_MAX_TOKENS = 25_000 // fast-jev-compaction's default, under Jev's 32k for state plus a question
+const SKILL_KEEP_AT = 0.5
+const SKILL_CONTEXT =
+  'A coding assistant conversation is being compacted. `observations` is its memory of the older conversation, `recent` the messages kept verbatim. Each question asks whether a skill (instructions the assistant loaded earlier) is still needed for the work going on.'
+const SKILL_BLOCK = /<skill name="([^"]*)">\n([\s\S]*?)\n<\/skill>(?=\n<skill name="|\n<\/skills-in-use>)/g
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-type Memory = { observations: string; currentTask?: string; suggestedResponse?: string }
+type Skill = { skill: string; text: string }
+type Memory = { observations: string; currentTask?: string; suggestedResponse?: string; skills?: Skill[] }
 
 const estimateTokens = (text: string) => Math.ceil(text.length / 4)
 
@@ -31,7 +41,7 @@ const messageText = (m: SessionMessage) =>
   [m.text, ...m.toolUses.map((u) => JSON.stringify(u.input) + (u.text ?? '')), ...(m.toolResults ?? []).map((r) => r.text)].join('\n')
 
 // Mastra's observer input: a date header, then one `Role: text` line per part, tool calls with their results.
-function renderHistory(messages: readonly SessionMessage[], now: Date) {
+function renderHistory(messages: readonly Message[], now: Date) {
   const lines = [`${MONTHS[now.getMonth()]} ${now.getDate()} ${now.getFullYear()}:`]
   for (const m of messages) {
     if (m.text) lines.push(`${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
@@ -64,6 +74,7 @@ function memoryMessage(memory: Memory): SessionMessage {
     `${OBSERVATION_CONTEXT_PROMPT}\n\n${OBSERVATION_CONTEXT_INSTRUCTIONS}\n\n<observations>\n${memory.observations}\n</observations>` +
     section('current-task', memory.currentTask) +
     section('suggested-response', memory.suggestedResponse) +
+    section('skills-in-use', memory.skills?.map((s) => `<skill name="${s.skill}">\n${s.text}\n</skill>`).join('\n')) +
     `\n\n<system-reminder>${OBSERVATION_CONTINUATION_HINT}</system-reminder>`
   return { role: 'user', text, toolUses: [] }
 }
@@ -71,13 +82,17 @@ function memoryMessage(memory: Memory): SessionMessage {
 // The memory message a previous compaction left at the head of the transcript.
 function priorMemory(first: SessionMessage | undefined): Memory | undefined {
   if (first?.role !== 'user' || !first.text.startsWith(OBSERVATION_CONTEXT_PROMPT)) return undefined
-  const start = first.text.indexOf('<observations>\n')
-  const end = first.text.lastIndexOf('\n</observations>')
+  const skillsAt = first.text.indexOf('\n\n<skills-in-use>\n')
+  const head = skillsAt < 0 ? first.text : first.text.slice(0, skillsAt)
+  const start = head.indexOf('<observations>\n')
+  const end = head.lastIndexOf('\n</observations>')
   if (start < 0 || end < start) return undefined
+  const skills = skillsAt < 0 ? [] : first.text.slice(skillsAt).matchAll(SKILL_BLOCK)
   return {
-    observations: first.text.slice(start + '<observations>\n'.length, end),
-    currentTask: tag(first.text, 'current-task'),
-    suggestedResponse: tag(first.text, 'suggested-response'),
+    observations: head.slice(start + '<observations>\n'.length, end),
+    currentTask: tag(head, 'current-task'),
+    suggestedResponse: tag(head, 'suggested-response'),
+    skills: [...skills].map((m) => ({ skill: m[1]!, text: m[2]! })),
   }
 }
 
@@ -90,6 +105,76 @@ function tailStart(messages: readonly SessionMessage[]) {
   for (let j = i; j < messages.length; j++) if (isPrompt(messages[j]!)) return j
   for (let j = i - 1; j > 0; j--) if (isPrompt(messages[j]!)) return j
   return 0
+}
+
+const jevAsker = ($: EngineInterface, apiKey: string): JevAsker => ({
+  async ask(state, questions) {
+    const request = buildJevRequest({ apiKey }, state, questions)
+    const r = await $.http.fetch(request.url, { method: request.method, headers: request.headers, body: request.body })
+    return parseJevResponse(r.status, r.ok, r.text)
+  },
+})
+
+const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+
+// fast-jev-compaction over the older section only: the memory message before it and the raw tail after it
+// ride along as context, pinned, and are cut off again. Any failure observes the section unpruned.
+async function prune(
+  $: EngineInterface,
+  jev: JevAsker | undefined,
+  head: readonly SessionMessage[],
+  older: readonly SessionMessage[],
+  tail: readonly SessionMessage[],
+): Promise<readonly Message[]> {
+  if (!jev) {
+    $.ui.log('observational-memory: no TYPESAFE_API_KEY, observing without the Jev pre-pass')
+    return older
+  }
+  try {
+    const { messages, stats } = await compact([...head, ...older, ...tail], jev, { preserveRecentMessages: tail.length })
+    $.ui.log(
+      `observational-memory: Jev kept ${stats.kept}, truncated ${stats.resultsDropped}, removed ${stats.callsDropped} calls ` +
+        `in ${stats.requests} requests`,
+    )
+    return messages.slice(head.length, messages.length - tail.length)
+  } catch (error) {
+    $.ui.log(`observational-memory: Jev pre-pass skipped (${errorText(error)}), observing unpruned`)
+    return older
+  }
+}
+
+const skillsKey = async ($: EngineInterface) => `skills:${await $.session.id()}`
+const mergeSkills = (...lists: readonly Skill[][]) => [...new Map(lists.flat().map((s) => [s.skill, s])).values()]
+
+// Skills not already in the raw tail, kept when Jev says they are still needed, all of them without Jev.
+async function skillsInUse(
+  $: EngineInterface,
+  jev: JevAsker | undefined,
+  skills: readonly Skill[],
+  observations: string,
+  tail: readonly SessionMessage[],
+  now: Date,
+) {
+  const tailText = tail.map(messageText).join('\n')
+  const pending = skills.filter((s) => !tailText.includes(s.text.trim()))
+  if (!pending.length || !jev) return pending
+  const state = { context: SKILL_CONTEXT, observations, recent: renderHistory(tail, now) }
+  for (let over; (over = jevTokens(JSON.stringify(state)) - JEV_STATE_MAX_TOKENS) > 0; ) {
+    const field = state.observations.length >= state.recent.length ? 'observations' : 'recent'
+    state[field] = state[field].slice(Math.max(over, Math.ceil(state[field].length / 10))) // keep the newest
+  }
+  const questions: JevQuestions = Object.fromEntries(
+    pending.map((s, i) => [`skill_${i}`, { type: 'noul', instructions: `Skill \`${s.skill}\` is still needed for the ongoing work` }]),
+  )
+  try {
+    const { answers } = await jev.ask(state, questions)
+    const kept = pending.filter((_, i) => noulAnswer(answers, `skill_${i}`) >= SKILL_KEEP_AT)
+    $.ui.log(`observational-memory: Jev kept ${kept.length} of ${pending.length} skills`)
+    return kept
+  } catch (error) {
+    $.ui.log(`observational-memory: keeping all ${pending.length} skills (${errorText(error)})`)
+    return pending
+  }
 }
 
 async function complete($: EngineInterface, system: string, prompt: string) {
@@ -142,11 +227,13 @@ export const register: Register = (on) => {
     const messages = prior ? e.messages.slice(1) : e.messages
     const start = tailStart(messages)
     if (start === 0) return next(e) // one long turn: nothing can be observed without splitting it
+    const tail = messages.slice(start)
 
     const now = new Date(await $.clock.now())
-    const observed = parseOutput(
-      await complete($, OBSERVER_SYSTEM_PROMPT, observerPrompt(renderHistory(messages.slice(0, start), now), prior)),
-    )
+    const apiKey = await $.env.get('TYPESAFE_API_KEY')
+    const jev = apiKey ? jevAsker($, apiKey) : undefined
+    const older = await prune($, jev, e.messages.slice(0, e.messages.length - messages.length), messages.slice(0, start), tail)
+    const observed = parseOutput(await complete($, OBSERVER_SYSTEM_PROMPT, observerPrompt(renderHistory(older, now), prior)))
     if (!observed.observations) throw new Error('observer produced no observations')
 
     let memory: Memory = {
@@ -157,16 +244,30 @@ export const register: Register = (on) => {
     }
     const reflecting = estimateTokens(memory.observations) >= REFLECT_AT_TOKENS
     if (reflecting) memory = await reflect($, memory)
+    // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
+    const recorded = e.agentId === undefined ? ((await $.store.get(await skillsKey($))) as Skill[] | undefined) : undefined
+    memory.skills = await skillsInUse($, jev, mergeSkills(prior?.skills ?? [], recorded ?? []), memory.observations, tail, now)
 
     $.ui.log(
       `observational-memory: observed ${start} messages, kept ${messages.length - start}; ` +
         `log ~${estimateTokens(memory.observations)} tokens${reflecting ? ', reflected' : ''}`,
     )
-    return { messages: [memoryMessage(memory), ...messages.slice(start)] }
+    return { messages: [memoryMessage(memory), ...tail] }
   }).catch(($, e, next) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     $.ui.log(`observational-memory: ${next.error.message}; using the built-in compaction`)
     return next(e)
+  })
+
+  // Subagent preloads fire here too; the event does not say which loop the skill loads into.
+  on('skill.prompt', async ($, e, next) => {
+    const r = await next(e)
+    const key = await skillsKey($)
+    const recorded = ((await $.store.get(key)) as Skill[] | undefined) ?? []
+    await $.store
+      .set(key, mergeSkills(recorded, [{ skill: e.skill, text: r.text }]))
+      .catch((error) => $.ui.log(`observational-memory: could not record skill ${e.skill} (${errorText(error)})`))
+    return r
   })
 }

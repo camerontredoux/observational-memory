@@ -1,4 +1,4 @@
 {
-  "description": "session.compact: replaces compaction with an observation log carried from one compaction to the next",
+  "description": "session.compact: replaces compaction with an observation log carried from one compaction to the next; skill.prompt: records the skills the session loads",
   "modules": ["./register.ts"]
 }
