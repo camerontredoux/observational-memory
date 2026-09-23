@@ -1,5 +1,3 @@
-import type { EngineInterface } from 'claude-code'
-
 // Usage statistics: one JSON file per session, written only by that session, debounced off every hook. Global
 // figures are merged from the files when asked for. A stats failure is logged once and never breaks anything.
 const SAMPLES = 200 // raw samples kept per metric, newest, for medians and p90
@@ -196,72 +194,87 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   return lines.join('\n')
 }
 
-// The engine-facing half: the sessions this process has touched, each loaded once and written after a pause.
+// The engine-facing half. The engine never lets `$` cross an import, so register.ts hands over these calls instead.
+export type Io = {
+  now: () => Promise<number>
+  sessionId: () => Promise<string>
+  cwd: () => Promise<string>
+  home: () => Promise<string | undefined>
+  dir: () => Promise<string | undefined> // OM_STATS_DIR
+  read: (path: string) => Promise<string>
+  write: (path: string, text: string) => Promise<void>
+  list: (path: string) => Promise<{ name: string; kind: string }[]>
+  after: (ms: number, fn: () => void) => { cancel: () => void }
+  log: (text: string) => void
+}
+
+// The sessions this process has touched, each loaded once and written after a pause.
 const live = new Map<string, Promise<SessionStats>>()
 const pending = new Map<string, { cancel: () => void }>()
 let warned = false
 
-function warn($: EngineInterface, error: unknown) {
+function warn(io: Io, error: unknown) {
   if (warned) return
   warned = true
-  $.ui.log(`stats disabled for now (${error instanceof Error ? error.message : String(error)})`)
+  io.log(`stats not saved (${error instanceof Error ? error.message : String(error)}); carrying on without them`)
 }
 
-export async function statsDir($: EngineInterface) {
-  const dir = await $.env.get('OM_STATS_DIR')
+export async function statsDir(io: Io) {
+  const dir = await io.dir()
   if (dir) return dir.replace(/\/$/, '')
-  const home = await $.env.get('HOME')
+  const home = await io.home()
   if (!home) throw new Error('no HOME to keep stats under')
   return `${home}/${DEFAULT_DIR}`
 }
 
-async function load($: EngineInterface, sessionId: string) {
-  const path = `${await statsDir($)}/${sessionId}.json`
-  const stored = await $.fs.read(path).then((t) => JSON.parse(String(t)) as SessionStats, () => undefined)
-  if (stored?.version === 1) return { ...stored, backfilled: undefined } // a backfilled file continues live
-  const [now, cwd] = await Promise.all([$.clock.now(), $.session.cwd().catch(() => undefined)])
+const parse = (text: string) => JSON.parse(text) as SessionStats
+
+async function load(io: Io, sessionId: string) {
+  const stored = await io.read(`${await statsDir(io)}/${sessionId}.json`).then(parse, () => undefined)
+  if (stored?.version === 1) return { ...stored, backfilled: undefined } // a resumed or backfilled session continues
+  const [now, cwd] = await Promise.all([io.now(), io.cwd().catch(() => undefined)])
   return emptyStats(sessionId, now, cwd)
 }
 
-async function write($: EngineInterface, sessionId: string) {
+async function write(io: Io, sessionId: string) {
   pending.get(sessionId)?.cancel()
   pending.delete(sessionId)
   const s = await live.get(sessionId)
-  if (s) await $.fs.write(`${await statsDir($)}/${sessionId}.json`, JSON.stringify(s))
+  if (s) await io.write(`${await statsDir(io)}/${sessionId}.json`, JSON.stringify(s))
 }
 
 // Applies `fn` to the session's stats and schedules the write. Never throws, never waits on the file system.
-export function record($: EngineInterface, sessionId: string, fn: (s: SessionStats, at: number) => void) {
+export function record(io: Io, sessionId: string, fn: (s: SessionStats, at: number) => void) {
   if (!live.has(sessionId)) {
-    const loading = load($, sessionId)
+    const loading = load(io, sessionId)
     loading.catch(() => live.delete(sessionId))
     live.set(sessionId, loading)
   }
   void (async () => {
-    const [s, at] = await Promise.all([live.get(sessionId)!, $.clock.now()])
+    const [s, at] = await Promise.all([live.get(sessionId)!, io.now()])
     fn(s, at)
     s.lastSeen = Math.max(s.lastSeen, at)
-    if (!pending.has(sessionId)) pending.set(sessionId, $.clock.after(WRITE_DELAY_MS, () => void write($, sessionId).catch((e) => warn($, e))))
-  })().catch((e) => warn($, e))
+    if (!pending.has(sessionId)) pending.set(sessionId, io.after(WRITE_DELAY_MS, () => void write(io, sessionId).catch((e) => warn(io, e))))
+  })().catch((e) => warn(io, e))
 }
 
 // Writes a session's pending stats now: at the session's end, and before a report reads the files.
-export async function flush($: EngineInterface, sessionId: string) {
-  if (pending.has(sessionId)) await write($, sessionId).catch((e) => warn($, e))
+export async function flush(io: Io, sessionId: string) {
+  if (pending.has(sessionId)) await write(io, sessionId).catch((e) => warn(io, e))
 }
 
-// `args`: `all` or a session id, then optionally a since (`7d`, an ISO date), in any order.
-export async function report($: EngineInterface, args: { scope?: string; sessionId?: string; since?: string }) {
-  const [current, now] = await Promise.all([$.session.id(), $.clock.now()])
+// `all`, or one session (this one by default), optionally only since `7d` or an ISO date.
+export async function report(io: Io, args: { scope?: string; sessionId?: string; since?: string }) {
+  const [current, now] = await Promise.all([io.sessionId(), io.now()])
   const since = args.since ? parseSince(args.since, now) : undefined
   if (args.since && since === undefined) return `om_stats: cannot read since "${args.since}" (try 7d, 12h or 2026-09-01).`
-  await flush($, current)
-  const dir = await statsDir($)
-  const read = (name: string) => $.fs.read(`${dir}/${name}`).then((t) => JSON.parse(String(t)) as SessionStats, () => undefined)
+  await flush(io, current)
+  const dir = await statsDir(io)
+  const read = (name: string) => io.read(`${dir}/${name}`).then(parse, () => undefined)
   let files: SessionStats[]
   let title: string
   if (args.scope === 'all') {
-    const names = (await $.fs.list(dir).catch(() => [])).filter((e) => e.kind === 'file' && e.name.endsWith('.json')).map((e) => e.name)
+    const names = (await io.list(dir).catch(() => [])).filter((e) => e.kind === 'file' && e.name.endsWith('.json')).map((e) => e.name)
     files = (await Promise.all(names.map(read))).filter((f): f is SessionStats => f?.version === 1)
     title = 'observational-memory stats, all sessions'
   } else {
@@ -270,7 +283,7 @@ export async function report($: EngineInterface, args: { scope?: string; session
     files = f ? [f] : []
     title = `observational-memory stats, session ${id}${f?.cwd ? ` (${f.cwd})` : ''}`
   }
-  if (args.since) title += ` since ${new Date(since!).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+  if (since !== undefined) title += ` since ${new Date(since).toISOString().slice(0, 16).replace('T', ' ')} UTC`
   return formatReport(title, merge(files, since))
 }
 

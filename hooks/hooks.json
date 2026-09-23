@@ -1,5 +1,5 @@
 {
-  "description": "session.compact: replaces compaction with the observation ledger, cut at the background watermark; turn.start and turn.complete: time the main conversation's prompts and answers and observe it in the background through pi; session.start and tool.call: the om_recall tool; classic.SessionStart and classic.Stop: record the transcript path; session.end: a /clear drops the session's state; skill.prompt: records the skills the session loads",
+  "description": "session.compact: replaces compaction with the observation ledger, cut at the background watermark; turn.start and turn.complete: time the main conversation's prompts and answers and observe it in the background through pi; session.start, tool.call and command.run: the om_recall and om_stats tools and /om-stats (usage statistics, one file per session); classic.SessionStart and classic.Stop: record the transcript path; session.end: a /clear drops the session's state; skill.prompt: records the skills the session loads",
   "modules": [
     "./register.ts"
   ]

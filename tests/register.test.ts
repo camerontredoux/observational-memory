@@ -45,13 +45,14 @@ function piOutput(prompt: string, text: string, end: { stopReason?: string; erro
     .map((event) => JSON.stringify(event))
     .join('\n')
 }
+const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
 const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
 
 // Local time on a day of September 2026.
 const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
 
 // The main conversation's history, grown as the engine would, a store the test can read, and a context size.
-function world(on: On) {
+function world(on: On, options: { failWrites?: boolean } = {}) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   on('session.messages', () => ({ value: history }))
@@ -59,7 +60,23 @@ function world(on: On) {
   on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
   on('store.set', ($, e) => ((stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
-  return { history, stored }
+  // The stats files, in memory under OM_STATS_DIR.
+  const files: Record<string, string> = {}
+  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u' })
+  const reads: string[] = []
+  on('fs.read', ($, e) => {
+    reads.push(e.path)
+    if (!(e.path in files)) throw new Error(`ENOENT: ${e.path}`)
+    return { value: files[e.path]! }
+  })
+  on('fs.write', ($, e) => {
+    if (options.failWrites) throw new Error('EACCES: permission denied')
+    return (files[e.path] = e.text), { value: undefined }
+  })
+  on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, isLink: false })) }))
+  on('session.cwd', () => ({ value: '/work/project' }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  return { history, stored, files, reads }
 }
 
 type Ledger = { entries: { id: string; line: string }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
@@ -479,7 +496,7 @@ describe('register', () => {
     const found = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'plum-7731' })
     const loose = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'auth.ts nothing-like-this', limit: 3 })
 
-    expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ required: ['query'] }) })])
+    expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ required: ['query'] }) }), expect.objectContaining({ name: 'om_stats' })])
     const text = String(found.result)
     // The newest prompt, note 29, is the one that asked: it is never a match.
     expect(text).toMatch(/^30 match\(es\) for "plum-7731" in 35 messages; showing the last 20\.\n\[#14 user\] note 9: the PLUM-7731 marker y+…\n/)
@@ -623,9 +640,8 @@ describe('register', () => {
 
   test('om_recall after a resume reads the transcript file for the history before the compaction', async ($, on) => {
     mock.clock(on)
-    const { history } = world(on)
+    const { history, files, reads } = world(on)
     on('classic.Stop', () => ({}))
-    const read: string[] = []
     const jsonl = [
       { type: 'user', timestamp: '2026-09-22T12:00:00.000Z', message: { role: 'user', content: 'remember the KIWI-42 marker' } },
       { type: 'assistant', timestamp: '2026-09-22T12:01:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'noted' }, { type: 'tool_use', id: 'u1', name: 'Bash', input: { command: 'echo KIWI-42' } }] } },
@@ -634,7 +650,7 @@ describe('register', () => {
       { type: 'user', isSidechain: true, message: { role: 'user', content: 'KIWI-42 in a subagent' } },
       { type: 'user', timestamp: '2026-09-22T13:00:00.000Z', message: { role: 'user', content: 'where is KIWI-42?' } },
     ]
-    on('fs.read', ($, e) => (read.push(e.path), { value: jsonl.map((r) => JSON.stringify(r)).join('\n') + '\n{"type":"user","mess' }))
+    files['/t/session-1.jsonl'] = jsonl.map((r) => JSON.stringify(r)).join('\n') + '\n{"type":"user","mess'
     // What `$.session.messages()` answers after --resume: rows since the compaction only.
     history.push(
       { role: 'user', text: 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nold', toolUses: [] },
@@ -644,12 +660,68 @@ describe('register', () => {
     await $.classic.Stop({ session_id: 'session-1', transcript_path: '/t/session-1.jsonl', stop_hook_active: false })
     const found = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'KIWI-42' })).result)
 
-    expect(read).toEqual(['/t/session-1.jsonl'])
+    expect(reads.filter((p) => p.startsWith('/t/'))).toEqual(['/t/session-1.jsonl'])
     expect(found).toBe(
       '3 match(es) for "KIWI-42" in 4 messages.\n' +
         `[#0 user ${stampOf('2026-09-22T12:00:00.000Z')}] remember the KIWI-42 marker\n` +
         `[#1 assistant ${stampOf('2026-09-22T12:01:00.000Z')} called Bash] {"command":"echo KIWI-42"}\n` +
         `[#2 Bash result ${stampOf('2026-09-22T12:01:10.000Z')}] KIWI-42`,
     )
+  })
+
+  test('stats: background calls and a compaction land in the session file, and om_stats and /om-stats report them', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, files } = world(on)
+    pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)], at(22, 14, 30))
+    await clock.settle()
+    history.push(...turn('c', 'c', CHUNK * 5), ...turn('d', 'd', 8_000))
+    await $.session.compact({ trigger: 'manual', messages: [...history] })
+    await clock.advance(5_000)
+
+    const file = JSON.parse(files['/stats/session-1.json']!) as { cwd: string; metrics: Record<string, { count: number; sum: number }> }
+    expect(file.cwd).toBe('/work/project')
+    expect(file.metrics['observer.background.ms']?.count).toBe(2)
+    expect(Math.round(file.metrics['observer.background.cost']!.sum * 1e7)).toBe(50_216)
+    expect(file.metrics['observer.background.in']?.sum).toBe(18_412)
+    expect(file.metrics['observer.background.observations']?.sum).toBe(2)
+    expect(file.metrics['observer.compaction.ms']?.count).toBeGreaterThan(0)
+    expect(file.metrics['compaction.manual.syncCalls']?.sum).toBe(file.metrics['observer.compaction.ms']?.count)
+    expect(file.metrics['compaction.manual.rowsObservedBefore']?.sum).toBe(7)
+    expect(file.metrics['compaction.manual.tokensBefore']?.sum).toBeGreaterThan(file.metrics['compaction.manual.tokensAfter']!.sum)
+
+    const tool = String((await $.tool.call({ tool: 'mcp__observational-memory__om_stats' })).result)
+    expect(tool).toContain('## observational-memory stats, session session-1 (/work/project)')
+    expect(tool).toMatch(/1 compaction\(s\), \d+ Luna call\(s\) \(0 failed\)/)
+    expect(tool).toMatch(/\| observer\.background\.ms \| 2 \|/)
+    files['/stats/other.json'] = JSON.stringify({ version: 1, sessionId: 'other', firstSeen: 0, lastSeen: 0, counts: {}, metrics: { 'observer.background.ms': { count: 1, sum: 5, min: 5, max: 5, recent: [[0, 5]] } } })
+    const all = await $.command.run({ command: 'om-stats', args: 'all', ...COMPOSER })
+    expect(all.text).toContain('## observational-memory stats, all sessions')
+    expect(all.text).toMatch(/^2 session\(s\)/m)
+    expect(all.text).toMatch(/\| observer\.background\.ms \| 3 \|/)
+    const recent = await $.command.run({ command: 'om-stats', args: 'all 1d', ...COMPOSER })
+    expect(recent.text).toMatch(/^1 session\(s\)/m)
+  })
+
+  test('stats: a failed stats write is logged once and compaction and observation carry on', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on, { failWrites: true })
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(22, 14, 30))
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    await clock.advance(5_000)
+    history.splice(0, history.length, ...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000))
+    const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    await clock.advance(5_000)
+
+    expect(observationsIn(first.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
+    expect(second.messages?.[0]?.text).toContain('Saw c')
+    // A hook that throws is skipped, so the engine reports the write as unanswered.
+    expect(seen.logs.filter((l) => l.startsWith('stats not saved'))).toEqual(['stats not saved (no implementation for fs.write); carrying on without them'])
   })
 })
