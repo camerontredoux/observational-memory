@@ -1167,12 +1167,13 @@ export const register: Register = (on) => {
     return yield* next(e)
   })
 
-  // A subagent's is its answer: its loop is done, and what it stored goes.
+  // A subagent's is its answer: its loop is done, and what it stored goes. A teammate's is one of many, as main's.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     try {
-      if (e.agentId !== undefined) await dropLoop($, loopOf(await $.session.id(), e.agentId).key)
-      else await schedule($, (await markTime($, false)).loop)
+      const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
+      if (e.agentId !== undefined && !teammate) await dropLoop($, loopOf(await $.session.id(), e.agentId).key)
+      else await schedule($, (await markTime($, false, e.agentId)).loop)
     } catch (error) {
       log($, errorText(error))
     }

@@ -53,13 +53,14 @@ const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day,
 
 // The main conversation's history, grown as the engine would, each listed subagent's under `agents` (any other id
 // is denied), a store the test can read, and a context size.
-function world(on: On, options: { failWrites?: boolean; unreadable?: string[] } = {}) {
+function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[] } = {}) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
   on('session.messages', ($, e) => ({ value: e.agentId === undefined ? history : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
   const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
-  on('agent.list', () => ({ value: listed().map((id) => ({ id, description: id, type: 'general-purpose', status: 'running' })) }))
+  const type = (id: string) => (options.teammates?.includes(id) ? 'teammate' : 'general-purpose')
+  on('agent.list', () => ({ value: listed().map((id) => ({ id, description: id, type: type(id), status: 'running' })) }))
   const stored: Record<string, unknown> = {}
   on('store.keys', () => ({ value: Object.keys(stored) }))
   on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
@@ -945,6 +946,21 @@ describe('register', () => {
     stored['ledger:session-2/agent-7'] = { entries: [] }
     await $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1', 'ledger:session-2/agent-7', 'times:session-1', 'turns:session-1'])
+  })
+
+  test("a teammate's turn.complete is one of many: its keys stay, and a pass runs as main's does", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents, stored } = world(on, { teammates: ['mate-1'] })
+    const seen = pi(on, { reply: readsIn })
+    on('turn.complete', () => ({ text: '' }))
+    agents['mate-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 4; n++) agents['mate-1'].push(...agentCall('one', n, 16_000))
+
+    await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 'm', reason: 'answer', agentId: 'mate-1' })
+    await clock.settle()
+
+    expect(seen.prompts).toHaveLength(1)
+    expect(Object.keys(stored).sort()).toEqual(['ledger:session-1/mate-1', 'times:session-1/mate-1'])
   })
 
   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
