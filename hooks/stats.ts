@@ -180,15 +180,15 @@ const show = (key: string, n: number) => (Number.isFinite(n) ? unit(key)(n) : '-
 const sumOf = (s: SessionStats, suffix: string) =>
   Object.entries(s.metrics).reduce((t, [k, m]) => (k.endsWith(suffix) && !k.includes('.failed.') ? t + m.sum : t), 0)
 const countOf = (s: SessionStats, re: RegExp) => Object.entries(s.metrics).reduce((t, [k, m]) => (re.test(k) ? t + m.count : t), 0)
+const when = (t: number) => (Number.isFinite(t) ? new Date(t).toISOString().slice(0, 16).replace('T', ' ') : '-')
 
-// The report om_stats and /om-stats answer: totals, then one row per metric, each value in its metric's unit.
+// The table om_stats and /om-stats answer with `full`: totals, then one row per metric, each value in its metric's unit.
 export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const { stats: s, sessions, approximate } = merged
   if (!sessions) return `${title}: no stats recorded yet.`
   const calls = countOf(s, /^(observer|reflector)\.\w+\.(failed\.)?ms$/)
   const failed = countOf(s, /\.failed\.ms$/)
   const compactions = countOf(s, /^compaction\.[\w-]+\.ms$/)
-  const when = (t: number) => (Number.isFinite(t) ? new Date(t).toISOString().slice(0, 16).replace('T', ' ') : '-')
   const lines = [
     `## ${title}`,
     '',
@@ -207,6 +207,83 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const counts = Object.entries(s.counts).sort(([a], [b]) => a.localeCompare(b))
   if (counts.length) lines.push('', `Counts: ${counts.map(([k, n]) => `${k} ${n}`).join(', ')}`)
   if (approximate) lines.push('', `Medians and p90 are approximate: they come from the newest ${SAMPLES} samples per metric per session.`)
+  return lines.join('\n')
+}
+
+const plural = (n: number, one: string, many = `${one}s`) => `${grouped(n)} ${n === 1 ? one : many}`
+const values = (m: Metric | undefined) => m?.recent.map(([, v]) => v) ?? []
+const median = (vs: readonly number[]) => percentile([...vs].sort((a, b) => a - b), 50)
+
+// Some triggers' compactions, each field paired with the rest by the time it was recorded at, which one compaction's share.
+function compactions(s: SessionStats, triggers: readonly string[]) {
+  const out = { total: 0, instant: [] as number[], waited: [] as number[], rows: 0, context: [] as number[], notes: [] as number[] }
+  for (const t of triggers) {
+    const metric = (name: string) => s.metrics[`compaction.${t}.${name}`]
+    const at = (name: string) => new Map(metric(name)?.recent ?? [])
+    const [ms, syncMs, rows] = [at('ms'), at('syncMs'), at('rowsObservedNow')]
+    out.total += metric('ms')?.count ?? 0
+    for (const [when, calls] of metric('syncCalls')?.recent ?? []) {
+      if (calls === 0) out.instant.push(ms.get(when) ?? NaN)
+      else out.waited.push(syncMs.get(when) ?? NaN), (out.rows += rows.get(when) ?? 0)
+    }
+    out.context.push(...values(metric('estTokensAfter')))
+    out.notes.push(...values(metric('observations')))
+  }
+  return out
+}
+
+// What om_stats and /om-stats answer by default: a few lines in plain words. `words` reproduce the scope for the hints.
+export function formatSummary(head: string, merged: ReturnType<typeof merge>, words: string) {
+  const { stats: s, sessions, approximate } = merged
+  if (!sessions) return `observational-memory · ${head}: no stats recorded yet.`
+  const [from, to] = [when(s.firstSeen), when(s.lastSeen)]
+  const lines = [`observational-memory · ${head} · ${from.slice(0, 10) === to.slice(0, 10) ? `${from}–${to.slice(11)}` : `${from} – ${to}`} UTC`, '']
+  const row = (label: string, text: string) => lines.push(`${label.padEnd(13)}${text}`)
+  const calls = countOf(s, /^(observer|reflector)\.\w+\.ms$/)
+  const cost = sumOf(s, '.cost')
+  if (calls) {
+    const who = countOf(s, /^reflector\.\w+\.ms$/) ? 'observer and reflector call' : 'observer call'
+    row('Cost', `${dollars(cost)} across ${plural(calls, who)} (about ${dollars(cost / calls)} each)`)
+  }
+  const triggers = [...new Set(Object.keys(s.metrics).flatMap((k) => k.match(/^compaction\.([\w-]+)\.ms$/)?.[1] ?? []))]
+  const main = compactions(s, triggers.filter((t) => t !== 'subagent'))
+  const sub = compactions(s, ['subagent'])
+  if (main.total + sub.total) row('Compactions', `${grouped(main.total + sub.total)}: ${grouped(main.total)} main, ${grouped(sub.total)} subagent`)
+  for (const [label, c] of [['  Main', main], ['  Subagent', sub]] as const) {
+    if (!c.instant.length && !c.waited.length) continue
+    const parts = [`${grouped(c.instant.length)} of ${grouped(c.instant.length + c.waited.length)} instant${c.instant.length ? ` (median ${duration(median(c.instant))})` : ''}`]
+    if (c.waited.length)
+      parts.push(`${grouped(c.waited.length)} waited ${duration(median(c.waited))}${c.waited.length > 1 ? ' (median)' : ''} to observe ${plural(c.rows, 'message')} on the spot`)
+    row(label, parts.join('; '))
+  }
+  const fellBack = Object.entries(s.counts).reduce((t, [k, n]) => (/^compaction\.[\w-]+\.fellBack$/.test(k) ? t + n : t), 0)
+  if (fellBack) row('  Fallbacks', `${grouped(fellBack)} used the built-in compaction`)
+  if (main.context.length)
+    row('Context', `after a main compaction: ~${grouped(median(main.context))} tokens (median)${main.notes.length ? `, ~${plural(median(main.notes), 'note')}` : ''}`)
+  const background = s.metrics['observer.background.ms']
+  if (background) {
+    const notes = values(s.metrics['observer.background.observations'])
+    row('Background', `${plural(background.count, 'observation')}, median ${duration(median(values(background)))} each${notes.length ? `, ~${plural(median(notes), 'note')} each` : ''}`)
+  }
+  const failed = new Map<string, number>()
+  for (const [k, n] of Object.entries(s.counts)) {
+    const c = k.match(/^(?:observer|reflector)\.\w+\.failed\.(.+)$/)?.[1]
+    if (c) failed.set(c, (failed.get(c) ?? 0) + n)
+  }
+  const empty = failed.get('no-observations') ?? 0
+  failed.delete('no-observations')
+  const other = [...failed.values()].reduce((t, n) => t + n, 0)
+  const problems = [
+    empty && `${plural(empty, 'observer reply', 'observer replies')} had no notes`,
+    other && `${plural(other, 'call')} failed (${[...failed].map(([c, n]) => `${c} ${n}`).join(', ')})`,
+    s.counts['compaction.notPersistent'] && plural(s.counts['compaction.notPersistent'], 'context/history mismatch', 'context/history mismatches'),
+  ].filter(Boolean)
+  if (problems.length) row('Problems', problems.join('; '))
+  const recall = s.metrics['recall.matches']?.count
+  if (recall) row('Recall', plural(recall, 'search', 'searches'))
+  if (approximate) lines.push('', `Splits and medians come from the newest ${SAMPLES} samples per metric per session.`)
+  const again = (w: string) => `/om-stats ${[words, w].filter(Boolean).join(' ')}`
+  lines.push('', `${again('full')} for every metric${words.split(' ').includes('all') ? '' : ' · /om-stats all for every session'}`)
   return lines.join('\n')
 }
 
@@ -282,8 +359,8 @@ export async function flush(io: Io, sessionId: string) {
   if (pending.has(sessionId)) await write(io, sessionId).catch((e) => warn(io, e))
 }
 
-// `all`, or one session (this one by default), optionally only since `7d` or an ISO date.
-export async function report(io: Io, args: { scope?: string; sessionId?: string; since?: string }) {
+// `all`, or one session (this one by default), optionally only since `7d` or an ISO date; `full` for every metric.
+export async function report(io: Io, args: Args) {
   const [current, now] = await Promise.all([io.sessionId(), io.now()])
   const since = args.since ? parseSince(args.since, now) : undefined
   if (args.since && since === undefined) return `om_stats: cannot read since "${args.since}" (try 7d, 12h or 2026-09-01).`
@@ -292,24 +369,39 @@ export async function report(io: Io, args: { scope?: string; sessionId?: string;
   const read = (name: string) => io.read(`${dir}/${name}`).then(parse, () => undefined)
   let files: SessionStats[]
   let title: string
+  let head: string
+  const id = args.sessionId || current
   if (args.scope === 'all') {
     const names = (await io.list(dir).catch(() => [])).filter((e) => e.kind === 'file' && e.name.endsWith('.json')).map((e) => e.name)
     files = (await Promise.all(names.map(read))).filter((f): f is SessionStats => f?.version === 1)
     title = 'observational-memory stats, all sessions'
+    head = 'all sessions'
   } else {
-    const id = args.sessionId || current
     const f = (await live.get(id)?.catch(() => undefined)) ?? (await read(`${id}.json`))
     files = f ? [f] : []
-    title = `observational-memory stats, session ${id}${f?.cwd ? ` (${f.cwd})` : ''}`
+    const cwd = f?.cwd ? ` (${f.cwd})` : ''
+    title = `observational-memory stats, session ${id}${cwd}`
+    head = `${id === current ? 'this session' : `session ${id}`}${cwd}`
   }
-  if (since !== undefined) title += ` since ${new Date(since).toISOString().slice(0, 16).replace('T', ' ')} UTC`
-  return formatReport(title, merge(files, since))
+  const merged = merge(files, since)
+  if (args.scope === 'all') head += ` (${merged.sessions})`
+  if (since !== undefined) {
+    const after = ` since ${new Date(since).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+    title += after
+    head += after
+  }
+  if (args.full) return formatReport(title, merged)
+  const words = [args.scope === 'all' ? 'all' : id === current ? '' : id, args.since ?? ''].filter(Boolean).join(' ')
+  return formatSummary(head, merged, words)
 }
 
+export type Args = { scope?: string; sessionId?: string; since?: string; full?: boolean }
+
 export function parseArgs(text: string) {
-  const out: { scope?: string; sessionId?: string; since?: string } = {}
+  const out: Args = {}
   for (const word of text.trim().split(/\s+/).filter(Boolean)) {
     if (word === 'all' || word === 'session') out.scope = word
+    else if (word === 'full') out.full = true
     else if (/^\d+(?:\.\d+)?[mhdw]$/.test(word) || /^\d{4}-\d{2}-\d{2}/.test(word)) out.since = word
     else out.sessionId = word
   }

@@ -21,7 +21,7 @@ import type { RecallInput, RecallIo } from './recall'
 declare module 'claude-code' {
   interface McpToolInputs {
     'mcp__observational-memory__om_recall': RecallInput
-    'mcp__observational-memory__om_stats': { scope?: 'session' | 'all'; sessionId?: string; since?: string }
+    'mcp__observational-memory__om_stats': { scope?: 'session' | 'all'; sessionId?: string; since?: string; full?: boolean }
   }
 }
 
@@ -1100,18 +1100,20 @@ export const register: Register = (on) => {
       $.tool.register({
         name: STATS_TOOL,
         description:
-          "observational-memory's usage statistics: how long Luna observations, reflections and compactions take, their tokens and " +
-          'cost (count, sum, mean, median, p90, min, max per metric), for this session or all sessions. Use it when the user asks for them.',
+          "observational-memory's usage statistics, for this session or all sessions: by default a short summary in plain words (cost, " +
+          'compactions and how many were instant, memory size, background observations, problems); with full, every metric with its ' +
+          'count, sum, mean, median, p90, min and max. Use it when the user asks for them.',
         inputSchema: {
           type: 'object',
           properties: {
             scope: { type: 'string', enum: ['session', 'all'], description: 'This session (default) or every session' },
             sessionId: { type: 'string', description: 'Another session to report on' },
             since: { type: 'string', description: 'Only what happened after this: 7d, 12h, or an ISO date' },
+            full: { type: 'boolean', description: 'Every metric in a table instead of the summary (default false)' },
           },
         },
       }),
-      $.command.register({ name: 'om-stats', description: 'observational-memory usage statistics', argumentHint: '[all|<session id>] [7d|<ISO date>]' }),
+      $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|<session id>] [full] [7d|<ISO date>]' }),
     ]).catch((error) => {
       log($, `could not register the stats tool and command (${errorText(error)})`)
       show($, `Setup failed (${brief(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
