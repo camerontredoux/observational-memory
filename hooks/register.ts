@@ -12,7 +12,7 @@ import {
   REFLECTOR_FORMAT,
   REFLECTOR_SYSTEM_PROMPT,
 } from './prompts'
-import { add, addCompaction, count, addLuna, addRecall, addReflection, failureClass, flush, parseArgs, record, report } from './stats'
+import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
 
@@ -110,7 +110,21 @@ const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
 // What truncate leaves of a text given no room: its note alone.
 const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
-const log = ($: EngineInterface, text: string) => $.ui.log(text) // the engine prefixes the plugin's name
+// `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
+const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
+const show = ($: EngineInterface, text: string) => $.ui.log(text)
+const plural = (n: number, noun: string) => `${grouped(n)} ${noun}${n === 1 ? '' : 's'}`
+// A pi failure in a few words for the screen: how it ended, never what it printed.
+function reason(error: unknown, timeoutMs: number) {
+  const text = errorText(error)
+  const kind = failureClass(text)
+  if (kind === 'timeout') return `timeout after ${timeoutMs % 60_000 ? duration(timeoutMs) : `${timeoutMs / 60_000}m`}`
+  if (kind === 'no-observations' || text.includes('no observations')) return 'no observations in the reply'
+  if (kind === 'no-message') return 'no reply from pi'
+  if (kind.startsWith('stop-')) return `pi stopped (${kind.slice(5)})`
+  if (kind.startsWith('exit-')) return `pi exited ${kind.slice(5)}`
+  return brief(text)
+}
 // The calls the stats module makes, spelled here: the engine never lets `$` cross an import.
 const statsIo = ($: EngineInterface): Io => ({
   now: () => $.clock.now(),
@@ -123,6 +137,7 @@ const statsIo = ($: EngineInterface): Io => ({
   list: (path) => $.fs.list(path),
   after: (ms, fn) => $.clock.after(ms, fn),
   log: (text) => log($, text),
+  show: (text) => show($, text),
 })
 
 // What a row says, a tool result counted once, on the user row that carries it.
@@ -586,11 +601,14 @@ function schedule($: EngineInterface, sessionId: string) {
 async function runJob($: EngineInterface, job: Job, v: View) {
   const { sessionId } = job
   let chunk: Chunk | undefined
+  const started = await $.clock.now()
   try {
     chunk = await observe($, v, job.range.from, job.range.to, 'background')
   } catch (error) {
     log($, `background observation of rows ${job.range.from}-${job.range.to} failed (${errorText(error)}); it will be retried`)
+    show($, `Observation failed (${reason(error, OBSERVER_TIMEOUT_MS)}) and will retry`)
   }
+  const ms = (await $.clock.now()) - started
   const landed = await locked(async () => {
     if (!running.includes(job)) {
       if (chunk) log($, 'a background chunk landed after its session was cleared; discarded')
@@ -610,6 +628,11 @@ async function runJob($: EngineInterface, job: Job, v: View) {
         $,
         `observed rows ${at.from}-${at.to} in the background, ${chunk.lines.length} observations; ` +
           `watermark ${next.watermark.to}, ${next.chunks.length} chunk(s) waiting on a gap`,
+      )
+    if (at)
+      show(
+        $,
+        `Observed ${plural(at.to - at.from, 'message')} in ${duration(ms)} · +${plural(chunk.lines.length, 'note')} · memory ${plural(next.entries.length, 'note')}`,
       )
     return !!at
   }).catch((error) => (log($, errorText(error)), false))
@@ -671,10 +694,14 @@ async function maybeReflect($: EngineInterface, sessionId: string) {
             `(~${estimateTokens(renderLines(reflected))} tokens) at compression level ${Math.min(level, 4)}; ` +
             `${entries.length - reflected.length} newer kept`,
         )
+        show($, `Condensed memory in ${duration((await $.clock.now()) - started)} · ${grouped(ledger.entries.length)} → ${plural(entries.length, 'note')}`)
       })
     }
     run()
-      .catch((error) => log($, `reflection failed (${errorText(error)})`))
+      .catch((error) => {
+        log($, `reflection failed (${errorText(error)})`)
+        show($, `Condensing failed (${reason(error, REFLECTOR_TIMEOUT_MS)}) and will retry later`)
+      })
       .finally(() => reflecting.delete(sessionId))
   })
 }
@@ -831,6 +858,7 @@ export const register: Register = (on) => {
     // reaches, and with nothing observed at all the built-in compaction runs instead.
     const chunks: Chunk[] = []
     let failed = 0
+    const keptInFull: string[] = [] // shown once the compaction stands: a fallback says so instead
     let sync = { calls: 0, ms: 0 }
     const start = tailStart(v, base)
     if (!fits(initial.watermark.to) && start > initial.watermark.to) {
@@ -846,6 +874,7 @@ export const register: Register = (on) => {
         if (r.status === 'fulfilled') return void (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length))
         failed++
         log($, `observation of rows ${gaps[i]![0]}-${gaps[i]![1]} at compaction failed (${errorText(r.reason)}); kept raw`)
+        keptInFull.push(`Observation failed (${reason(r.reason, OBSERVER_TIMEOUT_MS)}) and kept ${plural(gaps[i]![1] - gaps[i]![0], 'message')} in full`)
       })
     }
     // Read again: chunks that landed meanwhile count too. Once installed, the watermark restarts after the
@@ -862,6 +891,7 @@ export const register: Register = (on) => {
     const cut = ledger.watermark.to
     if (cut <= base && failed) throw new Error('the Observer failed and nothing is observed yet')
     if (cut <= base) throw new Error('nothing observed and nothing to observe before the raw tail')
+    for (const line of keptInFull) show($, line)
 
     const observations = renderLines(ledger.entries)
     const tail = messages.slice(cut)
@@ -902,6 +932,11 @@ export const register: Register = (on) => {
         `kept ${tail.length} raw messages (~${tokensBetween(v, cut, messages.length)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
         `${ledger.entries.length} observations, ${memory.skills.length} skill(s)`,
     )
+    show(
+      $,
+      `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
+        `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}`,
+    )
     const compaction = {
       trigger: main ? e.trigger : 'subagent',
       fellBack: false,
@@ -923,6 +958,7 @@ export const register: Register = (on) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     log($, `${next.error.message}; using the built-in compaction`)
+    show($, 'Observation failed. Using built-in compaction')
     // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
     const main = e.agentId === undefined && e.trigger !== 'precompute'
     const [rows, sessionId, started] = await Promise.all([main ? $.session.messages() : undefined, $.session.id(), $.clock.now()]).catch(() => [])
@@ -958,7 +994,10 @@ export const register: Register = (on) => {
           required: ['query'],
         },
       })
-      .catch((error) => log($, `could not register ${RECALL_TOOL} (${errorText(error)})`))
+      .catch((error) => {
+        log($, `could not register ${RECALL_TOOL} (${errorText(error)})`)
+        show($, `Setup failed (${brief(errorText(error))}). ${RECALL_TOOL} is unavailable this session`)
+      })
     await Promise.all([
       $.tool.register({
         name: STATS_TOOL,
@@ -975,7 +1014,10 @@ export const register: Register = (on) => {
         },
       }),
       $.command.register({ name: 'om-stats', description: 'observational-memory usage statistics', argumentHint: '[all|<session id>] [7d|<ISO date>]' }),
-    ]).catch((error) => log($, `could not register the stats tool and command (${errorText(error)})`))
+    ]).catch((error) => {
+      log($, `could not register the stats tool and command (${errorText(error)})`)
+      show($, `Setup failed (${brief(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
+    })
     return next(e)
   })
 

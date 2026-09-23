@@ -94,7 +94,7 @@ function pi(
     reply?: (prompt: string) => string
   } = {},
 ) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0 }
+  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0 }
   let reflections = 0
   on('process.run', async ($, e) => {
     const prompt = e.init?.stdin ?? ''
@@ -120,7 +120,7 @@ function pi(
     return { value: { exitCode: 0, stdout: piOutput(prompt, text), stderr: '' } }
   })
   on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
-  on('ui.log', ($, e) => (seen.logs.push(e.text), { value: undefined }))
+  on('ui.log', ($, e) => ((e.to === 'debug' ? seen.logs : seen.screen).push(e.text), { value: undefined }))
   return seen
 }
 
@@ -219,6 +219,7 @@ describe('register', () => {
     expect(text).toContain('AUTHORITATIVE HISTORY')
     expect(text).not.toContain('only as background')
     expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
+    expect(seen.screen).toEqual(['Compacted in 0 ms · observed 7 messages on the spot · memory 2 notes'])
   })
 
   test('the Observer records what happened, never what a chunk lacks', async ($, on) => {
@@ -252,6 +253,7 @@ describe('register', () => {
       'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
       'the Observer failed and nothing is observed yet; using the built-in compaction',
     ])
+    expect(seen.screen).toEqual(['Observation failed. Using built-in compaction'])
   })
 
   test("a subagent's or precompute's fallback does not depend on the session's id, messages or clock", async ($, on) => {
@@ -283,6 +285,10 @@ describe('register', () => {
     expect(failures.length).toBeGreaterThan(0)
     for (const line of failures) expect(line).toMatch(/^observation of rows (\d+)-\d+ at compaction failed \(pi exited 1: Error: network down\); kept raw$/)
     expect(failures[0]).toContain('rows 3-')
+    expect(seen.screen.filter((l) => l.startsWith('Observation failed'))).toEqual(failures.map((l) => {
+      const [, from, to] = l.match(/rows (\d+)-(\d+)/)!
+      return `Observation failed (pi exited 1) and kept ${Number(to) - Number(from)} messages in full`
+    }))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
     expect(result.messages?.slice(1)).toEqual(history.slice(3))
     expect(seen.modelCalls).toBe(0)
@@ -299,6 +305,7 @@ describe('register', () => {
 
     const failures = seen.logs.filter((l) => l.includes('failed'))
     expect(failures).toEqual(['background observation of rows 0-3 failed (pi exited 1: pi: 401 Unauthorized); it will be retried'])
+    expect(seen.screen).toEqual(['Observation failed (pi exited 1) and will retry'])
     expect(seen.prompts).toHaveLength(1)
     expect(seen.modelCalls).toBe(0)
     let ledger = stored['ledger:session-1'] as Ledger
@@ -335,6 +342,7 @@ describe('register', () => {
     expect(seen.prompts[0]).toContain('[User @ 2026-09-22 14:00]: a\n\n[Assistant @ 2026-09-22 14:00]: a\n[Read({"file_path":"/src/a.ts"})]')
     expect(seen.prompts[0]).toContain('[Assistant @ 2026-09-22 14:01]: a done\n\n[User @ 2026-09-22 14:30]: a')
     expect(seen.logs).toContain('observed rows 0-7 in the background, 4 observations; watermark 7, 0 chunk(s) waiting on a gap')
+    expect(seen.screen).toEqual(['Observed 7 messages in 0 ms · +4 notes · memory 4 notes'])
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
     // Clamped into the chunk's times, 13:59 to 14:32 (the latest time recorded plus a minute); a line without a
     // real time gets the chunk's latest.
@@ -411,6 +419,7 @@ describe('register', () => {
     expect(result.messages?.slice(1)).toEqual(messages.slice(3))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a')
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call, kept 9 raw messages/)
+    expect(seen.screen.at(-1)).toBe('Compacted in 0 ms · memory 1 note')
     history.push(...result.messages!) // the engine appends the compaction's result to the history
     open(2)
     await clock.settle()
@@ -453,6 +462,7 @@ describe('register', () => {
     expect(reflections[1]).toContain('## AGGRESSIVE COMPRESSION REQUIRED')
     expect(reflections[0]).not.toContain('Saw b')
     expect(seen.systems.at(-1)).toContain('memory consciousness')
+    expect(seen.screen).toContain('Condensed memory in 30m 0s · 4,001 → 2 notes')
     expect(seen.calls.at(-1)!.argv).toEqual([...PI_ARGV, seen.systems.at(-1), ...PI_FLAGS])
     expect((stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)).toEqual([
       '🔴 2026-09-22 14:30 Explored the auth module',
@@ -1023,5 +1033,6 @@ describe('register', () => {
     expect(second.messages?.[0]?.text).toContain('Saw c')
     // A hook that throws is skipped, so the engine reports the write as unanswered.
     expect(seen.logs.filter((l) => l.startsWith('stats not saved'))).toEqual(['stats not saved (no implementation for fs.write); carrying on without them'])
+    expect(seen.screen.filter((l) => l.startsWith('Stats'))).toEqual(['Stats failed (no implementation for fs.write) and will keep retrying quietly'])
   })
 })
