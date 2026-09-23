@@ -151,6 +151,20 @@ function hash(text: string) {
 }
 
 const rowHash = (m: SessionMessage) => hash(`${m.role}\n${rowText(m)}`)
+
+// The order rows are compared, observed and cut in: each tool result row right after its call's row. The history
+// holds them that way; a live context holds a response's parallel calls together, then all their results.
+// Answers the index in `rows` of each row in that order.
+function callOrder(rows: readonly SessionMessage[]) {
+  const callAt = new Map<string, number>()
+  const keys = rows.map((m, i) => {
+    for (const u of m.toolUses) callAt.set(u.tool_use_id, i)
+    const calls = (m.toolResults ?? []).map((r) => callAt.get(r.tool_use_id))
+    return calls.length && calls.every((c) => c !== undefined) ? Math.max(...(calls as number[])) + 0.5 : i
+  })
+  return rows.map((_, i) => i).sort((a, b) => keys[a]! - keys[b]! || a - b)
+}
+const inCallOrder = (rows: readonly SessionMessage[]) => callOrder(rows).map((i) => rows[i]!)
 // A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
 const isMemory = (m: SessionMessage | undefined) =>
   m?.role === 'user' && (m.text.startsWith(MEMORY_HEADER) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`))
@@ -538,7 +552,7 @@ async function liveStart($: EngineInterface, sessionId: string, rows: readonly S
 async function liveView($: EngineInterface, sessionId: string) {
   const [rows, marks] = await Promise.all([$.session.messages(), loadMarks($, sessionId)])
   const offset = await liveStart($, sessionId, rows)
-  return view(rows.slice(offset), marks, offset)
+  return view(inCallOrder(rows.slice(offset)), marks, offset)
 }
 
 // Records the time against the newest row: the prompt at turn.start, a tool result at each step, the answer at
@@ -838,14 +852,16 @@ function notPersistent($: EngineInterface, sessionId: string, messages: readonly
 export const register: Register = (on) => {
   registerPrune(on)
   on('session.compact', async ($, e, next) => {
-    const { messages } = e
+    const order = callOrder(e.messages)
+    const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
     const [sessionId, started, usage] = await Promise.all([$.session.id(), $.clock.now(), $.session.usage().catch(() => undefined)])
     // `e.messages` is the live context: the last rows of the main conversation's history. Anything else (a
     // subagent's, or a context that does not match) is compacted with no stored state.
-    const rows = main ? await $.session.messages() : []
-    const offset = rows.length - messages.length
+    const history = main ? await $.session.messages() : []
+    const offset = history.length - messages.length
+    const rows = offset < 0 ? history : [...history.slice(0, offset), ...inCallOrder(history.slice(offset))]
     const persistent = main && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
     if (main && !persistent) notPersistent($, sessionId, messages, rows, offset)
     const v = view(messages, persistent ? await loadMarks($, sessionId) : [], persistent ? offset : undefined)
@@ -895,6 +911,7 @@ export const register: Register = (on) => {
 
     const observations = renderLines(ledger.entries)
     const tail = messages.slice(cut)
+    const kept = new Set(order.slice(cut))
     const observedNow = chunks.reduce((n, c) => n + c.to - c.from, 0)
     const priorMemory = base ? parseMemory(messages[0]!) : undefined
     const prior = priorMemory?.skills ?? []
@@ -953,7 +970,8 @@ export const register: Register = (on) => {
     if (persistent && installs) void maybeReflect($, sessionId).catch((error) => log($, errorText(error)))
     // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
     // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
-    return { messages: [message, ...tail.map(({ handle: _, ...m }) => m)] }
+    // In the context's own order.
+    return { messages: [message, ...e.messages.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m)] }
   }).catch(async ($, e, next) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }

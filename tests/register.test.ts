@@ -960,6 +960,67 @@ describe('register', () => {
     expect(file.metrics['observer.background.observations']).toBeUndefined()
   })
 
+  // Parallel tool calls: the history holds each result right after its call, the live context all the calls, then
+  // all the results (as a live haiku run with several Reads per response showed).
+  const parallel = (name: string, n: number, size: number) => {
+    const calls = Array.from({ length: n }, (_, i) => call(Number(`${name.charCodeAt(0)}${i}`), size))
+    return { history: calls.flat(), context: [...calls.map((c) => c[0]!), ...calls.map((c) => c[1]!)] }
+  }
+  const tailKeepsCalls = (tail: readonly SessionMessage[]) => {
+    const ids = new Set(tail.flatMap((m) => m.toolUses.map((u) => u.tool_use_id)))
+    return tail.every((m) => (m.toolResults ?? []).every((r) => ids.has(r.tool_use_id)))
+  }
+
+  test('a context that groups parallel tool calls under the watermark still cuts there with no Observer call', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+    const block = parallel('a', 4, 10_000)
+    const answer = { role: 'assistant' as const, text: 'a done', toolUses: [] }
+
+    await runTurn($, [{ role: 'user', text: 'a', toolUses: [] }, ...block.history, answer], at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await clock.settle()
+    const observed = seen.prompts.length
+    const context = [history[0]!, ...block.context, ...history.slice(1 + block.history.length)]
+    const result = await $.session.compact({ trigger: 'auto', messages: context.map((m, i) => ({ ...m, handle: `h${i}` })) })
+
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.screen.at(-1)).toMatch(/^Compacted in 0 ms · memory \d+ notes?$/)
+    const tail = result.messages!.slice(1)
+    expect(tail).toEqual(context.slice(context.length - tail.length))
+    expect(tailKeepsCalls(tail)).toBe(true)
+  })
+
+  test('a context that groups parallel tool calls in the raw tail, at the same length as the history, is persistent', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle()
+    const observed = seen.prompts.length
+    const block = parallel('c', 2, 2_000)
+    history.push({ role: 'user', text: 'c', toolUses: [] }, ...block.history)
+    const context = [...history.slice(0, history.length - block.history.length), ...block.context]
+    expect(context).toHaveLength(history.length)
+    const result = await $.session.compact({ trigger: 'auto', messages: context })
+
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    const tail = result.messages!.slice(1)
+    expect(tail.slice(-4)).toEqual(block.context)
+    expect(tailKeepsCalls(tail)).toBe(true)
+  })
+
   test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
