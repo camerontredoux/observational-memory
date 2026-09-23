@@ -361,6 +361,27 @@ describe('register', () => {
     expect(text).toContain('* 🔴 Keep a')
   })
 
+  test('a reply with no tags at all is observed from its marked lines; unclosed sections still keep apart', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on, {
+      reply: (prompt) => {
+        const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
+        return name === 'a'
+          ? `Here are the observations:\n* 🔴 Saw a\n  * -> read a.ts`
+          : `<corrections>\n* 🔴 Keep b\n<observations>\n* 🔴 Saw b\n<current-task>\nPrimary: b`
+      },
+    })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+
+    expect(seen.prompts).toHaveLength(2)
+    const text = result.messages?.[0]?.text ?? ''
+    expect(observationsIn(text)).toBe('* 🔴 Saw a; read a.ts\n* 🔴 Saw b')
+    expect(text).toContain('* 🔴 Keep b')
+    expect(text).not.toContain('Keep b; ')
+  })
+
   test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
     mock.clock(on)
     world(on)
