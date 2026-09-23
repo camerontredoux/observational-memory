@@ -1,5 +1,5 @@
-// Mechanical facts read from a chunk's tool calls and results, without a model: files edited, commands run and how
-// they ended, test and typecheck counts, git commits, branches, pushes and PRs. The Observer is told these are
+// Mechanical facts read from a chunk's tool calls and results, without a model: files edited, commands that failed or
+// were refused, test and typecheck counts, git commits, branches, pushes and PRs. The Observer is told these are
 // recorded and writes only what needs understanding. Each fact line carries a tag after its time, `[edits]` and so
 // on, which is how the reflector's pass and a reader tell them apart from the Observer's lines.
 import type { SessionMessage } from 'claude-code'
@@ -8,7 +8,6 @@ export type Fact = { at?: number; marker: '🟡' | '🟢' | '✅'; text: string 
 
 
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
-const RAN_CHARS = 320 // a chunk's [ran] line; the commands past it counted
 const MAX_FAILED = 4 // [failed] lines per chunk; the rest counted on the last
 const CMD_CHARS = 120
 const NO_MATCH = new Set(['rg', 'grep', 'ffgrep', 'diff', 'cmp', 'test', '[', '[[']) // exit 1 is their answer, not a failure
@@ -24,7 +23,14 @@ const GIT_LOOKS = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'remote
 const GH_LOOKS = /^gh(?:-axi)? (?:\S+ )?(?:view|list|status|checks|diff|api|search)\b/
 // A word that names a test, typecheck or lint run: `vitest`, `pnpm test:db`, `bun test`, `pnpm -r typecheck`. Paths are not.
 const RUNNER_WORD = /^(?:vitest|jest|mocha|pytest|tsc|eslint|biome|test|typecheck|lint|validate)(?::[\w:-]+)?$|^[\w-]+:(?:test|typecheck|lint)$/
-const isRunner = (s: Segment) => !looks(s) && !writes(s).length && head(s.words).some((w) => !w.quoted && RUNNER_WORD.test(w.text))
+// A test script run by path (`./run-tests.sh`, `bin/fm-test-run.sh`) or a test file handed to an interpreter.
+const TEST_PROGRAM = /(?:^|[_.-])tests?(?:[_.-]|$)/
+const TEST_FILE = /\.(?:test|spec)\.\w+$|(?:^|\/)tests?\/\S+\.(?:sh|bash|py|ts|js|mjs|rb)$/
+const isRunner = (s: Segment) => {
+  if (looks(s) || writes(s).length) return false
+  const w = head(s.words).filter((x) => !x.quoted)
+  return w.some((x) => RUNNER_WORD.test(x.text) || TEST_FILE.test(x.text)) || (!!w[0] && /\//.test(w[0].text) && TEST_PROGRAM.test(name(s.words)))
+}
 
 type Word = { text: string; quoted: boolean }
 type Segment = { words: Word[]; raw: string; pipe: Word[][]; heredocs: string[] } // one simple command, its pipe filters after it, its heredoc bodies
@@ -239,15 +245,6 @@ const argv = (s: Segment, vars: ReadonlyMap<string, string> = new Map()) =>
 const shown = (s: Segment, cwd: string | undefined, vars?: ReadonlyMap<string, string>) =>
   oneLine(relative(argv(s, vars).map((w) => (/\s/.test(w.text) ? JSON.stringify(w.text) : w.text)).join(' '), cwd), CMD_CHARS)
 
-// What a [ran] line groups a command under: its program and subcommand, before the first flag, path or quoted argument.
-function family(s: Segment, cwd: string | undefined, vars?: ReadonlyMap<string, string>) {
-  const w = argv(s, vars)
-  const words = [w[0]!.text]
-  const second = w[1]
-  if (second && !second.quoted && /^[a-z][\w:-]*$/.test(second.text)) words.push(second.text)
-  return relative(words.join(' '), cwd)
-}
-
 function relative(text: string, cwd: string | undefined) {
   if (!cwd) return text
   const base = cwd.replace(/\/+$/, '')
@@ -269,8 +266,9 @@ type Kind = 'tests' | 'types' | 'lint'
 type Check = { ok: boolean; text: string; kind: Kind }
 const kindOf = (s: Segment): Kind => (/\b(?:tsc|typecheck)\b/.test(s.raw) ? 'types' : /\b(?:lint|eslint|biome)\b/.test(s.raw) ? 'lint' : 'tests')
 
-// Test, typecheck and lint counts a runner printed: vitest, jest, bun, pytest, tsc, eslint, or a plain `N pass / M fail`.
-function checksIn(output: string): Check[] {
+// Test, typecheck and lint counts a runner printed: vitest, jest, bun, pytest, tsc, eslint; and, when `harness` says
+// the command ran tests, a test script's own summary (harnessChecks).
+function checksIn(output: string, harness: boolean): Check[] {
   const text = output.replace(/\u001b\[[\d;]*m/g, '')
   const out: Check[] = []
   for (const m of text.matchAll(/^\s*Tests?\s+((?:\d+ \w+(?: \| )?)+)\s*\((\d+)\)/gm)) {
@@ -290,8 +288,7 @@ function checksIn(output: string): Check[] {
   }
   if (!out.length)
     for (const m of text.matchAll(/^=+ (.*?\b\d+ (?:passed|failed)\b.*?) in [\d.]+s\b.*=+$/gm)) out.push({ kind: 'tests', ok: !/\d+ (?:failed|error)/.test(m[1]!), text: m[1]! })
-  if (!out.length)
-    for (const m of text.matchAll(/\b(\d+) pass(?:ed)?\b[^\n]*?\b(\d+) fail(?:ed)?\b/g)) out.push({ kind: 'tests', ok: m[2] === '0', text: `${m[1]} passed, ${m[2]} failed` })
+  if (!out.length && harness) out.push(...harnessChecks(text))
   const ts = [...text.matchAll(/^(.*?)\((\d+),(\d+)\): error (TS\d+): (.*)$/gm)]
   if (ts.length) {
     const [first] = ts
@@ -301,6 +298,36 @@ function checksIn(output: string): Check[] {
   const lint = text.match(/✖ (\d+) problems? \((\d+) errors?, (\d+) warnings?\)/)
   if (lint) out.push({ kind: 'lint', ok: lint[2] === '0', text: `lint ${plural(Number(lint[2]), 'error')}, ${plural(Number(lint[3]), 'warning')}` })
   return out
+}
+
+// A shell test script's summary, in the first form found: `total=N failed=M`; a line like `N passed, M failed`,
+// `N tests passed` or `ok N/M` (the last such line); TAP `ok` / `not ok` lines; `PASS` / `FAIL` lines. Read only from a
+// command that ran tests, since the same words turn up in any text.
+function harnessChecks(text: string): Check[] {
+  const counts = (p: number, f: number): Check[] => [{ kind: 'tests', ok: !f, text: p || !f ? `${p} passed${f ? `, ${f} failed` : ''}` : `${f} failed` }]
+  const total = [...text.matchAll(/\btotal=(\d+)\b.*?\bfailed=(\d+)\b/g)].at(-1)
+  if (total) {
+    const [t, f] = [Number(total[1]), Number(total[2])]
+    return [{ kind: 'tests', ok: !f, text: `${f ? `${f} failed, ` : ''}${t - f} passed of ${t}` }]
+  }
+  const lines = text.split('\n').map((l) => l.trim())
+  for (const line of lines.toReversed()) {
+    const both = line.match(/\b(\d+) (?:tests? )?pass(?:ed|es)?\b.*?\b(\d+) (?:tests? )?fail(?:ed|ures?|s)?\b/i)
+    if (both) return counts(Number(both[1]), Number(both[2]))
+    const failFirst = line.match(/\b(\d+) (?:tests? )?fail(?:ed|ures?|s)?\b.*?\b(\d+) (?:tests? )?pass(?:ed|es)?\b/i)
+    if (failFirst) return counts(Number(failFirst[2]), Number(failFirst[1]))
+    const passed = line.match(/\b(\d+) tests? passed\b/i)
+    if (passed) return counts(Number(passed[1]), 0)
+    const failed = line.match(/\b(\d+) tests? failed\b/i)
+    if (failed) return counts(0, Number(failed[1]))
+    const ratio = line.match(/^(?:ok|pass(?:ed)?)\b:?\s+(\d+)\s*\/\s*(\d+)$/i)
+    if (ratio) return [{ kind: 'tests', ok: ratio[1] === ratio[2], text: `${ratio[1]} passed of ${ratio[2]}` }]
+  }
+  const tap = lines.filter((l) => /^(?:not )?ok\b(?:\s+\d+)?(?:\s+-|$)/.test(l))
+  if (tap.length) return counts(tap.filter((l) => l.startsWith('ok')).length, tap.filter((l) => l.startsWith('not')).length)
+  const pf = lines.filter((l) => /^(?:PASS|FAIL)(?:ED)?\b/.test(l))
+  if (pf.length) return counts(pf.filter((l) => l.startsWith('PASS')).length, pf.filter((l) => l.startsWith('FAIL')).length)
+  return []
 }
 
 const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`
@@ -349,8 +376,11 @@ function gitFacts(s: Segment, output: string, ok: boolean): string[] {
       return [`committed${sub.includes('-m') && msg ? ` "${oneLine(msg.split('\n')[0]!, 100)}"` : ''}`]
     }
     if (sub[0] === 'push') return [`pushed${sub.slice(1).filter((x) => !x.startsWith('-')).length ? ` ${sub.slice(1).filter((x) => !x.startsWith('-')).join(' ')}` : ''}`]
-    if (sub[0] === 'merge' || sub[0] === 'rebase' || sub[0] === 'cherry-pick' || sub[0] === 'reset' || sub[0] === 'revert')
-      return [`${sub[0]} ${oneLine(sub.slice(1).join(' '), 60)}`.trim()]
+    if ((sub[0] === 'merge' || sub[0] === 'rebase' || sub[0] === 'cherry-pick') && sub[1] === '--abort') return [`${sub[0]} aborted`]
+    if (sub[0] === 'merge' || sub[0] === 'rebase' || sub[0] === 'cherry-pick' || sub[0] === 'reset' || sub[0] === 'revert') {
+      const conflicts = sub[0] !== 'reset' && /^CONFLICT \(|^Automatic merge failed|^error: could not apply/m.test(output)
+      return [`${`${sub[0]} ${oneLine(sub.slice(1).join(' '), 60)}`.trim()}${conflicts ? ': conflicts' : ''}`]
+    }
   }
   if (/^gh(?:-axi)?$/.test(w[0] ?? '') && w[1] === 'pr' && ['create', 'merge'].includes(w[2] ?? '')) {
     const url = output.match(/https:\/\/github\.com\/\S+\/pull\/\d+/)?.[0]
@@ -368,9 +398,8 @@ export function extractFacts(rows: readonly SessionMessage[], at: readonly (numb
   })
   const edits = new Map<string, { n: number; created: boolean }>()
   let editAt: number | undefined
-  const ran = new Map<string, Map<string, number>>() // family → command as shown → count
-  let ranAt: number | undefined
   const failed: Fact[] = []
+  const refusals = new Map<string, { first?: number; at?: number; n: number; command?: string }>() // reason → its calls
   const checks: Fact[] = []
   const git: Git[] = []
   const edit = (path: string, t: number | undefined, created = false) => {
@@ -400,14 +429,23 @@ export function extractFacts(rows: readonly SessionMessage[], at: readonly (numb
           if (m && !/\$\(|`/.test(m[2]!)) vars.set(m[1]!, expand(m[2]!, vars))
         }
       const refused = r.isError && refusal(text)
-      if (refused) {
+      if (refused === REJECTED) {
         const s = segs.find((x) => !looks(x)) ?? segs[0]
         if (s) failed.push({ at: t, marker: '🟡', text: `[failed] ${shown(s, cwd, vars)} (${refused})` })
         continue
       }
+      if (refused) {
+        // The command a refusal is about: the one segment its reason names, or the only segment; else none is shown.
+        const named = segs.filter((x) => name(x.words) && new RegExp(`(?<![\\w.])${name(x.words).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?!\\w)`).test(refused))
+        const s = named.length === 1 ? named[0] : segs.length === 1 ? segs[0] : undefined
+        const was = refusals.get(refused)
+        refusals.delete(refused)
+        refusals.set(refused, { first: was?.first ?? t, at: t, n: (was?.n ?? 0) + 1, command: s && shown(s, cwd, vars) })
+        continue
+      }
       const ends = outcomes(segs, r, input.run_in_background === true)
-      const found = checksIn(text)
       const runners = segs.filter(isRunner)
+      const found = checksIn(text, runners.length > 0)
       const checked = new Set<Segment>() // runners whose result is a [checks] line
       const nth = new Map<Kind, number>()
       for (const c of found) {
@@ -431,19 +469,8 @@ export function extractFacts(rows: readonly SessionMessage[], at: readonly (numb
           failed.push({ at: t, marker: looks(s) ? '🟢' : '🟡', text: `[failed] ${shown(s, cwd, vars)} (exit ${end!.code}): ${why}` })
           continue
         }
-        if (looks(s) || checked.has(s)) continue
-        if (runners.includes(s) && end?.code === 0 && kindOf(s) === 'types') {
+        if (!looks(s) && !checked.has(s) && runners.includes(s) && end?.code === 0 && kindOf(s) === 'types')
           checks.push({ at: t, marker: '✅', text: `[checks] ${shown(s, cwd)}: no type errors` })
-          continue
-        }
-        if (gitFacts(s, text, true).length || writes(s, vars).length) continue
-        const c = shown(s, cwd, vars) + (end?.background ? ' (background)' : '')
-        if (!c) continue
-        const f = family(s, cwd, vars)
-        const seen = ran.get(f) ?? new Map<string, number>()
-        seen.set(c, (seen.get(c) ?? 0) + 1)
-        ran.set(f, seen)
-        ranAt = t ?? ranAt
       }
     }
   })
@@ -454,28 +481,49 @@ export function extractFacts(rows: readonly SessionMessage[], at: readonly (numb
       marker: '🟡',
       text: `[edits] ${[...edits].map(([p, e]) => `${p}${e.created ? ' (created)' : ''}${e.n > 1 ? ` ×${e.n}` : ''}`).join(', ')}`,
     })
-  if (ran.size) {
-    // A family run one way is shown whole; run several ways, by its name and count.
-    const list = [...ran].map(([f, seen]) => {
-      const n = [...seen.values()].reduce((a, b) => a + b, 0)
-      const [c] = seen.keys()
-      return `${seen.size === 1 ? c : f}${n > 1 ? ` ×${n}` : ''}`
-    })
-    let fit = 0
-    for (let len = 0; fit < list.length && (fit === 0 || len + list[fit]!.length <= RAN_CHARS); fit++) len += list[fit]!.length + 2
-    facts.push({ at: ranAt, marker: '🟢', text: `[ran] ${list.slice(0, fit).join('; ')}${list.length > fit ? `; +${list.length - fit} more` : ''}` })
+  if (git.length) {
+    const items = [...new Set(settleGit(git.map((g) => g.text)))]
+    facts.push({ at: git.at(-1)!.at, marker: gitMarker(items), text: `[git] ${items.join('; ')}` })
   }
-  if (git.length) facts.push({ at: git.at(-1)!.at, marker: '✅', text: `[git] ${[...new Set(git.map((g) => g.text))].join('; ')}` })
   facts.push(...dedupe(checks))
-  const fails = dedupe(failed)
+  for (const [why, r] of refusals)
+    failed.push({ at: r.at, marker: '🟡', text: `[failed] ${why}${r.n > 1 ? ` (×${r.n}${since(r.first, r.at)})` : r.command ? ` (${r.command})` : ''}` })
+  const fails = dedupe(failed).sort((a, b) => (a.at ?? 0) - (b.at ?? 0))
   facts.push(...fails.slice(0, MAX_FAILED))
   if (fails.length > MAX_FAILED) facts[facts.length - 1]!.text += ` (+${fails.length - MAX_FAILED} more failures)`
   return facts.sort((a, b) => (a.at ?? 0) - (b.at ?? 0))
 }
 
+// ` since HH:MM`, the time a repeated line first happened, when that is not the minute of its last.
+function since(first: number | undefined, last: number | undefined) {
+  if (first === undefined || last === undefined) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const [a, b] = [new Date(first), new Date(last)]
+  const day = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  const clock = `${pad(a.getHours())}:${pad(a.getMinutes())}`
+  if (day(a) === day(b) && clock === `${pad(b.getHours())}:${pad(b.getMinutes())}`) return ''
+  return ` since ${day(a) === day(b) ? '' : `${day(a)} `}${clock}`
+}
+
+// A merge, rebase or cherry-pick's abort put on the one it ends: `merge X: conflicts` then `merge aborted` becomes
+// `merge X aborted`. An abort with none before it stays.
+function settleGit(items: readonly string[]) {
+  const out: string[] = []
+  for (const item of items) {
+    const op = item.match(/^(merge|rebase|cherry-pick) aborted$/)?.[1]
+    const at = op ? out.findLastIndex((x) => x.startsWith(`${op} `) && !x.endsWith(' aborted')) : -1
+    if (at >= 0) out[at] = `${out[at]!.replace(/: conflicts$/, '')} aborted`
+    else out.push(item)
+  }
+  return out
+}
+const gitMarker = (items: readonly string[]) => (items.some((x) => /: conflicts$| aborted$/.test(x)) ? '🟡' : '✅')
+
+const REJECTED = 'rejected by the user'
+
 // A call that never ran: a hook denied it, a guard blocked it, or the user rejected it.
 function refusal(text: string) {
-  if (/^The user doesn't want to proceed/.test(text)) return 'rejected by the user'
+  if (/^The user doesn't want to proceed/.test(text)) return REJECTED
   const hook = text.match(/^PreToolUse:\S+ hook error/)
   if (hook) {
     const why = text.match(/"(?:systemMessage|permissionDecisionReason)":"((?:[^"\\]|\\.)*)"/)?.[1]
@@ -498,13 +546,17 @@ function dedupe(facts: readonly Fact[]) {
 
 const TAGGED = /^(\S+) (?:(\d{4}-\d{2}-\d{2} \d{2}):(\d{2}) )?\[(edits|ran|failed|checks|git)\] (.*)$/u
 
-// Fact lines condensed for a reflection, by code rather than the reflector, so none is garbled: [ran] lines and
-// failed looks dropped, each check's latest result kept, an hour's [edits] lines merged into one. Lines are
-// `<marker> [YYYY-MM-DD HH:MM ]<tagged text>`; the result is in time order.
+// Fact lines condensed for a reflection, by code rather than the reflector, so none is garbled: [ran] lines (no longer
+// written) and failed looks dropped, each check's latest result kept, an hour's [edits] lines merged into one, a
+// refusal repeated across chunks kept once at its last, counted since its first, and an abort put on the merge,
+// rebase or cherry-pick it ended. Lines are `<marker> [YYYY-MM-DD HH:MM ]<tagged text>`; the result is in time order.
 export function condenseFacts(lines: readonly string[]): string[] {
   const out: { line: string; at: string }[] = []
   const checks = new Map<string, number>() // runner → index in out
   const edits = new Map<string, { i: number; files: Map<string, { n: number; created: boolean }> }>() // hour → line
+  const refusals = new Map<string, { i: number; n: number; first: string }>() // reason → line
+  const gits: { i: number; at: string; items: string[] }[] = []
+  const gitLine = (g: { at: string; items: readonly string[] }) => `${gitMarker(g.items)} ${g.at ? `${g.at} ` : ''}[git] ${g.items.join('; ')}`
   for (const line of lines) {
     const m = line.match(TAGGED)
     if (!m) continue
@@ -512,6 +564,37 @@ export function condenseFacts(lines: readonly string[]): string[] {
     const at = hour ? `${hour}:${min}` : ''
     const stamped = (t: string) => `${marker} ${at ? `${at} ` : ''}[${tag}] ${t}`
     if (tag === 'ran' || (tag === 'failed' && marker === '🟢')) continue
+    if (tag === 'failed' && /^(?:blocked by a hook|Blocked)\b/.test(text!)) {
+      const c = text!.match(/^(.*?) \(×(\d+)(?: since ([^()]+))?\)$/) ?? text!.match(/^(.*?)(?: \([^()]*\))?$/)!
+      const [why, n] = [c[1]!, Number(c[2] ?? 1)]
+      const first = c[3] ? (/^\d\d:\d\d$/.test(c[3]) && at ? `${at.slice(0, 10)} ${c[3]}` : c[3]) : at
+      const was = refusals.get(why)
+      if (!was) {
+        refusals.set(why, { i: out.push({ line, at }) - 1, n, first })
+        continue
+      }
+      out[was.i] = { line: '', at: '' }
+      const earliest = was.first && (!first || was.first < first) ? was.first : first
+      const since = !earliest || earliest === at ? '' : ` since ${earliest.slice(0, 10) === at.slice(0, 10) ? earliest.slice(11) : earliest}`
+      refusals.set(why, { i: out.push({ line: stamped(`${why} (×${was.n + n}${since})`), at }) - 1, n: was.n + n, first: earliest })
+      continue
+    }
+    if (tag === 'git') {
+      const items = text!.split('; ')
+      const kept = items.filter((item) => {
+        const op = item.match(/^(merge|rebase|cherry-pick) aborted$/)?.[1]
+        const prior = op && gits.findLast((g) => g.items.some((x) => x.startsWith(`${op} `) && !x.endsWith(' aborted')))
+        if (!prior) return true
+        prior.items = settleGit([...prior.items, item])
+        out[prior.i] = { line: gitLine(prior), at: prior.at }
+        return false
+      })
+      if (!kept.length) continue
+      const g = { i: out.length, at, items: kept }
+      out.push({ line: kept.length === items.length ? line : gitLine(g), at })
+      gits.push(g)
+      continue
+    }
     if (tag === 'checks') {
       const runner = text!.match(/^(.*?): /)?.[1] ?? ''
       const was = checks.get(runner)

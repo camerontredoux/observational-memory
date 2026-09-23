@@ -50,15 +50,15 @@ describe('edits', () => {
 })
 
 describe('commands', () => {
-  test('read-only commands are skipped, work is kept with its wrappers, cd and filters left out, repeats counted', () => {
+  test('a command that succeeded is not a fact: neither a look nor work that changed no file', () => {
     expect(
       facts(
         bash('ls src; rg -n foo src | head; cat a.ts; git status; sed -n 1,20p a.ts', 'lots'),
         bash('cd /work/app && rtk proxy pnpm db:create-migration add_gorman 2>&1 | tail -3', 'Created'),
         bash('pnpm install', 'ok', 1),
-        bash('pnpm install', 'ok', 2),
+        call('Bash', { command: 'pnpm dev', run_in_background: true }, 'Command running in background with ID: b1', 2),
       ),
-    ).toEqual(['🟢 [ran] pnpm db:create-migration add_gorman; pnpm install ×2'])
+    ).toEqual([])
   })
 
   test('a status echoed after a pipeline is read from the output: EXIT 1 fails the command before it', () => {
@@ -73,18 +73,13 @@ describe('commands', () => {
     ])
   })
 
-  test('a failed call reads its code from `Exit code N`; a hook refusal quotes its message; a failed look is low priority', () => {
+  test('a failed call reads its code from `Exit code N`; a failed look is low priority', () => {
     expect(
       facts(
         bash('pnpm build', 'Exit code 2\nsrc/a.ts: something\nError: build failed', 0, true),
-        bash('cd /work/app && bin/relaunch.sh', 'PreToolUse:Bash hook error: {"decision":"deny","systemMessage":"[persistent-cd] a persistent cd is blocked"}', 1, true),
         bash('ls missing', "Exit code 2\nls: cannot access 'missing': No such file or directory", 2, true),
       ),
-    ).toEqual([
-      '🟡 [failed] pnpm build (exit 2): Error: build failed',
-      '🟡 [failed] bin/relaunch.sh (blocked by a hook: [persistent-cd] a persistent cd is blocked)',
-      "🟢 [failed] ls missing (exit 2): ls: cannot access 'missing': No such file or directory",
-    ])
+    ).toEqual(['🟡 [failed] pnpm build (exit 2): Error: build failed', "🟢 [failed] ls missing (exit 2): ls: cannot access 'missing': No such file or directory"])
   })
 
   test('a rejected call is one failure; grep finding nothing is not a failure; the program named in the error is the one that failed', () => {
@@ -94,34 +89,53 @@ describe('commands', () => {
         bash('rg -n foo src', 'Exit code 1', 1, true),
         bash('bin/report.sh; ls config/missing; wc -c a.md', "Exit code 1\nreport ok\nls: cannot access 'config/missing': No such file or directory\n12 a.md", 2, true),
       ),
-    ).toEqual(['🟡 [failed] bin/state.sh x (rejected by the user)', '🟢 [ran] bin/report.sh', "🟢 [failed] ls config/missing (exit 1): ls: cannot access 'config/missing': No such file or directory"])
+    ).toEqual(['🟡 [failed] bin/state.sh x (rejected by the user)', "🟢 [failed] ls config/missing (exit 1): ls: cannot access 'config/missing': No such file or directory"])
   })
 
-  test('a family run several ways is named and counted; a subshell and loop keywords are not commands; a python heredoc that writes a file is an edit', () => {
+  test('a subshell and loop keywords are not commands; a python heredoc that writes a file is an edit, one that does not is nothing', () => {
     expect(
       facts(
-        bash('bin/drain.sh --ack 1; bin/drain.sh --ack 2; (cd /work/app && make) ; for f in a b; do bin/one.sh $f; done', ''),
+        bash('(cd /work/app && make) ; for f in a b; do bin/one.sh $f > out/$f.txt; done', ''),
         bash("python3 - <<'EOF'\np='src/x.ts'\ns=open(p).read()\nopen(p,'w').write(s)\nEOF", '', 1),
+        bash("python3 - <<'EOF'\nimport os\nos.remove('x')\nEOF", '', 2),
       ),
-    ).toEqual(['🟢 [ran] bin/drain.sh ×2; make; bin/one.sh $f', '🟡 [edits] src/x.ts'])
-  })
-
-  test('a background command is marked so; heredoc bodies are not commands', () => {
-    expect(
-      facts(
-        call('Bash', { command: 'pnpm dev', run_in_background: true }, 'Command running in background with ID: b1'),
-        bash("python3 - <<'EOF'\nimport os\nos.remove('x')\nEOF", ''),
-      ),
-    ).toEqual(['🟢 [ran] pnpm dev (background); python3 -'])
+    ).toEqual(['🟡 [edits] src/x.ts'])
   })
 
   test('a function defined inline is not a command; a variable set from a command substitution is not expanded', () => {
     expect(
       facts(
-        bash('rep() { :; }; make build', ''),
-        bash('S=/work/app/state/x.status; N=$(wc -l <$S); timeout 60 bash -c "until [ \\$(wc -l <$S) -gt $N ]; do sleep 5; done"', '', 1),
+        bash('rep() { :; }; make build', 'Exit code 2\nmake: *** [build] Error 1', 0, true),
+        bash('S=/work/app/state/x.status; N=$(wc -l <$S); timeout 60 bash -c "until [ \\$(wc -l <$S) -gt $N ]; do sleep 5; done"', 'Exit code 124\ntimed out', 1, true),
       ),
-    ).toEqual(['🟢 [ran] make build; bash -c "until [ $(wc -l <state/x.status) -gt $N ]; do sleep 5; done"'])
+    ).toEqual(['🟡 [failed] make build (exit 2): make: *** [build] Error 1', '🟡 [failed] bash -c "until [ $(wc -l <state/x.status) -gt $N ]; do sleep 5; done" (exit 124): timed out'])
+  })
+})
+
+describe('refusals', () => {
+  const CD = 'PreToolUse:Bash hook error: [check.sh]: {"hookSpecificOutput":{"permissionDecision":"deny"},"systemMessage":"[persistent-cd] a persistent cd is blocked"}'
+
+  test('a hook refusal leads with its reason and names the segment the reason names; with none or several named, no command', () => {
+    expect(
+      facts(
+        bash('cd /work/app/sub && bin/relaunch.sh', CD, 0, true),
+        bash('bin/a.sh; bin/b.sh', 'PreToolUse:Bash hook error: {"systemMessage":"[no-chain] chained commands are blocked"}', 1, true),
+        bash('bin/deploy.sh prod', 'PreToolUse:Bash hook error: {"permissionDecisionReason":"prod is frozen"}', 2, true),
+        bash('sleep 45; bin/peek.sh x | tail -5', '<tool_use_error>Blocked: sleep 45 followed by: bin/peek.sh x tail -5. Use Monitor.</tool_use_error>', 3, true),
+      ),
+    ).toEqual([
+      '🟡 [failed] blocked by a hook: [persistent-cd] a persistent cd is blocked (cd sub)',
+      '🟡 [failed] blocked by a hook: [no-chain] chained commands are blocked',
+      '🟡 [failed] blocked by a hook: prod is frozen (bin/deploy.sh prod)',
+      '🟡 [failed] Blocked: sleep 45 followed by: bin/peek.sh x tail -5. Use Monitor.',
+    ])
+  })
+
+  test('the same refusal repeated in a chunk is one line, counted from its first time, whatever the commands', () => {
+    expect(facts(bash('cd /work/app/a && make', CD, 0, true), bash('cd b && make', CD, 5, true), bash('bin/x.sh', 'Exit code 1\nError: x', 6, true), bash('cd c', CD, 9, true))).toEqual([
+      '🟡 [failed] bin/x.sh (exit 1): Error: x',
+      '🟡 [failed] blocked by a hook: [persistent-cd] a persistent cd is blocked (×3 since 12:00)',
+    ])
   })
 })
 
@@ -158,6 +172,40 @@ describe('checks', () => {
     ])
   })
 
+  test('a test script’s own output: TAP ok/not ok lines, a total=/failed= summary, `N tests passed`, `ok N/M`, PASS/FAIL lines', () => {
+    expect(
+      facts(
+        bash('bash tests/fm-teardown.test.sh 2>&1 | tail -5', 'ok - tears down\nok - keeps the branch\nnot ok - teardown failed with a real backlog'),
+        bash(
+          'bin/fm-test-run.sh tests/a.test.sh tests/b.test.sh',
+          'FM_TEST_BEGIN 2026-09-23T12:00:00Z tests/a.test.sh family=x expected_gate_skip=none\nok - a\nnot ok - b\nFM_TEST_END 2026-09-23T12:00:01Z tests/a.test.sh exit=1 duration_ms=5 gate_skip=false\nFM_TEST_SUMMARY total=2 failed=1 skipped_gate=0 duration_ms=900\nFM_TEST_SUMMARY_FAMILY family=x count=2 duration_ms=900 failed=1',
+          1,
+        ),
+        bash('./run-tests.sh', 'Running 12 tests\nAll 12 tests passed', 2),
+        bash('make test', 'ok 7/8', 3),
+        bash('bash tests/smoke.sh', 'PASS: login\nPASS: logout\nFAIL: signup', 4),
+        bash('python3 tests/run.py', 'Results: 5 passed, 2 failed', 5),
+      ),
+    ).toEqual([
+      '🟡 [checks] bash tests/fm-teardown.test.sh: 2 passed, 1 failed',
+      '🟡 [checks] bin/fm-test-run.sh tests/a.test.sh tests/b.test.sh: 1 failed, 1 passed of 2',
+      '✅ [checks] ./run-tests.sh: 12 passed',
+      '🟡 [checks] make test: 7 passed of 8',
+      '🟡 [checks] bash tests/smoke.sh: 2 passed, 1 failed',
+      '🟡 [checks] python3 tests/run.py: 5 passed, 2 failed',
+    ])
+  })
+
+  test('pass and fail wording in the output of a command that ran no tests is not a check', () => {
+    expect(
+      facts(
+        bash('cat data/report.md', '| tests/a.test.sh | 1 | 67 / 1 `not ok - relaunch` |\nok - listed\nAll 3 tests passed\n5 passed, 1 failed\nPASS: x'),
+        bash('gh pr checks 12', 'Lint\tpass\t1m\nUnit\tfail\t2m', 1),
+        bash('bin/fm-wake-drain.sh', 'PASS: nothing\nok 3/3\n4 passed, 0 failed', 2),
+      ),
+    ).toEqual([])
+  })
+
   test('the same result twice in a chunk is one line, counted', () => {
     const run = () => bash('pnpm exec vitest run a.test.ts', '      Tests  6 passed (6)')
     expect(facts(run(), run())).toEqual(['✅ [checks] pnpm exec vitest run a.test.ts: 6 passed of 6 (×2)'])
@@ -174,7 +222,6 @@ describe('git', () => {
         bash('gh pr create --fill', 'https://github.com/o/r/pull/1417', 3),
       ),
     ).toEqual([
-      '🟢 [ran] no-mistakes doctor; git add -A',
       '✅ [git] created branch fm/gorman; committed 1a2b3c4 "Add Gorman PDF" on fm/gorman; pushed origin fm/gorman; opened PR https://github.com/o/r/pull/1417',
     ])
   })
@@ -182,7 +229,19 @@ describe('git', () => {
   test('a failed push is a failure, not a push; a hash in unrelated output is not a commit', () => {
     expect(
       facts(bash('git push origin main', 'Exit code 1\n! [rejected] main -> main (fetch first)\nerror: failed to push', 0, true), bash('bin/status.sh', '20198da4a no-mistakes(document): Document Gorman PDF', 1)),
-    ).toEqual(['🟡 [failed] git push origin main (exit 1): error: failed to push', '🟢 [ran] bin/status.sh'])
+    ).toEqual(['🟡 [failed] git push origin main (exit 1): error: failed to push'])
+  })
+
+  test('a merge or rebase that printed conflicts is not completed; an abort later in the chunk marks it aborted; an abort alone says so', () => {
+    const conflict = 'Auto-merging bin/a.sh\nCONFLICT (content): Merge conflict in bin/a.sh\nAutomatic merge failed; fix conflicts and then commit the result.'
+    expect(facts(bash('git merge --no-edit upstream/main 2>&1 | tail -30', conflict), bash('git merge --abort && git status -sb', '## main', 1))).toEqual([
+      '🟡 [git] merge --no-edit upstream/main aborted',
+    ])
+    expect(facts(bash('git merge upstream/main | tail', conflict))).toEqual(['🟡 [git] merge upstream/main: conflicts'])
+    expect(facts(bash('git rebase main | tail', 'CONFLICT (content): Merge conflict in a.ts\nerror: could not apply 1a2b3c4... x'), bash('git cherry-pick --abort', '', 1), bash('git rebase --abort', '', 2))).toEqual([
+      '🟡 [git] rebase main aborted; cherry-pick aborted',
+    ])
+    expect(facts(bash('git merge feature', 'Merge made by the ort strategy.'), bash('git commit -m "x"', '[main 1a2b3c4] x', 1))).toEqual(['✅ [git] merge feature; committed 1a2b3c4 "x" on main'])
   })
 })
 
@@ -196,6 +255,35 @@ test('every line is tagged, stamped by its last row, and sorted by time; isFact 
   expect(out.every((f) => isFact(`${f.marker} 2026-09-23 12:00 ${f.text}`))).toBe(true)
   expect(isFact('🟡 2026-09-23 12:00 [edits] a.ts')).toBe(true)
   expect(isFact('✅ 2026-09-23 12:00 completed: edits [edits] a.ts')).toBe(false)
+})
+
+test('condensing collapses a hook refusal repeated across chunks into its last, counted since its first; other failures stay', () => {
+  expect(
+    condenseFacts([
+      '🟡 2026-09-22 23:50 [failed] blocked by a hook: [persistent-cd] x (cd a)',
+      '🟡 2026-09-23 13:39 [failed] blocked by a hook: [persistent-cd] x (×3 since 13:30)',
+      '🟡 2026-09-23 14:00 [failed] pnpm build (exit 1): Error: boom',
+      '🟡 2026-09-23 14:10 [failed] blocked by a hook: prod is frozen (bin/deploy.sh)',
+      '🟡 2026-09-23 15:12 [failed] blocked by a hook: [persistent-cd] x',
+    ]),
+  ).toEqual([
+    '🟡 2026-09-23 14:00 [failed] pnpm build (exit 1): Error: boom',
+    '🟡 2026-09-23 14:10 [failed] blocked by a hook: prod is frozen (bin/deploy.sh)',
+    '🟡 2026-09-23 15:12 [failed] blocked by a hook: [persistent-cd] x (×5 since 2026-09-22 23:50)',
+  ])
+  expect(condenseFacts(['🟡 2026-09-23 13:27 [failed] blocked by a hook: y (cd a)', '🟡 2026-09-23 13:39 [failed] blocked by a hook: y (×2 since 13:30)'])).toEqual([
+    '🟡 2026-09-23 13:39 [failed] blocked by a hook: y (×3 since 13:27)',
+  ])
+})
+
+test('condensing marks a merge aborted in a later chunk as aborted and drops the abort', () => {
+  expect(
+    condenseFacts([
+      '🟡 2026-09-23 13:27 [git] merge --no-edit upstream/main: conflicts',
+      '🟡 2026-09-23 13:28 [git] merge aborted; pushed origin main',
+      '🟡 2026-09-23 13:29 [git] rebase aborted',
+    ]),
+  ).toEqual(['🟡 2026-09-23 13:27 [git] merge --no-edit upstream/main aborted', '✅ 2026-09-23 13:28 [git] pushed origin main', '🟡 2026-09-23 13:29 [git] rebase aborted'])
 })
 
 test('condensing for a reflection drops [ran] and failed looks, keeps each check’s latest, merges an hour’s edits', () => {

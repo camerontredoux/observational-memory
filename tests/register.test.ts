@@ -251,7 +251,6 @@ function mechanical(prompt: string, size = 0): SessionMessage[] {
 }
 const FACTS_A = [
   '* 🟡 2026-09-22 14:30 [edits] src/a.ts',
-  '* 🟢 2026-09-22 14:30 [ran] make build',
   '* ✅ 2026-09-22 14:30 [git] committed abc1234 "Fix a" on main',
   '* ✅ 2026-09-22 14:30 [checks] pnpm vitest run: 3 passed of 3 (1 file)',
 ]
@@ -530,7 +529,7 @@ describe('register', () => {
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
     const memory = result.messages![0]!.text
     expect(observationsIn(memory)).toBe(['* 🔴 2026-09-22 14:30 Saw a', ...FACTS_A].join('\n'))
-    expect(memory).toContain('Lines tagged [edits], [ran], [checks], [git] or [failed] were recorded mechanically')
+    expect(memory).toContain('Lines tagged [edits], [checks], [git] or [failed] were recorded mechanically')
 
     // A new process: no ledger in the store, so it restarts from the memory message, fact lines and all.
     delete stored['ledger:session-1']
@@ -576,7 +575,7 @@ describe('register', () => {
     expect(reflections[0]).not.toContain('[checks]')
     expect((stored['ledger:session-1'] as Ledger).entries.map((e) => `* ${e.line}`)).toEqual([
       '* 🔴 2026-09-22 14:30 Explored the auth module',
-      ...FACTS_A.filter((l) => !l.includes('[ran]')),
+      ...FACTS_A,
     ])
   })
 
@@ -1672,8 +1671,8 @@ describe('register', () => {
     // As the session logged (each chunk's one Observer line and its fact lines): rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail
     // until the turn that ended at 15:08:26.
     expect(seen.logs.filter((l) => l.includes('in the background'))).toEqual([
-      'observed rows 1-56 in the background, 4 observations; watermark 56, 0 chunk(s) waiting on a gap',
-      'observed rows 56-139 in the background, 5 observations; watermark 139, 0 chunk(s) waiting on a gap',
+      'observed rows 1-56 in the background, 3 observations; watermark 56, 0 chunk(s) waiting on a gap',
+      'observed rows 56-139 in the background, 4 observations; watermark 139, 0 chunk(s) waiting on a gap',
     ])
     expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(atCompaction).toBe(0)

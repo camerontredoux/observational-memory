@@ -86,7 +86,7 @@ Remember: these observations are the assistant's ONLY memory of this chunk once 
 
 // The Observer's prompt when hooks/facts.ts records the mechanical facts: it is told they are kept and not to restate
 // them, and its examples stop modelling "Read X" and test counts.
-const FACTS_RECORDED = `Mechanical facts are recorded separately, by code, from the tool calls themselves: the files edited or written, the commands run and how they exited, test, typecheck and lint counts, git branches, commits, pushes and PRs, and each failed command with its error line. Do not restate them, and do not write a note only to say that a file was read or searched or that a command ran. Record what needs understanding: what the user asked, decided and corrected; what was learned from reading or running something (the finding itself, naming the file it is in by its full path, with line numbers, identifiers and verbatim errors); what was concluded, decided or completed and why; and what is still open.`
+const FACTS_RECORDED = `Mechanical facts are recorded separately, by code, from the tool calls themselves: the files edited or written, test, typecheck and lint counts, git branches, commits, merges, pushes and PRs, and each failed or refused command with its error line. Do not restate them, and do not write a note only to say that a file was read or searched or that a command ran. Record what needs understanding: what the user asked, decided and corrected; what was learned from reading or running something (the finding itself, naming the file it is in by its full path, with line numbers, identifiers and verbatim errors); what was concluded, decided or completed and why; and what is still open.`
 const swap = (text: string, from: string, to: string) => {
   if (!text.includes(from)) throw new Error(`observer prompt: ${JSON.stringify(from.slice(0, 40))} not found`)
   return text.replace(from, to)
@@ -103,7 +103,7 @@ export const OBSERVER_FACTS_PROMPT = [
 
 // Added to the memory's instructions when its observations carry fact lines.
 export const FACTS_INSTRUCTIONS =
-  'Lines tagged [edits], [ran], [checks], [git] or [failed] were recorded mechanically from the tool calls: the files changed, the commands run, test and typecheck results, commits and failures, exactly as they happened.'
+  'Lines tagged [edits], [checks], [git] or [failed] were recorded mechanically from the tool calls: the files changed, test and typecheck results, commits, merges and failures, exactly as they happened.'
 
 // Appended to Mastra's reflector prompt: the ledger keeps a full timestamp on every line.
 export const REFLECTOR_FORMAT =
