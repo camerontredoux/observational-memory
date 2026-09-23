@@ -211,9 +211,11 @@ describe('register', () => {
 
     const skillQuestions = requests.find((r) => 'skill_0' in r.body.questions)!.body
     expect(Object.values(skillQuestions.questions).map((q) => q.instructions)).toEqual([
-      'Skill `deploy` is still needed for the ongoing work',
-      'Skill `lint` is still needed for the ongoing work',
+      'Skill `deploy`, whose instructions begin "Deploy steps (expanded)", still applies to the recent requests or requests like them',
+      'Skill `lint`, whose instructions begin "Lint steps (expanded)", still applies to the recent requests or requests like them',
     ])
+    expect(JSON.stringify(skillQuestions.questions)).toContain('"criteria":{"true":"The skill sets a standing rule')
+    expect(seen.prompts[0]).toContain('Write every observation without a time')
     expect(JSON.stringify(skillQuestions.state)).toContain('User asked to fix auth')
     const text = result.messages?.[0]?.text ?? ''
     expect(skillsIn(text)).toBe('<skill name="deploy">\nDeploy steps (expanded)\n</skill>')
@@ -260,5 +262,29 @@ describe('register', () => {
     expect(requests).toHaveLength(0)
     expect(skillsIn(result.messages?.[0]?.text)).toBe('<skill name="deploy">\nDeploy steps\n</skill>\n<skill name="lint">\nLint steps\n</skill>')
     expect(seen.logs[0]).toBe('observational-memory: no TYPESAFE_API_KEY, observing without the Jev pre-pass')
+  })
+
+  test('a skill the raw tail invoked is kept without asking Jev', async ($, on) => {
+    mock.clock(on)
+    world(on, { TYPESAFE_API_KEY: 'test-key' })
+    observer(on)
+    const requests = jev(on, () => 0)
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+
+    await $.skill.prompt({ skill: 'style', text: 'Start summaries with Gist:' })
+    await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps' })
+    await $.skill.prompt({ skill: 'lint', text: 'Lint steps' })
+    const recent: SessionMessage[] = [
+      { role: 'user', text: '<command-message>style</command-message>\n<command-name>/style</command-name>', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 's1', tool: 'Skill', input: { skill: 'deploy' }, text: 'Launching skill: deploy' }] },
+      ...turn('b', 'b', 30_000).slice(2),
+    ]
+    const result = await $.session.compact({ trigger: 'auto', messages: [...turn('a', 'a', 30_000), ...recent] })
+
+    const asked = requests.filter((r) => 'skill_0' in r.body.questions).map((r) => Object.keys(r.body.questions))
+    expect(asked).toEqual([['skill_0']])
+    expect(skillsIn(result.messages?.[0]?.text)).toBe(
+      '<skill name="style">\nStart summaries with Gist:\n</skill>\n<skill name="deploy">\nDeploy steps\n</skill>',
+    )
   })
 })

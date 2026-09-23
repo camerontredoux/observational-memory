@@ -23,7 +23,12 @@ const TIMEOUT_MS = 5 * 60_000
 const JEV_STATE_MAX_TOKENS = 25_000 // fast-jev-compaction's default, under Jev's 32k for state plus a question
 const SKILL_KEEP_AT = 0.5
 const SKILL_CONTEXT =
-  'A coding assistant conversation is being compacted. `observations` is its memory of the older conversation, `recent` the messages kept verbatim. Each question asks whether a skill (instructions the assistant loaded earlier) is still needed for the work going on.'
+  'A coding assistant conversation is being compacted. `observations` is its memory of the older conversation, `recent` the messages kept verbatim. Each question asks whether a skill (instructions the assistant loaded earlier) still applies.'
+const SKILL_EXCERPT_CHARS = 600
+const SKILL_CRITERIA = {
+  true: 'The skill sets a standing rule, style or workflow that the recent requests, or requests like them, fall under',
+  false: 'The skill was for a one-off task that is finished, or its subject is unrelated to the recent requests',
+}
 const SKILL_BLOCK = /<skill name="([^"]*)">\n([\s\S]*?)\n<\/skill>(?=\n<skill name="|\n<\/skills-in-use>)/g
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -155,25 +160,41 @@ async function skillsInUse(
   tail: readonly SessionMessage[],
   now: Date,
 ) {
+  // A skill the raw tail invoked, by the Skill tool or as /name, is kept without asking.
+  const invoked = new Set(
+    tail.flatMap((m) => [
+      ...m.toolUses.filter((u) => u.tool === 'Skill').map((u) => String(u.input.skill)),
+      ...[...m.text.matchAll(/<command-name>\/([^<\s]+)<\/command-name>/g)].map((c) => c[1]!),
+    ]),
+  )
   const tailText = tail.map(messageText).join('\n')
-  const pending = skills.filter((s) => !tailText.includes(s.text.trim()))
-  if (!pending.length || !jev) return pending
+  const unseen = skills.filter((s) => !tailText.includes(s.text.trim()))
+  const recent = unseen.filter((s) => invoked.has(s.skill))
+  const pending = unseen.filter((s) => !invoked.has(s.skill))
+  if (!pending.length || !jev) return [...recent, ...pending]
   const state = { context: SKILL_CONTEXT, observations, recent: renderHistory(tail, now) }
   for (let over; (over = jevTokens(JSON.stringify(state)) - JEV_STATE_MAX_TOKENS) > 0; ) {
     const field = state.observations.length >= state.recent.length ? 'observations' : 'recent'
     state[field] = state[field].slice(Math.max(over, Math.ceil(state[field].length / 10))) // keep the newest
   }
   const questions: JevQuestions = Object.fromEntries(
-    pending.map((s, i) => [`skill_${i}`, { type: 'noul', instructions: `Skill \`${s.skill}\` is still needed for the ongoing work` }]),
+    pending.map((s, i) => [
+      `skill_${i}`,
+      {
+        type: 'noul',
+        instructions: `Skill \`${s.skill}\`, whose instructions begin "${s.text.trim().slice(0, SKILL_EXCERPT_CHARS)}", still applies to the recent requests or requests like them`,
+        criteria: SKILL_CRITERIA,
+      },
+    ]),
   )
   try {
     const { answers } = await jev.ask(state, questions)
     const kept = pending.filter((_, i) => noulAnswer(answers, `skill_${i}`) >= SKILL_KEEP_AT)
     $.ui.log(`observational-memory: Jev kept ${kept.length} of ${pending.length} skills`)
-    return kept
+    return [...recent, ...kept]
   } catch (error) {
     $.ui.log(`observational-memory: keeping all ${pending.length} skills (${errorText(error)})`)
-    return pending
+    return [...recent, ...pending]
   }
 }
 
@@ -199,7 +220,9 @@ function observerPrompt(history: string, prior?: Memory) {
   }
   return (
     prompt +
-    '## Your Task\n\nExtract new observations from the message history above. Do not repeat observations that are already in the previous observations. Add your new observations in the format specified in your instructions.'
+    '## Your Task\n\nExtract new observations from the message history above. Do not repeat observations that are already in the previous observations. Add your new observations in the format specified in your instructions.' +
+    // Claude Code's messages carry no time of day, so a time would be invented.
+    '\n\nThe message history above carries no times of day. Write every observation without a time: `* 🔴 User asked …`, not `* 🔴 (14:30) User asked …`.'
   )
 }
 
