@@ -693,7 +693,7 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
   const out = [head]
   // Terms no block holds, whole or (a compound) by parts found anywhere: absent, so not worth searching for again.
   const absent = m.terms.filter((t, k) => !pool.some((h) => h.held[k]) && !(t.parts.length && t.parts.every((p) => pool.some((h) => h.lower.includes(p)))))
-  if (m.terms.length > 1 && absent.length) {
+  if (absent.length) {
     const scope = input.from || input.to ? 'this range' : c.note ? 'the readable history' : c.subagents.length && !input.subagents ? 'the main transcript' : 'this session'
     const named = absent.slice(0, ABSENT_MAX).map((t) => (t.word.includes(' ') ? `"${t.word}"` : t.word))
     out.push(`No occurrences in ${scope} of: ${named.join(', ')}${absent.length > ABSENT_MAX ? `, and ${absent.length - ABSENT_MAX} more` : ''}.`)
@@ -705,8 +705,7 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
         ? `${plural(rest.length, 'older match', 'older matches')} not shown; only if none above answers, repeat with "to": "${before!.ref}".`
         : `${plural(rest.length, 'more match', 'more matches')} not shown; only if none above answers, narrow the query or give "from" or "to".`,
     )
-  if (!input.subagents && c.subagents.length && !hits.length)
-    out.push(`${plural(c.subagents.length, 'subagent transcript')} not searched: repeat with "subagents": true.`)
+  if (!input.subagents && c.subagents.length) out.push(`${plural(c.subagents.length, 'subagent transcript')} not searched: repeat with "subagents": true.`)
   if (lead) {
     const n = lead.x!.lead + 1
     out.push(`Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "${lead.b.ref}", "lines": "${Math.max(1, n - 10)}-${Math.min(lead.x!.lines, n + 10)}"}.`)

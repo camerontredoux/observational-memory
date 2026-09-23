@@ -398,7 +398,11 @@ describe('recall', () => {
     const sub = `${DIR}/${OLD}/subagents`
     const io = () =>
       chain({ [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: subagent, [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: JSON.stringify({ agentType: 'Explore', description: 'find config', toolUseId: 'u1' }) })
-    expect(await run({ query: 'GRAPE-9' }, io())).toBe('0 match(es) for "GRAPE-9" in 6 blocks of 2 transcript files.\n1 subagent transcript not searched: repeat with "subagents": true.')
+    expect(await run({ query: 'GRAPE-9' }, io())).toBe(
+      '0 match(es) for "GRAPE-9" in 6 blocks of 2 transcript files.\n' +
+        'No occurrences in the main transcript of: grape-9.\n' +
+        '1 subagent transcript not searched: repeat with "subagents": true.',
+    )
     const found = await run({ query: 'GRAPE-9', subagents: true }, io())
     expect(found).toContain('2 match(es) for "GRAPE-9" in 8 blocks of 2 transcript files and 1 subagent transcript.')
     expect(found).toContain('[a1b2c3d4:2 ')
@@ -408,6 +412,20 @@ describe('recall', () => {
     // A reference bound in the main thread bounds a subagent's by time: up to the block after it, not at it.
     expect(await run({ query: 'GRAPE-9', subagents: true, to: 'aaaaaaaa:3' }, io())).toMatch(/^2 match/)
     expect(await run({ query: 'GRAPE-9', subagents: true, to: 'aaaaaaaa:2.2' }, io())).toMatch(/^0 match/)
+    // Subagents are excluded whether or not the main transcript alone found something: a match there is not proof
+    // there is nothing more in the transcripts left unsearched.
+    const foundInMain = await run({ query: '"plan is ALPHA"' }, io())
+    expect(foundInMain).toContain('1 subagent transcript not searched: repeat with "subagents": true.')
+  })
+
+  test('an absent term gets a scoped statement even alone, naming what was excluded, not proof the event never happened', async () => {
+    // GRAPE-9 exists only in the excluded subagent transcript: the statement must not read as a claim it never
+    // happened anywhere, only that it was not found in what this search actually covered.
+    const sub = `${DIR}/${OLD}/subagents`
+    const io = chain({ [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: subagent, [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: JSON.stringify({ agentType: 'Explore', toolUseId: 'u1' }) })
+    const found = await run({ query: 'GRAPE-9' }, io)
+    expect(found).toContain('No occurrences in the main transcript of: grape-9.')
+    expect(found).toContain('subagent transcript not searched')
   })
 
   test('the live history, with no file: rows addressed by index', async () => {
