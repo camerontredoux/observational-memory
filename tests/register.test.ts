@@ -419,6 +419,27 @@ describe('register', () => {
     expect(result.messages?.slice(1)).toEqual(messages.slice(5))
   })
 
+  test('an empty <observations> block and corrections alone are valid replies; marker-only and timestamp-only lines are not', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const correction = '🔴 User: "Never touch the migrations folder"'
+    const replies: Record<string, string> = {
+      a: '<observations></observations>',
+      b: `<corrections>\n* ${correction}\n</corrections>\n<observations>\n</observations>`,
+      c: '<observations>\n* 🔴\n* 🟡 2026-09-22 14:30\n</observations>',
+    }
+    const seen = pi(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)$/m)![1]!] })
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([expect.stringMatching(/^retrying rows 7-11 /)])
+    expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer answered without an <observations> block); kept raw')
+    const text = result.messages?.[0]?.text ?? ''
+    expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n\n</observations>`)
+    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+  })
+
   test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
     mock.clock(on)
     world(on)
@@ -479,6 +500,27 @@ describe('register', () => {
     expect(seen.prompts[1]).toContain('[User @ 2026-09-22 14:30]: a')
     expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 Saw a'])
     expect(seen.modelCalls).toBe(0)
+  })
+
+  test('a reply pi did not finish (token-limited, or ending in a way pi does not name) leaves its chunk unobserved', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const partial = '<observations>\n* 🔴 2026-09-22 14:30 Saw a\n* 🟡 2026-09-22 14:31 Read /src/a.ts and fou'
+    const ends = [{ stopReason: 'length' }, {}]
+    const seen = pi(on, { fail: (n) => (n <= ends.length ? { exitCode: 0, stdout: piOutput('', partial, ends[n - 1]), stderr: '' } : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+    await runTurn($, turn('b', 'b', 100), at(22, 14, 40))
+    await clock.settle()
+
+    expect(seen.logs.filter((l) => l.startsWith('background observation'))).toEqual([
+      'background observation of rows 0-3 failed (pi exited 0, stopReason length: ); it will be retried',
+      'background observation of rows 0-3 failed (pi exited 0, stopReason none: ); it will be retried',
+    ])
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect([ledger.watermark.to, ledger.entries, ledger.chunks]).toEqual([0, [], []])
   })
 
   test('observes in the background after turn.complete, off the dispatch, with real timestamps checked against the chunk', async ($, on) => {
@@ -632,6 +674,45 @@ describe('register', () => {
     expect(seen.logs).toContain(
       'reflected 4000 observations (~15000 tokens) into 1 (~12 tokens) at compression level 2; 1 newer kept'.replace('15000', String(Math.ceil('* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000).trimEnd().length / 4))),
     )
+  })
+
+  test('a reflection still over its target at the last compression level replaces nothing', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const line = '🟡 2026-09-22 14:30 read a file with a long name'
+    const big = `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`
+    const seen = pi(on, { reply: () => big, reflect: () => big.replace(/long name/g, 'longer name') })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(4)
+    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual([expect.stringMatching(/^reflection failed \(/)])
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
+    expect(ledger.entries).toHaveLength(4_000)
+  })
+
+  test('a reflection pi did not finish replaces nothing, though what it holds parses under the target', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const line = '🟡 2026-09-22 14:30 read a file with a long name'
+    const short = '<observations>\n* 🔴 2026-09-22 14:30 Reflected\n</observations>'
+    const seen = pi(on, {
+      reply: () => `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`,
+      fail: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? { exitCode: 0, stdout: piOutput('', short, { stopReason: 'length' }), stderr: '' } : undefined),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
+    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual(['reflection failed (pi exited 0, stopReason length: )'])
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
+    expect(ledger.entries).toHaveLength(4_000)
   })
 
   test("the user's corrections are quoted in their own section above the observations and pass through the Reflector unchanged", async ($, on) => {
@@ -849,6 +930,21 @@ describe('register', () => {
     expect(seen.logs).toContain('Compacted subagent in 0 ms · observed 3 messages on the spot · memory 1 note')
   })
 
+  test("a subagent's budget takes the smallest window, not the main model's million", async ($, on) => {
+    mock.clock(on)
+    world(on, { unreadable: ['agent-1'] })
+    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(6_000)}</observations>` })
+    // ~100k tokens of observations: under the main model's (1M - 20k) / 2, over a 200k window's 90k.
+    on('session.usage', () => ({ value: { context: { window: 1_000_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })
+
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~90000 allowed; using the built-in compaction$/))
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+  })
+
   test('main and two subagents observe in the background side by side, each under its own keys, four Observer calls in flight across them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
@@ -979,6 +1075,127 @@ describe('register', () => {
     expect(result.messages).toHaveLength(1)
     expect(observationsIn(result.messages?.[0]?.text)).toContain('Read f1')
     expect(seen.logs.at(-1)).toMatch(/^observed 6 rows now, kept 0 raw messages/)
+  })
+
+  test('a memory message over the budget a small window leaves keeps its skills as lines and its user messages as the brief, and the rest whole', async ($, on) => {
+    mock.clock(on, { now: at(22, 9, 0) })
+    world(on)
+    const correction = '🔴 User: "Keep the public API unchanged"'
+    const seen = pi(on, {
+      reply: (prompt) => {
+        const name = prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]
+        return `${name === 'a' ? `<corrections>\n* ${correction}\n</corrections>\n` : ''}<observations>\n* 🔴 Saw ${name}\n</observations>\n<current-task>\nPrimary: ${name}\n</current-task>`
+      },
+    })
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    // (50k - 20k of system prompt and tools) / 2: a 15k-token budget, which the two skills alone fill.
+    on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
+    await $.skill.prompt({ skill: 'plan', text: 'p'.repeat(30_000) })
+    await $.skill.prompt({ skill: 'style', text: 's'.repeat(30_000) })
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'auto', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(skillsIn(text)).toBe(`<skill name="style" invoked="2026-09-22 09:00">${FINISHED}</skill>\n<skill name="plan" invoked="2026-09-22 09:00">${FINISHED}</skill>`)
+    expect(userMessagesIn(text)).toEqual(['a', '(1 omitted)'])
+    expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>`)
+    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b')
+    expect(text).toContain('<current-task>\nPrimary: b\n</current-task>')
+    expect(nextStepIn(text)).toBe('b')
+    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: skills kept as lines, user messages as the brief$/))
+  })
+
+  test('over its budget on dense text while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const { gate, open } = gates()
+    const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
+    const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
+    const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
+    // Dense text: the last response measured 150k tokens where the characters estimate ~15k of messages, so the raw
+    // tail's ~5k count ~43k beside ~64k of memory, over the 90k budget.
+    on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 20_000), at(22, 15, 0))
+    await clock.settle() // [0, 3) observed: its ~51k tokens of observations start a reflection, held
+    expect(seen.prompts.at(-1)).toMatch(/^## OBSERVATIONS/)
+    const before = stored['ledger:session-1'] as Ledger
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(stored['ledger:session-1']).toEqual(before)
+    expect(before.corrections).toEqual([correction])
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~90000 allowed; using the built-in compaction$/))
+    expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
+    open(0)
+    await clock.settle()
+  })
+
+  test('a memory over its budget with chunks observed on the spot falls back and stores them committed, not installed', async ($, on) => {
+    mock.clock(on)
+    const { history, stored } = world(on)
+    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_000)}</observations>` })
+    // A 15k-token budget, under the ~20k of observations the two chunks bring even with the skills and prompts cut.
+    on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
+    const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
+    expect([ledger.watermark.to, ledger.entries.length, ledger.anchor]).toEqual([7, 2_000, undefined])
+  })
+
+  test('a memory whose corrections alone are over its budget falls back rather than drop any', async ($, on) => {
+    mock.clock(on)
+    const { history, stored } = world(on)
+    const corrections = Array.from({ length: 2_000 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
+    const seen = pi(on, {
+      reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
+    })
+    // A 15k-token budget, under the ~20k the corrections alone take.
+    on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
+    expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
+  })
+
+  test("the budget is half the room below the auto-compaction threshold, less the overhead the session's breakdown lists", async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(2_000)}</observations>` })
+    // (100k to auto-compaction - 20k - 10k of a loaded MCP tool - 10k of memory files) / 2: a 30k-token budget,
+    // under the ~34k of observations the two chunks bring. A deferred tool is outside the window.
+    const breakdown = {
+      autoCompactThreshold: 100_000,
+      rawMaxTokens: 200_000,
+      mcpTools: [
+        { name: 'mcp__big__loaded', serverName: 'big', tokens: 10_000, isLoaded: true },
+        { name: 'mcp__big__deferred', serverName: 'big', tokens: 50_000, isLoaded: false },
+      ],
+      memoryFiles: [{ path: '/work/project/CLAUDE.md', type: 'Project', tokens: 10_000 }],
+      agents: [],
+    }
+    on('session.usage', ($, e) => ({ value: { context: { window: 200_000, ...(e.breakdown === 'summary' ? { breakdown } : {}) }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~30000 allowed; using the built-in compaction$/))
   })
 
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
