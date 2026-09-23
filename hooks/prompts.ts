@@ -84,6 +84,27 @@ Detail preservation. Preserve distinguishing details so future queries can still
 
 Remember: these observations are the assistant's ONLY memory of this chunk once the raw messages fall out of context. Make them count.`
 
+// The Observer's prompt when hooks/facts.ts records the mechanical facts: it is told they are kept and not to restate
+// them, and its examples stop modelling "Read X" and test counts.
+const FACTS_RECORDED = `Mechanical facts are recorded separately, by code, from the tool calls themselves: the files edited or written, the commands run and how they exited, test, typecheck and lint counts, git branches, commits, pushes and PRs, and each failed command with its error line. Do not restate them, and do not list the files read or searched or the commands run. Record what needs understanding: what the user asked, decided and corrected; what was learned from reading or running something (the finding itself, with file:line, identifiers and verbatim errors); what was concluded, decided or completed and why; and what is still open.`
+const swap = (text: string, from: string, to: string) => {
+  if (!text.includes(from)) throw new Error(`observer prompt: ${JSON.stringify(from.slice(0, 40))} not found`)
+  return text.replace(from, to)
+}
+export const OBSERVER_FACTS_PROMPT = [
+  ['* 🟡 2026-09-23 14:32 Read src/auth/refresh.ts: refreshToken() never checks expiry (line 45)', '* 🟡 2026-09-23 14:32 Found that refreshToken() never checks expiry (src/auth/refresh.ts:45)'],
+  ['* ✅ 2026-09-23 14:40 completed: added the expiry check at src/auth/refresh.ts:45; npm test passes (212 tests)', '* ✅ 2026-09-23 14:40 completed: refreshToken() now rejects an expired token (src/auth/refresh.ts:45), fixing the refresh bug'],
+  ['What to observe:\n', `What to observe:\n${FACTS_RECORDED}\n`],
+  [
+    '- Always record which files were read, created or edited (full paths) and which commands ran, with what outcome: the assistant may later be asked what it did.',
+    '- Record what a command or edit meant, not that it happened: "typecheck failed on a Uint8Array/BodyInit mismatch in the PDF test; fixed by wrapping it in Buffer.from", not "ran pnpm typecheck".',
+  ],
+].reduce((text, [from, to]) => swap(text, from!, to!), OBSERVER_SYSTEM_PROMPT)
+
+// Added to the memory's instructions when its observations carry fact lines.
+export const FACTS_INSTRUCTIONS =
+  'Lines tagged [edits], [ran], [checks], [git] or [failed] were recorded mechanically from the tool calls: the files changed, the commands run, test and typecheck results, commits and failures, exactly as they happened.'
+
 // Appended to Mastra's reflector prompt: the ledger keeps a full timestamp on every line.
 export const REFLECTOR_FORMAT =
   'Output format for this memory: inside <observations>, one observation per line as `* <priority marker> YYYY-MM-DD HH:MM <observation>`, with no date groups and no nested bullets. Keep the timestamp of the latest observation a line condenses. 🔴 is reserved for the user\'s decisions and constraints: keep every one of them, and mark the user\'s requests, facts and goals 🟡 instead. Leave out <suggested-response>.'

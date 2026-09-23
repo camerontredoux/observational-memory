@@ -6,7 +6,6 @@ import type { SessionMessage } from 'claude-code'
 
 export type Fact = { at?: number; marker: '🟡' | '🟢' | '✅'; text: string }
 
-export const FACT_LINE = /^\S+ (?:\d{4}-\d{2}-\d{2} \d{2}:\d{2} )?\[(?:edits|ran|failed|checks|git)\] /u
 
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
 const RAN_CHARS = 320 // a chunk's [ran] line; the commands past it counted
@@ -491,3 +490,46 @@ function dedupe(facts: readonly Fact[]) {
   }
   return [...by.values()].map(({ n, ...f }) => ({ ...f, text: n > 1 ? `${f.text} (×${n})` : f.text }))
 }
+
+const TAGGED = /^(\S+) (?:(\d{4}-\d{2}-\d{2} \d{2}):(\d{2}) )?\[(edits|ran|failed|checks|git)\] (.*)$/u
+
+// Fact lines condensed for a reflection, by code rather than the reflector, so none is garbled: [ran] lines and
+// failed looks dropped, each check's latest result kept, an hour's [edits] lines merged into one. Lines are
+// `<marker> [YYYY-MM-DD HH:MM ]<tagged text>`; the result is in time order.
+export function condenseFacts(lines: readonly string[]): string[] {
+  const out: { line: string; at: string }[] = []
+  const checks = new Map<string, number>() // runner → index in out
+  const edits = new Map<string, { i: number; files: Map<string, { n: number; created: boolean }> }>() // hour → line
+  for (const line of lines) {
+    const m = line.match(TAGGED)
+    if (!m) continue
+    const [, marker, hour = '', min = '', tag, text] = m
+    const at = hour ? `${hour}:${min}` : ''
+    const stamped = (t: string) => `${marker} ${at ? `${at} ` : ''}[${tag}] ${t}`
+    if (tag === 'ran' || (tag === 'failed' && marker === '🟢')) continue
+    if (tag === 'checks') {
+      const runner = text!.match(/^(.*?): /)?.[1] ?? ''
+      const was = checks.get(runner)
+      if (was !== undefined) out[was] = { line: '', at: '' }
+      checks.set(runner, out.push({ line, at }) - 1)
+      continue
+    }
+    if (tag === 'edits') {
+      const e = edits.get(hour)
+      const files = e?.files ?? new Map<string, { n: number; created: boolean }>()
+      for (const item of text!.split(', ')) {
+        const f = item.match(/^(.*?)( \(created\))?(?: ×(\d+))?$/)!
+        const had = files.get(f[1]!) ?? { n: 0, created: false }
+        files.set(f[1]!, { n: had.n + Number(f[3] ?? 1), created: had.created || !!f[2] })
+      }
+      if (e) out[e.i] = { line: '', at: '' }
+      const merged = [...files].map(([p, x]) => `${p}${x.created ? ' (created)' : ''}${x.n > 1 ? ` ×${x.n}` : ''}`).join(', ')
+      edits.set(hour, { i: out.push({ line: stamped(merged), at }) - 1, files })
+      continue
+    }
+    out.push({ line, at })
+  }
+  return out.filter((o) => o.line).map((o) => o.line)
+}
+
+export const isFact = (line: string) => TAGGED.test(line)

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { extractFacts, FACT_LINE } from '../hooks/facts'
+import { condenseFacts, extractFacts, isFact } from '../hooks/facts'
 
 const CWD = '/work/app'
 const T = new Date(2026, 8, 23, 12, 0).getTime()
@@ -177,14 +177,37 @@ describe('git', () => {
   })
 })
 
-test('every line is tagged, stamped by its last row, and sorted by time; FACT_LINE knows them once stamped', () => {
+test('every line is tagged, stamped by its last row, and sorted by time; isFact knows them once stamped', () => {
   const rows = [
     call('Edit', { file_path: '/work/app/a.ts' }, 'updated', 5),
     bash('pnpm exec vitest run', '      Tests  1 passed (1)', 2),
   ]
   const out = extractFacts(rows.flatMap((c) => c.rows), rows.flatMap((c) => c.at), CWD)
   expect(out.map((f) => f.at)).toEqual([min(2), min(5)])
-  expect(out.every((f) => FACT_LINE.test(`${f.marker} 2026-09-23 12:00 ${f.text}`))).toBe(true)
-  expect(FACT_LINE.test('🟡 2026-09-23 12:00 [edits] a.ts')).toBe(true)
-  expect(FACT_LINE.test('✅ 2026-09-23 12:00 completed: edits [edits] a.ts')).toBe(false)
+  expect(out.every((f) => isFact(`${f.marker} 2026-09-23 12:00 ${f.text}`))).toBe(true)
+  expect(isFact('🟡 2026-09-23 12:00 [edits] a.ts')).toBe(true)
+  expect(isFact('✅ 2026-09-23 12:00 completed: edits [edits] a.ts')).toBe(false)
+})
+
+test('condensing for a reflection drops [ran] and failed looks, keeps each check’s latest, merges an hour’s edits', () => {
+  expect(
+    condenseFacts([
+      '🟡 2026-09-23 12:01 [edits] src/a.ts ×2, src/b.ts (created)',
+      '🟢 2026-09-23 12:02 [ran] make; bin/x.sh ×3',
+      '🟡 2026-09-23 12:03 [checks] pnpm typecheck: 1 type error, first TS2345 at a.ts:3: bad',
+      '🟢 2026-09-23 12:04 [failed] ls missing (exit 2): ls: cannot access',
+      '🟡 2026-09-23 12:05 User decided X',
+      '🟡 2026-09-23 12:30 [edits] src/a.ts, src/c.ts',
+      '✅ 2026-09-23 12:31 [checks] pnpm typecheck: no type errors',
+      '✅ 2026-09-23 12:32 [git] committed abc1234 "Add X" on main',
+      '🟡 2026-09-23 13:10 [edits] src/a.ts',
+      '🟡 2026-09-23 13:11 [failed] pnpm build (exit 1): Error: boom',
+    ]),
+  ).toEqual([
+    '🟡 2026-09-23 12:30 [edits] src/a.ts ×3, src/b.ts (created), src/c.ts',
+    '✅ 2026-09-23 12:31 [checks] pnpm typecheck: no type errors',
+    '✅ 2026-09-23 12:32 [git] committed abc1234 "Add X" on main',
+    '🟡 2026-09-23 13:10 [edits] src/a.ts',
+    '🟡 2026-09-23 13:11 [failed] pnpm build (exit 1): Error: boom',
+  ])
 })

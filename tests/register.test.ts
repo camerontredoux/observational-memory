@@ -53,7 +53,7 @@ const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day,
 
 // The main conversation's history, grown as the engine would, each listed subagent's under `agents` (any other id
 // is denied), a store the test can read, and a context size.
-function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[] } = {}) {
+function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[]; env?: Record<string, string> } = {}) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
@@ -68,7 +68,7 @@ function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; t
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
   // The stats files, in memory under OM_STATS_DIR.
   const files: Record<string, string> = {}
-  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u' })
+  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u', ...options.env })
   const reads: string[] = []
   on('fs.read', ($, e) => {
     reads.push(e.path)
@@ -231,6 +231,30 @@ const agentCall = (agent: string, n: number, size: number): SessionMessage[] => 
 // An Observer that names the files its chunk read.
 const readsIn = (prompt: string) => `<observations>\n* 🟡 Read ${[...prompt.matchAll(/"file_path":"\/src\/([\w-]+)\.ts"/g)].map((m) => m[1]).join(', ')}\n</observations>`
 const readers = (text: string) => new Set([...text.matchAll(/\b(main|one|two)-\d+/g)].map((m) => m[1]))
+// A turn that does mechanical work in /work/project: an edit, a build, a passing test run and a commit, then a Read
+// whose result is `size` characters.
+function mechanical(prompt: string, size = 0): SessionMessage[] {
+  const use = (id: string, tool: string, input: Record<string, unknown>): SessionMessage => ({ role: 'assistant', text: '', toolUses: [{ tool_use_id: id, tool, input }] })
+  const result = (id: string, text: string): SessionMessage => ({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: id, text, isError: false }] })
+  return [
+    { role: 'user', text: prompt, toolUses: [] },
+    use(`${prompt}-e`, 'Edit', { file_path: '/work/project/src/a.ts', old_string: 'x', new_string: 'y' }),
+    result(`${prompt}-e`, 'The file /work/project/src/a.ts has been updated.'),
+    use(`${prompt}-m`, 'Bash', { command: 'make build' }),
+    result(`${prompt}-m`, 'built'),
+    use(`${prompt}-t`, 'Bash', { command: 'pnpm vitest run' }),
+    result(`${prompt}-t`, ' Test Files  1 passed (1)\n      Tests  3 passed (3)'),
+    use(`${prompt}-g`, 'Bash', { command: 'git commit -qm "Fix a"' }),
+    result(`${prompt}-g`, '[main abc1234] Fix a\n 1 file changed'),
+    ...turn(prompt, prompt, size).slice(1),
+  ]
+}
+const FACTS_A = [
+  '* 🟡 2026-09-22 14:30 [edits] src/a.ts',
+  '* 🟢 2026-09-22 14:30 [ran] make build',
+  '* ✅ 2026-09-22 14:30 [git] committed abc1234 "Fix a" on main',
+  '* ✅ 2026-09-22 14:30 [checks] pnpm vitest run: 3 passed of 3 (1 file)',
+]
 
 describe('register', () => {
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
@@ -489,6 +513,71 @@ describe('register', () => {
       '* 🔴 2026-09-22 14:30 User asked a\n* 🟡 2026-09-22 13:59 Too early\n* 🟢 2026-09-22 14:30 Not a date\n* ✅ 2026-09-22 14:30 Untimed; a detail',
     )
     expect(result.messages?.slice(1)).toEqual(history.slice(7))
+  })
+
+  test('fact lines: code records the edits, commands, checks and commits of a chunk beside the Observer, which is told not to restate them; they reach the memory and survive a resume', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, mechanical('a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+    expect(seen.systems[0]).toContain('Mechanical facts are recorded separately, by code')
+    expect(seen.systems[0]).not.toContain('Always record which files were read')
+    expect(seen.prompts[0]).toContain('[Bash({"command":"pnpm vitest run"})]') // the Observer still reads them
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    const memory = result.messages![0]!.text
+    expect(observationsIn(memory)).toBe(['* 🔴 2026-09-22 14:30 Saw a', ...FACTS_A].join('\n'))
+    expect(memory).toContain('Lines tagged [edits], [ran], [checks], [git] or [failed] were recorded mechanically')
+
+    // A new process: no ledger in the store, so it restarts from the memory message, fact lines and all.
+    delete stored['ledger:session-1']
+    history.push(...result.messages!)
+    await runTurn($, turn('c', 'c', 100), at(22, 15, 30))
+    await clock.settle()
+    expect((stored['ledger:session-1'] as Ledger).entries.map((e) => `* ${e.line}`).join('\n')).toBe(observationsIn(memory))
+  })
+
+  test('fact lines: OM_FACTS=0 turns them off and gives the Observer its old prompt', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on, { env: { OM_FACTS: '0' } })
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, mechanical('a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+    expect(seen.systems[0]).toContain('Always record which files were read')
+    expect(seen.systems[0]).not.toContain('Mechanical facts are recorded separately')
+    const memory = (await $.session.compact({ trigger: 'manual', messages: [...history] })).messages![0]!.text
+    expect(observationsIn(memory)).toBe('* 🔴 2026-09-22 14:30 Saw a')
+    expect(memory).not.toContain('recorded mechanically')
+  })
+
+  test('fact lines: the reflector never sees them; code condenses them and merges them back by time', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
+    const seen = pi(on, {
+      reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🔴 2026-09-22 15:00 Saw b\n</observations>`),
+      reflect: () => '<observations>\n* 🔴 2026-09-22 14:30 Explored the auth module\n</observations>',
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, mechanical('a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+
+    const reflections = seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
+    expect(reflections).toHaveLength(1)
+    expect(reflections[0]).not.toContain('[edits]')
+    expect(reflections[0]).not.toContain('[checks]')
+    expect((stored['ledger:session-1'] as Ledger).entries.map((e) => `* ${e.line}`)).toEqual([
+      '* 🔴 2026-09-22 14:30 Explored the auth module',
+      ...FACTS_A.filter((l) => !l.includes('[ran]')),
+    ])
   })
 
   test('keeps at most four Observer calls in flight and schedules the rest as they land', async ($, on) => {
@@ -1580,11 +1669,11 @@ describe('register', () => {
       await clock.settle()
     }
 
-    // As the session logged: rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail
+    // As the session logged (each chunk's one Observer line and its fact lines): rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail
     // until the turn that ended at 15:08:26.
     expect(seen.logs.filter((l) => l.includes('in the background'))).toEqual([
-      'observed rows 1-56 in the background, 1 observations; watermark 56, 0 chunk(s) waiting on a gap',
-      'observed rows 56-139 in the background, 1 observations; watermark 139, 0 chunk(s) waiting on a gap',
+      'observed rows 1-56 in the background, 4 observations; watermark 56, 0 chunk(s) waiting on a gap',
+      'observed rows 56-139 in the background, 5 observations; watermark 139, 0 chunk(s) waiting on a gap',
     ])
     expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(atCompaction).toBe(0)
