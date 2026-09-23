@@ -114,6 +114,15 @@ describe('commands', () => {
       ),
     ).toEqual(['🟢 [ran] pnpm dev (background); python3 -'])
   })
+
+  test('a function defined inline is not a command; a variable set from a command substitution is not expanded', () => {
+    expect(
+      facts(
+        bash('rep() { :; }; make build', ''),
+        bash('S=/work/app/state/x.status; N=$(wc -l <$S); timeout 60 bash -c "until [ \\$(wc -l <$S) -gt $N ]; do sleep 5; done"', '', 1),
+      ),
+    ).toEqual(['🟢 [ran] make build; bash -c "until [ $(wc -l <state/x.status) -gt $N ]; do sleep 5; done"'])
+  })
 })
 
 describe('checks', () => {

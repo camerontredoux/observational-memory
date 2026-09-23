@@ -156,7 +156,7 @@ const name = (words: readonly Word[]) => (head(words)[0]?.text ?? '').replace(/^
 function looks(s: Segment) {
   const w = head(s.words)
   const n = name(s.words)
-  if (!n || /\(\)$|^[{}]$/.test(n)) return true // an assignment alone, a function's definition
+  if (!n || /\(\)?$|^[{}]$/.test(n)) return true // an assignment alone, a function's definition (`f()`, its parens stripped to `f(`)
   if (n === 'git') return GIT_LOOKS.has(w[1]?.text ?? '') && !(w[1]?.text === 'branch' && w.length > 2 && !w[2]!.text.startsWith('-')) && w[1]?.text !== 'stash'
   if (GH_LOOKS.test(w.map((x) => x.text).join(' '))) return true
   if (n === 'sed') return !w.some((x) => /^-[a-zA-Z]*i/.test(x.text) && !x.quoted)
@@ -393,7 +393,12 @@ export function extractFacts(rows: readonly SessionMessage[], at: readonly (numb
       const segs = segments(input.command)
       const text = r.text
       const vars = new Map<string, string>()
-      for (const x of segs) for (const w of x.words) if (/^[A-Za-z_]\w*=/.test(w.text)) vars.set(w.text.split('=')[0]!, w.text.slice(w.text.indexOf('=') + 1))
+      // A variable set to a string, itself expanded; one set from a command's output stays as written.
+      for (const x of segs)
+        for (const w of x.words) {
+          const m = w.text.match(/^([A-Za-z_]\w*)=(.*)$/s)
+          if (m && !/\$\(|`/.test(m[2]!)) vars.set(m[1]!, expand(m[2]!, vars))
+        }
       const refused = r.isError && refusal(text)
       if (refused) {
         const s = segs.find((x) => !looks(x)) ?? segs[0]
