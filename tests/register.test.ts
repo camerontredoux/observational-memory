@@ -80,6 +80,11 @@ function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; t
     return (files[e.path] = e.text), { value: undefined }
   })
   on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, isLink: false })) }))
+  on('fs.stat', ($, e) => {
+    if (!(e.path in files)) throw new Error(`ENOENT: ${e.path}`)
+    return { value: { kind: 'file' as const, size: files[e.path]!.length, mtimeMs: 0, isLink: false } }
+  })
+  on('fs.exists', ($, e) => ({ value: e.path in files || Object.keys(files).some((p) => p.startsWith(`${e.path}/`)) }))
   on('session.cwd', () => ({ value: '/work/project' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   return { history, agents, stored, files, reads }
@@ -1333,7 +1338,7 @@ describe('register', () => {
       JSON.stringify({ type: 'continued-in', sessionId: OLD, continuedInSessionId: NEW }),
     ].join('\n')
     const big = [row('user', '2026-09-22T13:00:00.000Z', 'where is FIG-8?'), row('assistant', '2026-09-22T13:01:00.000Z', [{ type: 'text', text: 'searching' }])].join('\n')
-    // `$.fs.read` refuses the new file, as it does one over 4 MiB: it is read with cat.
+    // `$.fs.stat` cannot size the new file, as `$.fs.read` refuses one over 4 MiB: it is read with cat.
     const argvs: (readonly string[])[] = []
     on('process.spawn', async function* ($, e) {
       argvs.push(e.argv)

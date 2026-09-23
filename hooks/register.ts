@@ -856,18 +856,16 @@ function skillsInUse($: EngineInterface, skills: readonly Skill[], tail: readonl
 // What om_recall reads files with. `$.fs.read` refuses a file over 4 MiB, which a long transcript is: `cat` reads it.
 const recallIo = ($: EngineInterface): RecallIo => ({
   read: async (path) => {
-    try {
-      return String(await $.fs.read(path))
-    } catch {
-      const cat = $.process.spawn({ argv: ['cat', '--', path] })
-      let text = ''
-      let error = ''
-      for await (const c of cat) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
-      if ((await cat.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
-      return text
-    }
+    const size = await $.fs.stat(path).then((s) => s.size, () => undefined)
+    if (size !== undefined && size < 4 * 1024 * 1024) return String(await $.fs.read(path))
+    const cat = $.process.spawn({ argv: ['cat', '--', path] })
+    let text = ''
+    let error = ''
+    for await (const c of cat) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
+    if ((await cat.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
+    return text
   },
-  list: async (dir) => (await $.fs.list(dir)).map((f) => f.name),
+  list: async (dir) => ((await $.fs.exists(dir)) ? (await $.fs.list(dir)).map((f) => f.name) : []),
   // A file's `continued-in` row, written as JSON by Claude Code: quoted inside a message, its quotes are escaped.
   continuing: async (dir, names, id) => {
     if (!names.length) return undefined
