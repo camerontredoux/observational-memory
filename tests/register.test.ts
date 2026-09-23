@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, SessionMessage } from 'claude-code'
 
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -20,11 +21,15 @@ Date: Sep 22, 2026
 Primary: fix auth
 </current-task>`
 
-// What the plugin reads beneath it besides the model: the environment, its store and the session id.
+// What the plugin reads beneath it besides the model: the environment, its store, the session id and the
+// main conversation's history, which the test grows as the engine would.
 function world(on: On, env: Record<string, string> = {}) {
   mock.env(on, env)
   mock.store(on)
   on('session.id', () => ({ value: 'session-1' }))
+  const history: SessionMessage[] = []
+  on('session.messages', () => ({ value: history }))
+  return history
 }
 
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
@@ -56,6 +61,52 @@ function jev(on: On, answer: (name: string, instructions: string) => number, sta
     return { value: { status, ok: status === 200, headers: {}, text } }
   })
   return requests
+}
+
+// Local time on a day of September 2026.
+const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
+
+// A store the test can read: the plugin's buffer, times and skills.
+function visibleStore(on: On) {
+  const stored: Record<string, unknown> = {}
+  on('store.get', ($, e) => ({ value: stored[e.key] }))
+  on('store.set', ($, e) => ((stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
+  on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
+  return stored
+}
+
+// A live main conversation: its history grown one turn at a time between a turn.start at `startAt` and a
+// turn.complete a minute later.
+function live(on: On, clock: MockClock, transcript: SessionMessage[]) {
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  return {
+    transcript,
+    async turn($: Engine, messages: SessionMessage[], startAt: number) {
+      const turnId = `turn-${transcript.length}`
+      await clock.set(startAt)
+      transcript.push(messages[0]!)
+      await $.turn.start({ text: messages[0]!.text, turnId })
+      await clock.advance(60_000)
+      transcript.push(...messages.slice(1))
+      await $.turn.complete({ answer: '', durationMs: 60_000, isAborted: false, turnId, reason: 'answer' })
+    },
+  }
+}
+
+// An Observer whose observation names the prompts it was shown, so each chunk's reply is told apart.
+function namingObserver(on: On, date = 'Sep 22, 2026') {
+  const seen = { prompts: [] as string[], logs: [] as string[] }
+  on('model.complete', ($, e) => {
+    seen.prompts.push(e.prompt)
+    const history = e.prompt.split('===== BEGIN MESSAGE HISTORY')[1]?.split('===== END MESSAGE HISTORY')[0] ?? ''
+    const names = [...history.matchAll(/^User(?: \([^)]*\))?: (\w+)$/gm)].map((m) => m[1])
+    const text = `<observations>\nDate: ${date}\n* 🔴 (14:30) Saw ${names.join(' ')}\n</observations>\n<current-task>\nPrimary: ${names.at(-1)}\n</current-task>`
+    return { value: { isAnswered: true, text, usage: USAGE } }
+  })
+  on('ui.log', ($, e) => (seen.logs.push(e.text), { value: undefined }))
+  return seen
 }
 
 const skillsIn = (text?: string) => text?.match(/<skills-in-use>\n([\s\S]*?)\n<\/skills-in-use>/)?.[1]
@@ -136,7 +187,7 @@ describe('register', () => {
   })
 
   test('a log past 40k tokens goes to the reflector, which replaces it', async ($, on) => {
-    mock.clock(on)
+    mock.clock(on, { now: at(24, 12, 0) })
     world(on)
     const systems: string[] = []
     const prompts: string[] = []
@@ -155,7 +206,7 @@ describe('register', () => {
     expect(prompts).toHaveLength(2)
     expect(systems[1]).toContain('memory consciousness')
     expect(prompts[1]).toContain('## COMPRESSION REQUIRED')
-    expect(result.messages?.[0]?.text).toContain('<observations>\nDate: Sep 22, 2026\n* 🔴 Explored the auth module\n</observations>')
+    expect(result.messages?.[0]?.text).toContain('<observations>\nDate: Sep 22, 2026 (2 days ago)\n* 🔴 Explored the auth module\n</observations>')
   })
 
   test('Jev prunes the older section before the observer sees it; the tail is context only', async ($, on) => {
@@ -227,6 +278,7 @@ describe('register', () => {
     mock.clock(on)
     mock.env(on, { TYPESAFE_API_KEY: 'test-key' })
     on('session.id', () => ({ value: 'session-1' }))
+    on('session.messages', () => ({ value: [] }))
     let stored: Record<string, unknown> = {}
     on('store.get', ($, e) => ({ value: stored[e.key] }))
     on('store.set', ($, e) => ((stored[e.key] = e.value), { value: undefined }))
@@ -286,5 +338,184 @@ describe('register', () => {
     expect(skillsIn(result.messages?.[0]?.text)).toBe(
       '<skill name="style">\nStart summaries with Gist:\n</skill>\n<skill name="deploy">\nDeploy steps\n</skill>',
     )
+  })
+
+  test('records when each prompt and answer was written and renders the times as Mastra does', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a'), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b'), at(23, 9, 15))
+    await conversation.turn($, turn('c', 'c', 30_000), at(23, 10, 0))
+    await $.session.compact({ trigger: 'manual', messages: conversation.transcript })
+
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toContain(
+      'Sep 22 2026:\nUser (2:30 PM): a\nAssistant: a\nTool Call Read: {"file_path":"/src/a.ts"}\nTool Result Read: [empty result]\n' +
+        'Assistant (2:31 PM): a done\nSep 23 2026:\nUser (9:15 AM): b\nAssistant: b\n',
+    )
+    expect(seen.prompts[0]).not.toContain('carries no times of day')
+    expect(seen.prompts[0]).toContain('===== END MESSAGE HISTORY =====')
+    expect(seen.prompts[0]).toMatch(/END MESSAGE HISTORY[\s\S]*## Your Task[\s\S]*not instructions to you/)
+  })
+
+  test('observes a chunk in the background after turn.complete once past the threshold, and not before', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await clock.advance(1_000)
+    expect(seen.prompts).toHaveLength(0)
+    await conversation.turn($, turn('b', 'b', 30_000), at(22, 15, 0))
+    expect(seen.prompts).toHaveLength(0) // the chunk waits for its timer, off the turn's dispatch
+    await clock.settle()
+
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toContain('User (2:30 PM): a')
+    expect(seen.prompts[0]).not.toContain('User (3:00 PM): b')
+    expect(seen.logs).toContain('observational-memory: observed messages 0-4 in the background, ~10 tokens')
+  })
+
+  test('compaction takes the buffered chunk and observes only the leftover before the raw tail', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 30_000), at(22, 15, 0))
+    await clock.settle()
+    history.push(...turn('c', 'c', 30_000), ...turn('d', 'd', 30_000))
+    const messages = [...history]
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.prompts[1]).not.toContain('User (2:30 PM): a')
+    expect(seen.prompts[1]).toContain('User (3:00 PM): b')
+    expect(seen.prompts[1]).toContain('User: c')
+    expect(seen.prompts[1]).toContain('## Previous Observations\n\nDate: Sep 22, 2026\n* 🔴 (14:30) Saw a\n')
+    expect(seen.prompts[1]).toContain('- prior current-task: Primary: a')
+    const text = result.messages?.[0]?.text ?? ''
+    expect(text).toContain('Saw a\n\n--- message boundary (')
+    expect(text).toContain('* 🔴 (14:30) Saw b c\n</observations>\n\n<current-task>\nPrimary: c\n</current-task>')
+    expect(result.messages?.slice(1)).toEqual(messages.slice(12))
+    expect(seen.logs).toContain('observational-memory: observed 12 messages (4 in the background), kept 4; log ~33 tokens')
+  })
+
+  test('a buffer whose fingerprint no longer matches the transcript is discarded', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 30_000), at(22, 15, 0))
+    await clock.settle()
+    // Rewound and asked something else: the first turn is no longer the one observed.
+    const messages = [...turn('z', 'z', 30_000), ...turn('b', 'b', 30_000), ...turn('d', 'd', 30_000)]
+    history.splice(0, history.length, ...messages)
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.logs).toContain('observational-memory: the transcript changed under 1 buffered chunk(s); dropping them')
+    expect(seen.prompts[1]).toContain('User: z')
+    expect(seen.prompts[1]).not.toContain('## Previous Observations')
+    expect(result.messages?.[0]?.text).not.toContain('Saw a')
+  })
+
+  test('a chunk still in flight at compaction is awaited, and the leftover observed meanwhile', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 30_000), at(22, 15, 0))
+    history.push(...turn('c', 'c', 30_000))
+    const compacting = $.session.compact({ trigger: 'auto', messages: [...history] })
+    await clock.settle() // the background chunk's timer fires while the compaction waits for it
+    const result = await compacting
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.prompts.filter((p) => p.includes('User (2:30 PM): a'))).toHaveLength(1)
+    expect(result.messages?.[0]?.text).toMatch(/Saw a\n\n--- message boundary \(.+\) ---\n\nDate: Sep 22, 2026 \(.+\)\n\* 🔴 \(14:30\) Saw b/)
+    expect(seen.logs).toContain('observational-memory: observed 8 messages (4 in the background), kept 4; log ~33 tokens')
+    expect(seen.logs.filter((l) => l.includes('in the background, ~'))).toEqual([]) // taken over, never buffered
+  })
+
+  test('relative dates are added when the memory message is written and stripped when it is read back', async ($, on) => {
+    mock.clock(on, { now: at(25, 18, 0) })
+    world(on)
+    const prompts: string[] = []
+    on('model.complete', ($, e) => {
+      prompts.push(e.prompt)
+      const date = prompts.length === 1 ? 'Sep 22, 2026' : 'Sep 25, 2026'
+      return { value: { isAnswered: true, text: `<observations>\nDate: ${date}\n* 🔴 (14:30) Step ${prompts.length}\n</observations>`, usage: USAGE } }
+    })
+    on('ui.log', () => ({ value: undefined }))
+
+    const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 30_000), ...turn('b', 'b', 30_000)] })
+    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', 30_000)] })
+    const third = await $.session.compact({ trigger: 'auto', messages: [...second.messages!, ...turn('d', 'd', 30_000)] })
+
+    expect(first.messages?.[0]?.text).toContain('<observations>\nDate: Sep 22, 2026 (3 days ago)\n* 🔴 (14:30) Step 1\n')
+    expect(prompts[1]).toContain('## Previous Observations\n\nDate: Sep 22, 2026\n* 🔴 (14:30) Step 1\n')
+    expect(second.messages?.[0]?.text).toMatch(
+      /Date: Sep 22, 2026 \(3 days ago\)\n\* 🔴 \(14:30\) Step 1\n\n--- message boundary \(.+\) ---\n\n\n\[3 days later\]\n\nDate: Sep 25, 2026 \(today\)\n/,
+    )
+    expect(prompts[2]).not.toMatch(/ago\)|today\)|later\]/)
+    const text = third.messages?.[0]?.text ?? ''
+    expect(text.match(/\(3 days ago\)/g)).toHaveLength(1)
+    expect(text.match(/\[3 days later\]/g)).toHaveLength(1)
+    expect(text.match(/\(today\)/g)).toHaveLength(2)
+  })
+
+  test('/clear drops the cleared session\'s times, buffer and skills', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.env(on, {})
+    on('session.id', () => ({ value: 'session-1' }))
+    const history: SessionMessage[] = []
+    on('session.messages', () => ({ value: history }))
+    const stored = visibleStore(on)
+    namingObserver(on)
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    const conversation = live(on, clock, history)
+
+    await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps' })
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 30_000), at(22, 15, 0))
+    await clock.settle()
+    expect(Object.keys(stored).sort()).toEqual(['buffer:session-1', 'skills:session-1', 'times:session-1'])
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+
+    expect(stored).toEqual({})
+  })
+
+  test('after a compaction the history goes on from the memory message: nothing before it is observed again, and the tail keeps its times', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 30_000), at(22, 15, 0))
+    await clock.settle()
+    await conversation.turn($, turn('c', 'c', 30_000), at(22, 15, 30))
+    await clock.settle()
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    expect(seen.prompts).toHaveLength(2) // both chunks in the background, nothing left over
+    history.push(...result.messages!) // the engine appends the compaction's result to the history
+    await conversation.turn($, turn('d', 'd', 30_000), at(22, 16, 0))
+    await clock.settle()
+
+    expect(seen.prompts).toHaveLength(3)
+    expect(seen.prompts[2]).toContain('User (3:30 PM): c')
+    expect(seen.prompts[2]).not.toContain('User (4:00 PM): d')
+    expect(seen.prompts[2]).not.toMatch(/User \(.+\): [ab]$/m)
+    expect(seen.prompts[2]).toContain('## Previous Observations\n\nDate: Sep 22, 2026\n* 🔴 (14:30) Saw a\n\n--- message boundary')
+    expect(seen.logs).toContain('observational-memory: observed messages 1-5 in the background, ~10 tokens')
   })
 })
