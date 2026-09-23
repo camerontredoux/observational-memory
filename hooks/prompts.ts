@@ -45,11 +45,14 @@ After </observations>, add these when the chunk says enough:
 Primary: what the assistant is working on as of the end of the chunk
 Secondary: other pending tasks (mark "waiting for user" where so)
 </current-task>
+Primary is the goal the assistant is pursuing (what it is building, fixing or answering), not the step it is on, such as reading or searching. Mark "waiting for user" only when the chunk ends with the assistant asking the user something. Leave <current-task> out when the chunk does not show the goal.
 
 What to observe:
 - Group repeated similar tool calls into a single observation rather than one per call.
 - Skip routine, low-information events.
 - Always record which files were read, created or edited (full paths) and which commands ran, with what outcome: the assistant may later be asked what it did.
+- Record what happened, never what did not happen in the chunk: other chunks cover the rest of the session, so "no files were edited", "no tests were run" or "nothing is recorded yet" is soon false. A negative result is an event and stays: a command or test failed, a search for X found nothing.
+- Never write "this chunk" or "the chunk" in an observation or the current task.
 
 Observation content rules:
 
