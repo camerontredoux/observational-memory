@@ -53,7 +53,7 @@ const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day,
 
 // The main conversation's history, grown as the engine would, each listed subagent's under `agents` (any other id
 // is denied), a store the test can read, and a context size.
-function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[] } = {}) {
+function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[]; env?: Record<string, string> } = {}) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
@@ -68,7 +68,7 @@ function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; t
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
   // The stats files, in memory under OM_STATS_DIR.
   const files: Record<string, string> = {}
-  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u' })
+  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u', ...options.env })
   const reads: string[] = []
   on('fs.read', ($, e) => {
     reads.push(e.path)
@@ -180,6 +180,12 @@ const stampOf = (iso: string) => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 const skillsIn = (text?: string) => text?.match(/<skills-in-use>\n([\s\S]*?)\n<\/skills-in-use>/)?.[1]
+const briefIn = (text?: string) => text?.match(/<session-brief>\n([\s\S]*?)\n<\/session-brief>/)?.[1]
+// An edit of `file` in the session's directory, answered.
+const edit = (file: string): SessionMessage[] => [
+  { role: 'assistant', text: '', toolUses: [{ tool_use_id: `e-${file}`, tool: 'Edit', input: { file_path: `/work/project/${file}`, old_string: 'x', new_string: 'y' } }] },
+  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `e-${file}`, text: 'updated', isError: false }] },
+]
 const FINISHED = '(finished; invoke it again to reread its text, or om_recall to find where it loaded)'
 
 // Turns a to c of a live session, then turn d still running: `old` is loaded in turn a, `mid` in b, `now` in d.
@@ -257,7 +263,7 @@ describe('register', () => {
     expect(text).toContain('<current-task>\nPrimary: b\n</current-task>')
     expect(text).toContain('AUTHORITATIVE HISTORY')
     expect(text).not.toContain('only as background')
-    expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
+    expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\), brief ~\d+ tokens$/)
     expect(seen.screen).toEqual(['Compacted in 0 ms · observed 7 messages on the spot · memory 2 notes'])
   })
 
@@ -1814,5 +1820,78 @@ describe('register', () => {
     // A hook that throws is skipped, so the engine reports the write as unanswered.
     expect(seen.logs.filter((l) => l.startsWith('stats not saved'))).toEqual(['stats not saved (no implementation for fs.write); carrying on without them'])
     expect(seen.screen.filter((l) => l.startsWith('Stats'))).toEqual(['Stats failed (no implementation for fs.write) and will keep retrying quietly'])
+  })
+
+  test('the session brief of the compacted span sits after the skills, and the next compaction merges it with its own span', async ($, on) => {
+    mock.clock(on, { now: at(22, 9, 0) })
+    const { stored } = world(on)
+    const seen = pi(on)
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps' })
+
+    const failing: SessionMessage[] = [
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'f1', tool: 'Bash', input: { command: 'bun test' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'f1', text: 'Exit code 1\n1 fail', isError: true }] },
+    ]
+    const firstSpan = [...turn('a', 'a', CHUNK), ...edit('src/a.ts'), ...failing, ...turn('b', 'b', CHUNK)]
+    const first = await $.session.compact({ trigger: 'manual', messages: [...firstSpan, ...turn('c', 'c', 8_000)] })
+    const firstText = first.messages?.[0]?.text ?? ''
+    expect(briefIn(firstText)).toContain('[Files And Changes]\n- Modified: src/a.ts')
+    expect(briefIn(firstText)).toContain('- Bash "bun test" ✗ exit 1: 1 fail')
+    expect(firstText.indexOf('</skills-in-use>')).toBeLessThan(firstText.indexOf('<session-brief>'))
+    expect(firstText.indexOf('</session-brief>')).toBeLessThan(firstText.indexOf('<all-user-messages>'))
+    expect(seen.prompts.join('\n')).not.toContain('<session-brief>') // Luna never reads it
+
+    for (const key of Object.keys(stored)) delete stored[key]
+    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...edit('src/b.ts'), ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
+    const text = second.messages?.[0]?.text ?? ''
+    const brief = briefIn(text) ?? ''
+    expect(brief).toContain('- Modified: src/a.ts, src/b.ts')
+    expect(brief).not.toContain('[Outstanding Context]') // always the newest span's: its failure was in the first
+    expect(brief).toContain('- Bash "bun test" ✗ exit 1: 1 fail') // the earlier transcript's tail, merged
+    // The rest of the memory message still reads back through the brief.
+    expect(skillsIn(text)).toBe('<skill name="deploy" invoked="2026-09-22 09:00">\nDeploy steps\n</skill>')
+    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b\n* 🔴 Saw c\n* 🔴 Saw d')
+    expect(userMessagesIn(text)).toEqual(['a', 'b', 'c', 'd'])
+    expect(text.match(/<session-brief>/g)).toHaveLength(1)
+  })
+
+  test('OM_VCC_ONLY calls no model, in the background or at compaction: the memory is the skills, the brief and the user messages', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored, files } = world(on, { env: { OM_VCC_ONLY: '1' } })
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, [...turn('a', 'a', CHUNK), ...edit('src/a.ts')], at(22, 14, 0))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 14, 10))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 14, 20))
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(0)
+    expect(stored['ledger:session-1']).toBeUndefined()
+
+    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(0)
+    const text = first.messages?.[0]?.text ?? ''
+    expect(text).not.toContain('<observations>')
+    expect(text).not.toContain('<current-task>')
+    expect(text).toContain("The following session brief and the user's messages are your memory")
+    expect(briefIn(text)).toContain('- Modified: src/a.ts')
+    expect(userMessagesIn(text)).toEqual(['a', 'b'])
+    // The raw tail an on-the-spot compaction keeps: KEEP_RAW_TOKENS back, from the first row a cut can fall on.
+    expect(first.messages?.slice(1).map((m) => m.text)).toEqual(['b done', 'c', 'c', '', 'c done'])
+    expect(seen.screen.at(-1)).toBe('Compacted in 0 ms · memory brief only')
+
+    history.push(...first.messages!, ...edit('src/b.ts'), ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000))
+    const second = await $.session.compact({ trigger: 'auto', messages: history.slice(-(first.messages!.length + 10)) })
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(0)
+    const later = second.messages?.[0]?.text ?? ''
+    expect(briefIn(later)).toContain('- Modified: src/a.ts, src/b.ts')
+    expect(userMessagesIn(later)).toEqual(['a', 'b', 'c', 'd'])
+    await clock.advance(5_000) // the stats write timer
+    const stats = JSON.parse(files['/stats/session-1.json'] ?? '{}')
+    expect(stats.metrics['compaction.auto.syncCalls']?.sum).toBe(0)
+    expect(stats.metrics['compaction.auto.briefTokens']?.count).toBe(2)
   })
 })

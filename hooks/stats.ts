@@ -40,6 +40,7 @@ export type Compaction = {
   rowsObservedBefore?: number
   memoryTokens?: number
   observations?: number
+  briefTokens?: number
 }
 export type Reflection = { ms: number; tokensBefore: number; tokensAfter: number; level: number }
 
@@ -104,6 +105,7 @@ export function addCompaction(s: SessionStats, c: Compaction, at: number) {
   add(s, `${key}.rowsObservedBefore`, c.rowsObservedBefore, at)
   add(s, `${key}.memoryTokens`, c.memoryTokens, at)
   add(s, `${key}.observations`, c.observations, at)
+  add(s, `${key}.briefTokens`, c.briefTokens, at)
 }
 
 export function addReflection(s: SessionStats, r: Reflection, at: number) {

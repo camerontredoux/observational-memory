@@ -1,5 +1,8 @@
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 import {
+  BRIEF_ONLY_CONTINUATION,
+  BRIEF_ONLY_HEADER,
+  BRIEF_ONLY_INSTRUCTIONS,
   COMPACT_RECENT,
   COMPACT_RESUME_DIRECTLY,
   COMPACT_TRANSCRIPT,
@@ -15,6 +18,8 @@ import {
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
+import { compileBrief, mergeBriefs, parseBrief, renderBrief } from './vcc'
+import type { Brief } from './vcc'
 
 declare module 'claude-code' {
   interface McpToolInputs {
@@ -87,6 +92,8 @@ type Memory = {
   skills: Skill[]
   userMessages: UserMessage[]
   nextStep?: string // the user's latest request, verbatim
+  brief?: Brief
+  briefOnly?: boolean // OM_VCC_ONLY: no observations, corrections or current task
   transcript?: string
   recentKept: boolean
   resumeDirectly: boolean
@@ -99,6 +106,9 @@ type Bounds = { lo: number; hi: number; latest: number } | undefined
 let running: Job[] = [] // background Observer calls in flight
 let lock: Promise<unknown> = Promise.resolve()
 const reflecting = new Set<string>()
+// OM_VCC_ONLY=1: no Observer or Reflector call, in the background or at compaction; the memory is the session
+// brief, the skills and the user's messages. A baseline to compare the observations against.
+const vccOnly = async ($: EngineInterface) => (await $.env.get('OM_VCC_ONLY')) === '1'
 const sinceScheduled = new Map<string, { rows: number; tokens: number }>() // history seen by the last step, and its growth since a pass
 const waiting = new Map<string, Loop>() // loops a pass left short of a slot, first in line when one frees
 
@@ -174,7 +184,8 @@ function callOrder(rows: readonly SessionMessage[]) {
 const inCallOrder = (rows: readonly SessionMessage[]) => callOrder(rows).map((i) => rows[i]!)
 // A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
 const isMemory = (m: SessionMessage | undefined) =>
-  m?.role === 'user' && (m.text.startsWith(MEMORY_HEADER) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`))
+  m?.role === 'user' &&
+  (m.text.startsWith(MEMORY_HEADER) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${BRIEF_ONLY_HEADER}`))
 const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
 const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
@@ -477,11 +488,18 @@ function unstamp(text: string) {
 }
 
 // Built as the built-in summary is framed: its wrapper first, the memory, then its notes after the summary.
+// The session brief sits after the skills, before the user's messages: its lines start with `>`, `[`, `-` or `@`,
+// so nothing in it can close a section around it.
+const SESSION_BRIEF = '\n\n<session-brief>\n'
 function memoryMessage(memory: Memory): SessionMessage {
+  const head = memory.briefOnly
+    ? `${COMPACT_WRAPPER}\n\n${BRIEF_ONLY_HEADER}\n\n${BRIEF_ONLY_INSTRUCTIONS}`
+    : `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
+      section('current-task', memory.currentTask)
   const text =
-    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
-    section('current-task', memory.currentTask) +
+    head +
     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
+    section('session-brief', memory.brief && renderBrief(memory.brief)) +
     renderUserMessages(memory.userMessages) +
     (memory.nextStep
       ? `${NEXT_STEP}Continue with the user's most recent request, quoted verbatim:\n"${truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)}"\n</optional-next-step>`
@@ -490,7 +508,7 @@ function memoryMessage(memory: Memory): SessionMessage {
     (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
     (memory.recentKept ? `\n${COMPACT_RECENT}` : '') +
     (memory.resumeDirectly ? `\n${COMPACT_RESUME_DIRECTLY}` : '') +
-    `\n\n<system-reminder>${MEMORY_CONTINUATION}</system-reminder>`
+    `\n\n<system-reminder>${memory.briefOnly ? BRIEF_ONLY_CONTINUATION : MEMORY_CONTINUATION}</system-reminder>`
   return { role: 'user', text, toolUses: [] }
 }
 
@@ -498,7 +516,11 @@ function memoryMessage(memory: Memory): SessionMessage {
 // The user's text starts no earlier than its section, so everything else is read before it.
 function parseMemory(first: SessionMessage) {
   const userAt = [USER_MESSAGES, NEXT_STEP].map((m) => first.text.indexOf(m)).filter((i) => i >= 0)
-  const own = userAt.length ? first.text.slice(0, Math.min(...userAt)) : first.text
+  const whole = userAt.length ? first.text.slice(0, Math.min(...userAt)) : first.text
+  // The brief comes last before the user's messages; a skill's text is read only up to it.
+  const briefAt = whole.lastIndexOf(SESSION_BRIEF)
+  const briefEnd = whole.lastIndexOf('\n</session-brief>')
+  const own = briefAt < 0 ? whole : whole.slice(0, briefAt)
   const skillsAt = own.indexOf('\n\n<skills-in-use>\n')
   const head = skillsAt < 0 ? own : own.slice(0, skillsAt)
   const start = head.indexOf('<observations>\n')
@@ -513,6 +535,7 @@ function parseMemory(first: SessionMessage) {
     currentTask: tag(head.slice(end), 'current-task'),
     skills,
     userMessages: parseUserMessages(first.text),
+    brief: briefAt < 0 || briefEnd < briefAt ? undefined : parseBrief(whole.slice(briefAt + SESSION_BRIEF.length, briefEnd)),
   }
 }
 
@@ -674,6 +697,7 @@ async function onStep($: EngineInterface, agentId?: string) {
 // of a slot waits for the next one to free.
 function schedule($: EngineInterface, loop: Loop) {
   return locked(async () => {
+    if (await vccOnly($)) return
     const v = await liveView($, loop)
     const ledger = await loadLedger($, loop.key, v)
     await $.store.set(ledgerKey(loop.key), ledger)
@@ -756,7 +780,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
 // never sent: they pass through as quoted.
 async function maybeReflect($: EngineInterface, loop: Loop) {
   const { sessionId, key } = loop
-  if (reflecting.has(key)) return
+  if (reflecting.has(key) || (await vccOnly($))) return
   const stored = (await $.store.get(ledgerKey(key))) as Ledger | undefined
   const snapshot = stored?.entries ?? []
   const text = renderLines(snapshot)
@@ -960,7 +984,14 @@ export const register: Register = (on) => {
     const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
-    const [sessionId, started, usage] = await Promise.all([$.session.id(), $.clock.now(), $.session.usage().catch(() => undefined)])
+    const [sessionId, started, usage, briefOnly, cwd, home] = await Promise.all([
+      $.session.id(),
+      $.clock.now(),
+      $.session.usage().catch(() => undefined),
+      vccOnly($),
+      $.session.cwd(),
+      $.env.get('HOME'),
+    ])
     const loop = loopOf(sessionId, e.agentId)
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
     // the session cannot read, or a context that does not match) is compacted with no stored state.
@@ -971,7 +1002,7 @@ export const register: Register = (on) => {
     if (history && !persistent) notPersistent($, sessionId, messages, rows, offset)
     const v = view(messages, persistent ? await loadMarks($, loop.key) : [], persistent ? offset : undefined)
     const base = v.base
-    const initial = persistent ? await locked(() => loadLedger($, loop.key, v)) : fresh(v)
+    const initial = persistent && !briefOnly ? await locked(() => loadLedger($, loop.key, v)) : fresh(v)
     const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
 
     // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
@@ -982,7 +1013,7 @@ export const register: Register = (on) => {
     const keptInFull: string[] = [] // shown once the compaction stands: a fallback says so instead
     let sync = { calls: 0, ms: 0 }
     const start = tailStart(v, base)
-    if (!fits(initial.watermark.to) && start > initial.watermark.to) {
+    if (!briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to) {
       const gaps: [number, number][] = []
       let from = initial.watermark.to
       for (const c of [...initial.chunks, { from: start, to: start }].sort((a, b) => a.from - b.from)) {
@@ -1018,8 +1049,9 @@ export const register: Register = (on) => {
       }
       return ledger
     }
-    const ledger = persistent ? await locked(async () => settle(await loadLedger($, loop.key, v))) : await settle(initial)
-    const cut = ledger.watermark.to
+    // OM_VCC_ONLY observes nothing: the cut keeps the raw tail a compaction that observes on the spot keeps.
+    const ledger = briefOnly ? initial : persistent ? await locked(async () => settle(await loadLedger($, loop.key, v))) : await settle(initial)
+    const cut = briefOnly ? tailStart(v, base) : ledger.watermark.to
     if (cut <= base && failed) throw new Error('the Observer failed and nothing is observed yet')
     if (cut <= base) throw new Error('nothing observed and nothing to observe before the raw tail')
     for (const line of keptInFull) show($, line, e.agentId)
@@ -1029,6 +1061,8 @@ export const register: Register = (on) => {
     const kept = new Set(order.slice(cut))
     const observedNow = chunks.reduce((n, c) => n + c.to - c.from, 0)
     const priorMemory = base ? parseMemory(messages[0]!) : undefined
+    // The span leaving context, compiled by code and merged into the brief the memory message carried.
+    const brief = mergeBriefs(priorMemory?.brief, compileBrief(messages.slice(base, cut), v.at.slice(base, cut), cwd, home ?? undefined))
     const prior = priorMemory?.skills ?? []
     // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
@@ -1054,6 +1088,8 @@ export const register: Register = (on) => {
       // agent back to the top of its brief.
       // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
       nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
+      brief,
+      briefOnly,
       transcript,
       recentKept: tail.length > 0,
       resumeDirectly: e.trigger === 'auto',
@@ -1061,14 +1097,14 @@ export const register: Register = (on) => {
     const message = memoryMessage(memory)
     log(
       $,
-      (observedNow ? `observed ${observedNow} rows now, ` : 'cut at the background watermark with no Observer call, ') +
+      (briefOnly ? 'brief only, ' : observedNow ? `observed ${observedNow} rows now, ` : 'cut at the background watermark with no Observer call, ') +
         `kept ${tail.length} raw messages (~${tokensBetween(v, cut, messages.length)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
-        `${ledger.entries.length} observations, ${memory.skills.length} skill(s)`,
+        `${ledger.entries.length} observations, ${memory.skills.length} skill(s), brief ~${estimateTokens(renderBrief(brief))} tokens`,
     )
     show(
       $,
       `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
-        `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}`,
+        `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${briefOnly ? 'brief only' : plural(ledger.entries.length, 'note')}`,
       e.agentId,
     )
     const compaction = {
@@ -1082,9 +1118,10 @@ export const register: Register = (on) => {
       rowsObservedBefore: cut - base - observedNow,
       memoryTokens: estimateTokens(message.text),
       observations: ledger.entries.length,
+      briefTokens: estimateTokens(renderBrief(brief)),
     }
     record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
-    if (persistent && installs) void maybeReflect($, loop).catch((error) => log($, errorText(error)))
+    if (persistent && installs && !briefOnly) void maybeReflect($, loop).catch((error) => log($, errorText(error)))
     // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
     // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
     // In the context's own order.
