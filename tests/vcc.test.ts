@@ -58,7 +58,7 @@ describe('vcc', () => {
   })
 
   test('inspects: commands made only of programs that look, writing nothing', () => {
-    for (const c of ['rg -n foo src | head', 'sed -n 1,20p a.ts; wc -l a.ts', 'git diff --stat HEAD~1', 'rtk proxy rg x', 'for f in a b; do cat $f; done', 'gh pr view 12'])
+    for (const c of ['rg -n foo src | head', 'sed -n 1,20p a.ts; wc -l a.ts', 'git diff --stat HEAD~1', 'rtk proxy rg x', 'for f in a b; do cat $f; done', 'gh pr view 12', 'rg -n "name: \\"(unit|e2e)\\"" -A12 v.ts | rg -n "include|name"'])
       expect([c, inspects(c, CWD)]).toEqual([c, true])
     for (const c of ["sed -i 's/a/b/' a.ts", 'git commit -m x', 'echo x > a.txt', "python3 - <<'PY'\nprint(1)\nPY", 'bun test', 'curl -s localhost:5173', 'gh pr merge 12'])
       expect([c, inspects(c, CWD)]).toEqual([c, false])

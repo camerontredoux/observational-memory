@@ -116,10 +116,14 @@ function words(line: string) {
   let cur: string | undefined
   for (let i = 0; i < line.length; i++) {
     const c = line[i]!
-    if (c === "'" || c === '"') {
+    if (c === "'") {
       const end = line.indexOf(c, i + 1)
       cur = (cur ?? '') + line.slice(i + 1, end < 0 ? line.length : end)
       i = end < 0 ? line.length : end
+    } else if (c === '"') {
+      // Inside double quotes a backslash escapes `"`, `\\`, `$` and `` ` ``.
+      cur ??= ''
+      for (i++; i < line.length && line[i] !== '"'; i++) cur += line[i] === '\\' && /["\\$`]/.test(line[i + 1] ?? '') ? line[++i] : line[i]
     } else if (c === '\\' && i + 1 < line.length) cur = (cur ?? '') + line[++i]
     else if (c === '\n') {
       if (cur !== undefined) out.push(cur)
