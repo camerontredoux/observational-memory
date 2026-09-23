@@ -135,14 +135,17 @@ function gates() {
 }
 
 const observationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
-// The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters.
+// The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters, or an
+// omission line, read as `(n omitted)`.
 function userMessagesIn(text?: string) {
   const start = text?.indexOf('\n\n<all-user-messages>\n') ?? -1
   if (!text || start < 0) return undefined
   const out: string[] = []
-  const entry = /\* User(?: @ [\d-]+ [\d:]+)? \((\d+) chars\):\n/y
+  const entry = /\* User(?: @ [\d-]+ [\d:]+)? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted; om_recall can search them\)\n/y
   entry.lastIndex = start + '\n\n<all-user-messages>\n'.length
-  for (let m; (m = entry.exec(text)); entry.lastIndex += Number(m[1]) + 1) out.push(text.slice(entry.lastIndex, entry.lastIndex + Number(m[1])))
+  for (let m; (m = entry.exec(text)); )
+    if (m[2]) out.push(`(${m[2]} omitted)`)
+    else out.push(text.slice(entry.lastIndex, entry.lastIndex + Number(m[1]))), (entry.lastIndex += Number(m[1]) + 1)
   return out
 }
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -618,22 +621,83 @@ describe('register', () => {
     expect(again).toContain('\nContinue the conversation from where it left off without asking the user any further questions.')
   })
 
-  test('the user messages section keeps the newest prompts within its cap', async ($, on) => {
+  test('the user messages section keeps the first prompt, the brief, and the newest prompts within its cap', async ($, on) => {
     mock.clock(on)
     world(on)
     pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const long = (n: number) => `${n} ${'w'.repeat(4_000)}`
-    const messages = [...Array.from({ length: 30 }, (_, i) => turn(long(i), 'r', 2_000)).flat(), ...turn('last', 'r', 8_000)]
+    const brief = `brief ${'b'.repeat(14_600)}`
+    const messages = [...turn(brief, 'r', 2_000), ...Array.from({ length: 30 }, (_, i) => turn(long(i), 'r', 2_000)).flat(), ...turn('last', 'r', 8_000)]
 
     const result = await $.session.compact({ trigger: 'manual', messages })
 
     const kept = userMessagesIn(result.messages?.[0]?.text) ?? []
-    expect(kept.length).toBeGreaterThan(3)
-    expect(kept.length).toBeLessThan(30)
-    const numbers = kept.map((k) => Number(k.split(' ')[0]))
+    expect(kept[0]).toBe(brief)
+    const omitted = Number(kept[1]!.match(/^\((\d+) omitted\)$/)![1])
+    const numbers = kept.slice(2).map((k) => Number(k.split(' ')[0]))
+    expect(numbers.length).toBeGreaterThan(3)
     expect(numbers).toEqual(numbers.map((_, i) => numbers[0]! + i)) // a contiguous run
     expect(numbers.at(-1)).toBeGreaterThanOrEqual(27) // up to the newest prompt that left context
+    expect(omitted).toBe(numbers[0]) // every prompt between the brief and the run
     expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4)
+
+    // Chained: the brief stays first and the omitted count grows rather than resets.
+    const more = Array.from({ length: 5 }, (_, i) => turn(long(100 + i), 'r', 2_000)).flat()
+    const second = await $.session.compact({ trigger: 'manual', messages: [...result.messages!, ...more, ...turn('end', 'r', 8_000)] })
+    const again = userMessagesIn(second.messages?.[0]?.text) ?? []
+    expect(again[0]).toBe(brief)
+    const tail = again.slice(2).map((k) => Number(k.split(' ')[0]))
+    const order = [...Array.from({ length: 30 }, (_, i) => i), NaN, 100, 101, 102, 103, 104] // NaN: 'last'
+    const from = order.findIndex((n) => Object.is(n, tail[0]))
+    expect(tail).toEqual(order.slice(from, from + tail.length))
+    expect(tail.at(-1)).toBeGreaterThanOrEqual(103)
+    expect(Number(again[1]!.match(/^\((\d+) omitted\)$/)![1])).toBe(from) // accumulated, not reset
+    expect(again.join('').length).toBeLessThanOrEqual(10_000 * 4)
+  })
+
+  test('an oversized brief is cut to the cap and the newest prompt is still kept, cut to what remains', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const brief = `brief ${'b'.repeat(50_000)}`
+    const newest = `newest ${'n'.repeat(50_000)}`
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn('mid', 'r', 2_000), ...turn(newest, 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
+
+    const kept = userMessagesIn(result.messages?.[0]?.text) ?? []
+    expect(kept.length).toBe(3)
+    expect(kept[0]!.startsWith('brief ')).toBe(true)
+    expect(kept[0]!.length).toBeLessThan(brief.length)
+    expect(kept[1]).toBe('(1 omitted)')
+    expect(kept[2]).toStartWith('\n... [truncated') // nothing of the cap is left, but the newest is still marked
+  })
+
+  test('a brief within the cap stays whole and a newest prompt over the remainder is cut', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const brief = `brief ${'b'.repeat(14_600)}`
+    const newest = `newest ${'n'.repeat(40_000)}`
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn(newest, 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
+
+    const kept = userMessagesIn(result.messages?.[0]?.text) ?? []
+    expect(kept.length).toBe(2)
+    expect(kept[0]).toBe(brief)
+    expect(kept[1]!.startsWith('newest ')).toBe(true)
+    expect(kept[1]!.length).toBeLessThan(newest.length)
+    expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4 + 100) // and the truncation note
+  })
+
+  test('a single-prompt session keeps that prompt once', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const brief = `brief ${'b'.repeat(50_000)}`
+    const messages: SessionMessage[] = [...turn(brief, 'r', CHUNK), ...turn('tail', 'r', 8_000)]
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    const kept = userMessagesIn(result.messages?.[0]?.text) ?? []
+    expect(kept.length).toBe(1)
+    expect(kept[0]!.startsWith('brief ')).toBe(true)
   })
 
   test('only 🔴 corrections are quoted; the observer and reflector reserve 🔴 for the user\'s decisions and constraints', async ($, on) => {

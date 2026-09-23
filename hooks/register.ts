@@ -70,7 +70,7 @@ type View = {
   at: (number | undefined)[]
   base: number // 1 when a memory message leads
 }
-type UserMessage = { at?: string; text: string }
+type UserMessage = { at?: string; text: string; omitted?: number } // `omitted`: a line standing for that many dropped
 type Memory = {
   corrections: string[]
   observations: string
@@ -321,34 +321,49 @@ const section = (name: string, value?: string) => (value ? `\n\n<${name}>\n${val
 // The user's messages, verbatim, each after a header that gives its length, so no text inside can end the section.
 const USER_MESSAGES = '\n\n<all-user-messages>\n'
 const NEXT_STEP = '\n\n<optional-next-step>\n'
+const omittedLine = (n: number) => `* (${n} earlier user messages omitted; om_recall can search them)\n`
 const renderUserMessages = (messages: readonly UserMessage[]) =>
   messages.length
-    ? `${USER_MESSAGES}${messages.map((m) => `* User${m.at ? ` @ ${m.at}` : ''} (${m.text.length} chars):\n${m.text}\n`).join('')}</all-user-messages>`
+    ? `${USER_MESSAGES}${messages.map((m) => (m.omitted ? omittedLine(m.omitted) : `* User${m.at ? ` @ ${m.at}` : ''} (${m.text.length} chars):\n${m.text}\n`)).join('')}</all-user-messages>`
     : ''
 
 function parseUserMessages(text: string) {
   const out: UserMessage[] = []
   const start = text.indexOf(USER_MESSAGES)
   if (start < 0) return out
-  const entry = /\* User(?: @ ([\d-]+ [\d:]+))? \((\d+) chars\):\n/y
+  const entry = /\* User(?: @ ([\d-]+ [\d:]+))? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted; om_recall can search them\)\n/y
   entry.lastIndex = start + USER_MESSAGES.length
-  for (let m; (m = entry.exec(text)); entry.lastIndex += Number(m[2]) + 1)
-    out.push({ ...(m[1] ? { at: m[1] } : {}), text: text.slice(entry.lastIndex, entry.lastIndex + Number(m[2])) })
+  for (let m; (m = entry.exec(text)); )
+    if (m[3]) out.push({ text: '', omitted: Number(m[3]) })
+    else {
+      out.push({ ...(m[1] ? { at: m[1] } : {}), text: text.slice(entry.lastIndex, entry.lastIndex + Number(m[2])) })
+      entry.lastIndex += Number(m[2]) + 1
+    }
   return out
 }
 
-// The newest messages within USER_MESSAGES_MAX_TOKENS, oldest first; a newest one alone over it is cut.
+// The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
+// oldest first, one line counting those dropped between. The brief alone over the cap is cut, as is the newest over
+// what remains; the newest is always kept.
 function capUserMessages(messages: readonly UserMessage[]) {
+  const [first, ...rest] = messages
+  if (!first) return []
+  const brief = { ...first, text: truncate(first.text, USER_MESSAGES_MAX_TOKENS) }
+  let left = USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text)
   const kept: UserMessage[] = []
-  let tokens = 0
-  for (const m of [...messages].reverse()) {
+  for (const m of [...rest].reverse()) {
+    if (m.omitted) continue
     const t = estimateTokens(m.text)
-    if (!kept.length && t > USER_MESSAGES_MAX_TOKENS) return [{ ...m, text: truncate(m.text, USER_MESSAGES_MAX_TOKENS) }]
-    if (tokens + t > USER_MESSAGES_MAX_TOKENS) break
+    if (!kept.length && t > left) {
+      kept.unshift({ ...m, text: truncate(m.text, Math.max(left, 0)) })
+      break
+    }
+    if (t > left) break
     kept.unshift(m)
-    tokens += t
+    left -= t
   }
-  return kept
+  const omitted = rest.slice(0, rest.length - kept.length).reduce((n, m) => n + (m.omitted ?? 1), 0)
+  return [brief, ...(omitted ? [{ text: '', omitted }] : []), ...kept]
 }
 
 // Built as the built-in summary is framed: its wrapper first, the memory, then its notes after the summary.
@@ -793,7 +808,8 @@ export const register: Register = (on) => {
       return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
     })
     const userMessages = capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)])
-    const typedSoFar = [...(priorMemory?.userMessages ?? []), ...prompts.map((p) => p.message)]
+    // An omitted-count line stands for dropped prompts, never for the latest one.
+    const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted), ...prompts.map((p) => p.message)]
     const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
     const memory: Memory = {
       corrections: ledger.corrections,
