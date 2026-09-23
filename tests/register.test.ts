@@ -1894,4 +1894,64 @@ describe('register', () => {
     expect(stats.metrics['compaction.auto.syncCalls']?.sum).toBe(0)
     expect(stats.metrics['compaction.auto.briefTokens']?.count).toBe(2)
   })
+
+  test("a subagent's brief is its own loop's, merged across its compactions; the main conversation's holds none of it", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents } = world(on)
+    const seen = pi(on, { reply: readsIn })
+    const step = steps(on)
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'Prototype it', toolUses: [] }, ...edit('src/sub.ts')])
+    const run = async (from: number, to: number) => {
+      for (let n = from; n < to; n++) {
+        await clock.set(at(23, 9, n + 1))
+        rows.push(...agentCall('one', n, 16_000))
+        await step($, 's', n, rows.length, 'agent-1')
+        await clock.settle()
+      }
+    }
+
+    await run(0, 10)
+    const first = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(briefIn(first.messages?.[0]?.text)).toContain('[Files And Changes]\n- Modified: src/sub.ts')
+
+    const live = rows.length
+    rows.push(...first.messages!, ...edit('src/sub2.ts'))
+    await run(10, 20)
+    const second = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: rows.slice(live) })
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(briefIn(second.messages?.[0]?.text)).toContain('- Modified: src/sub.ts, src/sub2.ts')
+    expect(second.messages?.[0]?.text.match(/<session-brief>/g)).toHaveLength(1)
+
+    const main = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...edit('src/main.ts'), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+    const brief = briefIn(main.messages?.[0]?.text) ?? ''
+    expect(brief).toContain('- Modified: src/main.ts')
+    expect(brief).not.toContain('sub')
+  })
+
+  test("OM_VCC_ONLY observes no subagent in the background either: its steps call no model and store no ledger, and its compaction is the brief", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents, stored } = world(on, { env: { OM_VCC_ONLY: '1' } })
+    const seen = pi(on)
+    const step = steps(on)
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'Prototype it', toolUses: [] }, ...edit('src/sub.ts')])
+    for (let n = 0; n < 10; n++) {
+      await clock.set(at(23, 9, n + 1))
+      rows.push(...agentCall('one', n, 16_000))
+      await step($, 's', n, rows.length, 'agent-1')
+      await clock.settle()
+    }
+    expect(seen.prompts).toHaveLength(0)
+    expect(Object.keys(stored).filter((k) => k.startsWith('ledger:'))).toEqual([])
+
+    const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(0)
+    const text = result.messages?.[0]?.text ?? ''
+    expect(text).not.toContain('<observations>')
+    expect(briefIn(text)).toContain('- Modified: src/sub.ts')
+    expect(userMessagesIn(text)).toEqual(['Prototype it'])
+    expect(seen.screen).toEqual([])
+    expect(seen.logs.at(-1)).toBe('Compacted subagent in 0 ms · memory brief only')
+  })
 })
