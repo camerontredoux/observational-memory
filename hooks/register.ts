@@ -389,8 +389,8 @@ function capUserMessages(messages: readonly UserMessage[]) {
   if (!first) return []
   // A brief an earlier compaction cut keeps the note that counts what it lost.
   const briefMax = USER_MESSAGES_MAX_TOKENS - NEWEST_RESERVE_TOKENS
-  const isCut = TRUNCATED.test(first.text) && first.text.replace(TRUNCATED, '').length <= briefMax * 4
-  const brief = { ...first, text: isCut ? first.text : truncate(first.text, briefMax) }
+  const wasCut = TRUNCATED.test(first.text) && first.text.replace(TRUNCATED, '').length <= briefMax * 4
+  const brief = { ...first, text: wasCut ? first.text : truncate(first.text, briefMax) }
   let left = USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text)
   const kept: UserMessage[] = []
   for (const m of [...rest].reverse()) {
