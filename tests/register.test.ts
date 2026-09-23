@@ -402,6 +402,23 @@ describe('register', () => {
     expect(text).not.toContain('Keep b; ')
   })
 
+  test('at compaction, a gap with nothing to show (thinking-only rows) is observed with no Observer call', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    const thought = { role: 'assistant' as const, text: '', toolUses: [] }
+    // Chunks cut before a row that would pass 10k tokens: [0, 3) is a, [3, 5) the two empty rows; the tail starts at y.
+    const messages = [...turn('a', 'a', CHUNK).slice(0, 3), thought, thought, { role: 'user' as const, text: 'y'.repeat(CHUNK), toolUses: [] }, ...turn('c', 'c', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows') || l.includes('at compaction failed'))).toEqual([])
+    expect(seen.screen).toEqual(['Compacted in 0 ms · observed 5 messages on the spot · memory 1 note'])
+    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 Saw a')
+    expect(result.messages?.slice(1)).toEqual(messages.slice(5))
+  })
+
   test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
     mock.clock(on)
     world(on)
