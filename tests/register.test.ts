@@ -1062,6 +1062,34 @@ describe('register', () => {
     expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: skills kept as lines, user messages as the brief$/))
   })
 
+  test('over its budget on dense text while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const { gate, open } = gates()
+    const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
+    const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
+    const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
+    // Dense text: the last response measured 120k tokens where the characters estimate ~12k of messages.
+    on('session.usage', () => ({ value: { context: { tokens: 120_000, window: 200_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle() // [0, 3) observed: its ~51k tokens of observations start a reflection, held
+    expect(seen.prompts.at(-1)).toMatch(/^## OBSERVATIONS/)
+    const before = stored['ledger:session-1'] as Ledger
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(stored['ledger:session-1']).toEqual(before)
+    expect(before.corrections).toEqual([correction])
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context, ~\d+ tokens, is over its ~\d+-token budget; using the built-in compaction$/))
+    expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
+    open(0)
+    await clock.settle()
+  })
+
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
     const clock = mock.clock(on)
     const { agents } = world(on)
