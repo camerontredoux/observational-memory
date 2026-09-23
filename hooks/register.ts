@@ -47,6 +47,7 @@ const RECALL_MAX_HITS = 20
 const RECALL_SNIPPET_CHARS = 400
 const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
 const NEXT_STEP_MAX_TOKENS = 2_000
+const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
 const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -105,6 +106,9 @@ function locked<T>(fn: () => Promise<T>): Promise<T> {
 const estimateTokens = (text: string) => Math.ceil(text.length / 4)
 const truncate = (text: string, maxTokens: number) =>
   text.length <= maxTokens * 4 ? text : `${text.slice(0, maxTokens * 4)}\n... [truncated ~${estimateTokens(text) - maxTokens} tokens]`
+const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
+// What truncate leaves of a text given no room: its note alone.
+const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 const log = ($: EngineInterface, text: string) => $.ui.log(text) // the engine prefixes the plugin's name
 // The calls the stats module makes, spelled here: the engine never lets `$` cross an import.
@@ -375,12 +379,15 @@ function parseUserMessages(text: string) {
 }
 
 // The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
-// oldest first, one line counting those dropped between. The brief alone over the cap is cut, as is the newest over
-// what remains; the newest is always kept.
+// oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS, and the
+// newest over what remains is cut; the newest is always kept.
 function capUserMessages(messages: readonly UserMessage[]) {
   const [first, ...rest] = messages
   if (!first) return []
-  const brief = { ...first, text: truncate(first.text, USER_MESSAGES_MAX_TOKENS) }
+  // A brief an earlier compaction cut keeps the note that counts what it lost.
+  const briefMax = USER_MESSAGES_MAX_TOKENS - NEWEST_RESERVE_TOKENS
+  const isCut = TRUNCATED.test(first.text) && first.text.replace(TRUNCATED, '').length <= briefMax * 4
+  const brief = { ...first, text: isCut ? first.text : truncate(first.text, briefMax) }
   let left = USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text)
   const kept: UserMessage[] = []
   for (const m of [...rest].reverse()) {
@@ -853,7 +860,8 @@ export const register: Register = (on) => {
     })
     const userMessages = capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)])
     // An omitted-count line stands for dropped prompts, never for the latest one.
-    const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted), ...prompts.map((p) => p.message)]
+    // A prompt cut to its note alone quotes nothing.
+    const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
     const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
     const memory: Memory = {
       corrections: ledger.corrections,

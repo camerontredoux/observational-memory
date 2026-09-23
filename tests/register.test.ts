@@ -151,6 +151,9 @@ function gates() {
   return { gate, open: (n: number) => (gate(n), release.get(n)!()) }
 }
 
+// A turn's work after its prompt: no new prompt.
+const work = (name: string, size = 0) => turn(name, 'r', size).slice(1)
+const nextStepIn = (text?: string) => text?.match(/quoted verbatim:\n"([\s\S]*)"\n<\/optional-next-step>/)?.[1]
 const observationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
 // The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters, or an
 // omission line, read as `(n omitted)`.
@@ -673,20 +676,39 @@ describe('register', () => {
     expect(again.join('').length).toBeLessThanOrEqual(10_000 * 4)
   })
 
-  test('an oversized brief is cut to the cap and the newest prompt is still kept, cut to what remains', async ($, on) => {
+  test('an oversized brief is cut short of the cap, so the newest prompt keeps a reserve and stays the next step', async ($, on) => {
     mock.clock(on)
     world(on)
     pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(50_000)}`
     const newest = `newest ${'n'.repeat(50_000)}`
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn('mid', 'r', 2_000), ...turn(newest, 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn('mid', 'r', 2_000), ...turn(newest, 'r', CHUNK), ...work('w', 8_000)] })
 
     const kept = userMessagesIn(result.messages?.[0]?.text) ?? []
     expect(kept.length).toBe(3)
     expect(kept[0]!.startsWith('brief ')).toBe(true)
-    expect(kept[0]!.length).toBeLessThan(brief.length)
+    expect(kept[0]!).toMatch(/\n\.\.\. \[truncated ~\d+ tokens\]$/)
     expect(kept[1]).toBe('(1 omitted)')
-    expect(kept[2]).toStartWith('\n... [truncated') // nothing of the cap is left, but the newest is still marked
+    expect(kept[2]!.startsWith('newest n')).toBe(true) // the reserve, not a bare truncation note
+    expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4 + 100)
+
+    // Compacted again with no new prompt: the next step is still the newest prompt, and the brief keeps its note.
+    const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...work('v', CHUNK), ...work('u', 8_000)] })
+    const again = second.messages?.[0]?.text
+    expect(nextStepIn(again)!.startsWith('newest n')).toBe(true)
+    expect(userMessagesIn(again)![0]).toBe(kept[0])
+  })
+
+  test('the next step after a compaction of [brief, (n omitted), x] with no new prompt is x', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const brief = `brief ${'b'.repeat(14_600)}`
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn(`mid ${'m'.repeat(30_000)}`, 'r', 2_000), ...turn('do the thing', 'r', CHUNK), ...work('w', 8_000)] })
+    expect(userMessagesIn(result.messages?.[0]?.text)).toEqual([brief, '(1 omitted)', 'do the thing'])
+
+    const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...work('v', CHUNK), ...work('u', 8_000)] })
+    expect(nextStepIn(second.messages?.[0]?.text)).toBe('do the thing')
   })
 
   test('a brief within the cap stays whole and a newest prompt over the remainder is cut', async ($, on) => {
