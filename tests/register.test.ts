@@ -709,4 +709,23 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(2)
   })
 
+  test("a crewmate's launch brief, its only prompt, is quoted in full across compactions and never offered as the next step", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const brief = `FIRSTMATE_OP: v1 launch-brief: ${'Do the work on your own. '.repeat(600)}`.trim()
+    const messages = [{ role: 'user' as const, text: brief, toolUses: [] }, ...call(0, CHUNK), ...call(1, CHUNK), ...call(2, 8_000)]
+
+    const result = await $.session.compact({ trigger: 'auto', messages })
+    const text = result.messages?.[0]?.text ?? ''
+    expect(userMessagesIn(text)).toEqual([brief])
+    expect(text).not.toContain('<optional-next-step>')
+
+    const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...call(3, CHUNK), ...call(4, CHUNK), ...call(5, 8_000)] })
+    const again = second.messages?.[0]?.text ?? ''
+    expect(userMessagesIn(again)).toEqual([brief])
+    expect(again).not.toContain('<optional-next-step>')
+    expect(seen.prompts.length).toBeGreaterThan(2)
+  })
+
 })

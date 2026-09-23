@@ -793,6 +793,7 @@ export const register: Register = (on) => {
       return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
     })
     const userMessages = capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)])
+    const typedSoFar = [...(priorMemory?.userMessages ?? []), ...prompts.map((p) => p.message)]
     const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
     const memory: Memory = {
       corrections: ledger.corrections,
@@ -800,7 +801,9 @@ export const register: Register = (on) => {
       currentTask: ledger.currentTask,
       skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail),
       userMessages,
-      nextStep: prompts.at(-1)?.message.text ?? priorMemory?.userMessages.at(-1)?.text,
+      // The session's first prompt, a crewmate's whole brief, is quoted above; as the next step it would send the
+      // agent back to the top of its brief.
+      nextStep: typedSoFar.length > 1 ? typedSoFar.at(-1)!.text : undefined,
       transcript,
       recentKept: tail.length > 0,
       resumeDirectly: e.trigger === 'auto',
