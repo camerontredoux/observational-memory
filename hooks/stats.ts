@@ -162,13 +162,24 @@ export function merge(files: readonly SessionStats[], since?: number) {
   return { stats: out, sessions, approximate }
 }
 
-const num = (n: number) =>
-  !Number.isFinite(n) ? '-' : Math.abs(n) >= 100 || Number.isInteger(n) ? String(Math.round(n)) : n >= 1 ? n.toFixed(1) : n.toFixed(4)
+const grouped = (n: number) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+const num = (n: number) => (Math.abs(n) >= 100 || Number.isInteger(n) ? grouped(n) : n >= 1 ? n.toFixed(1) : n.toFixed(2))
+const duration = (ms: number) => {
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
+  const s = Math.round(ms / 1000)
+  return s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+}
+const dollars = (n: number) => `$${n.toFixed(n >= 1 ? 2 : 4)}`
+// A metric's values in its unit, read off its name: durations end in ms, costs in cost, token counts in in, out or Tokens*.
+const unit = (key: string) =>
+  /ms$/i.test(key) ? duration : key.endsWith('.cost') ? dollars : /\.(in|out)$|tokens/i.test(key) ? grouped : num
+const show = (key: string, n: number) => (Number.isFinite(n) ? unit(key)(n) : '-')
 const sumOf = (s: SessionStats, suffix: string) =>
   Object.entries(s.metrics).reduce((t, [k, m]) => (k.endsWith(suffix) && !k.includes('.failed.') ? t + m.sum : t), 0)
 const countOf = (s: SessionStats, re: RegExp) => Object.entries(s.metrics).reduce((t, [k, m]) => (re.test(k) ? t + m.count : t), 0)
 
-// The report om_stats and /om-stats answer: totals, then one row per metric. Durations are ms, cost USD.
+// The report om_stats and /om-stats answer: totals, then one row per metric, each value in its metric's unit.
 export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const { stats: s, sessions, approximate } = merged
   if (!sessions) return `${title}: no stats recorded yet.`
@@ -180,7 +191,7 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
     `## ${title}`,
     '',
     `${sessions} session(s), ${when(s.firstSeen)} to ${when(s.lastSeen)} UTC. ${compactions} compaction(s), ${calls} Luna call(s) ` +
-      `(${failed} failed), $${sumOf(s, '.cost').toFixed(4)}, ${sumOf(s, '.in')} tokens in, ${sumOf(s, '.out')} out.`,
+      `(${failed} failed), ${dollars(sumOf(s, '.cost'))}, ${grouped(sumOf(s, '.in'))} tokens in, ${grouped(sumOf(s, '.out'))} out.`,
     '',
     '| metric | count | sum | mean | median | p90 | min | max |',
     '|---|---|---|---|---|---|---|---|',
@@ -188,7 +199,8 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   for (const k of Object.keys(s.metrics).sort()) {
     const m = s.metrics[k]!
     const sorted = m.recent.map(([, v]) => v).sort((a, b) => a - b)
-    lines.push(`| ${k} | ${m.count} | ${num(m.sum)} | ${num(m.sum / m.count)} | ${num(percentile(sorted, 50))} | ${num(percentile(sorted, 90))} | ${num(m.min)} | ${num(m.max)} |`)
+    const cells = [m.sum, m.sum / m.count, percentile(sorted, 50), percentile(sorted, 90), m.min, m.max].map((n) => show(k, n))
+    lines.push(`| ${k} | ${grouped(m.count)} | ${cells.join(' | ')} |`)
   }
   const counts = Object.entries(s.counts).sort(([a], [b]) => a.localeCompare(b))
   if (counts.length) lines.push('', `Counts: ${counts.map(([k, n]) => `${k} ${n}`).join(', ')}`)
