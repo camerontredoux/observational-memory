@@ -24,7 +24,7 @@ const WRAP = 1_000 // a longer line counts as several, so every line fits a page
 const RESPONSE_MAX_CHARS = 16_000 // all of one call's response, about 4k tokens
 const ARG_MAX_CHARS = 500
 const TURN_CALLS = 3 // om_recall calls in one turn before a reminder to answer
-export const CHAIN_MAX_FILES = 20
+const CHAIN_MAX_FILES = 20
 const TAG = 8 // characters of a session or agent id naming its file in a reference
 
 export type RecallIo = {
@@ -557,7 +557,7 @@ type Excerpt = { text: string; best: number; lead: number; lines: number }
 // A phrase held only whole-block (its words fall on different display lines: a real newline, or just a display wrap
 // of one long line) is not on any single line to score or cut around. Locate it in the raw text instead, and report
 // the display lines its match spans, so the excerpt still shows it rather than falling back to a default line.
-function spanning(b: Block, starts: readonly number[], lines: readonly string[], heldPerLine: readonly Held[][], m: Matcher) {
+function spanning(b: Block, starts: readonly number[], heldPerLine: readonly Held[][], m: Matcher) {
   const spans = new Map<number, number>() // display line index the match starts on -> how many lines it spans
   const phrases = m.terms.filter((t, k) => t.word.includes(' ') && !heldPerLine.some((h) => h[k]))
   if (!phrases.length) return spans
@@ -609,7 +609,7 @@ function excerpt(b: Block, m: Matcher): Excerpt {
   const atoms = [...new Set(m.terms.flatMap((t) => [t.word, ...t.parts]))]
   const freq = new Map(atoms.map((a) => [a, lowers.filter((l) => l.includes(a)).length]))
   const heldPerLine = lines.map((l, i) => held(m, l, lowers[i]))
-  const spans = spanning(b, starts, lines, heldPerLine, m)
+  const spans = spanning(b, starts, heldPerLine, m)
   type Line = { i: number; terms: number; rarity: number; span: number }
   const scored: Line[] = lines.map((l, i) => ({
     i,

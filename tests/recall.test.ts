@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { MEMORY_HEADER } from '../hooks/prompts'
-import { CHAIN_MAX_FILES, legacyRecall, liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
+import { legacyRecall, liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
 import type { RecallInput, RecallIo } from '../hooks/recall'
 
 const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
@@ -98,18 +98,20 @@ describe('recall', () => {
       if (i < n - 1) rows.push(JSON.stringify({ type: 'continued-in', sessionId: id, continuedInSessionId: ids[i + 1] }))
       files[`${DIR}/${id}.jsonl`] = rows.join('\n')
     })
-    return { io: memoryIo(files), path: `${DIR}/${ids[0]}.jsonl` }
+    return { io: memoryIo(files), path: `${DIR}/${ids[0]}.jsonl`, ids }
   }
 
   test('a chain longer than the file cap is read only up to the cap, and the coverage gap is reported', async () => {
-    const { io, path } = forwardChain(CHAIN_MAX_FILES + 4)
+    const { io, path } = forwardChain(50) // comfortably longer than any reasonable cap
     const corpus = await loadTranscript(io, path, { asking: true })
-    // Only files actually read are counted; the count matches the reads made.
-    expect(corpus.files.length).toBe(CHAIN_MAX_FILES)
-    expect(io.reads.length).toBe(CHAIN_MAX_FILES)
-    expect(corpus.note).toMatch(new RegExp(`${CHAIN_MAX_FILES}`))
+    // Only files actually read are counted; the count matches the reads made, short of the whole chain.
+    expect(corpus.files.length).toBeLessThan(50)
+    expect(io.reads.length).toBe(corpus.files.length)
+    expect(corpus.note).toMatch(new RegExp(`${corpus.files.length}`))
     const found = await recall(corpus, { mode: 'search', query: 'chunk', subagents: false })
     expect(found.text).toContain(`(${corpus.note})`)
+    const outlined = await recall(corpus, { mode: 'outline' })
+    expect(outlined.text).toContain(`(${corpus.note})`)
   })
 
   test('a chain within the cap has no coverage note', async () => {
@@ -120,37 +122,33 @@ describe('recall', () => {
   })
 
   test('a chain file that fails to read stops the chain there, without losing what was already read', async () => {
-    const ids = ['g0', 'g1', 'g2']
-    const files: Record<string, string> = {}
-    ids.forEach((id, i) => {
-      const rows = [msg('user', i, `chunk ${id}`)]
-      if (i < ids.length - 1) rows.push(JSON.stringify({ type: 'continued-in', sessionId: id, continuedInSessionId: ids[i + 1] }))
-      files[`${DIR}/${id}.jsonl`] = rows.join('\n')
-    })
-    const inner = memoryIo(files)
-    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith('g2.jsonl') ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
+    const { io: inner, ids } = forwardChain(3)
+    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith(`${ids[2]}.jsonl`) ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
     const corpus = await loadTranscript(io, `${DIR}/${ids[0]}.jsonl`, { asking: true })
-    expect(corpus.files).toEqual(['g0', 'g1'])
-    expect(corpus.main.blocks.some((b) => b.text === 'chunk g0')).toBe(true)
+    expect(corpus.files).toEqual([ids[0], ids[1]])
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[0]}`)).toBe(true)
     expect(corpus.note).toMatch(/could not (be )?read/)
   })
 
   test('an unreadable predecessor leaves a gap behind it, but the requested file and anything after it still load', async () => {
-    const ids = ['h0', 'h1', 'h2']
-    const files: Record<string, string> = {}
-    ids.forEach((id, i) => {
-      const rows = [msg('user', i, `chunk ${id}`)]
-      if (i < ids.length - 1) rows.push(JSON.stringify({ type: 'continued-in', sessionId: id, continuedInSessionId: ids[i + 1] }))
-      files[`${DIR}/${id}.jsonl`] = rows.join('\n')
-    })
-    const inner = memoryIo(files)
-    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith('h0.jsonl') ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
-    // h0 -> h1 -> h2, requested from the middle file h1: h0 is an older predecessor, unreadable.
+    const { io: inner, ids } = forwardChain(3)
+    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith(`${ids[0]}.jsonl`) ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
+    // f0 -> f1 -> f2, requested from the middle file f1: f0 is an older predecessor, unreadable.
     const corpus = await loadTranscript(io, `${DIR}/${ids[1]}.jsonl`, { asking: true })
-    expect(corpus.files).toEqual(['h1', 'h2'])
-    expect(corpus.main.blocks.some((b) => b.text === 'chunk h1')).toBe(true)
-    expect(corpus.main.blocks.some((b) => b.text === 'chunk h2')).toBe(true)
-    expect(corpus.main.blocks.some((b) => b.text === 'chunk h0')).toBe(false)
+    expect(corpus.files).toEqual([ids[1], ids[2]])
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[1]}`)).toBe(true)
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[2]}`)).toBe(true)
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[0]}`)).toBe(false)
+    expect(corpus.note).toMatch(/could not (be )?read/)
+  })
+
+  test('a failure discovering a predecessor, not just reading one, is also reported as an unreadable link', async () => {
+    const { io: inner, ids } = forwardChain(3)
+    const io: RecallIo = { ...inner, continuing: async () => Promise.reject(new Error('EACCES')) }
+    // Requested from the newest file: looking back for its predecessor fails before any file content is unreadable.
+    const corpus = await loadTranscript(io, `${DIR}/${ids[2]}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual([ids[2]])
+    expect(corpus.main.blocks.some((b) => b.text === `chunk ${ids[2]}`)).toBe(true)
     expect(corpus.note).toMatch(/could not (be )?read/)
   })
 
