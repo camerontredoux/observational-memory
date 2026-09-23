@@ -290,11 +290,14 @@ async function chainOf(io: RecallIo, path: string) {
 
 // The session's whole transcript from its newest file: the files before it, and after it when it was continued.
 export async function loadTranscript(io: RecallIo, path: string, options: { asking?: boolean } = {}): Promise<Corpus> {
-  const { dir, names, files, truncated: backTruncated, unreadableLink: backUnreadable, discoveryFailed } = await chainOf(io, path)
+  const { dir, names, files, truncated: backTruncated, unreadableLink: backLinkUnreadable, discoveryFailed } = await chainOf(io, path)
+  const pathIndex = files.indexOf(path) // stable: only files after it are ever appended below
   const seen = newSeen()
   const blocks: Block[] = []
+  const unread = new Set<number>()
   let forwardTruncated = false
   let forwardUnreadable = false
+  let backContentUnreadable = false
   for (let i = 0; i < files.length; i++) {
     const tag = tagFor(stem(files[i]!))
     let text: string
@@ -302,6 +305,12 @@ export async function loadTranscript(io: RecallIo, path: string, options: { aski
       text = await io.read(files[i]!)
     } catch (error) {
       if (files[i] === path) throw error // the file the caller asked for: let it fall back to the live history, as before
+      if (i < pathIndex) {
+        // an older predecessor, not the requested file or anything after it: note the gap and keep reading forward
+        backContentUnreadable = true
+        unread.add(i)
+        continue
+      }
       files.length = i // only the files actually read are counted
       forwardUnreadable = true
       break
@@ -314,6 +323,7 @@ export async function loadTranscript(io: RecallIo, path: string, options: { aski
       else forwardTruncated = true
     }
   }
+  if (unread.size) files.splice(0, files.length, ...files.filter((_, i) => !unread.has(i)))
   if (options.asking) markAsking(blocks)
   // Each file's subagents: `<id>/subagents/agent-<agent id>.jsonl`, with a `.meta.json` naming the call that started it.
   const subagents: Thread[] = []
@@ -335,7 +345,7 @@ export async function loadTranscript(io: RecallIo, path: string, options: { aski
   const notes = [
     discoveryFailed && `the transcript directory could not be listed, so an older link in its chain may be missing`,
     (backTruncated || forwardTruncated) && `the chain has more than ${CHAIN_MAX_FILES} files; only the newest ${CHAIN_MAX_FILES} are read`,
-    (backUnreadable || forwardUnreadable) && `a chain file could not be read, so coverage stops there`,
+    (backLinkUnreadable || backContentUnreadable || forwardUnreadable) && `a chain file could not be read, leaving a gap in coverage`,
   ].filter((s): s is string => !!s)
   return {
     main: { tag: 'main', label: 'session', blocks, loaded: true },

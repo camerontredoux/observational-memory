@@ -135,6 +135,25 @@ describe('recall', () => {
     expect(corpus.note).toMatch(/could not (be )?read/)
   })
 
+  test('an unreadable predecessor leaves a gap behind it, but the requested file and anything after it still load', async () => {
+    const ids = ['h0', 'h1', 'h2']
+    const files: Record<string, string> = {}
+    ids.forEach((id, i) => {
+      const rows = [msg('user', i, `chunk ${id}`)]
+      if (i < ids.length - 1) rows.push(JSON.stringify({ type: 'continued-in', sessionId: id, continuedInSessionId: ids[i + 1] }))
+      files[`${DIR}/${id}.jsonl`] = rows.join('\n')
+    })
+    const inner = memoryIo(files)
+    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith('h0.jsonl') ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
+    // h0 -> h1 -> h2, requested from the middle file h1: h0 is an older predecessor, unreadable.
+    const corpus = await loadTranscript(io, `${DIR}/${ids[1]}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual(['h1', 'h2'])
+    expect(corpus.main.blocks.some((b) => b.text === 'chunk h1')).toBe(true)
+    expect(corpus.main.blocks.some((b) => b.text === 'chunk h2')).toBe(true)
+    expect(corpus.main.blocks.some((b) => b.text === 'chunk h0')).toBe(false)
+    expect(corpus.note).toMatch(/could not (be )?read/)
+  })
+
   test('a directory that cannot be listed reports that chain discovery failed', async () => {
     const inner = chain()
     const io: RecallIo = { ...inner, list: async () => Promise.reject(new Error('EACCES')) }
