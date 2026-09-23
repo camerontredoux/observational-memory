@@ -754,14 +754,15 @@ describe('register', () => {
     expect(text).toMatch(/^30 match\(es\) for "plum-7731" in 34 blocks of the live history; showing 20, the newest\.\n\[#14 · user\] 3 lines\n  1: note \d+: the PLUM-7731 marker y+…\n/)
     expect(text).toContain('[#33 · user] 3 lines\n  1: note 28: the PLUM-7731 marker')
     expect(text).not.toContain('note 29')
-    expect(text).toMatch(/\nOlder matches: repeat with "to": "#13"\.\nRead a block in full: \{"mode": "read", "ref": "#33"\}\.$/)
+    expect(text).toMatch(/\n10 older matches not shown; only if none above answers, repeat with "to": "#13"\.\nOnly if an excerpt is not enough, read just the lines you need: \{"mode": "read", "ref": "#33", "lines": "1-3"\}\.$/)
     expect(text.length).toBeLessThan(12_000)
     expect(String(loose.result)).toBe(
-      '1 match(es) for "auth.ts nothing-like-this" in 34 blocks of the live history; no block holds every term, so these hold some, best first.\n' +
-        '[#1.2 · Read call] 1 line\n  1: file_path: /src/auth.ts\nRead a block in full: {"mode": "read", "ref": "#1.2"}.',
+      '1 match(es) for "auth.ts nothing-like-this" in 34 blocks of the live history; no block holds every term, so these hold some, chosen by the rarest.\n' +
+        'No occurrences in this session of: nothing-like-this.\n' +
+        '[#1.2 · Read call] 1 line\n  1: file_path: /src/auth.ts\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#1.2", "lines": "1-1"}.',
     )
     const whole = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', ref: '#33', lines: '1' })).result)
-    expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines: ask \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
+    expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines \(1,031 characters\); only if you still need them: \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
   })
 
   test('om_recall labels tool results with the tool that produced them', async ($, on) => {
@@ -772,7 +773,7 @@ describe('register', () => {
 
     const found = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PLUM' })
 
-    expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 blocks of the live history.\n[#2 · Read result] 1 line\n  1: export const marker = "PLUM-7731"\nRead a block in full: {"mode": "read", "ref": "#2"}.')
+    expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 blocks of the live history.\n[#2 · Read result] 1 line\n  1: export const marker = "PLUM-7731"\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#2", "lines": "1-1"}.')
   })
 
   test('/clear drops the cleared session\'s ledger, times, skills and seen stamp, its subagents\' too', async ($, on) => {
@@ -1322,7 +1323,7 @@ describe('register', () => {
         `[session-1:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] 1 line\n  1: remember the KIWI-42 marker\n` +
         `[session-1:2.2 · ${stampOf('2026-09-22T12:01:00.000Z')} · Bash call] 1 line\n  1: command: echo KIWI-42\n` +
         `[session-1:3 · ${stampOf('2026-09-22T12:01:10.000Z')} · Bash result] 1 line\n  1: KIWI-42\n` +
-        'Read a block in full: {"mode": "read", "ref": "session-1:3"}.',
+        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "session-1:3", "lines": "1-1"}.',
     )
   })
 
@@ -1364,7 +1365,7 @@ describe('register', () => {
     expect(found).toBe(
       '1 match(es) for "FIG-8" in 2 blocks of 2 transcript files.\n' +
         `[aaaaaaaa:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] 1 line\n  1: remember the FIG-8 marker\n` +
-        'Read a block in full: {"mode": "read", "ref": "aaaaaaaa:1"}.',
+        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "aaaaaaaa:1", "lines": "1-1"}.',
     )
     expect(read).toBe(`[aaaaaaaa:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] lines 1-1 of 1\n   1 | remember the FIG-8 marker`)
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { count: number; sum: number }> }

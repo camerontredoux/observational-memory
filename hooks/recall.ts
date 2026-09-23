@@ -12,6 +12,8 @@ export const SEARCH_MAX_HITS = 20
 const SEARCH_MAX_CHARS = 10_000 // about 2.5k tokens of hits
 const SEARCH_LINES_PER_HIT = 3
 const SEARCH_LINE_CHARS = 200
+const SEARCH_LINE_GAP = 2 // lines shown from one hit are further apart than this
+const ABSENT_MAX = 20 // absent terms named
 const READ_MAX_LINES = 200
 const READ_MAX_CHARS = 12_000 // one page of a block, about 3k tokens
 const NEIGHBORS_MAX = 5 // blocks before or after a read block
@@ -19,6 +21,9 @@ const NEIGHBOR_MAX_CHARS = 1_000
 const OUTLINE_MAX_LINES = 120
 const OUTLINE_MAX_CHARS = 12_000
 const WRAP = 1_000 // a longer line counts as several, so every line fits a page
+const RESPONSE_MAX_CHARS = 16_000 // all of one call's response, about 4k tokens
+const ARG_MAX_CHARS = 500
+const TURN_CALLS = 3 // om_recall calls in one turn before a reminder to answer
 const CHAIN_MAX_FILES = 20
 const TAG = 8 // characters of a session or agent id naming its file in a reference
 
@@ -433,54 +438,81 @@ function callSummary(b: Block) {
 
 // ---- Search -----------------------------------------------------------------------------------------------------
 
-type Matcher = { all: (text: string) => boolean; score: (text: string) => number; line: (text: string) => number; terms: number; shown: string }
+// A word or "quoted phrase" of the query. A compound word (RAW_TOKEN, contract-signed) has its parts too, so a block
+// that spells it apart (RAW TRACE TOKEN) still holds it when no block holds it whole.
+type Term = { word: string; parts: string[] }
+type Matcher = { regex?: RegExp; terms: Term[]; shown: string }
+type Held = 'whole' | 'parts' | undefined
 
 // `/regex/flags` (case-insensitive unless flags are given), else words and "quoted phrases", all of which must appear.
 function matcher(query: string): Matcher | string {
   const re = query.match(/^\/([\s\S]+)\/([a-z]*)$/)
   if (re) {
-    let rx: RegExp
     try {
-      rx = new RegExp(re[1]!, (re[2] || 'i').replace(/[gy]/g, ''))
+      return { regex: new RegExp(re[1]!, (re[2] || 'i').replace(/[gy]/g, '')), terms: [], shown: `/${re[1]}/${re[2] ?? ''}` }
     } catch (error) {
       return `om_recall: not a valid regular expression (${error instanceof Error ? error.message : String(error)}).`
     }
-    return { all: (t) => rx.test(t), score: (t) => (rx.test(t) ? 1 : 0), line: (t) => t.search(rx), terms: 1, shown: `/${re[1]}/${re[2] ?? ''}` }
   }
-  const terms = [...query.matchAll(/"([^"]+)"|(\S+)/g)].map((m) => (m[1] ?? m[2]!).toLowerCase())
+  const terms: Term[] = []
+  for (const q of query.matchAll(/"([^"]+)"|(\S+)/g)) {
+    const word = (q[1] ?? q[2]!).toLowerCase()
+    const parts = q[1] === undefined ? word.split(/[_-]+/).filter((p) => p.length > 1) : []
+    if (!terms.some((t) => t.word === word)) terms.push({ word, parts: parts.length > 1 ? parts : [] })
+  }
   if (!terms.length) return 'om_recall: give a query.'
-  const score = (t: string) => {
-    const lower = t.toLowerCase()
-    return terms.filter((w) => lower.includes(w)).length
-  }
-  return {
-    all: (t) => score(t) === terms.length,
-    score,
-    line: (t) => {
-      const lower = t.toLowerCase()
-      const at = terms.map((w) => lower.indexOf(w)).filter((n) => n >= 0)
-      return at.length ? Math.min(...at) : -1
-    },
-    terms: terms.length,
-    shown: /^".*"$/.test(query.trim()) ? query.trim() : `"${query}"`,
-  }
+  return { terms, shown: /^".*"$/.test(query.trim()) ? query.trim() : `"${query}"` }
 }
 
-function renderHit(b: Block, m: Matcher) {
+// How a text holds each term (a regex is one): whole, by a compound's parts alone, or not.
+function held(m: Matcher, text: string, lower = text.toLowerCase()): Held[] {
+  if (m.regex) return [m.regex.test(text) ? 'whole' : undefined]
+  return m.terms.map((t) => (lower.includes(t.word) ? 'whole' : t.parts.length && t.parts.every((p) => lower.includes(p)) ? 'parts' : undefined))
+}
+
+type Excerpt = { text: string; best: number; lead: number; lines: number }
+
+// A hit's lines to show: those holding the most terms, then the rarest in the block (on the fewest of its lines), each
+// more than SEARCH_LINE_GAP from another, the farthest from those taken on a tie. Each is cut around its rarest term.
+// `best`, the most terms one line holds, ranks the hit; `lead` is the line taken first.
+function excerpt(b: Block, m: Matcher): Excerpt {
   const lines = linesOf(b.text)
-  const found: string[] = []
-  let more = 0
-  lines.forEach((l, i) => {
-    const at = m.line(l)
-    if (at < 0) return
-    if (found.length >= SEARCH_LINES_PER_HIT) return void more++
-    const start = Math.max(0, Math.min(at - 60, l.length - SEARCH_LINE_CHARS))
-    const cut = l.slice(start, start + SEARCH_LINE_CHARS).replace(/\s+/g, ' ')
-    found.push(`  ${i + 1}: ${start > 0 ? '…' : ''}${cut}${start + SEARCH_LINE_CHARS < l.length ? '…' : ''}`)
-  })
+  const lowers = lines.map((l) => l.toLowerCase())
+  const atoms = [...new Set(m.terms.flatMap((t) => [t.word, ...t.parts]))]
+  const freq = new Map(atoms.map((a) => [a, lowers.filter((l) => l.includes(a)).length]))
+  type Line = { i: number; terms: number; rarity: number }
+  const scored: Line[] = lines.map((l, i) => ({
+    i,
+    terms: held(m, l, lowers[i]).filter(Boolean).length,
+    rarity: atoms.reduce((s, a) => s + (lowers[i]!.includes(a) ? 1 / freq.get(a)! : 0), 0),
+  }))
+  let pool = scored.filter((s) => s.terms > 0)
+  if (!pool.length) pool = scored.filter((s) => s.rarity > 0) // a compound's parts on separate lines
+  const taken: Line[] = []
+  const gap = (s: Line) => Math.min(...taken.map((t) => Math.abs(t.i - s.i)))
+  while (taken.length < SEARCH_LINES_PER_HIT) {
+    const open = pool.filter((s) => !taken.length || gap(s) > SEARCH_LINE_GAP)
+    if (!open.length) break
+    open.sort((x, y) => y.terms - x.terms || y.rarity - x.rarity || (taken.length ? gap(y) - gap(x) : 0) || x.i - y.i)
+    taken.push(open[0]!)
+  }
+  const lead = taken[0]?.i ?? 0
+  const anchor = (i: number) => {
+    if (m.regex) return Math.max(0, lines[i]!.search(m.regex))
+    const rarest = atoms.filter((a) => lowers[i]!.includes(a)).sort((x, y) => freq.get(x)! - freq.get(y)! || y.length - x.length)[0]
+    return rarest ? lowers[i]!.indexOf(rarest) : 0
+  }
+  const found = taken
+    .sort((x, y) => x.i - y.i)
+    .map(({ i }) => {
+      const l = lines[i]!
+      const start = Math.max(0, Math.min(anchor(i) - 60, l.length - SEARCH_LINE_CHARS))
+      const cut = l.slice(start, start + SEARCH_LINE_CHARS).replace(/\s+/g, ' ')
+      return `  ${i + 1}: ${start > 0 ? '…' : ''}${cut}${start + SEARCH_LINE_CHARS < l.length ? '…' : ''}`
+    })
   if (!found.length) found.push(`  1: ${oneLine(lines[0] ?? '', SEARCH_LINE_CHARS)}`) // a match on the tool's name alone
-  if (more) found.push(`  … ${plural(more, 'more matching line')}`)
-  return `[${label(b)}] ${plural(lines.length, 'line')}\n${found.join('\n')}`
+  if (pool.length > taken.length) found.push(`  … ${plural(pool.length - taken.length, 'more matching line')}`)
+  return { text: `[${label(b)}] ${plural(lines.length, 'line')}\n${found.join('\n')}`, best: Math.max(0, ...pool.map((s) => s.terms)), lead, lines: lines.length }
 }
 
 async function search(c: Corpus, input: Input): Promise<RecallResult> {
@@ -490,9 +522,8 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
   if (input.subagents) for (const s of c.subagents) await c.load(s)
   const home = await threadFor(c, input.from ?? input.to)
   const threads = input.subagents ? [c.main, ...c.subagents] : [home]
-  type Hit = { b: Block; t: Thread; i: number; time: number; score: number }
+  type Hit = { b: Block; t: Thread; i: number; time: number; lower: string; held: Held[]; score: number; x?: Excerpt }
   const pool: Hit[] = []
-  let searched = 0
   for (const t of threads) {
     const r = range(t, input.from, input.to, home)
     if (typeof r === 'string') return { mode: 'search', text: `om_recall: ${r}.`, matches: 0 }
@@ -500,43 +531,64 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
     for (let i = r[0]; i <= r[1]; i++) {
       const b = t.blocks[i]!
       if (b.own || b.asking || b.kind === 'memory') continue
-      searched++
       const text = b.tool ? `${b.tool}\n${b.text}` : b.text
-      pool.push({ b, t, i, time: times[i] ?? 0, score: m.score(text) })
+      const lower = text.toLowerCase()
+      pool.push({ b, t, i, time: times[i] ?? 0, lower, held: held(m, text, lower), score: 0 })
     }
   }
-  let hits = pool.filter((h) => h.score === m.terms)
+  let hits = pool.filter((h) => h.held.every((x) => x === 'whole'))
   const loose = !hits.length
-  if (loose) hits = pool.filter((h) => h.score > 0)
+  if (loose) hits = pool.filter((h) => h.held.some(Boolean))
+  // A term weighs more the fewer blocks hold it, so a block with one rare term outranks many with a common one.
+  const weight = pool[0]?.held.map((_, k) => Math.log(1 + pool.length / Math.max(1, pool.filter((h) => h.held[k]).length))) ?? []
+  for (const h of hits) {
+    h.x = excerpt(h.b, m)
+    h.score = h.held.reduce((s, x, k) => s + (x ? weight[k]! : 0), 0)
+  }
   const byTime = (a: Hit, b: Hit) => a.time - b.time || (a.t === b.t ? a.i - b.i : 0)
-  hits.sort(byTime)
-  // Newest first within the caps, best first when no block holds every term; shown in time order.
-  const ranked = loose ? [...hits].sort((a, b) => b.score - a.score || byTime(b, a)) : [...hits].reverse()
-  const shown: { h: Hit; text: string }[] = []
+  // The rarest terms first when no block holds every term, then the most terms on one line, then the newest.
+  const ranked = [...hits].sort((a, b) => (loose ? b.score - a.score : 0) || b.x!.best - a.x!.best || byTime(b, a))
+  const shown: Hit[] = []
   let chars = 0
   for (const h of ranked) {
     if (shown.length >= limit) break
-    const text = renderHit(h.b, m)
-    if (shown.length && chars + text.length > SEARCH_MAX_CHARS) break
-    shown.push({ h, text })
-    chars += text.length + 1
+    if (shown.length && chars + h.x!.text.length > SEARCH_MAX_CHARS) break
+    shown.push(h)
+    chars += h.x!.text.length + 1
   }
-  shown.sort((a, b) => byTime(a.h, b.h))
+  const rest = ranked.slice(shown.length)
+  const lead = shown[0]
+  shown.sort(byTime) // shown in time order
+  const oldest = shown[0]
+  const before = oldest && oldest.t.blocks[oldest.i - 1]
+  const older = !loose && !!before && rest.every((h) => byTime(h, oldest) < 0)
   const where = c.live ? `the live history` : `${plural(c.files.length, 'transcript file')}${threads.length > 1 ? ` and ${plural(threads.length - 1, 'subagent transcript')}` : ''}`
   const head =
-    `${hits.length} match(es) for ${m.shown} in ${plural(searched, 'block')} of ${where}${c.note ? ` (${c.note})` : ''}` +
-    (loose && hits.length ? `; no block holds every term, so these hold some, best first` : '') +
-    (hits.length > shown.length ? `; showing ${shown.length}${loose ? '' : ', the newest'}` : '') +
+    `${hits.length} match(es) for ${m.shown} in ${plural(pool.length, 'block')} of ${where}${c.note ? ` (${c.note})` : ''}` +
+    (loose && hits.length ? `; no block holds every term, so these hold some, chosen by the rarest` : '') +
+    (rest.length ? `; showing ${shown.length}${loose ? '' : older ? ', the newest' : ', those with the most terms on one line'}` : '') +
     '.'
-  const out = [head, ...shown.map((s) => s.text)]
-  if (hits.length > shown.length && !loose && shown.length) {
-    const oldest = shown[0]!.h
-    const before = oldest.t.blocks[oldest.i - 1]
-    if (before) out.push(`Older matches: repeat with "to": "${before.ref}".`)
+  const out = [head]
+  // Terms no block holds, whole or (a compound) by parts found anywhere: absent, so not worth searching for again.
+  const absent = m.terms.filter((t, k) => !pool.some((h) => h.held[k]) && !(t.parts.length && t.parts.every((p) => pool.some((h) => h.lower.includes(p)))))
+  if (m.terms.length > 1 && absent.length) {
+    const scope = input.from || input.to ? 'this range' : c.note ? 'the readable history' : c.subagents.length && !input.subagents ? 'the main transcript' : 'this session'
+    const named = absent.slice(0, ABSENT_MAX).map((t) => (t.word.includes(' ') ? `"${t.word}"` : t.word))
+    out.push(`No occurrences in ${scope} of: ${named.join(', ')}${absent.length > ABSENT_MAX ? `, and ${absent.length - ABSENT_MAX} more` : ''}.`)
   }
+  out.push(...shown.map((h) => h.x!.text))
+  if (rest.length)
+    out.push(
+      older
+        ? `${plural(rest.length, 'older match', 'older matches')} not shown; only if none above answers, repeat with "to": "${before!.ref}".`
+        : `${plural(rest.length, 'more match', 'more matches')} not shown; only if none above answers, narrow the query or give "from" or "to".`,
+    )
   if (!input.subagents && c.subagents.length && !hits.length)
     out.push(`${plural(c.subagents.length, 'subagent transcript')} not searched: repeat with "subagents": true.`)
-  if (shown.length) out.push(`Read a block in full: {"mode": "read", "ref": "${shown.at(-1)!.h.b.ref}"}.`)
+  if (lead) {
+    const n = lead.x!.lead + 1
+    out.push(`Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "${lead.b.ref}", "lines": "${Math.max(1, n - 10)}-${Math.min(lead.x!.lines, n + 10)}"}.`)
+  }
   return { mode: 'search', text: out.join('\n'), matches: hits.length }
 }
 
@@ -551,7 +603,7 @@ function parseLines(spec: string | undefined, total: number): [number, number] |
   return [Math.max(1, a), Math.min(total, b)]
 }
 
-function page(b: Block, spec: string | undefined) {
+function page(b: Block, spec: string | undefined, maxChars = READ_MAX_CHARS) {
   const lines = linesOf(b.text)
   const r = parseLines(spec, lines.length)
   if (typeof r === 'string') return r
@@ -562,7 +614,7 @@ function page(b: Block, spec: string | undefined) {
   let n = a
   for (; n <= want && n - a < READ_MAX_LINES; n++) {
     const l = lines[n - 1]!
-    if (out.length && chars + l.length > READ_MAX_CHARS) break
+    if (out.length && chars + l.length > maxChars) break
     out.push(`${String(n).padStart(4)} | ${l}`)
     chars += l.length + 8
   }
@@ -572,17 +624,17 @@ function page(b: Block, spec: string | undefined) {
     .join('; ')
   const head = `[${label(b)}] lines ${a}-${last} of ${lines.length}${links ? ` (${links})` : ''}`
   const rest = lines.length - last
-  const tail =
-    last < want || rest > 0
-      ? `\n… ${plural(rest, 'more line')}: ask {"mode": "read", "ref": "${b.ref}", "lines": "${last + 1}-${Math.min(lines.length, last + READ_MAX_LINES)}"}.`
-      : ''
+  const size = lines.slice(last).join('\n').length
+  const tail = rest
+    ? `\n… ${plural(rest, 'more line')} (${plural(size, 'character')}); only if you still need them: {"mode": "read", "ref": "${b.ref}", "lines": "${last + 1}-${Math.min(lines.length, last + READ_MAX_LINES)}"}.`
+    : ''
   return `${head}\n${out.join('\n')}${tail}`
 }
 
 function neighbor(b: Block) {
   const lines = linesOf(b.text)
   let text = b.text
-  if (text.length > NEIGHBOR_MAX_CHARS) text = `${text.slice(0, NEIGHBOR_MAX_CHARS)}\n… (read ${b.ref} for all ${plural(lines.length, 'line')})`
+  if (text.length > NEIGHBOR_MAX_CHARS) text = `${text.slice(0, NEIGHBOR_MAX_CHARS)}\n… (${plural(lines.length, 'line')} in all; read ${b.ref} only if you need the rest)`
   return `[${label(b)}]\n${text}`
 }
 
@@ -592,7 +644,6 @@ async function read(c: Corpus, input: Input): Promise<RecallResult> {
   const i = indexOf(t, ref)
   if (i < 0) return { mode: 'read', text: `om_recall: no block ${ref}. A reference looks like ${t.blocks[0]?.ref ?? 'a79f045b:12'}, from a search or an outline.`, matches: 0 }
   const b = t.blocks[i]!
-  const shown = page(b, input.lines)
   const pick = (from: number, step: number, n: number) => {
     const out: Block[] = []
     for (let j = from; j >= 0 && j < t.blocks.length && out.length < n; j += step) if (!t.blocks[j]!.own) out.push(t.blocks[j]!)
@@ -600,6 +651,9 @@ async function read(c: Corpus, input: Input): Promise<RecallResult> {
   }
   const before = pick(i - 1, -1, Math.min(input.before ?? 0, NEIGHBORS_MAX)).reverse()
   const after = pick(i + 1, 1, Math.min(input.after ?? 0, NEIGHBORS_MAX))
+  const around = [...before, ...after].reduce((n, x) => n + neighbor(x).length + 2, 0)
+  // The neighbours asked for share the response's cap with the page, which shrinks to fit: its tail says what is left.
+  const shown = page(b, input.lines, Math.min(READ_MAX_CHARS, RESPONSE_MAX_CHARS - around - 1_000))
   return { mode: 'read', text: [...before.map(neighbor), shown, ...after.map(neighbor)].join('\n\n'), matches: 0 }
 }
 
@@ -652,9 +706,12 @@ async function outline(c: Corpus, input: Input): Promise<RecallResult> {
         : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})`
       : `${t.label}`
   const subs = t === c.main && c.subagents.length ? `; ${plural(c.subagents.length, 'subagent transcript')} (${c.subagents.map((s) => s.tag).join(', ')})` : ''
-  const head = `Outline of ${source}: ${plural(all.length, 'entry', 'entries')}${span}${subs}. Tool calls point → at their results; read any block with {"mode": "read", "ref": "<ref>"}.`
+  const head = `Outline of ${source}: ${plural(all.length, 'entry', 'entries')}${span}${subs}. Tool calls point → at their results; read a block only for what this lacks: {"mode": "read", "ref": "<ref>"}.`
   const out = [head, ...(lines.length ? lines : ['(nothing in this range)'])]
-  if (next) out.push(`More: {"mode": "outline", "from": "${next.ref}"${input.to ? `, "to": "${input.to}"` : ''}}.`)
+  if (next) {
+    const left = t.blocks.slice(t.blocks.indexOf(next), r[1] + 1).filter(visible).length
+    out.push(`${plural(left, 'more entry', 'more entries')}; only if you still need them: {"mode": "outline", "from": "${next.ref}"${input.to ? `, "to": "${input.to}"` : ''}}.`)
+  }
   return { mode: 'outline', text: out.join('\n'), matches: lines.length }
 }
 
@@ -670,6 +727,10 @@ const num = (v: unknown) => {
 
 // The tool's input, loosely typed as a model sends it. A query alone searches, a ref alone reads, nothing outlines.
 export function parseInput(e: RecallInput): Input | string {
+  for (const key of ['query', 'mode', 'ref', 'lines', 'from', 'to'] as const) {
+    const v = str(e[key])
+    if (v && v.length > ARG_MAX_CHARS) return `om_recall: ${key} is at most ${ARG_MAX_CHARS} characters${key === 'query' ? '; search for its rarest words' : ''}.`
+  }
   const query = str(e.query)
   const ref = str(e.ref)
   const mode = str(e.mode) ?? (ref && !query ? 'read' : query ? 'search' : 'outline')
@@ -691,10 +752,23 @@ export function parseInput(e: RecallInput): Input | string {
   }
 }
 
+// om_recall's calls this turn that have answered: those after the prompt that asked.
+function answeredThisTurn(t: Thread) {
+  const asked = t.blocks.findIndex((b) => b.asking)
+  return asked < 0 ? 0 : t.blocks.slice(asked).filter((b) => b.own && b.kind === 'call' && b.pair).length
+}
+
 export async function recall(c: Corpus, e: RecallInput): Promise<RecallResult> {
   const input = parseInput(e)
   if (typeof input === 'string') return { mode: str(e.mode) === 'read' ? 'read' : str(e.mode) === 'outline' ? 'outline' : 'search', text: input, matches: 0 }
-  return input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : outline(c, input)
+  const found = await (input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : outline(c, input))
+  const calls = answeredThisTurn(c.main)
+  const nudge = calls >= TURN_CALLS ? `\nThis is om_recall call ${calls + 1} this turn: answer from what you have found unless a specific fact is still missing.` : ''
+  // Each mode keeps under the cap; this holds it whatever the input.
+  const room = RESPONSE_MAX_CHARS - nudge.length
+  const cut = `\n… cut at ${grouped(RESPONSE_MAX_CHARS)} characters; ask for less.`
+  const text = found.text.length > room ? `${found.text.slice(0, room - cut.length)}${cut}` : found.text
+  return { ...found, text: text + nudge }
 }
 
 // ---- v0.4.9 -----------------------------------------------------------------------------------------------------

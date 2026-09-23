@@ -75,7 +75,7 @@ describe('recall', () => {
       '1 match(es) for "NEEDLE-42" in 6 blocks of 2 transcript files.\n' +
         `[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result] 301 lines\n` +
         '  250: row 250 has the NEEDLE-42 marker\n' +
-        'Read a block in full: {"mode": "read", "ref": "aaaaaaaa:3"}.',
+        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "aaaaaaaa:3", "lines": "240-260"}.',
     )
     const forward = await run({ query: '"plan is ALPHA"' }, chain(), `${DIR}/${OLD}.jsonl`)
     expect(forward).toMatch(/^1 match\(es\) for "plan is ALPHA" in 6 blocks of 2 transcript files\./)
@@ -108,9 +108,118 @@ describe('recall', () => {
     expect(await run({ query: '/NEEDLE-4[0-9]/' })).toContain('250: row 250')
     expect(await run({ query: '/(unclosed/' })).toMatch(/^om_recall: not a valid regular expression/)
     expect(await run({ query: '"plan is ALPHA"' })).toContain('aaaaaaaa:10')
-    // A phrase must appear as written: failing that, blocks holding some of the terms, best first.
+    // A phrase must appear as written: failing that, blocks holding some of the terms, chosen by the rarest.
     expect(await run({ query: '"ALPHA plan"' })).toMatch(/^0 match/)
     expect(await run({ query: 'ALPHA plan' })).toMatch(/^1 match/)
+  })
+
+  // A session of its own: one file, the given user and assistant rows, then the prompt that asked.
+  const session = (rows: string[]) => memoryIo({ [`${DIR}/${NEW}.jsonl`]: [...rows, msg('user', 59, 'what happened?')].join('\n') })
+  const result = (m: number, id: string, text: string) => [
+    msg('assistant', m, [{ type: 'tool_use', id, name: 'Bash', input: { command: `run ${id}` } }]),
+    msg('user', m, [{ type: 'tool_result', tool_use_id: id, content: text }]),
+  ]
+
+  test('search shows the lines holding the most and rarest terms, spread apart, cut around the rarest', async () => {
+    const out = Array.from({ length: 300 }, (_, i) => {
+      const n = i + 1
+      if (n <= 5 || n === 280) return `import { it } from "vitest" // ${n}`
+      if (n === 10 || n === 11) return `throw new Error("failed fixture ${n}")`
+      if (n === 200) return ' FAIL vitest: 1 failed'
+      if (n === 150) return `vitest ${'x'.repeat(600)} QUINCE-3 here`
+      return `line ${n}`
+    }).join('\n')
+    const io = session(result(20, 'v1', out))
+    expect(await run({ query: 'vitest failed' }, io)).toBe(
+      `1 match(es) for "vitest failed" in 2 blocks of 1 transcript file.\n` +
+        `[bbbbbbbb:2 · 2026-09-22 ${hm(20)} · Bash result] 300 lines\n` +
+        '  10: throw new Error("failed fixture 10")\n' +
+        '  200:  FAIL vitest: 1 failed\n' +
+        '  280: import { it } from "vitest" // 280\n' +
+        '  … 7 more matching lines\n' +
+        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "bbbbbbbb:2", "lines": "190-210"}.',
+    )
+    // A long line is cut around its rarest term, not its first.
+    expect(await run({ query: 'vitest QUINCE-3' }, session(result(20, 'v1', out)))).toContain(`  150: …${'x'.repeat(186)} QUINCE-3 here\n`)
+  })
+
+  test('search ranks blocks with the terms on one line above those that scatter them, newest first among equals', async () => {
+    const io = session([
+      ...result(20, 'a', 'Test Files 2 passed (2)'),
+      ...result(21, 'b', 'Test the files\nnothing passed yet'),
+      ...result(22, 'c', 'files to test\nall passed'),
+    ])
+    expect(await run({ query: 'test files passed', limit: 1 }, io)).toBe(
+      '3 match(es) for "test files passed" in 6 blocks of 1 transcript file; showing 1, those with the most terms on one line.\n' +
+        `[bbbbbbbb:2 · 2026-09-22 ${hm(20)} · Bash result] 1 line\n` +
+        '  1: Test Files 2 passed (2)\n' +
+        '2 more matches not shown; only if none above answers, narrow the query or give "from" or "to".\n' +
+        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "bbbbbbbb:2", "lines": "1-1"}.',
+    )
+    // Blocks alike are cut newest first, and the older ones are one "to" away.
+    const alike = session([...result(20, 'a', 'PEAR one'), ...result(21, 'b', 'PEAR two'), ...result(22, 'c', 'PEAR three')])
+    expect(await run({ query: 'PEAR', limit: 2 }, alike)).toMatch(
+      /^3 match\(es\) for "PEAR" in 6 blocks of 1 transcript file; showing 2, the newest\.\n[\s\S]*\n1 older match not shown; only if none above answers, repeat with "to": "bbbbbbbb:3"\.\n/,
+    )
+  })
+
+  test('with no block holding every term, rare terms outrank common ones, and absent terms are named', async () => {
+    const io = session([
+      ...Array.from({ length: 8 }, (_, i) => msg('assistant', 20 + i, `the common path ${i}`)),
+      msg('assistant', 30, 'RARE-9 was set'),
+      ...Array.from({ length: 8 }, (_, i) => msg('assistant', 31 + i, `another common path ${i}`)),
+    ])
+    const found = await run({ query: 'common RARE-9 lunar checksum', limit: 2 }, io)
+    expect(found.split('\n').slice(0, 3)).toEqual([
+      '17 match(es) for "common RARE-9 lunar checksum" in 17 blocks of 1 transcript file; no block holds every term, so these hold some, chosen by the rarest; showing 2.',
+      'No occurrences in this session of: lunar, checksum.',
+      `[bbbbbbbb:9 · 2026-09-22 ${hm(30)} · assistant] 1 line`,
+    ])
+    // Nothing found says which terms are absent, so there is nothing to search again for.
+    expect((await run({ query: 'lunar checksum' }, io)).split('\n')).toEqual(['0 match(es) for "lunar checksum" in 17 blocks of 1 transcript file.', 'No occurrences in this session of: lunar, checksum.'])
+    expect((await run({ query: 'lunar checksum', from: 'bbbbbbbb:3' }, io)).split('\n')[1]).toBe('No occurrences in this range of: lunar, checksum.')
+  })
+
+  test('a compound term matches its parts when it appears nowhere whole, and is not called absent', async () => {
+    const io = session([msg('assistant', 20, 'the RAW TRACE TOKEN is 7f3a'), msg('assistant', 21, 'nothing here')])
+    const found = await run({ query: 'RAW_TOKEN' }, io)
+    expect(found).toMatch(/^1 match\(es\) for "RAW_TOKEN" in 2 blocks of 1 transcript file; no block holds every term, so these hold some, chosen by the rarest\.\n\[bbbbbbbb:1 [^\n]*\n  1: the RAW TRACE TOKEN is 7f3a\n/)
+    expect(await run({ query: 'RAW_TOKEN zebra' }, io)).toContain('\nNo occurrences in this session of: zebra.\n')
+  })
+
+  test('every mode keeps its whole response under one size cap', async () => {
+    const wide = (n: number) => Array.from({ length: n }, (_, i) => `${i} ${'w'.repeat(900)}`).join('\n')
+    const io = session([
+      ...Array.from({ length: 6 }, (_, i) => msg('assistant', 20 + i, `before ${wide(8)}`)),
+      ...result(30, 'big', wide(60)),
+      ...Array.from({ length: 6 }, (_, i) => msg('assistant', 31 + i, `after ${wide(8)}`)),
+    ])
+    const read = await run({ ref: 'bbbbbbbb:8', before: 5, after: 5 }, io)
+    expect(read.length).toBeLessThanOrEqual(16_000)
+    expect(read).toContain('[bbbbbbbb:8 ')
+    expect(read).toMatch(/\n… \d+ more lines \([\d,]+ characters\); only if you still need them: \{"mode": "read", "ref": "bbbbbbbb:8", "lines": "\d+-\d+"\}\./)
+    expect(read).toContain('[bbbbbbbb:9 ')
+    expect((await run({ query: 'w' }, io)).length).toBeLessThanOrEqual(16_000)
+    expect((await run({ mode: 'outline' }, io)).length).toBeLessThanOrEqual(16_000)
+  })
+
+  test('a long argument is refused before it is searched or echoed', async () => {
+    expect(await run({ query: 'x'.repeat(501) })).toBe('om_recall: query is at most 500 characters; search for its rarest words.')
+    expect(await run({ ref: `aaaaaaaa:${'1'.repeat(600)}` })).toBe('om_recall: ref is at most 500 characters.')
+  })
+
+  test('after three om_recall calls in one turn, a reminder to answer from what was found', async () => {
+    const recallRows = (n: number) =>
+      Array.from({ length: n }, (_, i) => [
+        msg('assistant', 40 + i, [{ type: 'tool_use', id: `r${i}`, name: 'mcp__observational-memory__om_recall', input: { query: 'PEAR' } }]),
+        msg('user', 40 + i, [{ type: 'tool_result', tool_use_id: `r${i}`, content: 'found' }]),
+      ]).flat()
+    // This call, not yet answered, is in the transcript too.
+    const pending = msg('assistant', 50, [{ type: 'tool_use', id: 'now', name: 'mcp__observational-memory__om_recall', input: { query: 'PEAR' } }])
+    const turn = (n: number) => memoryIo({ [`${DIR}/${NEW}.jsonl`]: [msg('user', 1, 'the PEAR is ripe'), msg('user', 30, 'what about the PEAR?'), ...recallRows(n), pending].join('\n') })
+    expect(await run({ query: 'PEAR' }, turn(2))).not.toContain('om_recall calls')
+    expect((await run({ query: 'PEAR' }, turn(3))).split('\n').at(-1)).toBe('This is om_recall call 4 this turn: answer from what you have found unless a specific fact is still missing.')
+    expect((await run({ ref: 'bbbbbbbb:1' }, turn(5))).split('\n').at(-1)).toBe('This is om_recall call 6 this turn: answer from what you have found unless a specific fact is still missing.')
   })
 
   test('read pages a long block with a continuation, and shows neighbours', async () => {
@@ -119,13 +228,13 @@ describe('recall', () => {
     expect(lines[0]).toBe(`[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result] lines 1-200 of 301 (call: aaaaaaaa:2.2)`)
     expect(lines[1]).toBe('   1 | row 1')
     expect(lines).toHaveLength(202)
-    expect(lines.at(-1)).toBe('… 101 more lines: ask {"mode": "read", "ref": "aaaaaaaa:3", "lines": "201-301"}.')
+    expect(lines.at(-1)).toBe('… 101 more lines (832 characters); only if you still need them: {"mode": "read", "ref": "aaaaaaaa:3", "lines": "201-301"}.')
     const rest = await run({ mode: 'read', ref: 'aaaaaaaa:3', lines: '201-' })
     expect(rest.split('\n')[0]).toContain('lines 201-301 of 301')
     expect(rest).toContain(' 250 | row 250 has the NEEDLE-42 marker')
     expect(rest).not.toContain('more line')
     expect(await run({ ref: 'aaaaaaaa:3', lines: '250' })).toBe(
-      `[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result] lines 250-250 of 301 (call: aaaaaaaa:2.2)\n 250 | row 250 has the NEEDLE-42 marker\n… 51 more lines: ask {"mode": "read", "ref": "aaaaaaaa:3", "lines": "251-301"}.`,
+      `[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result] lines 250-250 of 301 (call: aaaaaaaa:2.2)\n 250 | row 250 has the NEEDLE-42 marker\n… 51 more lines (407 characters); only if you still need them: {"mode": "read", "ref": "aaaaaaaa:3", "lines": "251-301"}.`,
     )
     // A row holding several blocks: its reference alone finds the first.
     const call = await run({ ref: 'aaaaaaaa:2', after: 1 })
@@ -139,7 +248,7 @@ describe('recall', () => {
   test('outline: one line per message and tool call, in order, without memory content or om_recall, paged', async () => {
     const all = await run({ mode: 'outline' })
     expect(all.split('\n')).toEqual([
-      `Outline of 2 transcript files (aaaaaaaa → bbbbbbbb): 7 entries, 2026-09-22 ${hm(0)} to 2026-09-22 ${hm(11)}. Tool calls point → at their results; read any block with {"mode": "read", "ref": "<ref>"}.`,
+      `Outline of 2 transcript files (aaaaaaaa → bbbbbbbb): 7 entries, 2026-09-22 ${hm(0)} to 2026-09-22 ${hm(11)}. Tool calls point → at their results; read a block only for what this lacks: {"mode": "read", "ref": "<ref>"}.`,
       '— 2026-09-22 —',
       `aaaaaaaa:1 ${hm(0)} USER: start the KIWI job`,
       `aaaaaaaa:2.1 ${hm(1)} ASSISTANT: Looking`,
@@ -160,7 +269,7 @@ describe('recall', () => {
     const many = Array.from({ length: 150 }, (_, i) => msg('user', 20, `prompt ${i}`)).join('\n')
     const paged = await run({ mode: 'outline' }, memoryIo({ [`${DIR}/${NEW}.jsonl`]: many }))
     expect(paged.split('\n')).toHaveLength(1 + 120 + 1)
-    expect(paged.split('\n').at(-1)).toBe('More: {"mode": "outline", "from": "bbbbbbbb:120"}.')
+    expect(paged.split('\n').at(-1)).toBe('31 more entries; only if you still need them: {"mode": "outline", "from": "bbbbbbbb:120"}.')
   })
 
   test('subagent transcripts: listed, searched with the flag, outlined by their tag', async () => {
@@ -193,7 +302,7 @@ describe('recall', () => {
     const found = (await recall(c, { query: 'MANGO' })).text
     expect(found).toBe(
       '2 match(es) for "MANGO" in 3 blocks of the live history (only the newest 4 messages of the live history are readable).\n' +
-        '[#0 · user] 1 line\n  1: remember MANGO\n[#2 · Read result] 1 line\n  1: MANGO = 1\nRead a block in full: {"mode": "read", "ref": "#2"}.',
+        '[#0 · user] 1 line\n  1: remember MANGO\n[#2 · Read result] 1 line\n  1: MANGO = 1\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#2", "lines": "1-1"}.',
     )
     expect((await recall(c, { ref: '#1' })).text).toBe('[#1 · Read call] lines 1-1 of 1 (result: #2)\n   1 | file_path: /a.ts')
   })
@@ -224,8 +333,14 @@ describe('recall', () => {
     expect((await recall(c, { query: '"Test Files 10 passed"', to: 'b8d50671:147' })).text).toContain('  61: Test Files 10 passed (10)')
     const page = (await recall(c, { ref: 'a79f045b:73' })).text
     expect(page.split('\n')[0]).toMatch(/^\[a79f045b:73 · .* · Bash result\] lines 1-\d+ of 748 \(call: a79f045b:70\)$/)
-    expect(page.split('\n').at(-1)).toMatch(/^… \d+ more lines: ask \{"mode": "read", "ref": "a79f045b:73", "lines": "\d+-\d+"\}\.$/)
+    expect(page.split('\n').at(-1)).toMatch(/^… \d+ more lines \([\d,]+ characters\); only if you still need them: \{"mode": "read", "ref": "a79f045b:73", "lines": "\d+-\d+"\}\.$/)
     expect(page.length).toBeLessThan(14_000)
+    // In a long result, the line holding every term shows, not the first lines holding one.
+    expect((await recall(c, { query: 'Test Files passed' })).text).toContain('\n  55:  Test Files 1 failed | 1 passed (2)\n')
+    const wide = (await recall(c, { ref: 'a79f045b:73', before: 5, after: 5 })).text
+    expect(wide.length).toBeLessThanOrEqual(16_000)
+    expect(wide).toContain('[a79f045b:78 ')
+    expect((await recall(c, { query: 'gorman lunar checksum' })).text.split('\n')[1]).toBe('No occurrences in the main transcript of: lunar, checksum.')
     expect((await recall(c, { query: 'plan', subagents: true })).text).toContain('and 1 subagent transcript')
   })
 })
