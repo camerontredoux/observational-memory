@@ -24,7 +24,7 @@ const WRAP = 1_000 // a longer line counts as several, so every line fits a page
 const RESPONSE_MAX_CHARS = 16_000 // all of one call's response, about 4k tokens
 const ARG_MAX_CHARS = 500
 const TURN_CALLS = 3 // om_recall calls in one turn before a reminder to answer
-const CHAIN_MAX_FILES = 20
+export const CHAIN_MAX_FILES = 20
 const TAG = 8 // characters of a session or agent id naming its file in a reference
 
 export type RecallIo = {
@@ -250,31 +250,69 @@ function markAsking(blocks: readonly Block[]) {
 }
 
 // The session's files, oldest first: each found by the `continued-in` row that names the one after it.
+// The chain's files, oldest to newest, only as far back as CHAIN_MAX_FILES reaches and a link stays readable.
+// `truncated` and `unreadableLink` say why it may stop short of the session's actual start; `discoveryFailed` says
+// the directory listing itself could not be read, so the walk may have missed a link that was really there.
 async function chainOf(io: RecallIo, path: string) {
   const dir = dirOf(path)
-  const names = (await io.list(dir).catch(() => [])).filter((n) => n.endsWith('.jsonl'))
+  let names: string[] = []
+  let discoveryFailed = false
+  try {
+    names = (await io.list(dir)).filter((n) => n.endsWith('.jsonl'))
+  } catch {
+    discoveryFailed = true
+  }
   const files = [path]
+  let unreadableLink = false
   for (let id = stem(path); files.length < CHAIN_MAX_FILES; ) {
     const taken = new Set(files.map((f) => f.slice(f.lastIndexOf('/') + 1)))
-    const prev = await io.continuing(dir, names.filter((n) => !taken.has(n)), id).catch(() => undefined)
+    let prev: string | undefined
+    try {
+      prev = await io.continuing(dir, names.filter((n) => !taken.has(n)), id)
+    } catch {
+      unreadableLink = true
+      break
+    }
     if (!prev) break
     files.unshift(`${dir}/${prev}`)
     id = stem(prev)
   }
-  return { dir, names, files }
+  // The walk above stops as soon as it fills the cap, whether or not a predecessor really remains: check once more,
+  // without reading it, only to report the gap truthfully.
+  let truncated = false
+  if (files.length === CHAIN_MAX_FILES) {
+    const taken = new Set(files.map((f) => f.slice(f.lastIndexOf('/') + 1)))
+    const more = await io.continuing(dir, names.filter((n) => !taken.has(n)), stem(files[0]!)).catch(() => undefined)
+    if (more) truncated = true
+  }
+  return { dir, names, files, truncated, unreadableLink, discoveryFailed }
 }
 
 // The session's whole transcript from its newest file: the files before it, and after it when it was continued.
 export async function loadTranscript(io: RecallIo, path: string, options: { asking?: boolean } = {}): Promise<Corpus> {
-  const { dir, names, files } = await chainOf(io, path)
+  const { dir, names, files, truncated: backTruncated, unreadableLink: backUnreadable, discoveryFailed } = await chainOf(io, path)
   const seen = newSeen()
   const blocks: Block[] = []
-  for (let i = 0; i < files.length && files.length <= CHAIN_MAX_FILES; i++) {
+  let forwardTruncated = false
+  let forwardUnreadable = false
+  for (let i = 0; i < files.length; i++) {
     const tag = tagFor(stem(files[i]!))
-    const parsed = parseFile(tag, await io.read(files[i]!), seen, false)
+    let text: string
+    try {
+      text = await io.read(files[i]!)
+    } catch (error) {
+      if (i === 0) throw error // the file the caller asked for: let it fall back to the live history, as before
+      files.length = i // only the files actually read are counted
+      forwardUnreadable = true
+      break
+    }
+    const parsed = parseFile(tag, text, seen, false)
     blocks.push(...parsed.blocks)
     const next = parsed.continuedIn && `${parsed.continuedIn}.jsonl`
-    if (i === files.length - 1 && next && names.includes(next) && !files.includes(`${dir}/${next}`)) files.push(`${dir}/${next}`)
+    if (i === files.length - 1 && next && names.includes(next) && !files.includes(`${dir}/${next}`)) {
+      if (files.length < CHAIN_MAX_FILES) files.push(`${dir}/${next}`)
+      else forwardTruncated = true
+    }
   }
   if (options.asking) markAsking(blocks)
   // Each file's subagents: `<id>/subagents/agent-<agent id>.jsonl`, with a `.meta.json` naming the call that started it.
@@ -294,11 +332,17 @@ export async function loadTranscript(io: RecallIo, path: string, options: { aski
       if (call) call.agent = tag
     }
   }
+  const notes = [
+    discoveryFailed && `the transcript directory could not be listed, so an older link in its chain may be missing`,
+    (backTruncated || forwardTruncated) && `the chain has more than ${CHAIN_MAX_FILES} files; only the newest ${CHAIN_MAX_FILES} are read`,
+    (backUnreadable || forwardUnreadable) && `a chain file could not be read, so coverage stops there`,
+  ].filter((s): s is string => !!s)
   return {
     main: { tag: 'main', label: 'session', blocks, loaded: true },
     files: files.map((f) => tagFor(stem(f))),
     subagents,
     live: false,
+    ...(notes.length ? { note: notes.join('; ') } : {}),
     load: async (t) => {
       if (t.loaded || !t.path) return
       t.blocks = parseFile(t.tag, await io.read(t.path), newSeen(), true).blocks
@@ -781,7 +825,7 @@ async function outline(c: Corpus, input: Input): Promise<RecallResult> {
     t === c.main
       ? c.live
         ? `the live history${c.note ? ` (${c.note})` : ''}`
-        : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})`
+        : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})${c.note ? ` (${c.note})` : ''}`
       : `${t.label}`
   const subs = t === c.main && c.subagents.length ? `; ${plural(c.subagents.length, 'subagent transcript')} (${c.subagents.map((s) => s.tag).join(', ')})` : ''
   const head = `Outline of ${source}: ${plural(all.length, 'entry', 'entries')}${span}${subs}. Tool calls point → at their results; read a block only for what this lacks: {"mode": "read", "ref": "<ref>"}.`

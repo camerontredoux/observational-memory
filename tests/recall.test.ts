@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { MEMORY_HEADER } from '../hooks/prompts'
-import { legacyRecall, liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
+import { CHAIN_MAX_FILES, legacyRecall, liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
 import type { RecallInput, RecallIo } from '../hooks/recall'
 
 const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
@@ -87,6 +87,60 @@ describe('recall', () => {
     const forward = await run({ query: '"plan is ALPHA"' }, chain(), `${DIR}/${OLD}.jsonl`)
     expect(forward).toMatch(/^1 match\(es\) for "plan is ALPHA" in 6 blocks of 2 transcript files\./)
     expect(await run({ mode: 'outline' }, chain(), `${DIR}/${OLD}.jsonl`)).toContain('bbbbbbbb:3')
+  })
+
+  // A chain of N files, each continuing into the next; io.reads records only the files actually read.
+  const forwardChain = (n: number) => {
+    const ids = Array.from({ length: n }, (_, i) => `f${i}`)
+    const files: Record<string, string> = {}
+    ids.forEach((id, i) => {
+      const rows = [msg('user', i, `chunk ${id}`)]
+      if (i < n - 1) rows.push(JSON.stringify({ type: 'continued-in', sessionId: id, continuedInSessionId: ids[i + 1] }))
+      files[`${DIR}/${id}.jsonl`] = rows.join('\n')
+    })
+    return { io: memoryIo(files), path: `${DIR}/${ids[0]}.jsonl` }
+  }
+
+  test('a chain longer than the file cap is read only up to the cap, and the coverage gap is reported', async () => {
+    const { io, path } = forwardChain(CHAIN_MAX_FILES + 4)
+    const corpus = await loadTranscript(io, path, { asking: true })
+    // Only files actually read are counted; the count matches the reads made.
+    expect(corpus.files.length).toBe(CHAIN_MAX_FILES)
+    expect(io.reads.length).toBe(CHAIN_MAX_FILES)
+    expect(corpus.note).toMatch(new RegExp(`${CHAIN_MAX_FILES}`))
+    const found = await recall(corpus, { mode: 'search', query: 'chunk', subagents: false })
+    expect(found.text).toContain(`(${corpus.note})`)
+  })
+
+  test('a chain within the cap has no coverage note', async () => {
+    const { io, path } = forwardChain(3)
+    const corpus = await loadTranscript(io, path, { asking: true })
+    expect(corpus.files.length).toBe(3)
+    expect(corpus.note).toBeUndefined()
+  })
+
+  test('a chain file that fails to read stops the chain there, without losing what was already read', async () => {
+    const ids = ['g0', 'g1', 'g2']
+    const files: Record<string, string> = {}
+    ids.forEach((id, i) => {
+      const rows = [msg('user', i, `chunk ${id}`)]
+      if (i < ids.length - 1) rows.push(JSON.stringify({ type: 'continued-in', sessionId: id, continuedInSessionId: ids[i + 1] }))
+      files[`${DIR}/${id}.jsonl`] = rows.join('\n')
+    })
+    const inner = memoryIo(files)
+    const io: RecallIo = { ...inner, read: async (p) => (p.endsWith('g2.jsonl') ? Promise.reject(new Error('EACCES')) : inner.read(p)) }
+    const corpus = await loadTranscript(io, `${DIR}/${ids[0]}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual(['g0', 'g1'])
+    expect(corpus.main.blocks.some((b) => b.text === 'chunk g0')).toBe(true)
+    expect(corpus.note).toMatch(/could not (be )?read/)
+  })
+
+  test('a directory that cannot be listed reports that chain discovery failed', async () => {
+    const inner = chain()
+    const io: RecallIo = { ...inner, list: async () => Promise.reject(new Error('EACCES')) }
+    const corpus = await loadTranscript(io, `${DIR}/${NEW}.jsonl`, { asking: true })
+    expect(corpus.files).toEqual(['bbbbbbbb'])
+    expect(corpus.note).toMatch(/discover|list/)
   })
 
   test('a query alone searches, as before; a ref alone reads; nothing outlines', async () => {
