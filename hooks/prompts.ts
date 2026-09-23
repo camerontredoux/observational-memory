@@ -97,7 +97,7 @@ export const OBSERVER_FACTS_PROMPT = [
   ['What to observe:\n', `What to observe:\n${FACTS_RECORDED}\n`],
   [
     '- Always record which files were read, created or edited (full paths) and which commands ran, with what outcome: the assistant may later be asked what it did.',
-    '- Record what a command or edit meant, not that it happened: "typecheck failed on a Uint8Array/BodyInit mismatch in the PDF test; fixed by wrapping it in Buffer.from", not "ran pnpm typecheck".',
+    '- Record what a command or edit meant, not that it happened: "the migration failed because the users table already had the column; dropped the duplicate ALTER", not "ran pnpm db:migrate".',
   ],
 ].reduce((text, [from, to]) => swap(text, from!, to!), OBSERVER_SYSTEM_PROMPT)
 
