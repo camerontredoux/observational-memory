@@ -849,6 +849,11 @@ describe('register', () => {
       'observed rows 7-13 in the background, 1 observations; watermark 0, 1 chunk(s) waiting on a gap',
       'observed rows 0-7 in the background, 1 observations; watermark 13, 0 chunk(s) waiting on a gap',
     ])
+    // On screen, a chunk held behind a gap already counts toward the memory.
+    expect(seen.screen.filter((l) => l.startsWith('Observed')).map((l) => l.replace(/ in .* · \+/, ' · +'))).toEqual([
+      'Observed 6 messages · +1 note · memory 1 note',
+      'Observed 7 messages · +1 note · memory 2 notes',
+    ])
     // The rows' times come from the steps that brought them, not only the prompt's.
     expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 09:03 Read a file', '🟡 2026-09-23 09:06 Read a file'])
 

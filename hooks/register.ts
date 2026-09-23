@@ -632,7 +632,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
     if (at)
       show(
         $,
-        `Observed ${plural(at.to - at.from, 'message')} in ${duration(ms)} · +${plural(chunk.lines.length, 'note')} · memory ${plural(next.entries.length, 'note')}`,
+        `Observed ${plural(at.to - at.from, 'message')} in ${duration(ms)} · +${plural(chunk.lines.length, 'note')} · memory ${plural(next.entries.length + next.chunks.reduce((n, c) => n + c.lines.length, 0), 'note')}`,
       )
     return !!at
   }).catch((error) => (log($, errorText(error)), false))
