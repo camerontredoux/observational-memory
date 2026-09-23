@@ -301,7 +301,7 @@ export async function loadTranscript(io: RecallIo, path: string, options: { aski
     try {
       text = await io.read(files[i]!)
     } catch (error) {
-      if (i === 0) throw error // the file the caller asked for: let it fall back to the live history, as before
+      if (files[i] === path) throw error // the file the caller asked for: let it fall back to the live history, as before
       files.length = i // only the files actually read are counted
       forwardUnreadable = true
       break
