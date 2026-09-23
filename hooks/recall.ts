@@ -459,7 +459,7 @@ function matcher(query: string): Matcher | string {
       return at.length ? Math.min(...at) : -1
     },
     terms: terms.length,
-    shown: `"${query}"`,
+    shown: /^".*"$/.test(query.trim()) ? query.trim() : `"${query}"`,
   }
 }
 

@@ -78,7 +78,7 @@ describe('recall', () => {
         'Read a block in full: {"mode": "read", "ref": "aaaaaaaa:3"}.',
     )
     const forward = await run({ query: '"plan is ALPHA"' }, chain(), `${DIR}/${OLD}.jsonl`)
-    expect(forward).toMatch(/^1 match\(es\) for ""plan is ALPHA"" in 6 blocks of 2 transcript files\./)
+    expect(forward).toMatch(/^1 match\(es\) for "plan is ALPHA" in 6 blocks of 2 transcript files\./)
     expect(await run({ mode: 'outline' }, chain(), `${DIR}/${OLD}.jsonl`)).toContain('bbbbbbbb:3')
   })
 
