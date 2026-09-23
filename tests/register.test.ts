@@ -814,7 +814,9 @@ describe('register', () => {
     expect(stored).toEqual({})
     expect(seen.logs).toContain("subagent agent-1's history is unreadable (no agent agent-1 in this session)")
     expect(seen.logs).toContain("subagent agent-1's history is unreadable (no agent agent-1 in this session); observing its context on the spot")
-    expect(seen.screen).toEqual(['Compacted subagent in 0 ms · observed 3 messages on the spot · memory 1 note'])
+    // A subagent's lines go to the debug log only: the main chat never sees them.
+    expect(seen.screen).toEqual([])
+    expect(seen.logs).toContain('Compacted subagent in 0 ms · observed 3 messages on the spot · memory 1 note')
   })
 
   test('main and two subagents observe in the background side by side, each under its own keys, four Observer calls in flight across them', async ($, on) => {
@@ -847,6 +849,11 @@ describe('register', () => {
     expect(seen.maxInFlight).toBe(4)
     // Every call read one loop's rows, and a loop left short of a slot got the next one free.
     for (const prompt of seen.prompts) expect(readers(prompt).size).toBe(1)
+    // Only main's observations show in the chat; the subagents' go to the debug log.
+    const byMain = seen.prompts.filter((p) => readers(p).has('main')).length
+    expect(byMain).toBeGreaterThan(0)
+    expect(seen.screen.filter((l) => l.startsWith('Observed'))).toHaveLength(byMain)
+    expect(seen.logs.filter((l) => l.startsWith('Observed'))).toHaveLength(seen.prompts.length - byMain)
     const ledgers = { main: 'ledger:session-1', one: 'ledger:session-1/agent-1', two: 'ledger:session-1/agent-2' }
     for (const [who, key] of Object.entries(ledgers)) {
       const ledger = stored[key] as Ledger
@@ -887,7 +894,7 @@ describe('register', () => {
     expect(calls).toBeGreaterThan(0)
     const first = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
     expect(seen.prompts).toHaveLength(calls)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
     const text = first.messages?.[0]?.text ?? ''
     expect(userMessagesIn(text)).toEqual([brief])
     expect(text).not.toContain('<optional-next-step>')
@@ -905,7 +912,8 @@ describe('register', () => {
     expect(userMessagesIn(second.messages?.[0]?.text)).toEqual([brief])
     expect(observationsIn(second.messages?.[0]?.text)).toContain('one-10')
     expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
-    expect(seen.screen.filter((l) => l.startsWith('Compacted'))).toEqual([expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/), expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)])
+    expect(seen.screen).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual([expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/), expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)])
     const file = JSON.parse(files['/stats/session-1.json']!) as { metrics: Record<string, { count: number; sum: number }> }
     expect(file.metrics['compaction.subagent.syncCalls']).toMatchObject({ count: 2, sum: 0 })
     expect(file.metrics['compaction.auto.ms']).toBeUndefined()
@@ -1322,7 +1330,8 @@ describe('register', () => {
       expect(r.rawTokens).toBeLessThanOrEqual(6_000 + 5_000 + 10_000) // the raw tail, a scheduling interval, a chunk in flight
       expect(r.nextStep).toBe(false)
     }
-    expect(seen.screen.filter((l) => l.startsWith('Compacted'))).toEqual(fx.compactions.map(() => expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)))
+    expect(seen.screen).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual(fx.compactions.map(() => expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)))
     expect(Object.keys(stored)).toEqual([]) // the finished subagent's keys are gone
   })
 

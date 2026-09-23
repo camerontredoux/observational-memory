@@ -118,7 +118,8 @@ const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(tex
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
-const show = ($: EngineInterface, text: string) => $.ui.log(text)
+// A subagent's lines go to the debug log only: the main chat shows the main conversation's.
+const show = ($: EngineInterface, text: string, agentId?: string) => (agentId === undefined ? $.ui.log(text) : $.ui.log(text, { to: 'debug' }))
 const plural = (n: number, noun: string) => `${grouped(n)} ${noun}${n === 1 ? '' : 's'}`
 // A pi failure in a few words for the screen: how it ended, never what it printed.
 function reason(error: unknown, timeoutMs: number) {
@@ -689,7 +690,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
     chunk = await observe($, v, job.range.from, job.range.to, 'background')
   } catch (error) {
     log($, `background observation of rows ${job.range.from}-${job.range.to} failed (${errorText(error)}); it will be retried`)
-    show($, `Observation failed (${reason(error, OBSERVER_TIMEOUT_MS)}) and will retry`)
+    show($, `Observation failed (${reason(error, OBSERVER_TIMEOUT_MS)}) and will retry`, loop.agentId)
   }
   const ms = (await $.clock.now()) - started
   const landed = await locked(async () => {
@@ -716,6 +717,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
       show(
         $,
         `Observed ${plural(at.to - at.from, 'message')} in ${duration(ms)} · +${plural(chunk.lines.length, 'note')} · memory ${plural(next.entries.length + next.chunks.reduce((n, c) => n + c.lines.length, 0), 'note')}`,
+        loop.agentId,
       )
     return !!at
   }).catch((error) => (log($, errorText(error)), false))
@@ -779,13 +781,13 @@ async function maybeReflect($: EngineInterface, loop: Loop) {
             `(~${estimateTokens(renderLines(reflected))} tokens) at compression level ${Math.min(level, 4)}; ` +
             `${entries.length - reflected.length} newer kept`,
         )
-        show($, `Condensed memory in ${duration((await $.clock.now()) - started)} · ${grouped(ledger.entries.length)} → ${plural(entries.length, 'note')}`)
+        show($, `Condensed memory in ${duration((await $.clock.now()) - started)} · ${grouped(ledger.entries.length)} → ${plural(entries.length, 'note')}`, loop.agentId)
       })
     }
     run()
       .catch((error) => {
         log($, `reflection failed (${errorText(error)})`)
-        show($, `Condensing failed (${reason(error, REFLECTOR_TIMEOUT_MS)}) and will retry later`)
+        show($, `Condensing failed (${reason(error, REFLECTOR_TIMEOUT_MS)}) and will retry later`, loop.agentId)
       })
       .finally(() => reflecting.delete(key))
   })
@@ -996,7 +998,7 @@ export const register: Register = (on) => {
     const cut = ledger.watermark.to
     if (cut <= base && failed) throw new Error('the Observer failed and nothing is observed yet')
     if (cut <= base) throw new Error('nothing observed and nothing to observe before the raw tail')
-    for (const line of keptInFull) show($, line)
+    for (const line of keptInFull) show($, line, e.agentId)
 
     const observations = renderLines(ledger.entries)
     const tail = messages.slice(cut)
@@ -1043,6 +1045,7 @@ export const register: Register = (on) => {
       $,
       `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
         `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}`,
+      e.agentId,
     )
     const compaction = {
       trigger: main ? e.trigger : 'subagent',
@@ -1066,7 +1069,7 @@ export const register: Register = (on) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     log($, `${next.error.message}; using the built-in compaction`)
-    show($, 'Observation failed. Using built-in compaction')
+    show($, 'Observation failed. Using built-in compaction', e.agentId)
     // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
     const installs = e.trigger !== 'precompute'
     const [rows, sessionId, started] = await Promise.all([installs ? historyOf($, e.agentId).catch(() => undefined) : undefined, $.session.id(), $.clock.now()]).catch(() => [])
