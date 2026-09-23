@@ -22,6 +22,7 @@ const MAX_OUTPUT_TOKENS = 32_000
 const TIMEOUT_MS = 5 * 60_000
 const JEV_STATE_MAX_TOKENS = 25_000 // fast-jev-compaction's default, under Jev's 32k for state plus a question
 const CHUNK_TOKENS = 10_000 // observe in the background once this much unobserved history builds up
+const RAW_MAX_TOKENS = 20_000 // past this much raw history after the watermark, compaction observes it instead
 const WAIT_MS = 60_000 // how long a compaction waits for a background chunk still in flight
 const WAIT_MARGIN_MS = 3_000 // of the hook's own budget, left when it stops waiting
 const WAIT_TICK_MS = 500
@@ -62,6 +63,8 @@ const truncate = (text: string, maxTokens: number) =>
 
 const messageText = (m: SessionMessage) =>
   [m.text, ...m.toolUses.map((u) => JSON.stringify(u.input) + (u.text ?? '')), ...(m.toolResults ?? []).map((r) => r.text)].join('\n')
+
+const tokensOf = (messages: readonly SessionMessage[]) => messages.reduce((n, m) => n + estimateTokens(messageText(m)), 0)
 
 const dateLabel = (d: Date) => `${MONTHS[d.getMonth()]} ${d.getDate()} ${d.getFullYear()}`
 const timeLabel = (d: Date) => `${d.getHours() % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${d.getHours() < 12 ? 'AM' : 'PM'}`
@@ -492,7 +495,6 @@ export const register: Register = (on) => {
     const base = prior ? 1 : 0
     const start = base + tailStart(messages.slice(base))
     if (start === base) return next(e) // one long turn: nothing can be observed without splitting it
-    const tail = messages.slice(start)
 
     const now = new Date(await $.clock.now())
     const apiKey = await $.env.get('TYPESAFE_API_KEY')
@@ -522,27 +524,49 @@ export const register: Register = (on) => {
       log = appendChunk(log, chunk)
       latest = chunk
     }
-    // The leftover after the pending chunk is observed while it finishes: the hook's budget stands still meanwhile.
-    const leftoverFrom = pending?.to ?? watermark
-    const leftover = leftoverFrom < start ? observe($, c, leftoverFrom, start, logSoFar(log, latest)) : undefined
-    leftover?.catch(() => {})
+    // Pi's cut: everything from the last observed chunk on stays raw, when something is observed and the rest fits.
+    const fits = (cut: number) => cut > base && tokensOf(messages.slice(cut)) <= RAW_MAX_TOKENS
     let background = watermark - base
-    if (pending) {
+    let cut = watermark
+    let waiting = pending
+    if (pending && fits(pending.to)) {
+      waiting = undefined
       const chunk = await settle($, () => next.budget.remainingMs, pending.result)
-      if (chunk) background += pending.to - pending.from
-      else {
+      if (chunk) {
+        cut = pending.to
+        background += pending.to - pending.from
+        log = appendChunk(log, chunk)
+        latest = chunk
+      } else {
         pending.abandoned = installs
-        $.ui.log('observational-memory: the background chunk is not ready; observing it now')
+        $.ui.log(`observational-memory: the background chunk is not ready; ${fits(cut) ? 'cutting at the watermark' : 'observing it now'}`)
       }
-      const observed = chunk ?? (await observe($, c, pending.from, pending.to, logSoFar(log, latest)))
-      log = appendChunk(log, observed)
-      latest = observed
     }
-    if (leftover) {
-      const observed = await leftover
-      log = appendChunk(log, observed)
-      latest = observed
+    const atWatermark = fits(cut)
+    if (!atWatermark) {
+      cut = start
+      // The leftover after the pending chunk is observed while it finishes: the hook's budget stands still meanwhile.
+      const leftoverFrom = waiting?.to ?? watermark
+      const leftover = leftoverFrom < start ? observe($, c, leftoverFrom, start, logSoFar(log, latest)) : undefined
+      leftover?.catch(() => {})
+      if (waiting) {
+        const chunk = await settle($, () => next.budget.remainingMs, waiting.result)
+        if (chunk) background += waiting.to - waiting.from
+        else {
+          waiting.abandoned = installs
+          $.ui.log('observational-memory: the background chunk is not ready; observing it now')
+        }
+        const observed = chunk ?? (await observe($, c, waiting.from, waiting.to, logSoFar(log, latest)))
+        log = appendChunk(log, observed)
+        latest = observed
+      }
+      if (leftover) {
+        const observed = await leftover
+        log = appendChunk(log, observed)
+        latest = observed
+      }
     }
+    const tail = messages.slice(cut)
 
     let memory: Memory = { observations: log, currentTask: latest?.currentTask, suggestedResponse: latest?.suggestedResponse }
     const reflecting = estimateTokens(memory.observations) >= REFLECT_AT_TOKENS
@@ -554,14 +578,17 @@ export const register: Register = (on) => {
     // The history goes on with [memory message, ...tail]: nothing in the tail is observed yet, and its times move
     // to its copies.
     if (main && installs) {
-      const moved = marks.filter((k) => k.i >= offset + start).map((k) => ({ ...k, i: k.i - offset - start + rows.length + 1 }))
+      const moved = marks.filter((k) => k.i >= offset + cut).map((k) => ({ ...k, i: k.i - offset - cut + rows.length + 1 }))
       await Promise.all([$.store.delete(bufferKey(sessionId)), $.store.set(timesKey(sessionId), moved)]).catch((error) =>
         $.ui.log(`observational-memory: could not reset the buffer (${errorText(error)})`),
       )
     }
     $.ui.log(
-      `observational-memory: observed ${start - base} messages${background ? ` (${background} in the background)` : ''}, ` +
-        `kept ${messages.length - start}; log ~${estimateTokens(memory.observations)} tokens${reflecting ? ', reflected' : ''}`,
+      atWatermark
+        ? `observational-memory: cut at the background watermark, kept ${tail.length} raw messages (~${tokensOf(tail)} tokens), ` +
+            `no Observer call; log ~${estimateTokens(memory.observations)} tokens${reflecting ? ', reflected' : ''}`
+        : `observational-memory: observed ${start - base} messages${background ? ` (${background} in the background)` : ''}, ` +
+            `kept ${tail.length}; log ~${estimateTokens(memory.observations)} tokens${reflecting ? ', reflected' : ''}`,
     )
     return { messages: [memoryMessage(memory, now), ...tail] }
   }).catch(async ($, e, next) => {

@@ -95,11 +95,13 @@ function live(on: On, clock: MockClock, transcript: SessionMessage[]) {
   }
 }
 
-// An Observer whose observation names the prompts it was shown, so each chunk's reply is told apart.
-function namingObserver(on: On, date = 'Sep 22, 2026') {
+// An Observer whose observation names the prompts it was shown, so each chunk's reply is told apart; `hold`
+// delays the answer to the nth call.
+function namingObserver(on: On, date = 'Sep 22, 2026', hold?: (n: number) => Promise<void> | undefined) {
   const seen = { prompts: [] as string[], logs: [] as string[] }
-  on('model.complete', ($, e) => {
+  on('model.complete', async ($, e) => {
     seen.prompts.push(e.prompt)
+    await hold?.(seen.prompts.length)
     const history = e.prompt.split('===== BEGIN MESSAGE HISTORY')[1]?.split('===== END MESSAGE HISTORY')[0] ?? ''
     const names = [...history.matchAll(/^User(?: \([^)]*\))?: (\w+)$/gm)].map((m) => m[1])
     const text = `<observations>\nDate: ${date}\n* 🔴 (14:30) Saw ${names.join(' ')}\n</observations>\n<current-task>\nPrimary: ${names.at(-1)}\n</current-task>`
@@ -517,5 +519,140 @@ describe('register', () => {
     expect(seen.prompts[2]).not.toMatch(/User \(.+\): [ab]$/m)
     expect(seen.prompts[2]).toContain('## Previous Observations\n\nDate: Sep 22, 2026\n* 🔴 (14:30) Saw a\n\n--- message boundary')
     expect(seen.logs).toContain('observational-memory: observed messages 1-5 in the background, ~10 tokens')
+  })
+  test('with buffered chunks compaction cuts at the watermark: no model call, everything after it raw', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on, { TYPESAFE_API_KEY: 'test-key' })
+    const seen = namingObserver(on)
+    const requests = jev(on, () => 0.9)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+    history.push(...turn('c', 'c', 8_000), ...turn('d', 'd', 8_000))
+    const messages = [...history]
+    const jevCalls = requests.length
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts).toHaveLength(1) // the background chunk's
+    expect(requests).toHaveLength(jevCalls)
+    expect(result.messages?.slice(1)).toEqual(messages.slice(4))
+    expect(result.messages?.[0]?.text).toContain('* 🔴 (14:30) Saw a\n</observations>\n\n<current-task>\nPrimary: a\n</current-task>')
+    expect(seen.logs).toContain(
+      'observational-memory: cut at the background watermark, kept 12 raw messages (~12033 tokens), no Observer call; log ~10 tokens',
+    )
+  })
+
+  test('a chunk in flight that lands within the budget moves the cut to its end', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 22_000), at(22, 15, 0))
+    await clock.settle()
+    await conversation.turn($, turn('c', 'c'), at(22, 15, 30)) // starts the chunk over b
+    history.push(...turn('d', 'd'))
+    const messages = [...history]
+    const compacting = $.session.compact({ trigger: 'auto', messages })
+    await clock.settle()
+    const result = await compacting
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.prompts[1]).toContain('User (3:00 PM): b')
+    expect(result.messages?.slice(1)).toEqual(messages.slice(8))
+    expect(result.messages?.[0]?.text).toMatch(/Saw a\n\n--- message boundary \(.+\) ---\n\nDate: Sep 22, 2026 \(.+\)\n\* 🔴 \(14:30\) Saw b\n/)
+    expect(seen.logs.filter((l) => l.includes('in the background, ~'))).toHaveLength(1) // taken over, never buffered
+  })
+
+  test('a chunk in flight that misses the budget leaves the cut at the watermark, and its late result is discarded', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.env(on, {})
+    on('session.id', () => ({ value: 'session-1' }))
+    const history: SessionMessage[] = []
+    on('session.messages', () => ({ value: history }))
+    const stored = visibleStore(on)
+    let release = () => {}
+    const late = new Promise<void>((resolve) => (release = resolve))
+    const seen = namingObserver(on, 'Sep 22, 2026', (n) => (n === 2 ? late : undefined))
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 22_000), at(22, 15, 0))
+    await clock.settle()
+    await conversation.turn($, turn('c', 'c'), at(22, 15, 30))
+    history.push(...turn('d', 'd'))
+    const messages = [...history]
+    const compacting = $.session.compact({ trigger: 'auto', messages })
+    await clock.advance(60_000)
+    const result = await compacting
+    release()
+    await clock.settle()
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(result.messages?.slice(1)).toEqual(messages.slice(4))
+    expect(result.messages?.[0]?.text).not.toContain('Saw b')
+    expect(seen.logs).toContain('observational-memory: the background chunk is not ready; cutting at the watermark')
+    expect(seen.logs).toContain('observational-memory: a background chunk landed after its compaction; discarded')
+    expect(stored['buffer:session-1']).toBeUndefined()
+  })
+
+  test('raw history past RAW_MAX_TOKENS after the watermark is observed synchronously', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 30_000), at(22, 15, 0))
+    await clock.settle()
+    history.push(...turn('c', 'c', 30_000))
+    const messages = [...history]
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(result.messages?.slice(1)).toEqual(messages.slice(8))
+    expect(seen.logs).toContain('observational-memory: observed 8 messages (4 in the background), kept 4; log ~33 tokens')
+  })
+
+  test('with nothing observed yet compaction observes synchronously, however little is left raw', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = namingObserver(on)
+    const messages = [...turn('a', 'a', 8_000), ...turn('b', 'b', 8_000), ...turn('c', 'c', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts).toHaveLength(1)
+    expect(result.messages?.slice(1)).toEqual(messages.slice(8))
+    expect(seen.logs).toContain('observational-memory: observed 8 messages, kept 4; log ~10 tokens')
+  })
+
+  test('after a watermark cut the next background chunk observes the kept-raw messages once, with their times', async ($, on) => {
+    const clock = mock.clock(on)
+    const history = world(on)
+    const seen = namingObserver(on)
+    const conversation = live(on, clock, history)
+
+    await conversation.turn($, turn('a', 'a', 30_000), at(22, 14, 30))
+    await conversation.turn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+    await conversation.turn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await conversation.turn($, turn('d', 'd', 8_000), at(22, 16, 0))
+    await clock.settle()
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    history.push(...result.messages!)
+    await conversation.turn($, turn('e', 'e', 30_000), at(22, 16, 30))
+    await clock.settle()
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.prompts[1]).toContain('User (3:00 PM): b')
+    expect(seen.prompts[1]).toContain('User (3:30 PM): c')
+    expect(seen.prompts[1]).toContain('User (4:00 PM): d')
+    expect(seen.prompts[1]).toContain('## Previous Observations\n\nDate: Sep 22, 2026\n* 🔴 (14:30) Saw a\n')
+    for (const name of 'abcde') expect(seen.prompts.join('\n').match(new RegExp(`^User \\(.+\\): ${name}$`, 'gm')) ?? []).toHaveLength(name === 'e' ? 0 : 1)
+    expect(seen.logs).toContain('observational-memory: observed messages 1-13 in the background, ~11 tokens')
   })
 })

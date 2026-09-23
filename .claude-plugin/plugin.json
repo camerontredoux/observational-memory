@@ -1,6 +1,6 @@
 {
   "name": "observational-memory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Compaction as Mastra's observational memory: an Observer turns older messages into a dated observation log, in the background as the conversation goes, a Reflector condenses the log when it grows, and recent messages stay whole. Prompts and answers are timestamped, Jev prunes stale tool output before the Observer reads it, and skills still in use are carried across compactions.",
   "author": {
     "name": "Cameron Tredoux"
