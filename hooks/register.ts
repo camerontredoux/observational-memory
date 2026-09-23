@@ -668,7 +668,9 @@ export const register: Register = (on) => {
         `${ledger.entries.length} observations, ${memory.skills.length} skill(s)`,
     )
     if (persistent && installs) void maybeReflect($, sessionId).catch((error) => log($, errorText(error)))
-    return { messages: [message, ...tail] }
+    // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
+    // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
+    return { messages: [message, ...tail.map(({ handle: _, ...m }) => m)] }
   }).catch(async ($, e, next) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }

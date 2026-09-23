@@ -144,7 +144,8 @@ describe('register', () => {
     const seen = pi(on)
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
-    const result = await $.session.compact({ trigger: 'manual', messages })
+    // The engine stamps a handle on each message it hands the hook; the kept ones must come back without it.
+    const result = await $.session.compact({ trigger: 'manual', messages: messages.map((m, i) => ({ ...m, handle: `h${i}` })) })
 
     expect(seen.prompts).toHaveLength(2)
     expect(seen.maxInFlight).toBe(2)
