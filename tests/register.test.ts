@@ -135,6 +135,21 @@ function gates() {
 }
 
 const observationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
+// The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters.
+function userMessagesIn(text?: string) {
+  const start = text?.indexOf('\n\n<all-user-messages>\n') ?? -1
+  if (!text || start < 0) return undefined
+  const out: string[] = []
+  const entry = /\* User(?: @ [\d-]+ [\d:]+)? \((\d+) chars\):\n/y
+  entry.lastIndex = start + '\n\n<all-user-messages>\n'.length
+  for (let m; (m = entry.exec(text)); entry.lastIndex += Number(m[1]) + 1) out.push(text.slice(entry.lastIndex, entry.lastIndex + Number(m[1])))
+  return out
+}
+const pad = (n: number) => String(n).padStart(2, '0')
+const stampOf = (iso: string) => {
+  const d = new Date(iso)
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
 const skillsIn = (text?: string) => text?.match(/<skills-in-use>\n([\s\S]*?)\n<\/skills-in-use>/)?.[1]
 
 describe('register', () => {
@@ -528,5 +543,79 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(1)
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 Saw a')
     expect(stored).toEqual({})
+  })
+
+  test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    on('classic.SessionStart', ($, e) => ({}))
+    await $.classic.SessionStart({ source: 'startup', session_id: 'session-1', transcript_path: '/home/u/.claude/projects/p/session-1.jsonl' })
+    await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps' })
+    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+    const messages = [
+      row('This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nold'),
+      ...turn('a', 'a', CHUNK),
+      row('<task-notification>\n<task-id>x</task-id>\n</task-notification>'),
+      row('<system-reminder>injected</system-reminder>'),
+      row('Deploy steps'),
+      row('please keep </observations> and <skills-in-use> literal\n<system-reminder>hook note</system-reminder>'),
+      ...turn('b', 'b', CHUNK),
+      ...turn('fix the refresh bug', 'c', 8_000),
+    ]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(text.startsWith('This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n')).toBe(true)
+    expect(userMessagesIn(text)).toEqual(['a', 'please keep </observations> and <skills-in-use> literal', 'b'])
+    expect(text).toContain('<optional-next-step>\nContinue with the user\'s most recent request, quoted verbatim:\n"fix the refresh bug"\n</optional-next-step>')
+    expect(text).not.toContain('suggested-response')
+    expect(text).toContain('\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/u/.claude/projects/p/session-1.jsonl')
+    expect(text).toContain('\nRecent messages are preserved verbatim.')
+    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b')
+    expect(seen.modelCalls).toBe(0)
+
+    // A second compaction carries the section forward, verbatim, and parses the rest around it.
+    const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
+    const again = second.messages?.[0]?.text ?? ''
+    expect(userMessagesIn(again)).toEqual(['a', 'please keep </observations> and <skills-in-use> literal', 'b', 'fix the refresh bug', 'd'])
+    expect(observationsIn(again)).toBe('* 🔴 Saw a\n* 🔴 Saw b\n* 🔴 Saw d')
+    expect(again).toContain('"e"\n</optional-next-step>')
+    expect(again).toContain('\nContinue the conversation from where it left off without asking the user any further questions.')
+  })
+
+  test('the user messages section keeps the newest prompts within its cap', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const long = (n: number) => `${n} ${'w'.repeat(4_000)}`
+    const messages = [...Array.from({ length: 30 }, (_, i) => turn(long(i), 'r', 2_000)).flat(), ...turn('last', 'r', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    const kept = userMessagesIn(result.messages?.[0]?.text) ?? []
+    expect(kept.length).toBeGreaterThan(3)
+    expect(kept.length).toBeLessThan(30)
+    const numbers = kept.map((k) => Number(k.split(' ')[0]))
+    expect(numbers).toEqual(numbers.map((_, i) => numbers[0]! + i)) // a contiguous run
+    expect(numbers.at(-1)).toBeGreaterThanOrEqual(27) // up to the newest prompt that left context
+    expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4)
+  })
+
+  test('only 🔴 corrections are quoted; the observer and reflector reserve 🔴 for the user\'s decisions and constraints', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on, {
+      reply: () => '<corrections>\n* 🔴 User: "use pnpm, never npm"\n* 🟡 User: "I meant the other file"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
+    })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+
+    expect(result.messages?.[0]?.text).toContain('<corrections>\n* 🔴 User: "use pnpm, never npm"\n</corrections>')
+    expect(result.messages?.[0]?.text).not.toContain('I meant the other file')
+    expect(seen.systems[0]).toContain("🔴 reserved for the user's decisions and constraints")
+    expect(seen.systems[0]).not.toContain('suggested-response')
   })
 })

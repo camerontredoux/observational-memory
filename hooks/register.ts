@@ -1,5 +1,9 @@
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 import {
+  COMPACT_RECENT,
+  COMPACT_RESUME_DIRECTLY,
+  COMPACT_TRANSCRIPT,
+  COMPACT_WRAPPER,
   COMPRESSION_GUIDANCE,
   MEMORY_CONTINUATION,
   MEMORY_HEADER,
@@ -35,6 +39,8 @@ const STAMP_SLACK_MS = 60_000
 const RECALL_TOOL = 'om_recall'
 const RECALL_MAX_HITS = 20
 const RECALL_SNIPPET_CHARS = 400
+const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
+const NEXT_STEP_MAX_TOKENS = 2_000
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
 const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -44,7 +50,7 @@ type Skill = { skill: string; text: string }
 type Mark = { i: number; hash: string; at: number } // when row `i` of `$.session.messages()` was written
 // Rows [from, to) of the live context, known again by their hashes wherever they sit later.
 type Range = { from: number; to: number; hash: string; head: string }
-type Observed = { lines: string[]; corrections: string[]; currentTask?: string; suggestedResponse?: string }
+type Observed = { lines: string[]; corrections: string[]; currentTask?: string }
 type Chunk = Range & Observed
 type Entry = { id: string; line: string } // line: `🔴 2026-09-23 14:30 User asked …`
 type Ledger = {
@@ -54,7 +60,6 @@ type Ledger = {
   corrections: string[] // the user's corrections, quoted: never reflected
   chunks: Chunk[] // observed past a gap in the watermark, committed once the gap closes
   currentTask?: string
-  suggestedResponse?: string
   seq: number
 }
 type View = {
@@ -64,7 +69,18 @@ type View = {
   at: (number | undefined)[]
   base: number // 1 when a memory message leads
 }
-type Memory = { corrections: string[]; observations: string; currentTask?: string; suggestedResponse?: string; skills: Skill[] }
+type UserMessage = { at?: string; text: string }
+type Memory = {
+  corrections: string[]
+  observations: string
+  currentTask?: string
+  skills: Skill[]
+  userMessages: UserMessage[]
+  nextStep?: string // the user's latest request, verbatim
+  transcript?: string
+  recentKept: boolean
+  resumeDirectly: boolean
+}
 type Job = { sessionId: string; range: Range }
 type Bounds = { lo: number; hi: number; latest: number } | undefined
 
@@ -96,9 +112,22 @@ function hash(text: string) {
 }
 
 const rowHash = (m: SessionMessage) => hash(`${m.role}\n${rowText(m)}`)
-const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(MEMORY_HEADER)
+// A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
+const isMemory = (m: SessionMessage | undefined) =>
+  m?.role === 'user' && (m.text.startsWith(MEMORY_HEADER) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`))
+const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
 const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
+
+// What the user typed, if a row is a real prompt: no tool results, compaction summary, injected block (a system
+// reminder, task notification, local command's caveat or output, image note) or skill text. A system reminder a
+// hook appended to a prompt is cut from it.
+function typed(m: SessionMessage, skills: readonly Skill[]) {
+  if (!isPrompt(m) || isMemory(m) || isSummary(m)) return undefined
+  const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+  if (!text || /^<[a-z][a-z-]*>/.test(text) || text.startsWith('[Image')) return undefined
+  return skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
+}
 
 const pad = (n: number) => String(n).padStart(2, '0')
 const stamp = (ms: number) => {
@@ -278,9 +307,8 @@ async function observe($: EngineInterface, v: View, from: number, to: number): P
   return {
     ...range(v, from, to),
     lines: parseLines(observationsOf(text), bounds, !bounds),
-    corrections: parseLines(correctionsOf(text), bounds, !bounds),
+    corrections: parseLines(correctionsOf(text), bounds, !bounds).filter((l) => l.startsWith('🔴')),
     currentTask: tag(text, 'current-task'),
-    suggestedResponse: tag(text, 'suggested-response'),
   }
 }
 
@@ -288,32 +316,76 @@ const renderLines = (entries: readonly Entry[]) => entries.map((e) => `* ${e.lin
 const renderCorrections = (lines: readonly string[]) => (lines.length ? `<corrections>\n${lines.map((l) => `* ${l}`).join('\n')}\n</corrections>\n\n` : '')
 const section = (name: string, value?: string) => (value ? `\n\n<${name}>\n${value}\n</${name}>` : '')
 
+// The user's messages, verbatim, each after a header that gives its length, so no text inside can end the section.
+const USER_MESSAGES = '\n\n<all-user-messages>\n'
+const NEXT_STEP = '\n\n<optional-next-step>\n'
+const renderUserMessages = (messages: readonly UserMessage[]) =>
+  messages.length
+    ? `${USER_MESSAGES}${messages.map((m) => `* User${m.at ? ` @ ${m.at}` : ''} (${m.text.length} chars):\n${m.text}\n`).join('')}</all-user-messages>`
+    : ''
+
+function parseUserMessages(text: string) {
+  const out: UserMessage[] = []
+  const start = text.indexOf(USER_MESSAGES)
+  if (start < 0) return out
+  const entry = /\* User(?: @ ([\d-]+ [\d:]+))? \((\d+) chars\):\n/y
+  entry.lastIndex = start + USER_MESSAGES.length
+  for (let m; (m = entry.exec(text)); entry.lastIndex += Number(m[2]) + 1)
+    out.push({ ...(m[1] ? { at: m[1] } : {}), text: text.slice(entry.lastIndex, entry.lastIndex + Number(m[2])) })
+  return out
+}
+
+// The newest messages within USER_MESSAGES_MAX_TOKENS, oldest first; a newest one alone over it is cut.
+function capUserMessages(messages: readonly UserMessage[]) {
+  const kept: UserMessage[] = []
+  let tokens = 0
+  for (const m of [...messages].reverse()) {
+    const t = estimateTokens(m.text)
+    if (!kept.length && t > USER_MESSAGES_MAX_TOKENS) return [{ ...m, text: truncate(m.text, USER_MESSAGES_MAX_TOKENS) }]
+    if (tokens + t > USER_MESSAGES_MAX_TOKENS) break
+    kept.unshift(m)
+    tokens += t
+  }
+  return kept
+}
+
+// Built as the built-in summary is framed: its wrapper first, the memory, then its notes after the summary.
 function memoryMessage(memory: Memory): SessionMessage {
   const text =
-    `${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
+    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
     section('current-task', memory.currentTask) +
-    section('suggested-response', memory.suggestedResponse) +
     section('skills-in-use', memory.skills.map((s) => `<skill name="${s.skill}">\n${s.text}\n</skill>`).join('\n')) +
+    renderUserMessages(memory.userMessages) +
+    (memory.nextStep
+      ? `${NEXT_STEP}Continue with the user's most recent request, quoted verbatim:\n"${truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)}"\n</optional-next-step>`
+      : '') +
+    '\n' +
+    (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
+    (memory.recentKept ? `\n${COMPACT_RECENT}` : '') +
+    (memory.resumeDirectly ? `\n${COMPACT_RESUME_DIRECTLY}` : '') +
     `\n\n<system-reminder>${MEMORY_CONTINUATION}</system-reminder>`
   return { role: 'user', text, toolUses: [] }
 }
 
 // The memory message a previous compaction left at the head of the live context.
-function parseMemory(first: SessionMessage): Memory & { anchor: string; lines: string[] } {
-  const skillsAt = first.text.indexOf('\n\n<skills-in-use>\n')
-  const head = skillsAt < 0 ? first.text : first.text.slice(0, skillsAt)
+// The user's text starts no earlier than its section, so everything else is read before it.
+function parseMemory(first: SessionMessage) {
+  const userAt = [USER_MESSAGES, NEXT_STEP].map((m) => first.text.indexOf(m)).filter((i) => i >= 0)
+  const own = userAt.length ? first.text.slice(0, Math.min(...userAt)) : first.text
+  const skillsAt = own.indexOf('\n\n<skills-in-use>\n')
+  const head = skillsAt < 0 ? own : own.slice(0, skillsAt)
   const start = head.indexOf('<observations>\n')
   const end = head.lastIndexOf('\n</observations>')
   const observations = start < 0 || end < start ? '' : head.slice(start + '<observations>\n'.length, end)
-  const skills = skillsAt < 0 ? [] : [...first.text.slice(skillsAt).matchAll(SKILL_BLOCK)].map((m) => ({ skill: m[1]!, text: m[2]! }))
+  const skills = skillsAt < 0 ? [] : [...own.slice(skillsAt).matchAll(SKILL_BLOCK)].map((m) => ({ skill: m[1]!, text: m[2]! }))
   return {
-    corrections: start < 0 ? [] : parseLines(tag(head.slice(0, start), 'corrections') ?? '', undefined),
+    corrections: start < 0 ? [] : parseLines(tag(head.slice(0, start), 'corrections') ?? '', undefined).filter((l) => l.startsWith('🔴')),
     observations,
     anchor: hash(observations),
     lines: parseLines(observations, undefined),
     currentTask: tag(head.slice(end), 'current-task'),
-    suggestedResponse: tag(head.slice(end), 'suggested-response'),
     skills,
+    userMessages: parseUserMessages(first.text),
   }
 }
 
@@ -327,14 +399,13 @@ function fresh(v: View, seq = 0): Ledger {
     corrections: memory?.corrections ?? [],
     chunks: [],
     currentTask: memory?.currentTask,
-    suggestedResponse: memory?.suggestedResponse,
     seq: n,
   }
 }
 
 // Moves every chunk that now continues the watermark into the entries, in row order.
 function commit(ledger: Ledger, v: View): Ledger {
-  let { watermark, entries, corrections, seq, currentTask, suggestedResponse } = ledger
+  let { watermark, entries, corrections, seq, currentTask } = ledger
   const waiting: Chunk[] = []
   for (const c of [...ledger.chunks].sort((a, b) => a.from - b.from)) {
     if (c.from > watermark.to) waiting.push(c)
@@ -343,9 +414,8 @@ function commit(ledger: Ledger, v: View): Ledger {
     corrections = [...corrections, ...c.corrections]
     watermark = range(v, watermark.from, c.to)
     currentTask = c.currentTask ?? currentTask
-    suggestedResponse = c.suggestedResponse ?? suggestedResponse
   }
-  return { ...ledger, watermark, entries, corrections, seq, currentTask, suggestedResponse, chunks: waiting.filter((c) => c.from >= watermark.to) }
+  return { ...ledger, watermark, entries, corrections, seq, currentTask, chunks: waiting.filter((c) => c.from >= watermark.to) }
 }
 
 // The stored ledger, checked against the live context: a different memory message, or rows under the watermark
@@ -375,6 +445,7 @@ const ledgerKey = (sessionId: string) => `ledger:${sessionId}`
 const timesKey = (sessionId: string) => `times:${sessionId}`
 const liveKey = (sessionId: string) => `live:${sessionId}`
 const skillsKey = (sessionId: string) => `skills:${sessionId}`
+const transcriptKey = (sessionId: string) => `transcript:${sessionId}`
 
 const loadMarks = async ($: EngineInterface, sessionId: string) => ((await $.store.get(timesKey(sessionId))) as Mark[] | undefined) ?? []
 const loadLedger = async ($: EngineInterface, sessionId: string, v: View) =>
@@ -596,6 +667,11 @@ function recall(rows: readonly SessionMessage[], marks: readonly Mark[], query: 
   return out.join('')
 }
 
+async function noteTranscript($: EngineInterface, e: { session_id: string; transcript_path: string }) {
+  if (!e.transcript_path) return
+  await $.store.set(transcriptKey(e.session_id), e.transcript_path).catch((error) => log($, `could not record the transcript path (${errorText(error)})`))
+}
+
 export const register: Register = (on) => {
   on('session.compact', async ($, e, next) => {
     const { messages } = e
@@ -650,15 +726,28 @@ export const register: Register = (on) => {
     const observations = renderLines(ledger.entries)
     const tail = messages.slice(cut)
     const observedNow = chunks.reduce((n, c) => n + c.to - c.from, 0)
-    const prior = base ? parseMemory(messages[0]!).skills : []
+    const priorMemory = base ? parseMemory(messages[0]!) : undefined
+    const prior = priorMemory?.skills ?? []
     // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
+    const known = mergeSkills(prior, recorded)
+    // The prompts leaving context join those the memory message carried; the newest prompt anywhere is the next step.
+    const prompts = messages.flatMap((m, i) => {
+      const text = i < base ? undefined : typed(m, known)
+      return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
+    })
+    const userMessages = capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)])
+    const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
     const memory: Memory = {
       corrections: ledger.corrections,
       observations,
       currentTask: ledger.currentTask,
-      suggestedResponse: ledger.suggestedResponse,
       skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail),
+      userMessages,
+      nextStep: prompts.at(-1)?.message.text ?? priorMemory?.userMessages.at(-1)?.text,
+      transcript,
+      recentKept: tail.length > 0,
+      resumeDirectly: e.trigger === 'auto',
     }
     const message = memoryMessage(memory)
     log(
@@ -711,6 +800,10 @@ export const register: Register = (on) => {
     return { result: recall(rows, await loadMarks($, sessionId), typeof query === 'string' ? query : '', most) }
   })
 
+  // Where the transcript file is, for om_recall and the memory message: known at start and after every turn.
+  on('classic.SessionStart', async ($, e, next) => (await noteTranscript($, e), next(e)))
+  on('classic.Stop', async ($, e, next) => (await noteTranscript($, e), next(e)))
+
   // Subagents raise no turn.start, so each is the main conversation's prompt.
   on('turn.start', async ($, e, next) => {
     await markTime($, true).catch((error) => log($, `could not record the prompt's time (${errorText(error)})`))
@@ -732,7 +825,7 @@ export const register: Register = (on) => {
   on('session.end', async ($, e, next) => {
     if (e.reason !== 'clear') return next(e)
     running = running.filter((j) => j.sessionId !== e.sessionId)
-    await Promise.all([ledgerKey, timesKey, liveKey, skillsKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
+    await Promise.all([ledgerKey, timesKey, liveKey, skillsKey, transcriptKey].map((key) => $.store.delete(key(e.sessionId)))).catch((error) =>
       log($, `could not drop the cleared session's state (${errorText(error)})`),
     )
     return next(e)
