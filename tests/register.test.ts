@@ -198,6 +198,18 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
   })
 
+  test('the Observer records what happened, never what a chunk lacks', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+
+    await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+
+    expect(seen.systems[0]).toContain('Record what happened, never what did not happen in the chunk')
+    expect(seen.systems[0]).toContain('Never write "this chunk" or "the chunk" in an observation or the current task')
+    expect(seen.systems[0]).toContain('not the step it is on, such as reading or searching')
+  })
+
   test('when pi fails at compaction with nothing observed, the built-in compaction runs instead', async ($, on) => {
     mock.clock(on)
     world(on)
