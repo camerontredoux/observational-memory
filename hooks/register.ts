@@ -754,7 +754,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
 }
 
 // Mastra's reflector over a snapshot of the entries, in the background: each attempt re-sends the snapshot with
-// stronger guidance until the result comes under REFLECT_TARGET_TOKENS (the last non-empty one stands). The
+// stronger guidance until the result comes under REFLECT_TARGET_TOKENS; with none under it, nothing changes. The
 // snapshot's entries are then replaced in place, so entries committed while it ran survive. The corrections are
 // never sent: they pass through as quoted.
 async function maybeReflect($: EngineInterface, loop: Loop) {
@@ -774,19 +774,18 @@ async function maybeReflect($: EngineInterface, loop: Loop) {
       })
       const bounds = times.length ? { lo: Math.min(...times), hi: Math.max(...times), latest: Math.max(...times) } : undefined
       let lines: string[] = []
-      let level = 1
-      for (; level <= 4; level++) {
+      let level = 0
+      while (!lines.length && level < 4) {
+        level++
         const prompt =
           `## OBSERVATIONS TO REFLECT ON\n\n${text}\n\n---\n\n` +
           "Please analyze these observations and produce a refined, condensed version that will become the assistant's entire memory going forward." +
           `\n\n${COMPRESSION_GUIDANCE[level]}\n\n${REFLECTOR_FORMAT}`
         const reply = await complete($, `reflector level ${level}`, REFLECTOR_SYSTEM_PROMPT, prompt, REFLECTOR_TIMEOUT_MS, { phase: 'background' })
         const parsed = parseLines(observationsOf(reply), bounds)
-        if (!parsed.length) continue
-        lines = parsed
-        if (estimateTokens(renderLines(lines.map((line) => ({ id: '', line })))) < REFLECT_TARGET_TOKENS) break
+        if (parsed.length && estimateTokens(renderLines(parsed.map((line) => ({ id: '', line })))) < REFLECT_TARGET_TOKENS) lines = parsed
       }
-      if (!lines.length) throw new Error('the reflector produced no observations at any compression level')
+      if (!lines.length) throw new Error(`no reflection came under ~${REFLECT_TARGET_TOKENS} tokens at any compression level`)
       await locked(async () => {
         const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
         const ids = new Set(snapshot.map((e) => e.id))
@@ -801,11 +800,11 @@ async function maybeReflect($: EngineInterface, loop: Loop) {
         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
         await $.store.set(ledgerKey(key), { ...ledger, entries, seq })
         record(statsIo($), sessionId, (s, at) =>
-          addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: estimateTokens(renderLines(reflected)), level: Math.min(level, 4) }, at))
+          addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: estimateTokens(renderLines(reflected)), level: level }, at))
         log(
           $,
           `reflected ${snapshot.length} observations (~${estimateTokens(text)} tokens) into ${reflected.length} ` +
-            `(~${estimateTokens(renderLines(reflected))} tokens) at compression level ${Math.min(level, 4)}; ` +
+            `(~${estimateTokens(renderLines(reflected))} tokens) at compression level ${level}; ` +
             `${entries.length - reflected.length} newer kept`,
         )
         show($, `Condensed memory in ${duration((await $.clock.now()) - started)} · ${grouped(ledger.entries.length)} → ${plural(entries.length, 'note')}`, loop.agentId)

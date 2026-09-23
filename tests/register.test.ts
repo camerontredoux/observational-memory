@@ -676,6 +676,24 @@ describe('register', () => {
     )
   })
 
+  test('a reflection still over its target at the last compression level replaces nothing', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const line = '🟡 2026-09-22 14:30 read a file with a long name'
+    const big = `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`
+    const seen = pi(on, { reply: () => big, reflect: () => big.replace(/long name/g, 'longer name') })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(4)
+    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual([expect.stringMatching(/^reflection failed \(/)])
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
+    expect(ledger.entries).toHaveLength(4_000)
+  })
+
   test("the user's corrections are quoted in their own section above the observations and pass through the Reflector unchanged", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
