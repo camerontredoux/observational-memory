@@ -15,10 +15,12 @@ import {
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
+import { liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
+import type { RecallInput, RecallIo } from './recall'
 
 declare module 'claude-code' {
   interface McpToolInputs {
-    'mcp__observational-memory__om_recall': { query: string; limit?: number }
+    'mcp__observational-memory__om_recall': RecallInput
     'mcp__observational-memory__om_stats': { scope?: 'session' | 'all'; sessionId?: string; since?: string }
   }
 }
@@ -44,8 +46,6 @@ const MAX_MARKS = 4_000
 const STAMP_SLACK_MS = 60_000
 const RECALL_TOOL = 'om_recall'
 const STATS_TOOL = 'om_stats'
-const RECALL_MAX_HITS = 20
-const RECALL_SNIPPET_CHARS = 400
 const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
 const NEXT_STEP_MAX_TOKENS = 2_000
 const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
@@ -853,82 +853,29 @@ function skillsInUse($: EngineInterface, skills: readonly Skill[], tail: readonl
   return kept
 }
 
-type TranscriptRow = {
-  type?: string
-  isSidechain?: boolean
-  timestamp?: string
-  message?: { content?: string | { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean }[] }
-}
-
-// The transcript file's main-chain user and assistant rows as `$.session.messages()` rows, each with its time.
-function transcriptRows(jsonl: string) {
-  const rows: SessionMessage[] = []
-  const at: (number | undefined)[] = []
-  for (const line of jsonl.split('\n')) {
-    let r: TranscriptRow
+// What om_recall reads files with. `$.fs.read` refuses a file over 4 MiB, which a long transcript is: `cat` reads it.
+const recallIo = ($: EngineInterface): RecallIo => ({
+  read: async (path) => {
     try {
-      r = JSON.parse(line) as TranscriptRow
+      return String(await $.fs.read(path))
     } catch {
-      continue // a line still being written
+      const cat = $.process.spawn({ argv: ['cat', '--', path] })
+      let text = ''
+      let error = ''
+      for await (const c of cat) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
+      if ((await cat.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
+      return text
     }
-    if ((r.type !== 'user' && r.type !== 'assistant') || r.isSidechain) continue
-    const content = r.message?.content
-    const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : (content ?? [])
-    const resultText = (c: unknown): string =>
-      typeof c === 'string' ? c : Array.isArray(c) ? c.map((b: { text?: string }) => b.text ?? '').join('\n') : ''
-    const m: SessionMessage = {
-      role: r.type,
-      text: blocks.flatMap((b) => (b.type === 'text' && b.text ? [b.text] : [])).join('\n'),
-      toolUses: blocks.flatMap((b) => (b.type === 'tool_use' ? [{ tool_use_id: b.id ?? '', tool: b.name ?? '', input: (b.input ?? {}) as Record<string, unknown> }] : [])),
-    }
-    const results = blocks.flatMap((b) => (b.type === 'tool_result' ? [{ tool_use_id: b.tool_use_id ?? '', text: resultText(b.content), isError: !!b.is_error }] : []))
-    if (results.length) m.toolResults = results
-    if (!m.text && !m.toolUses.length && !results.length) continue
-    rows.push(m)
-    const time = r.timestamp ? Date.parse(r.timestamp) : NaN
-    at.push(Number.isNaN(time) ? undefined : time)
-  }
-  return { rows, at }
-}
-
-// om_recall: every row part that holds all the query's words (any, when none holds all), newest last. The newest
-// prompt is the one that asked, never a match.
-function recall(rows: readonly SessionMessage[], times: readonly (number | undefined)[], query: string, limit: number, capped: boolean) {
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
-  if (!words.length) return 'om_recall: give a query.'
-  let asking = rows.length - 1
-  while (asking >= 0 && typed(rows[asking]!, []) === undefined) asking--
-  const names = new Map<string, string>()
-  const parts: { i: number; label: string; text: string }[] = []
-  rows.forEach((m, i) => {
-    if (isMemory(m)) return
-    const when = times[i] === undefined ? '' : ` ${stamp(times[i]!)}`
-    if (m.text && i !== asking) parts.push({ i, label: `${m.role}${when}`, text: m.text })
-    for (const u of m.toolUses) {
-      names.set(u.tool_use_id, u.tool)
-      if (!u.tool.endsWith(`__${RECALL_TOOL}`)) parts.push({ i, label: `assistant${when} called ${u.tool}`, text: JSON.stringify(u.input) })
-    }
-    for (const r of m.toolResults ?? []) {
-      const tool = names.get(r.tool_use_id) ?? 'tool'
-      if (!tool.endsWith(`__${RECALL_TOOL}`)) parts.push({ i, label: `${tool} result${when}${r.isError ? ' (error)' : ''}`, text: r.text })
-    }
-  })
-  const score = (text: string) => words.filter((w) => text.toLowerCase().includes(w)).length
-  let hits = parts.filter((p) => score(p.text) === words.length)
-  if (!hits.length) hits = parts.filter((p) => score(p.text) > 0).sort((a, b) => score(b.text) - score(a.text) || a.i - b.i)
-  const shown = hits.slice(-limit).sort((a, b) => a.i - b.i)
-  const out = [
-    `${hits.length} match(es) for "${query}" in ${rows.length} messages${capped ? ` (only the newest ${ROWS_CAP} are searchable)` : ''}` +
-      `${hits.length > shown.length ? `; showing the last ${shown.length}` : ''}.`,
-  ]
-  for (const p of shown) {
-    const lower = p.text.toLowerCase()
-    const at = Math.max(0, Math.min(...words.map((w) => lower.indexOf(w)).filter((n) => n >= 0)) - RECALL_SNIPPET_CHARS / 4)
-    const snippet = `${at > 0 ? '…' : ''}${p.text.slice(at, at + RECALL_SNIPPET_CHARS)}${at + RECALL_SNIPPET_CHARS < p.text.length ? '…' : ''}`
-    out.push(`\n[#${p.i} ${p.label}] ${snippet.replace(/\s+/g, ' ')}`)
-  }
-  return out.join('')
-}
+  },
+  list: async (dir) => (await $.fs.list(dir)).map((f) => f.name),
+  // A file's `continued-in` row, written as JSON by Claude Code: quoted inside a message, its quotes are escaped.
+  continuing: async (dir, names, id) => {
+    if (!names.length) return undefined
+    const r = await $.process.run(['grep', '-lF', `"continuedInSessionId":"${id}"`, '--', ...names.map((n) => `${dir}/${n}`)])
+    const hit = r.stdout.split('\n')[0]
+    return hit ? hit.slice(hit.lastIndexOf('/') + 1) : undefined
+  },
+})
 
 function noteRecall($: EngineInterface, sessionId: string, result: string, fromFile: boolean) {
   record(statsIo($), sessionId, (s, at) => addRecall(s, Number(result.match(/^(\d+) match/)?.[1] ?? 0), fromFile, at))
@@ -1120,16 +1067,27 @@ export const register: Register = (on) => {
       .register({
         name: RECALL_TOOL,
         description:
-          "Searches this session's full transcript, including messages compaction removed from context, for a query " +
-          '(case-insensitive words, all of which must appear; failing that, any). Returns matching snippets with the ' +
-          "message's index, role, tool name and time. Use it when the observations lack a detail you need: exact text, a tool's output, a quote.",
+          "Searches, reads and outlines this session's full transcript: what compaction removed from context, the earlier " +
+          'files a moved session continued from, optionally its subagents. Use it when the observations lack a detail you ' +
+          "need: exact text, a tool's output, a quote, what happened when. Every block (message, tool call, tool result) has " +
+          'a reference like a79f045b:2133. search (a query alone): words, all of which must appear (failing that, any), ' +
+          '"quoted phrases" or /regex/; returns references with the matching lines. read (a ref alone): the block in full, ' +
+          'a page of lines at a time, with neighbours. outline (neither): the session in order, a line per message or tool ' +
+          'call, for a from/to range.',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Words to find, e.g. a file name, an error, a marker' },
-            limit: { type: 'number', description: `Most matches to return, newest kept (default and most ${RECALL_MAX_HITS})` },
+            query: { type: 'string', description: 'Words, "quoted phrases" or /regex/flags to find, e.g. a file name, an error, a marker' },
+            mode: { type: 'string', enum: ['search', 'read', 'outline'], description: 'Default: search with a query, read with a ref alone, else outline' },
+            ref: { type: 'string', description: 'A block reference from a search or outline, to read; a subagent reference, to outline its transcript' },
+            lines: { type: 'string', description: 'Lines of the block to read, e.g. "1-200" or "201-" (read)' },
+            before: { type: 'number', description: 'Blocks before the read one to show too, at most 5 (read)' },
+            after: { type: 'number', description: 'Blocks after the read one to show too, at most 5 (read)' },
+            from: { type: 'string', description: 'Range start: a reference, "HH:MM" or "YYYY-MM-DD HH:MM" (outline, search)' },
+            to: { type: 'string', description: 'Range end, inclusive, the same forms (outline, search)' },
+            limit: { type: 'number', description: `Most search matches to return, newest kept (default and most ${SEARCH_MAX_HITS})` },
+            subagents: { type: 'boolean', description: "Search the subagents' transcripts too (default false)" },
           },
-          required: ['query'],
         },
       })
       .catch((error) => {
@@ -1159,22 +1117,22 @@ export const register: Register = (on) => {
     return next(e)
   })
 
-  // After --resume `$.session.messages()` starts at the last compaction; the transcript file still has the rest.
+  // The transcript file and those it continued from hold the whole session, compactions and --resume included; the
+  // live history stands in when no file is known or readable.
   on('tool.call', { tool: 'mcp__observational-memory__om_recall' }, async ($, e) => {
-    const { query, limit } = e
     const [rows, sessionId] = await Promise.all([$.session.messages(), $.session.id()])
-    const most = typeof limit === 'number' && limit >= 1 ? Math.min(Math.floor(limit), RECALL_MAX_HITS) : RECALL_MAX_HITS
-    const text = typeof query === 'string' ? query : ''
-    const path = isSummary(rows[0]) ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
+    const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
+    let corpus: Awaited<ReturnType<typeof loadTranscript>> | undefined
     if (path) {
       try {
-        const file = transcriptRows(String(await $.fs.read(path)))
-        if (file.rows.length > rows.length) return { result: noteRecall($, sessionId, recall(file.rows, file.at, text, most, false), true) }
+        corpus = await loadTranscript(recallIo($), path, { asking: true })
       } catch (error) {
         log($, `could not read the transcript for om_recall (${errorText(error)}); searching the live history`)
       }
     }
-    return { result: noteRecall($, sessionId, recall(rows, view(rows, await loadMarks($, sessionId), 0).at, text, most, rows.length >= ROWS_CAP), false) }
+    const fromFile = !!corpus?.main.blocks.length
+    const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, sessionId), 0).at, rows.length >= ROWS_CAP), e)
+    return { result: noteRecall($, sessionId, found.text, fromFile) }
   })
 
   on('tool.call', { tool: 'mcp__observational-memory__om_stats' }, async ($, e) => ({ result: await report(statsIo($), e) }))

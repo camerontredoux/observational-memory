@@ -741,15 +741,22 @@ describe('register', () => {
     const found = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'plum-7731' })
     const loose = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'auth.ts nothing-like-this', limit: 3 })
 
-    expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ required: ['query'] }) }), expect.objectContaining({ name: 'om_stats' })])
+    // No field is required: a query alone still searches, a ref alone reads, neither outlines.
+    expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ properties: expect.objectContaining({ query: expect.anything(), ref: expect.anything(), mode: expect.anything() }) }) }), expect.objectContaining({ name: 'om_stats' })])
+    expect(registered[0]).not.toHaveProperty('inputSchema.required')
     const text = String(found.result)
-    // The newest prompt, note 29, is the one that asked: it is never a match.
-    expect(text).toMatch(/^30 match\(es\) for "plum-7731" in 35 messages; showing the last 20\.\n\[#14 user\] note 9: the PLUM-7731 marker y+…\n/)
-    expect(text).toContain('[#33 user] note 28: the PLUM-7731 marker')
+    // The newest prompt, note 29, is the one that asked: it is never a match. Hits are cut by the size cap, newest kept.
+    expect(text).toMatch(/^30 match\(es\) for "plum-7731" in 34 blocks of the live history; showing 20, the newest\.\n\[#14 · user\] 3 lines\n  1: note \d+: the PLUM-7731 marker y+…\n/)
+    expect(text).toContain('[#33 · user] 3 lines\n  1: note 28: the PLUM-7731 marker')
     expect(text).not.toContain('note 29')
-    expect(text.split('\n')).toHaveLength(21)
-    expect(text.length).toBeLessThan(10_000)
-    expect(String(loose.result)).toBe('1 match(es) for "auth.ts nothing-like-this" in 35 messages.\n[#1 assistant called Read] {"file_path":"/src/auth.ts"}')
+    expect(text).toMatch(/\nOlder matches: repeat with "to": "#13"\.\nRead a block in full: \{"mode": "read", "ref": "#33"\}\.$/)
+    expect(text.length).toBeLessThan(12_000)
+    expect(String(loose.result)).toBe(
+      '1 match(es) for "auth.ts nothing-like-this" in 34 blocks of the live history; no block holds every term, so these hold some, best first.\n' +
+        '[#1.2 · Read call] 1 line\n  1: file_path: /src/auth.ts\nRead a block in full: {"mode": "read", "ref": "#1.2"}.',
+    )
+    const whole = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', ref: '#33', lines: '1' })).result)
+    expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines: ask \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
   })
 
   test('om_recall labels tool results with the tool that produced them', async ($, on) => {
@@ -760,7 +767,7 @@ describe('register', () => {
 
     const found = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PLUM' })
 
-    expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 messages.\n[#2 Read result] export const marker = "PLUM-7731"')
+    expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 blocks of the live history.\n[#2 · Read result] 1 line\n  1: export const marker = "PLUM-7731"\nRead a block in full: {"mode": "read", "ref": "#2"}.')
   })
 
   test('/clear drops the cleared session\'s ledger, times, skills and seen stamp, its subagents\' too', async ($, on) => {
@@ -1306,11 +1313,58 @@ describe('register', () => {
 
     expect(reads.filter((p) => p.startsWith('/t/'))).toEqual(['/t/session-1.jsonl'])
     expect(found).toBe(
-      '3 match(es) for "KIWI-42" in 4 messages.\n' +
-        `[#0 user ${stampOf('2026-09-22T12:00:00.000Z')}] remember the KIWI-42 marker\n` +
-        `[#1 assistant ${stampOf('2026-09-22T12:01:00.000Z')} called Bash] {"command":"echo KIWI-42"}\n` +
-        `[#2 Bash result ${stampOf('2026-09-22T12:01:10.000Z')}] KIWI-42`,
+      '3 match(es) for "KIWI-42" in 4 blocks of 1 transcript file.\n' +
+        `[session-1:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] 1 line\n  1: remember the KIWI-42 marker\n` +
+        `[session-1:2.2 · ${stampOf('2026-09-22T12:01:00.000Z')} · Bash call] 1 line\n  1: command: echo KIWI-42\n` +
+        `[session-1:3 · ${stampOf('2026-09-22T12:01:10.000Z')} · Bash result] 1 line\n  1: KIWI-42\n` +
+        'Read a block in full: {"mode": "read", "ref": "session-1:3"}.',
     )
+  })
+
+  test('om_recall reads a moved session from both its files, a file over the fs limit through cat, and counts the calls', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files, reads } = world(on)
+    on('classic.Stop', () => ({}))
+    const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
+    const NEW = 'bbbbbbbb-2222-4222-8222-222222222222'
+    const row = (type: string, iso: string, content: unknown) => JSON.stringify({ type, timestamp: iso, message: { role: type, content } })
+    files[`/t/${OLD}.jsonl`] = [
+      row('user', '2026-09-22T12:00:00.000Z', 'remember the FIG-8 marker'),
+      JSON.stringify({ type: 'continued-in', sessionId: OLD, continuedInSessionId: NEW }),
+    ].join('\n')
+    const big = [row('user', '2026-09-22T13:00:00.000Z', 'where is FIG-8?'), row('assistant', '2026-09-22T13:01:00.000Z', [{ type: 'text', text: 'searching' }])].join('\n')
+    // `$.fs.read` refuses the new file, as it does one over 4 MiB: it is read with cat.
+    const argvs: (readonly string[])[] = []
+    on('process.spawn', async function* ($, e) {
+      argvs.push(e.argv)
+      yield { stream: 'stdout' as const, text: big.slice(0, 50) }
+      yield { stream: 'stdout' as const, text: big.slice(50) }
+      return { value: { code: 0, signal: null } }
+    })
+    on('process.run', ($, e) => {
+      argvs.push(e.argv)
+      const pattern = e.argv[2]!
+      const hit = e.argv.slice(4).filter((p) => files[p]?.includes(pattern))
+      return { value: { exitCode: hit.length ? 0 : 1, stdout: hit.map((p) => `${p}\n`).join(''), stderr: '' } }
+    })
+
+    await $.classic.Stop({ session_id: 'session-1', transcript_path: `/t/${NEW}.jsonl`, stop_hook_active: false })
+    const found = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'FIG-8' })).result)
+    const read = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', ref: 'aaaaaaaa:1' })).result)
+    await clock.advance(5_000)
+
+    expect(argvs).toContainEqual(['cat', '--', `/t/${NEW}.jsonl`])
+    expect(argvs).toContainEqual(['grep', '-lF', `"continuedInSessionId":"${NEW}"`, '--', `/t/${OLD}.jsonl`])
+    expect(reads).toContain(`/t/${OLD}.jsonl`)
+    expect(found).toBe(
+      '1 match(es) for "FIG-8" in 2 blocks of 2 transcript files.\n' +
+        `[aaaaaaaa:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] 1 line\n  1: remember the FIG-8 marker\n` +
+        'Read a block in full: {"mode": "read", "ref": "aaaaaaaa:1"}.',
+    )
+    expect(read).toBe(`[aaaaaaaa:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] lines 1-1 of 1\n   1 | remember the FIG-8 marker`)
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { count: number; sum: number }> }
+    expect(stats.metrics['recall.matches']).toMatchObject({ count: 2, sum: 1 })
+    expect(stats.counts['recall.fromFile']).toBe(2)
   })
 
   test('observes in the background mid-turn, after the model steps of one long turn, with the times of the rows it read', async ($, on) => {
