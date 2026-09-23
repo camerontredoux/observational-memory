@@ -1,17 +1,24 @@
 # Open issues
 
-## Main thread observes on the spot after a compaction keeps only an oversized read
+## Token estimates run low on dense text
 
-Found by the v0.4.12 smoke runs (`/tmp/om-tail/runs/smokeC`, `smokeD`: sonnet, 60k window, 36 KB reads).
+OM estimates tokens as characters ÷ 4. Dense text (the v0.4.12 smoke chapters in `/tmp/om-tail/runs/smokeC`, `smokeD`
+were ~2 characters per token) makes the kept raw tail about twice its estimate, so compactions come more often than
+intended.
 
-When a compaction keeps only the oversized newest call/result pair, the unobserved rows before it come to about
-9.4k estimated tokens, just short of the 10k needed to start a background chunk. The step that could start that
-chunk doesn't, because after a check that starts nothing the step token count resets and needs another 5k tokens.
-The next large read then triggers compaction at the same moment, so each such compaction makes about two Observer
-calls on the spot (8–10 s). No fallbacks, no timeouts.
+## Not fixing: on-the-spot observation after a compaction keeps only an oversized read
 
-Likely fix: in `schedule()` (`hooks/register.ts`), reset the step token count only when a check actually starts a
-chunk. Test first with a replay of smokeC/smokeD showing 0 on-the-spot Observer calls.
+Seen only with a small window (the smokeC/smokeD runs: 60k window, 36 KB reads). When a compaction keeps only the
+oversized newest read, the rows before it are ~9.4k estimated tokens, short of a 10k chunk, and the next read compacts
+again ~3.5 s after the step that could start one, so each such compaction observes ~2 chunks on the spot (8–10 s).
 
-Related: OM estimates tokens as characters ÷ 4; dense text (the smoke chapters were ~2 characters per token) makes
-the kept raw tail about twice its estimate, so compactions come more often than intended.
+Tried on branch `sched-reset`:
+- Resetting the step count only when a check starts a chunk still left 2 on-the-spot calls per compaction and more
+  than doubled scheduling passes in the replays.
+- `675d1e3` (start a half chunk before an oversized raw tail) removed the on-the-spot calls, but compaction then cut at
+  the background watermark and kept ~38k real tokens raw in the 60k window; the engine's rapid-refill breaker stopped
+  the live smoke (`/tmp/om-tail/runs/smokeE`) after 6 of 8 chapters, where the old code finished 30.
+
+With the usual 190k window a background chunk has minutes to land before the next compaction. If it matters later:
+keep `675d1e3` and observe on the spot when cutting at the watermark would keep too much of the window raw (window size
+from `$.session.usage()`).
