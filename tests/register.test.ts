@@ -920,6 +920,151 @@ describe('register', () => {
     expect(stored['ledger:session-1']).toBeUndefined()
   })
 
+  test('a newest tool result past the raw tail budget, with nothing observed yet, stays raw with its call and the rest is observed', async ($, on) => {
+    mock.clock(on)
+    const { history, agents } = world(on)
+    const seen = pi(on)
+    // The newest row, a 36 KB read (~9k tokens), is more than the raw tail's 6k on its own. Turn b is short of a chunk
+    // so the kept tail is just the call and its result: with a full-size b, b's closing reply stays raw too.
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000), ...call(1, 36_000))
+    agents['agent-1'] = [...history]
+
+    for (const agentId of [undefined, 'agent-1']) {
+      const result = await $.session.compact({ trigger: 'auto', ...(agentId ? { agentId } : {}), messages: [...history] })
+      expect(result.messages?.slice(1)).toEqual(call(1, 36_000))
+      expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 Saw a\n* 🔴 Saw b')
+    }
+    expect(seen.prompts).toHaveLength(4)
+    expect(seen.logs.filter((l) => l.includes('built-in'))).toEqual([])
+  })
+
+  test('a newest call and result past RAW_MAX_TOKENS on their own are observed too, and nothing stays raw', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on, { reply: readsIn })
+    history.push(...turn('a', 'a', CHUNK), ...call(1, 200_000)) // a 50k-token result
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(result.messages).toHaveLength(1)
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('Read f1')
+    expect(seen.logs.at(-1)).toMatch(/^observed 6 rows now, kept 0 raw messages/)
+  })
+
+  test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents } = world(on)
+    const seen = pi(on, { reply: readsIn })
+    const step = steps(on)
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'Read the chapters in order.', toolUses: [] }])
+    // As run 1 of the subagent smoke: each step starts on a 36 KB read, the newest row.
+    for (let n = 0; n < 8; n++) {
+      await clock.set(at(23, 9, n + 1))
+      rows.push(...agentCall('one', n, 36_000))
+      await step($, 's', n, rows.length, 'agent-1')
+      await clock.settle()
+    }
+    const calls = seen.prompts.length
+    expect(calls).toBeGreaterThan(0)
+
+    const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
+
+    expect(seen.prompts).toHaveLength(calls)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(result.messages?.slice(-2)).toEqual(agentCall('one', 7, 36_000))
+  })
+
+  // What a built-in compaction hands back: its summary, then the newest call and result it keeps, with their handles.
+  const SUMMARY: SessionMessage = {
+    role: 'user',
+    text: 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. Primary Request and Intent: read the files.',
+    toolUses: [],
+  }
+  const overloaded = (): ProcessRunResult => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' })
+
+  test("after a subagent's built-in fallback, its later compactions match its history and cut at the background watermark", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents, stored } = world(on)
+    let failing = true
+    const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'Read the files, then report.', toolUses: [] }])
+    let context = () => [...rows]
+    const run = async (from: number, to: number) => {
+      for (let n = from; n < to; n++) {
+        await clock.set(at(23, 9, n + 1))
+        rows.push(...agentCall('one', n, 16_000))
+        await step($, 's', n, rows.length, 'agent-1')
+        await clock.settle()
+      }
+    }
+
+    await run(0, 10)
+    const first = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: context() })
+    expect(first.messages?.[0]).toEqual(SUMMARY)
+    // The engine appends the summary to the subagent's history and leaves the rows it kept where they were, before
+    // it; the live context is the summary, the kept rows, then what comes after.
+    const kept = first.messages!.slice(1)
+    rows.push(SUMMARY)
+    const live = rows.length
+    context = () => [SUMMARY, ...kept, ...rows.slice(live)]
+    failing = false
+    await run(10, 20)
+    const calls = seen.prompts.length
+    expect(calls).toBeGreaterThan(0)
+
+    const second = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: context() })
+
+    expect(seen.prompts).toHaveLength(calls)
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(observationsIn(second.messages?.[0]?.text)).toContain('one-10')
+    expect(seen.screen).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual([expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)])
+    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    expect(Object.keys(stored)).toEqual([]) // the fallback's record goes with the subagent's other keys
+  })
+
+  test('after a main built-in fallback, later compactions match the history its summary leads and cut at the background watermark', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    let failing = true
+    const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
+    const run = async (from: number, to: number) => {
+      for (let n = from; n < to; n++) {
+        await clock.set(at(23, 9, n + 1))
+        history.push(...agentCall('main', n, 16_000))
+        await step($, 't', n + 1, history.length)
+        await clock.settle()
+      }
+    }
+    await clock.set(at(23, 9, 0))
+    history.push({ role: 'user', text: 'Read the files, then report.', toolUses: [] })
+    await $.turn.start({ text: 'Read the files, then report.', turnId: 't' })
+
+    await run(0, 10)
+    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    expect(first.messages?.[0]).toEqual(SUMMARY)
+    // The main history is the compaction's result from here on; it grows past its old length before the next.
+    history.splice(0, history.length, ...first.messages!)
+    failing = false
+    await run(10, 24)
+    const calls = seen.prompts.length
+    expect(calls).toBeGreaterThan(0)
+
+    const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+
+    expect(seen.prompts).toHaveLength(calls)
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent') || l.includes('restarting the ledger'))).toEqual([])
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(observationsIn(second.messages?.[0]?.text)).toContain('main-10')
+  })
+
   test("a finished subagent's keys are dropped, a chunk landing after it is discarded, and session end sweeps any left", async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
@@ -1333,6 +1478,65 @@ describe('register', () => {
     expect(seen.screen).toEqual([])
     expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual(fx.compactions.map(() => expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)))
     expect(Object.keys(stored)).toEqual([]) // the finished subagent's keys are gone
+  })
+
+  // Run 1 of the v0.4.10 subagent smoke (/tmp/om-sub/live/run1), replayed from its subagent's transcript:
+  // /tmp/om-tail/make-fixture.py writes the module (gitignored). The subagent read 36 KB files (~9k tokens each, more
+  // than the raw tail's budget) and was compacted five times, each right after a read; every one fell back to the
+  // built-in summary. Here the Observer fails until the first compaction, so it falls back as run 1's did; the engine
+  // appends the summary to the subagent's history and leaves the rows it kept before it. Each later compaction must
+  // match that history and cut at the background watermark. Without the module the test has nothing to replay and passes.
+  test('replays run 1 of the subagent smoke: after one built-in fallback, later compactions match the history and make no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
+    const fx = (await import('./fixtures/fallback.local').catch(() => undefined)) as
+      | { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
+      | undefined
+    if (!fx) return
+    const clock = mock.clock(on, { now: fx.at[0] })
+    const { agents, stored } = world(on)
+    let failing = true
+    const seen = pi(on, { hold: () => (failing ? undefined : clock.sleep(15_000)), reply: () => '<observations>\n* 🟡 Read a chapter\n</observations>', fail: () => (failing ? overloaded() : undefined) })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    let builtin = 0
+    on('session.compact', ($, e) => (builtin++, { messages: [SUMMARY, ...e.messages.slice(-2)] }))
+    const rows: SessionMessage[] = (agents['agent-1'] = [fx.rows[0]!])
+
+    let index = 0
+    let head: SessionMessage[] = [] // the context's rows that are not the tail of the history
+    let live = 0 // where the rest of the context starts in the history
+    const report: { lunaAtCompaction: number; memory: boolean }[] = []
+    for (let i = 1; i < fx.rows.length; i++) {
+      await clock.set(Math.max(clock.now(), fx.at[i]!))
+      if (fx.compactions.some((c) => c.at === i)) {
+        const before = seen.prompts.length
+        const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...head, ...rows.slice(live)] })
+        const memory = result.messages?.[0]?.text !== SUMMARY.text
+        report.push({ lunaAtCompaction: seen.prompts.length - before, memory })
+        if (memory) {
+          head = []
+          live = rows.length
+          rows.push(...result.messages!)
+        } else {
+          head = [...result.messages!]
+          rows.push(SUMMARY)
+          live = rows.length
+          failing = false
+        }
+      }
+      if (fx.step[i]) await step($, 's', index++, rows.length, 'agent-1')
+      rows.push(fx.rows[i]!)
+      await clock.settle()
+    }
+    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+
+    expect(builtin).toBe(1)
+    expect(report).toHaveLength(fx.compactions.length)
+    expect(report[0]!.memory).toBe(false)
+    for (const r of report.slice(1)) expect(r).toEqual({ lunaAtCompaction: 0, memory: true })
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.screen).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual(fx.compactions.slice(1).map(() => expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes?$/)))
+    expect(Object.keys(stored)).toEqual([])
   })
 
   // A real firstmate stretch, replayed from a private transcript: /tmp/om-stall/work/make-fixture.ts writes the

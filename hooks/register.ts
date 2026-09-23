@@ -218,12 +218,16 @@ function locate(v: View, r: Range, floor: number): Range | undefined {
   return undefined
 }
 
-// The tail kept raw: about KEEP_RAW_TOKENS back from the end, starting where no tool result loses its call.
+// The tail kept raw: about KEEP_RAW_TOKENS back from the end, starting where no tool result loses its call. When the
+// newest results alone pass that, it starts at their call instead, unless the call and its results pass RAW_MAX_TOKENS:
+// then nothing stays raw.
 function tailStart(v: View, from: number) {
-  let i = v.messages.length
+  const end = v.messages.length
+  let i = end
   for (let tokens = 0; i > from && tokens < KEEP_RAW_TOKENS; ) tokens += v.tokens[--i]!
-  for (let j = i; j < v.messages.length; j++) if (isCut(v.messages[j]!)) return Math.max(j, from)
-  return from
+  for (let j = i; j < end; j++) if (isCut(v.messages[j]!)) return Math.max(j, from)
+  while (i > from && !isCut(v.messages[i]!)) i--
+  return tokensBetween(v, i, end) <= RAW_MAX_TOKENS ? i : end
 }
 
 // A chunk from `from`: rows until the next would pass CHUNK_TOKENS and may start a chunk. At the frontier it
@@ -596,18 +600,38 @@ async function historyOf($: EngineInterface, agentId?: string) {
   return rows
 }
 
+// A built-in compaction's result, by row hash: its summary and the rows it kept.
+type Fallback = { summary: string; kept: string[] }
+
+// After a built-in compaction the live context is its summary, the rows it kept, then what came after. The main
+// history holds them in that order; a subagent's appends the summary after the kept rows, left where they were, so
+// here the summary moves ahead of them.
+function arrange(rows: readonly SessionMessage[], fallback: Fallback | undefined) {
+  if (typeof fallback?.summary !== 'string') return rows // none, or a v0.4.10 row count
+  const s = rows.findLastIndex((m) => rowHash(m) === fallback.summary)
+  const k = fallback.kept.length
+  const keeps = (from: number) => from >= 0 && [...rows.slice(from, from + k).map(rowHash)].sort().join() === [...fallback.kept].sort().join()
+  if (s < 0 || !k || keeps(s + 1) || !keeps(s - k)) return rows
+  return [...rows.slice(0, s - k), rows[s]!, ...rows.slice(s - k, s), ...rows.slice(s + 1)]
+}
+
+// A loop's history as its live context reads it.
+async function loopHistory($: EngineInterface, loop: Loop) {
+  const [rows, fallback] = await Promise.all([historyOf($, loop.agentId), $.store.get(liveKey(loop.key))])
+  return arrange(rows, fallback as Fallback | undefined)
+}
+
 // `$.session.messages()` is the whole history, each compaction's result appended to it: the live context starts
-// at the last memory message, or where a built-in compaction left it.
-async function liveStart($: EngineInterface, key: string, rows: readonly SessionMessage[]) {
+// at the last memory message or built-in summary.
+function liveStart(rows: readonly SessionMessage[]) {
   let i = rows.length - 1
-  while (i > 0 && !isMemory(rows[i]!)) i--
-  const floor = (await $.store.get(liveKey(key))) as number | undefined
-  return Math.max(i, floor !== undefined && floor < rows.length ? floor : 0)
+  while (i > 0 && !isMemory(rows[i]!) && !isSummary(rows[i]!)) i--
+  return Math.max(i, 0)
 }
 
 async function liveView($: EngineInterface, loop: Loop) {
-  const [rows, marks] = await Promise.all([historyOf($, loop.agentId), loadMarks($, loop.key)])
-  const offset = await liveStart($, loop.key, rows)
+  const [rows, marks] = await Promise.all([loopHistory($, loop), loadMarks($, loop.key)])
+  const offset = liveStart(rows)
   return view(inCallOrder(rows.slice(offset)), marks, offset)
 }
 
@@ -940,7 +964,7 @@ export const register: Register = (on) => {
     const loop = loopOf(sessionId, e.agentId)
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
     // the session cannot read, or a context that does not match) is compacted with no stored state.
-    const history = await historyOf($, e.agentId).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
+    const history = await loopHistory($, loop).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
     const offset = (history?.length ?? 0) - messages.length
     const rows = !history || offset < 0 ? (history ?? []) : [...history.slice(0, offset), ...inCallOrder(history.slice(offset))]
     const persistent = !!history && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
@@ -1072,7 +1096,7 @@ export const register: Register = (on) => {
     show($, 'Observation failed. Using built-in compaction', e.agentId)
     // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
     const installs = e.trigger !== 'precompute'
-    const [rows, sessionId, started] = await Promise.all([installs ? historyOf($, e.agentId).catch(() => undefined) : undefined, $.session.id(), $.clock.now()]).catch(() => [])
+    const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
     const fellBack = (r: Awaited<ReturnType<typeof next>>) => (
       sessionId !== undefined &&
         started !== undefined &&
@@ -1081,9 +1105,13 @@ export const register: Register = (on) => {
         ),
       r
     )
-    // Its summary carries no memory message, so where the live context now starts is recorded instead.
+    // Its summary is no memory message: what it kept is recorded, to find the live context in the history by.
     const r = fellBack(await next(e))
-    if (r.messages && rows && sessionId !== undefined) await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), rows.length)
+    const [summary, ...kept] = r.messages ?? []
+    if (installs && summary && sessionId !== undefined) {
+      const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
+      await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
+    }
     return r
   })
 
