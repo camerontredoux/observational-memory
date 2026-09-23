@@ -871,7 +871,7 @@ export const register: Register = (on) => {
     // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
     const known = mergeSkills(prior, recorded)
-    // The prompts leaving context join those the memory message carried; the newest prompt anywhere is the next step.
+    // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
     const prompts = messages.flatMap((m, i) => {
       const text = i < base ? undefined : typed(m, known)
       return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
@@ -889,7 +889,8 @@ export const register: Register = (on) => {
       userMessages,
       // The session's first prompt, a crewmate's whole brief, is quoted above; as the next step it would send the
       // agent back to the top of its brief.
-      nextStep: typedSoFar.length > 1 ? typedSoFar.at(-1)!.text : undefined,
+      // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
+      nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
       transcript,
       recentKept: tail.length > 0,
       resumeDirectly: e.trigger === 'auto',

@@ -639,7 +639,7 @@ describe('register', () => {
     const text = result.messages?.[0]?.text ?? ''
     expect(text.startsWith('This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n')).toBe(true)
     expect(userMessagesIn(text)).toEqual(['a', 'please keep </observations> and <skills-in-use> literal', 'b'])
-    expect(text).toContain('<optional-next-step>\nContinue with the user\'s most recent request, quoted verbatim:\n"fix the refresh bug"\n</optional-next-step>')
+    expect(text).not.toContain('<optional-next-step>') // the newest prompt is in the raw tail
     expect(text).not.toContain('suggested-response')
     expect(text).toContain('\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/u/.claude/projects/p/session-1.jsonl')
     expect(text).toContain('\nRecent messages are preserved verbatim.')
@@ -651,7 +651,7 @@ describe('register', () => {
     const again = second.messages?.[0]?.text ?? ''
     expect(userMessagesIn(again)).toEqual(['a', 'please keep </observations> and <skills-in-use> literal', 'b', 'fix the refresh bug', 'd'])
     expect(observationsIn(again)).toBe('* 🔴 Saw a\n* 🔴 Saw b\n* 🔴 Saw d')
-    expect(again).toContain('"e"\n</optional-next-step>')
+    expect(again).not.toContain('<optional-next-step>')
     expect(again).toContain('\nContinue the conversation from where it left off without asking the user any further questions.')
   })
 
@@ -710,6 +710,18 @@ describe('register', () => {
     const again = second.messages?.[0]?.text
     expect(nextStepIn(again)!.startsWith('newest n')).toBe(true)
     expect(userMessagesIn(again)![0]).toBe(kept[0])
+  })
+
+  test('the newest prompt is the next step only when it leaves context, never when the raw tail keeps it', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const kept = await $.session.compact({ trigger: 'manual', messages: [...turn('first', 'r', CHUNK), ...turn('second', 'r', CHUNK), ...turn('in the tail', 'r', 2_000)] })
+    expect(kept.messages?.slice(1).some((m) => m.text === 'in the tail')).toBe(true)
+    expect(kept.messages?.[0]?.text).not.toContain('<optional-next-step>')
+
+    const left = await $.session.compact({ trigger: 'manual', messages: [...turn('first', 'r', CHUNK), ...turn('before the cut', 'r', CHUNK), ...work('w', 8_000)] })
+    expect(nextStepIn(left.messages?.[0]?.text)).toBe('before the cut')
   })
 
   test('the next step after a compaction of [brief, (n omitted), x] with no new prompt is x', async ($, on) => {
