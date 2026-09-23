@@ -961,6 +961,29 @@ describe('register', () => {
     expect(Object.keys(stored).filter((k) => k.includes('fork'))).toEqual([])
   })
 
+  test("fact lines: a subagent's are recorded in its own ledger and reach its memory, not the main loop's", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents, stored } = world(on)
+    pi(on)
+    const step = steps(on)
+
+    await clock.set(at(22, 14, 30))
+    const rows: SessionMessage[] = (agents['agent-1'] = mechanical('a', CHUNK))
+    await step($, 's', 0, rows.length, 'agent-1')
+    await clock.set(at(22, 14, 40))
+    rows.push(...agentCall('one', 0, 32_000))
+    await step($, 's', 1, rows.length, 'agent-1')
+    await clock.settle()
+
+    const facts = FACTS_A.map((l) => l.replace(/^\* \S+ [\d-]+ [\d:]+ /u, ''))
+    const lines = (stored['ledger:session-1/agent-1'] as Ledger).entries.map((e) => e.line)
+    for (const fact of facts) expect(lines.some((l) => l.endsWith(fact))).toBe(true)
+    expect(stored['ledger:session-1']).toBeUndefined()
+    const memory = (await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })).messages![0]!.text
+    for (const fact of facts) expect(observationsIn(memory)).toContain(fact)
+    expect(memory).toContain('Lines tagged [edits], [checks], [git] or [failed] were recorded mechanically')
+  })
+
   test("a subagent's compaction cuts at its own background watermark with no Observer call, its brief quoted, counted as a subagent's", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored, files } = world(on)
