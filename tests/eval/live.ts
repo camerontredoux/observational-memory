@@ -207,7 +207,7 @@ export function describePlan(plan: Plan): string {
 }
 
 /** Problems with `claude plugin list --json` for the plan's settings: none when exactly the expected plugin loads, cleanly. */
-export function checkPluginList(json: string, plan: Plan): string[] {
+export function checkPluginList(json: string, plan: Pick<Plan, 'expectedPlugin'>): string[] {
   let entries: { id?: string; enabled?: boolean; installPath?: string; errors?: unknown[] }[]
   try {
     entries = JSON.parse(json)
