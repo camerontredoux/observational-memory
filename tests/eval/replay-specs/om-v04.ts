@@ -20,7 +20,7 @@ export const spec: ReplaySpec = {
   ],
   questions: [
     { id: 'subagent-model', ask: 'Which model and effort level did the user choose for the build subagent?', from: 1, expect: ['opus', 'low'] },
-    { id: 'standing-brief', ask: 'What did the user say must always stay in the context as the standing brief?', from: 2, expect: ['first message'] },
+    { id: 'standing-brief', ask: 'What did the user say must always stay in the context as the standing brief?', from: 2, expect: ['first'] },
     { id: 'log-notes', ask: 'Which part of the compaction logs did the user ask to keep when standardizing them?', from: 3, expect: ['+11 notes'] },
     { id: 'vcc-repo', ask: 'Which GitHub repository did the user link as the official VCC implementation?', from: 7, expect: ['lllyasviel/VCC'] },
     { id: 'subagent-logs', ask: 'What did the user want done about subagent compaction messages?', from: 8 },

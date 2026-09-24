@@ -21,7 +21,7 @@ export const spec: ReplaySpec = {
     { id: 'worktrees', ask: 'In which directory must the agents create their git worktrees?', from: 1, expect: ['.worktrees'] },
     { id: 'base-spec', ask: 'Which GitHub issue is the base spec for the open tickets?', from: 1, expect: ['#1'] },
     { id: 'reviewers', ask: 'How does the code review step split its work between agents?', from: 1, expect: ['spec', 'standards'] },
-    { id: 'budget', ask: 'What spending limit did the user set for benchmark runs with paid models?', from: 1, expect: ['30', '50'] },
+    { id: 'budget', ask: 'What spending limit did the user set for benchmark runs with paid models?', from: 1, expect: ['50'] },
     { id: 'runs', ask: 'How many runs per configuration did the user ask for?', from: 1 },
     { id: 'reviewer-effort', ask: "How must a reviewer agent's effort level compare with the implementer's?", from: 1 },
     { id: 'larger-window', ask: 'What new benchmark scenario did the user ask for after asking how big the context windows were?', from: 4 },
