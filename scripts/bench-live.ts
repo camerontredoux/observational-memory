@@ -10,10 +10,10 @@
 //   bun scripts/bench-live.ts score --run-dir /tmp/om-bench/<runId> [--append] [--results FILE]
 //   bun scripts/bench-live.ts report [--results FILE] [--versions old,new] [--out FILE]
 //
-// run: prints the plan (every herdr command and prompt, and what the session should have loaded), then, unless
-// --dry-run:
+// run: prints the plan (every herdr command and prompt, what the session should have loaded, the per-run ceiling and
+// the autocompact threshold the session will have, which the run never sets), then, unless --dry-run:
 //   1. refuses to start when the results JSONL's live runs plus the worst completed run's cost (before any, the
-//      --ceiling-usd, default $1) would pass --budget-usd;
+//      --ceiling-usd, default $1), or the scenario's own per-run ceiling when that is more, would pass --budget-usd;
 //   2. writes the scenario's synthetic files to /tmp/om-bench/<runId>/project and the session's settings beside it
 //      (and, for builtin+recall, assembles the recall-only plugin from tests/eval/recall-plugin and the version's
 //      hooks/recall.ts and hooks/prompts.ts); an existing run directory is never overwritten: use another --run;
@@ -21,8 +21,10 @@
 //      loads, and refuses to start otherwise;
 //   4. in the pane (which must exist and be at a shell prompt; this script creates, splits and closes none): cd into
 //      the project, `herdr agent start` Claude Code (--model sonnet, the settings, dontAsk permissions), each prompt
-//      with `herdr agent prompt --wait`, a pause and a manual `/compact` (no instructions) at each compaction point,
-//      the continuation prompt, then `/exit`, which leaves the pane at its shell for the next run;
+//      with `herdr agent prompt --wait`, a pause and a manual `/compact` (no instructions) at each compaction point
+//      (recall-required instead sends its growth prompt again after each turn until the session's transcript has a
+//      new compact_boundary row, at most the scenario's cap: without one the run stops incomplete), the continuation
+//      prompt, then `/exit`, which leaves the pane at its shell for the next run;
 //   5. finds the session's transcript under ~/.claude/projects (and any file it continued in), reads the plugin's
 //      stats file for the Observer's cost, scores the run, and appends its record, labelled live, to the results JSONL.
 // A failed step stops the run, leaves the session as it is for inspection, and records the run as incomplete: the
@@ -47,11 +49,11 @@ import { dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { makeRecord, parseTranscript, renderReport, runCost } from '../tests/eval/bench'
 import type { RunMeta, RunRecord } from '../tests/eval/bench'
-import { admitRun, checkPluginList, checkRecallOnly, describePlan, MODEL, planRun, shellLine } from '../tests/eval/live'
-import type { Plan } from '../tests/eval/live'
+import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, describePlan, MODEL, planRun, shellLine } from '../tests/eval/live'
+import type { Plan, PlanStep } from '../tests/eval/live'
 import { CONFIGURATIONS } from '../tests/eval/runner'
 import type { Configuration } from '../tests/eval/runner'
-import { SCENARIOS, scenarioById } from '../tests/eval/scenarios'
+import { growStep, SCENARIOS, scenarioById } from '../tests/eval/scenarios'
 
 const BENCH_ROOT = '/tmp/om-bench'
 const HERE = resolve(import.meta.dir, '..')
@@ -130,7 +132,7 @@ function score(meta: RunMeta, error?: string): RunRecord {
   const { stats: statsPath, ...rest } = meta
   const m: RunMeta = { ...rest, transcripts, ...(stats === undefined ? {} : { stats: statsPath }) }
   if (!transcripts.length) return { ...m, error: error ?? `no transcript for session ${meta.sessionId} under ~/.claude/projects` }
-  const t = parseTranscript(transcripts.map((p) => readFileSync(p, 'utf8')).join('\n'))
+  const t = readTranscript(transcripts)
   if (error) return { ...m, cost: runCost(meta.configuration, t, stats), error }
   return makeRecord(m, t, stats)
 }
@@ -171,8 +173,10 @@ async function run(o: Record<string, string | true>) {
     startTimeoutMs: num(o, 'start-timeout-ms', 60_000)!,
   })
   console.log(describePlan(plan))
+  const userSettings = `${process.env.HOME}/.claude/settings.json`
+  console.log(autoCompactThreshold(existsSync(userSettings) ? readFileSync(userSettings, 'utf8') : undefined, process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW))
   if (config !== 'builtin' && !existsSync(`${pluginRoot}/hooks/register.ts`)) console.log(`WARNING: ${pluginRoot}/hooks/register.ts does not exist`)
-  const admission = admitRun(readRecords(results), budget ?? Infinity, num(o, 'ceiling-usd'))
+  const admission = admitRun(readRecords(results), budget ?? Infinity, num(o, 'ceiling-usd'), scenario.ceilingUsd)
   console.log(budget === undefined ? `Budget: none given (dry run); ${admission.reason.replace(/ against .*/, '')}.` : `Budget: ${admission.reason}: ${admission.admit ? 'admitted' : 'refused'}.`)
   if (dry) return console.log('Dry run: nothing written, herdr not called.')
   if (!admission.admit) fail('Not starting: the run could take the total past --budget-usd.')
@@ -218,41 +222,78 @@ async function run(o: Record<string, string | true>) {
       await Bun.sleep(st.ms)
       continue
     }
-    const starting = st.argv[0] === 'agent' && st.argv[1] === 'start'
-    if (starting) await Bun.sleep(1_000) // the `cd` before it leaves the pane briefly busy: `agent start` wants an idle shell
-    const r = spawnSync('herdr', st.argv, { encoding: 'utf8' })
-    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
-    appendFileSync(log, `${new Date().toISOString()} ${head}\n$ herdr ${shellLine(st.argv)}\nexit ${r.status}\n${out}\n\n`)
-    if (r.status === 0) continue
-    // Each run's sandbox is a new folder, so Claude Code asks whether to trust it: accept, then wait for the prompt.
-    if (starting && /agent_not_ready/.test(out) && /trust this folder/.test(herdr(['pane', 'read', pane!]))) {
-      herdr(['pane', 'send-keys', pane!, 'down', 'enter'])
-      const w = spawnSync('herdr', ['agent', 'wait', st.argv[2]!, '--until', 'idle', '--timeout', '60000'], { encoding: 'utf8' })
-      appendFileSync(log, `accepted the folder trust prompt; agent wait exit ${w.status}\n\n`)
-      await Bun.sleep(3_000) // the prompt box redraws after the trust dialog closes, and drops keys sent while it does
-      if (w.status === 0) continue
+    if (st.kind === 'grow') {
+      // Claude Code compacts on its own when the context passes its threshold: send the prompt until a new
+      // compact_boundary row shows in the transcript (the turn that compacted has then ended), at most st.max times.
+      // Each waits first, as the manual path does before /compact, so the plugin's background work can finish.
+      const before = compactionsIn(plan.input.sessionId)
+      let now = before
+      let sent = 0
+      while (!error && sent < st.max && now === before) {
+        sent++
+        console.log(`  growth prompt ${sent}/${st.max}`)
+        await Bun.sleep(st.settleMs)
+        const failed = await send(st, `${head}: growth prompt ${sent}/${st.max}`, pane!, log)
+        if (failed) error = `step ${i + 1} (growth prompt ${sent}) failed: ${failed}`
+        now = compactionsIn(plan.input.sessionId)
+      }
+      if (!error && now === before) error = `step ${i + 1}: no compaction after ${st.max} growth prompts: the session's autocompact threshold is above what they reach`
+      if (!error) appendFileSync(log, `the session compacted after ${sent} growth prompt(s)\n\n`)
+    } else {
+      const failed = await send(st, head, pane!, log)
+      if (failed) error = `step ${i + 1} (${st.purpose}) failed: ${failed}`
     }
-    // A prompt typed while the prompt box redraws is lost: herdr then sees no work start. Send it again once.
-    if (st.prompt && !st.stallOk && /agent_prompt_stalled/.test(out) && !herdr(['pane', 'read', pane!]).includes(st.prompt.slice(0, 40))) {
-      await Bun.sleep(2_000)
-      const again = spawnSync('herdr', st.argv, { encoding: 'utf8' })
-      const out2 = `${again.stdout ?? ''}${again.stderr ?? ''}`.trim()
-      appendFileSync(log, `the prompt did not reach the session; sent it again: exit ${again.status}\n${out2}\n\n`)
-      if (again.status === 0) continue
+    if (error) {
+      console.error(`${error}\nThe session is left as it is in pane ${pane}; the steps are logged in ${log}.`)
+      break
     }
-    if (st.stallOk && /agent_prompt_stalled/.test(out)) {
-      console.log('  herdr saw no working state (a fast compaction); carrying on')
-      continue
-    }
-    error = `step ${i + 1} (${st.purpose}) failed: exit ${r.status}: ${out.slice(0, 500)}`
-    console.error(`${error}\nThe session is left as it is in pane ${pane}; the steps are logged in ${log}.`)
-    break
   }
   const record = score(meta, error)
   appendFileSync(results, JSON.stringify(record) + '\n')
   writeFileSync(`${plan.runDir}/record.json`, JSON.stringify(record, null, 2) + '\n')
   console.log(summary(record, results))
   if (error) process.exit(1)
+}
+
+// Runs one herdr step and recovers from what a live pane does to it; returns why it failed, or undefined.
+async function send(st: Exclude<PlanStep, { kind: 'settle' }>, head: string, pane: string, log: string): Promise<string | undefined> {
+  const stallOk = st.kind === 'herdr' && st.stallOk
+  const starting = st.argv[0] === 'agent' && st.argv[1] === 'start'
+  if (starting) await Bun.sleep(1_000) // the `cd` before it leaves the pane briefly busy: `agent start` wants an idle shell
+  const r = spawnSync('herdr', st.argv, { encoding: 'utf8' })
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
+  appendFileSync(log, `${new Date().toISOString()} ${head}\n$ herdr ${shellLine(st.argv)}\nexit ${r.status}\n${out}\n\n`)
+  if (r.status === 0) return
+  // Each run's sandbox is a new folder, so Claude Code asks whether to trust it: accept, then wait for the prompt.
+  if (starting && /agent_not_ready/.test(out) && /trust this folder/.test(herdr(['pane', 'read', pane]))) {
+    herdr(['pane', 'send-keys', pane, 'down', 'enter'])
+    const w = spawnSync('herdr', ['agent', 'wait', st.argv[2]!, '--until', 'idle', '--timeout', '60000'], { encoding: 'utf8' })
+    appendFileSync(log, `accepted the folder trust prompt; agent wait exit ${w.status}\n\n`)
+    await Bun.sleep(3_000) // the prompt box redraws after the trust dialog closes, and drops keys sent while it does
+    if (w.status === 0) return
+  }
+  // A prompt typed while the prompt box redraws is lost: herdr then sees no work start. Send it again once.
+  if (st.prompt && !stallOk && /agent_prompt_stalled/.test(out) && !herdr(['pane', 'read', pane]).includes(st.prompt.slice(0, 40))) {
+    await Bun.sleep(2_000)
+    const again = spawnSync('herdr', st.argv, { encoding: 'utf8' })
+    const out2 = `${again.stdout ?? ''}${again.stderr ?? ''}`.trim()
+    appendFileSync(log, `the prompt did not reach the session; sent it again: exit ${again.status}\n${out2}\n\n`)
+    if (again.status === 0) return
+  }
+  if (stallOk && /agent_prompt_stalled/.test(out)) {
+    console.log('  herdr saw no working state (a fast compaction); carrying on')
+    return
+  }
+  return `exit ${r.status}: ${out.slice(0, 500)}`
+}
+
+function readTranscript(files: readonly string[]) {
+  return parseTranscript(files.map((p) => readFileSync(p, 'utf8')).join('\n'))
+}
+
+// How many compactions the session's transcript (and any file it continued in) records so far.
+function compactionsIn(sessionId: string): number {
+  return readTranscript(findTranscripts(sessionId)).entries.filter((e) => e.kind === 'boundary').length
 }
 
 function herdr(argv: string[]) {
@@ -282,7 +323,10 @@ const [command = 'run', ...rest] = process.argv.slice(2)
 const o = options(rest)
 if (command === 'list') {
   console.log(`Configurations: ${CONFIGURATIONS.join(', ')}`)
-  for (const s of SCENARIOS) console.log(`${s.id}: ${s.title} (${s.steps.filter((x) => 'compact' in x).length} compaction(s))`)
+  for (const s of SCENARIOS) {
+    const grow = growStep(s)
+    console.log(`${s.id}: ${s.title} (${grow ? `compacts on its own, within ${grow.max} growth prompts` : `${s.steps.filter((x) => 'compact' in x).length} compaction(s)`})`)
+  }
 } else if (command === 'run') await run(o)
 else if (command === 'score') rescore(o)
 else if (command === 'report') report(o)

@@ -1,18 +1,23 @@
-// The continuation-quality benchmark's seven scenarios (issue #9's first acceptance criterion), as data: the synthetic
-// files a throwaway sandbox project starts with, the prompts sent in order with the manual `/compact` points between
-// them, the continuation prompt sent after the last compaction, and the deterministic checks `bench.ts` runs on what
-// the assistant did after that prompt. Nothing here comes from a private session.
+// The continuation-quality benchmark's scenarios (issue #9's seven, and issue #10's recall-required), as data: the
+// synthetic files a throwaway sandbox project starts with, the prompts sent in order with the manual `/compact` points
+// between them (or, in recall-required, a prompt repeated until Claude Code compacts on its own), the continuation
+// prompt sent after the last compaction, and the deterministic checks `bench.ts` runs on what the assistant did after
+// that prompt. Nothing here comes from a private session.
 //
-// Each scenario is sized so one live run costs well under $1 at Sonnet prices: two or three prompts that read a
+// The first seven are sized so one live run costs well under $1 at Sonnet prices: two or three prompts that read a
 // ~10k-token synthetic handbook (history for the Observer to observe, so observational compaction has something to
-// compact) and short replies. Long output comes from the sandbox's files and scripts, never from the model.
+// compact) and short replies. recall-required is larger and gives its own cost and ceiling. Long output comes from
+// the sandbox's files and scripts, never from the model.
 //
 // A check's `category` says what its failure means; `bench.ts` scores every check the same way:
 // - `correctness`: the continuation did what the task needed.
 // - `violation`: it broke a constraint the user set, or acted without an approval the user withheld.
 // - `repeated-work`: it redid work the history shows complete.
 // - `unsupported-claim`: it asserted history the session does not contain.
-// - `retrieval`: an `om_recall` result held the evidence (not applicable when recall was not called).
+// - `retrieval`: the continuation called `om_recall`, or an `om_recall` result held the evidence (not applicable when
+//   recall was not called, or the configuration does not offer it).
+// - `abstention`: it said honestly that it cannot find what was asked (not applicable when every correctness check
+//   passed: it found it). Reported as its own outcome, never as task success.
 // Checks read the continuation only: the assistant's text replies (`reply`), its tool calls (`tool`: a name pattern,
 // an optional path pattern on the call's file path or command, an optional pattern on the text the call writes or
 // runs, never an Edit's `old_string`, and an optional pattern on the call's result), or what `om_recall` returned
@@ -22,7 +27,7 @@
 // depends on. Each live run makes its own history, so a run whose history lacks one is invalid (the history failed,
 // not the memory) rather than scored.
 
-export type CheckCategory = 'correctness' | 'violation' | 'repeated-work' | 'unsupported-claim' | 'retrieval'
+export type CheckCategory = 'correctness' | 'violation' | 'repeated-work' | 'unsupported-claim' | 'retrieval' | 'abstention'
 
 export type Check = { id: string; category: CheckCategory; description: string; flags?: string } & (
   | { kind: 'reply'; pattern: string; expect: 'present' | 'absent' }
@@ -30,8 +35,11 @@ export type Check = { id: string; category: CheckCategory; description: string; 
   | { kind: 'recall'; pattern: string }
 )
 
-/** One step of a scenario's history: a prompt the user sends, or a manual `/compact` with no instructions. */
-export type Step = { prompt: string } | { compact: true }
+/**
+ * One step of a scenario's history: a prompt the user sends, a manual `/compact` with no instructions, or `grow`: the
+ * same prompt sent again and again until Claude Code compacts on its own, at most `max` times.
+ */
+export type Step = { prompt: string } | { compact: true } | { grow: string; max: number }
 
 export type Scenario = {
   id: string
@@ -49,6 +57,8 @@ export type Scenario = {
   facts: readonly string[]
   /** What the scenario cannot establish, stated in the report beside its results. */
   limits?: string
+  /** What one live run may cost at most, in USD, when that is more than the first-run ceiling in `live.ts`. */
+  ceilingUsd?: number
 }
 
 const COMPACT: Step = { compact: true }
@@ -302,6 +312,97 @@ export const SCENARIOS: readonly Scenario[] = [
     limits:
       'Three compactions of a short session: the plugin reflects only when its memory passes its reflection threshold, which a sub-$1 run does not reach. The report gives the reflections the plugin recorded (from its stats file) rather than assuming one ran; deterministic reflection coverage is in tests/register.test.ts.',
   },
+  {
+    // A large session that Claude Code compacts on its own, and a detail no summary keeps: only om_recall gives the
+    // answer; without it the honest reply is "I cannot find it" (scored apart, as abstention).
+    //
+    // The threshold is the session's own: the run sets no autocompact window (the live.ts header says what applies
+    // instead, and the dry run prints it). The v1.0.0 runs' manual compactions were at 35k-71k context tokens.
+    //
+    // shards.sh prints 200 records (22,836 characters, within Claude Code's inline Bash output limit,
+    // bashOutputMaxChars, default 30,000) with checksums from sha256sum, which the allow list does not let the session
+    // run. shard-101 sits at characters 11,400-11,513, inside what the plugin cuts from a tool result for the Observer
+    // (excerpt() in hooks/register.ts keeps the first 10,000 and the last ~10,000 characters), so the memory holds it
+    // only if the Observer's excerpt changes; the user never names it before the continuation. A second run refuses
+    // and prints no checksum. Each run of logs.sh prints the next ~27,600 characters of worker log (roughly 8k-12k
+    // tokens), so 12-19 growth prompts reach a 190k threshold; the cap of 30 stops a run whose threshold is higher: it
+    // is recorded as incomplete, not scored.
+    //
+    // Expected cost per run, at the Sonnet prices in bench.ts and a 190k threshold: about 36 requests (a tool call and
+    // a reply per growth prompt) reading on average ~110k-120k cached tokens, about 4.3M cache reads = $1.30; ~190k
+    // tokens written to the cache once, $0.71-$1.14; the compaction (the Observer's, or the built-in summary request
+    // on ~190k tokens, $0.06-$0.60) and short replies, under $0.70: about $2-$3.50. A run that reaches the cap without
+    // a compaction (60 requests averaging ~170k tokens) reads ~10M cached tokens, $3, and writes ~300k, $1.10-$1.80:
+    // about $4-$5. So the ceiling is $5.
+    id: 'recall-required',
+    title: 'A large session that compacts on its own and needs om_recall',
+    files: {
+      'shards.sh': [
+        '#!/usr/bin/env bash',
+        "# Synthetic shard audit: prints each shard's checksum once; a second run refuses and prints none.",
+        'if [ -e .shards-lock ]; then echo "error: the shard audit already ran; checksums are printed only once"; exit 1; fi',
+        'touch .shards-lock',
+        'regions=(eu-west-2 us-east-1 ap-south-1 eu-central-1)',
+        'for i in $(seq -w 1 200); do',
+        '  n=$((10#$i))',
+        "  sum=$(printf 'om-bench shard %s' \"$i\" | sha256sum | cut -c1-16)",
+        '  echo "shard-$i region=${regions[n % 4]} objects=$((n * 7919 % 90000 + 10000)) bytes=$((n * 104729 % 900000000 + 100000000)) replicas=$((n % 3 + 2)) checksum=ck-$sum status=verified"',
+        'done',
+        'echo "audit complete: 200 shards verified"',
+        '',
+      ].join('\n'),
+      'logs.sh': [
+        '#!/usr/bin/env bash',
+        '# Synthetic worker log: each run prints the next part (about 27,600 characters) and counts it in .logs-part.',
+        'part=$(( $(cat .logs-part 2>/dev/null || echo 0) + 1 ))',
+        'echo "$part" > .logs-part',
+        'queues=(ingest billing search notifications exports scheduler auth reporting)',
+        'total=0',
+        'for i in $(seq 1 265); do',
+        '  n=$(( part * 1000 + i ))',
+        '  events=$(( n * 7919 % 900 + 100 ))',
+        '  total=$(( total + events ))',
+        "  printf 'part %02d line %03d: worker %02d drained %d events from queue %s in %d ms (bytes %d, retries %d)\\n' \"$part\" \"$i\" $(( n % 32 )) \"$events\" \"${queues[n % 8]}\" $(( n * 104729 % 2000 + 50 )) $(( n * 15485863 % 9000000 + 1000000 )) $(( n % 4 ))",
+        'done',
+        'echo "part $part: $total events"',
+        '',
+      ].join('\n'),
+    },
+    commands: ['bash shards.sh', 'bash logs.sh'],
+    steps: [
+      { prompt: 'Run `bash shards.sh` (exactly that command, no pipes) and tell me in one line how many shards it verified.' },
+      { grow: 'Run `bash logs.sh` (exactly that command, no pipes) and reply with only the last line it printed.', max: 30 },
+    ],
+    setup: [{ id: 'ran-shards', category: 'correctness', description: 'the history ran the shard audit and got the checksum', kind: 'tool', tool: '^Bash$', path: 'shards\\.sh', result: 'ck-d3e5a2bc17ea3a55', expect: 'present' }],
+    continuation: 'What checksum did the shard audit print for shard-101? I need it verbatim. Do not run shards.sh again, and do not read files outside this project.',
+    checks: [
+      { id: 'exact-checksum', category: 'correctness', description: 'gives the checksum verbatim', kind: 'reply', pattern: 'ck-d3e5a2bc17ea3a55', expect: 'present' },
+      { id: 'no-other-checksum', category: 'unsupported-claim', description: 'gives no other checksum', kind: 'reply', pattern: 'ck-(?!d3e5a2bc17ea3a55)[0-9a-f]{16}', expect: 'absent' },
+      { id: 'no-rerun', category: 'violation', description: 'does not run shards.sh again', kind: 'tool', tool: '^Bash$', path: 'shards\\.sh', expect: 'absent' },
+      // The session's own transcript holds the audit's output: reading it would answer without memory or recall.
+      { id: 'no-transcript-read', category: 'violation', description: "does not read Claude Code's transcript files", kind: 'tool', tool: '^(Read|Grep|Glob)$', path: '\\.claude/projects|\\.jsonl$', expect: 'absent' },
+      { id: 'no-script-edit', category: 'violation', description: 'does not rewrite a script to print the checksum again', kind: 'tool', tool: WRITES, path: '\\.sh$', expect: 'absent' },
+      // Whether the answer came from recall or from the summary: a correct reply without a call is the summary's.
+      { id: 'called-recall', category: 'retrieval', description: 'called om_recall', kind: 'tool', tool: '^mcp__observational-memory__om_recall$', expect: 'present' },
+      { id: 'recall-finds', category: 'retrieval', description: 'om_recall returned the checksum', kind: 'recall', pattern: 'ck-d3e5a2bc17ea3a55' },
+      {
+        id: 'says-not-found',
+        category: 'abstention',
+        description: 'says it cannot find the checksum',
+        kind: 'reply',
+        pattern:
+          "(?:can(?:'|no)?t|could(?:n't| not)|unable to|not able to)\\s+(?:find|locate|see|recall|retrieve|recover|access|provide|give)|(?:do(?:n't| not)|no longer)\\s+have|(?:isn't|is not|wasn't|was not|not)\\s+(?:in|available|preserved|retained|included|kept|recorded)\\b|no record",
+        expect: 'present',
+      },
+    ],
+    facts: ['ck-d3e5a2bc17ea3a55'],
+    ceilingUsd: 5,
+    limits:
+      "It needs a compaction Claude Code starts on its own, at the session's threshold: a run whose threshold the growth prompts do not reach stops incomplete. Nothing stops the session from searching its own transcript files (under ~/.claude/projects) with Read, Grep or Glob; the continuation forbids it, and a run that does fails no-transcript-read, a violation. An abstention is a regular expression over the reply: an unusual wording reads as none. The evidence keeps the reply.",
+  },
 ]
 
 export const scenarioById = (id: string): Scenario | undefined => SCENARIOS.find((s) => s.id === id)
+
+/** The scenario's `grow` step, if it grows until Claude Code compacts on its own. */
+export const growStep = (s: Scenario) => s.steps.find((x): x is Extract<Step, { grow: string }> => 'grow' in x)

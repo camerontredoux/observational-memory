@@ -13,6 +13,10 @@
 //   setting. builtin+recall: an evaluation-only plugin (tests/eval/recall-plugin) that registers om_recall alone.
 // - `--permission-mode dontAsk` with an allow list in the settings: the session never stops at a permission prompt;
 //   what the list leaves out is denied (the attempt stays in the transcript for the checks).
+// - Auto-compaction: the run sets no window (no `autoCompactWindow` in its settings, no `--autocompact`, no
+//   `CLAUDE_CODE_AUTO_COMPACT_WINDOW`), so the session compacts at its own threshold: the user's `autoCompactWindow`
+//   (an any-file setting, so --settings leaves it in force), or Claude Code's default for the model (per its
+//   model-config docs, about 967k tokens for Sonnet 5's native 1M window). `autoCompactThreshold` says which.
 
 import { RECALL_TOOL } from './bench'
 import type { RunRecord } from './bench'
@@ -49,6 +53,8 @@ export type PlanInput = {
 export type PlanStep =
   | { kind: 'herdr'; argv: string[]; purpose: string; prompt?: string; stallOk?: boolean }
   | { kind: 'settle'; ms: number; purpose: string }
+  /** Send `argv` (a prompt), after a `settleMs` pause, again after each turn until the transcript has a new compaction, at most `max` times. */
+  | { kind: 'grow'; argv: string[]; purpose: string; prompt: string; max: number; settleMs: number }
 
 /** The session's `--settings` file. */
 export type Settings = { env: { CLAUDE_CODE_PLUGIN_DIRS: string; OM_STATS_DIR: string }; permissions: { allow: string[] } }
@@ -111,9 +117,10 @@ export function planRun(input: PlanInput): Plan {
 
   const agent = `bench-${input.sessionId.slice(0, 8)}` // herdr names are at most 32 characters; a run id can be longer
   const { pane, timeoutMs } = input
+  const promptArgv = (text: string) => ['agent', 'prompt', agent, text, '--wait', '--timeout', String(timeoutMs)]
   const prompt = (text: string, purpose: string, stallOk = false): PlanStep => ({
     kind: 'herdr',
-    argv: ['agent', 'prompt', agent, text, '--wait', '--timeout', String(timeoutMs)],
+    argv: promptArgv(text),
     purpose,
     prompt: text,
     ...(stallOk ? { stallOk } : {}),
@@ -129,6 +136,15 @@ export function planRun(input: PlanInput): Plan {
   let compactions = 0
   s.steps.forEach((st, i) => {
     if ('prompt' in st) return steps.push(prompt(st.prompt, `scenario prompt ${i + 1}`))
+    if ('grow' in st)
+      return steps.push({
+        kind: 'grow',
+        argv: promptArgv(st.grow),
+        prompt: st.grow,
+        max: st.max,
+        settleMs: input.settleMs,
+        purpose: `growth prompt, each after a ${input.settleMs / 1000} s pause for background work (as a pausing user would), repeated until Claude Code compacts on its own (a new compact_boundary row in the transcript), at most ${st.max} times; after ${st.max} without one the run stops incomplete`,
+      })
     compactions++
     steps.push({ kind: 'settle', ms: input.settleMs, purpose: 'let background work finish before compacting, as a pausing user would' })
     // Observational compaction can finish before herdr sees the agent working: a stalled wait is then not a failure.
@@ -170,10 +186,12 @@ export function describePlan(plan: Plan): string {
     ...plan.copies.map((c) => `- copy ${c.from} -> ${c.to}`),
     '',
     'Steps:',
-    ...plan.steps.map((st, i) => `${i + 1}. ${st.kind === 'herdr' ? `herdr ${shellLine(st.argv)}` : `wait ${st.ms / 1000} s`}   # ${st.purpose}`),
+    ...plan.steps.map((st, i) => `${i + 1}. ${st.kind === 'settle' ? `wait ${st.ms / 1000} s` : `herdr ${shellLine(st.argv)}`}   # ${st.purpose}`),
     '',
     'Prompts, in order:',
-    ...plan.steps.flatMap((st) => (st.kind === 'herdr' && st.prompt ? [`- ${st.prompt}`] : [])),
+    ...plan.steps.flatMap((st) => (st.kind === 'grow' ? [`- ${st.prompt} (1 to ${st.max} times)`] : st.kind === 'herdr' && st.prompt ? [`- ${st.prompt}`] : [])),
+    '',
+    input.scenario.ceilingUsd === undefined ? `Per-run ceiling: --ceiling-usd (default $${FIRST_RUN_CEILING_USD}) until a live run completes, then the worst completed run.` : `Per-run ceiling: $${input.scenario.ceilingUsd}, the scenario's own (its comment in tests/eval/scenarios.ts gives the expected cost), or the worst completed run when that is more.`,
     '',
     `If Claude Code asks whether to trust ${plan.projectDir}, answer it in the pane within ${input.startTimeoutMs / 1000} s.`,
   ]
@@ -206,19 +224,39 @@ export type Admission = { admit: boolean; spentUsd: number; reserveUsd: number; 
 
 /**
  * Whether the budget admits one more live run: what the live runs so far cost, plus as much again as the worst
- * completed run (before any, `ceilingUsd`), must stay within `budgetUsd`. A live run that did not complete or has no
- * total counts at the worst run's cost, or its own when larger: what it spent is not known. Offline runs cost nothing.
+ * completed run (before any, `ceilingUsd`), or the scenario's own per-run ceiling when that is more, must stay within
+ * `budgetUsd`. A live run that did not complete or has no total counts at the worst run's cost, or its own when
+ * larger: what it spent is not known. Offline runs cost nothing.
  */
-export function admitRun(records: readonly RunRecord[], budgetUsd: number, ceilingUsd = FIRST_RUN_CEILING_USD): Admission {
+export function admitRun(records: readonly RunRecord[], budgetUsd: number, ceilingUsd = FIRST_RUN_CEILING_USD, scenarioCeilingUsd = 0): Admission {
   const live = records.filter((r) => r.mode === 'live')
   const total = (r: RunRecord) => (r.cost?.total.status === 'estimated' || r.cost?.total.status === 'measured' ? r.cost.total.value : undefined)
   const complete = live.filter((r) => !r.error && total(r) !== undefined).map((r) => total(r)!)
   const worst = complete.length ? Math.max(...complete) : ceilingUsd
+  const reserve = Math.max(worst, scenarioCeilingUsd)
   const spent = live.reduce((t, r) => t + (!r.error && total(r) !== undefined ? total(r)! : Math.max(worst, total(r) ?? 0)), 0)
   const spentUsd = Math.round(spent * 1e6) / 1e6
-  const admit = spentUsd + worst <= budgetUsd
-  const reason = `${live.length} live run(s) so far, $${spentUsd.toFixed(4)}; reserving $${worst.toFixed(4)} (${complete.length ? 'the worst completed run' : 'the first-run ceiling'}) against a $${budgetUsd} budget`
-  return { admit, spentUsd, reserveUsd: worst, reason }
+  const admit = spentUsd + reserve <= budgetUsd
+  const why = reserve > worst ? "the scenario's per-run ceiling" : complete.length ? 'the worst completed run' : 'the first-run ceiling'
+  const reason = `${live.length} live run(s) so far, $${spentUsd.toFixed(4)}; reserving $${reserve.toFixed(4)} (${why}) against a $${budgetUsd} budget`
+  return { admit, spentUsd, reserveUsd: reserve, reason }
+}
+
+/**
+ * The autocompact threshold a run's session will have, which the run does not set: from the environment variable
+ * (which overrides every other source), else the user's `autoCompactWindow`, else Claude Code's default for the model.
+ */
+export function autoCompactThreshold(userSettingsJson: string | undefined, envWindow: string | undefined): string {
+  const head = 'Auto-compaction: the run sets no window; the session has'
+  if (envWindow) return `Auto-compaction: the run sets no window, but CLAUDE_CODE_AUTO_COMPACT_WINDOW=${envWindow} is set in this environment: if the pane has it too, it overrides every setting.`
+  let window: unknown
+  try {
+    window = userSettingsJson === undefined ? undefined : (JSON.parse(userSettingsJson) as { autoCompactWindow?: unknown }).autoCompactWindow
+  } catch {
+    return `${head} a threshold this script cannot tell: it cannot read ~/.claude/settings.json.`
+  }
+  if (window !== undefined) return `${head} autoCompactWindow ${String(window)} from ~/.claude/settings.json.`
+  return `${head} Claude Code's default for the model (about 967k tokens for Sonnet 5): a growth cap far below that ends the run incomplete.`
 }
 
 const RECALL_ONLY_HOOKS = ['session.start', `tool.call{tool=${RECALL_TOOL}}`, 'classic.SessionStart', 'classic.Stop']

@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { RECALL_TOOL } from './eval/bench'
 import type { RunRecord } from './eval/bench'
-import { admitRun, checkPluginList, checkRecallOnly, describePlan, planRun, runIdOf, shellLine } from './eval/live'
+import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, describePlan, planRun, runIdOf, shellLine } from './eval/live'
 import type { PlanInput } from './eval/live'
 import { CONFIGURATIONS } from './eval/runner'
 import type { Configuration } from './eval/runner'
-import { scenarioById } from './eval/scenarios'
+import { growStep, scenarioById } from './eval/scenarios'
 
 const SESSION = '0f1e2d3c-4b5a-4968-8776-655443322110'
 const input = (config: Configuration, extra: Partial<PlanInput> = {}): PlanInput => ({
@@ -96,6 +96,43 @@ describe('the live run plan', () => {
   })
 })
 
+describe('the live plan of a scenario that compacts on its own', () => {
+  const rr = scenarioById('recall-required')!
+  const plan = planRun(input('om+recall', { scenario: rr }))
+  const grow = growStep(rr)!
+
+  test('repeats the growth prompt until a compaction shows in the transcript, capped, with no manual /compact', () => {
+    const sent = plan.steps.flatMap((st) => (st.kind !== 'settle' && st.argv[1] === 'prompt' ? [st.argv[3]!] : []))
+    expect(sent).toEqual([(rr.steps[0] as { prompt: string }).prompt, grow.grow, rr.continuation])
+    const step = plan.steps.find((st) => st.kind === 'grow')!
+    expect(step).toMatchObject({ kind: 'grow', prompt: grow.grow, max: 30, settleMs: plan.input.settleMs, argv: ['agent', 'prompt', plan.agent, grow.grow, '--wait', '--timeout', '600000'] })
+    expect(plan.steps.some((st) => st.kind !== 'settle' && st.argv[3] === '/compact')).toBe(false)
+    expect(plan.steps.filter((st) => st.kind === 'settle')).toHaveLength(1) // the one after /exit
+  })
+
+  test('sets no autocompact window: not in the settings, the environment or the command line', () => {
+    expect(JSON.stringify(plan.settings)).not.toMatch(/autoCompact|AUTO_COMPACT/i)
+    expect(plan.claudeArgs.join(' ')).not.toMatch(/autocompact/i)
+  })
+
+  test('the dry run shows the growth loop, its cap and the per-run ceiling', () => {
+    const text = describePlan(plan)
+    expect(text).toContain(`herdr ${shellLine(plan.steps.find((st) => st.kind === 'grow')!.argv)}`)
+    expect(text).toContain('(as a pausing user would), repeated until Claude Code compacts on its own (a new compact_boundary row in the transcript), at most 30 times')
+    expect(text).toContain('Per-run ceiling: $5')
+    expect(describePlan(planRun(input('om')))).toContain('Per-run ceiling: --ceiling-usd (default $1) until a live run completes')
+  })
+
+  test("says which autocompact threshold the session will have, from the user's settings and the environment", () => {
+    expect(autoCompactThreshold(JSON.stringify({ autoCompactWindow: 190000 }), undefined)).toBe(
+      'Auto-compaction: the run sets no window; the session has autoCompactWindow 190000 from ~/.claude/settings.json.',
+    )
+    expect(autoCompactThreshold('{}', undefined)).toMatch(/^Auto-compaction: the run sets no window; the session has Claude Code's default for the model \(about 967k tokens for Sonnet 5\)/)
+    expect(autoCompactThreshold(undefined, '300000')).toMatch(/CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000 is set in this environment/)
+    expect(autoCompactThreshold('not json', undefined)).toMatch(/cannot read ~\/\.claude\/settings\.json/)
+  })
+})
+
 describe('checking what a session will load', () => {
   const list = (entries: object[]) => JSON.stringify(entries)
   const om = { id: 'observational-memory@inline', enabled: true, installPath: '/repo', errors: [] }
@@ -152,6 +189,15 @@ describe('the run budget', () => {
     const done = [rec('live', 0.2), rec('live', 0.35)]
     expect(admitRun(done, 0.8)).toMatchObject({ admit: false, spentUsd: 0.55, reserveUsd: 0.35 })
     expect(admitRun(done, 1).admit).toBe(true)
+  })
+
+  test("reserves a scenario's own per-run ceiling when it is more than the worst completed run", () => {
+    const done = [rec('live', 0.2), rec('live', 0.35)]
+    expect(admitRun(done, 4, 1, 4)).toMatchObject({ admit: false, spentUsd: 0.55, reserveUsd: 4 })
+    expect(admitRun(done, 5, 1, 4)).toMatchObject({ admit: true, reserveUsd: 4 })
+    expect(admitRun([], 3, 1, 4).admit).toBe(false)
+    expect(admitRun([rec('live', 5)], 10, 1, 4).reserveUsd).toBe(5)
+    expect(admitRun(done, 5, 1, 4).reason).toContain("reserving $4.0000 (the scenario's per-run ceiling)")
   })
 
   test('counts a live run that did not complete at the worst cost, since what it spent is unknown', () => {
