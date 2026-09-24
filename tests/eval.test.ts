@@ -347,10 +347,12 @@ function world(on: On, sessionId: string | (() => string)) {
   return { history: history(resolve()), historyOf: history, stored }
 }
 
-// pi on the host, trimmed from register.test.ts's own `pi`: answers every chunk with one observation per user row.
+// pi on the host, trimmed from register.test.ts's own `pi`: answers every chunk with one observation per user row, and
+// git, which reads the environment at compaction, as outside a repository.
 function pi(on: On) {
   const seen = { prompts: [] as string[], logs: [] as string[] }
   on('process.run', ($, e): { value: ProcessRunResult } => {
+    if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } }
     const prompt = e.init?.stdin ?? ''
     seen.prompts.push(prompt)
     const text = `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>`

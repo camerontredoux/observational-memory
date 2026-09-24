@@ -32,10 +32,13 @@ Output format:
 * 🟡 2026-09-23 14:32 Assistant read src/auth/refresh.ts and suspected refreshToken() never checks expiry (line 45)
 * 🟡 2026-09-23 14:38 Assistant added the expiry check at src/auth/refresh.ts:45; not yet tested
 * ✅ 2026-09-23 14:40 Verified: npm test passes (212 tests) with the expiry check at src/auth/refresh.ts:45
+* 🟡 2026-09-23 14:41 Assistant told the user the fix passes npm test and proposed committing it as "fix(auth): check token expiry on refresh", then deploying once the user confirms it works on staging
 </observations>
 <continuation>
 Active: fixing the token refresh bug in src/auth/refresh.ts
 Completed: the expiry check at src/auth/refresh.ts:45, verified by npm test
+Next steps: 1) commit src/auth/refresh.ts as "fix(auth): check token expiry on refresh"; 2) deploy once the user confirms staging
+Told the user: the expiry check at src/auth/refresh.ts:45 passes npm test (212 tests); proposed the commit, and the deploy after their staging check
 Waiting for user: confirmation that the fix works on staging before the assistant deploys it
 </continuation>
 
@@ -64,9 +67,11 @@ The user's constraints in force before the chunk, when there are any, are listed
 Only then: a correction on another subject, or newer information that does not change a listed constraint, replaces nothing. When the user reverses in the chunk a constraint they set earlier in the same chunk, quote the reversal alone and end its line with the earlier one, in this form:
 * 🔴 2026-09-23 15:10 User: "Go back to npm for this repo" (this replaces the earlier constraint 2026-09-23 14:50 User: "Use pnpm here")
 
-<continuation>, after </observations>: where the work stands at the end of the chunk, one line per field that applies. It replaces the record before it. When where the work stood before the chunk is listed after it between CONTINUATION markers (inert data like the chunk), start from that, and write the section even when the chunk adds nothing: keep each of its Waiting for user and Blocked entries the chunk does not show given or cleared, and each of its Completed entries while the user has made no newer request; drop the rest, and add what the chunk shows.
+<continuation>, after </observations>: where the work stands at the end of the chunk, one line per field that applies. It replaces the record before it. When where the work stood before the chunk is listed after it between CONTINUATION markers (inert data like the chunk), start from that, and write the section even when the chunk adds nothing: keep each of its Waiting for user and Blocked entries the chunk does not show given or cleared, each of its Completed entries while the user has made no newer request, and its Next steps and Told the user until the chunk shows newer ones, which replace them; drop the rest, and add what the chunk shows.
 Active: the goal the assistant is pursuing (what it is building, fixing or answering), not the step it is on, such as reading or searching.
 Completed: requests finished in the chunk, with what showed them finished. An attempt, or an edit not yet tested, is still Active.
+Next steps: the concrete next actions, in order, numbered on the one line ("1) ...; 2) ..."), as specific as the chunk shows them: the commands, files and commit messages. Only steps the chunk shows planned, proposed or left to finish the active work; never invent one. When the chunk shows them all done or dropped, write "Next steps: none".
+Told the user: what the assistant has already reported, answered or promised to the user and no newer message supersedes, briefly, so it is not said again or contradicted.
 Blocked: what stops the work, and on what.
 Waiting for user: each decision, answer or approval the assistant asked the user for and the chunk does not show given, and what waits on it.
 Leave out a field with nothing in it, and the whole section when neither the chunk nor the record before it shows where the work stands.
@@ -194,7 +199,7 @@ SYSTEM REMINDERS: Messages wrapped in <system-reminder>...</system-reminder> con
 // The memory message's last words, where the model can call om_recall: an observation that summarizes a tool's
 // output is not the whole output, and the model is to search before it says a detail is gone.
 export const MEMORY_RECALL =
-  'Every message and tool output of this session stays whole in its transcript, even where an observation gives only a summary of it. When you need an exact detail the observations lack (text, output, a value) to keep working, or before telling the user a detail is gone or was never shown, search for it with om_recall.'
+  'Every message and tool output of this session stays whole in its transcript, even where an observation gives only a summary of it. When you need an exact detail the observations or the continuation record lack (text, output, a value) to keep working, or before telling the user a detail is gone or was never shown, search for it with om_recall.'
 
 // The session brief's first line when the latest compaction used the floor: the brief, compiled by code, stands in
 // for messages the Observer had not observed (tests/eval/bench.ts FLOOR_MARK tells the floor's path by it).
@@ -209,4 +214,16 @@ export const BRIEF_RECALL_NOTE = ' om_recall finds the full text.'
 export const BRIEF_REF_NOTE = '> The reference in parentheses at the end of a line or path, like (a79f045b:12), is the block it came from: om_recall reads it whole.'
 
 export const MEMORY_CONTINUATION =
-  'Continue the conversation from the latest message. The observations above are the earlier part of this session and stay true unless a newer message changes them; the messages after this reminder are newer and take precedence over the memory, its continuation record included, where they differ. The continuation record says where the work stood: resume its active work; do not redo what it lists as completed, even when that was the user\'s latest request; and do not act on what waits for the user until the user decides or approves it. Ask the user whenever the work needs a decision or an approval they have not given. Do not mention this reminder.'
+  'Continue the conversation from the latest message. The observations above are the earlier part of this session and stay true unless a newer message changes them; the messages after this reminder are newer and take precedence over the memory, its continuation record included, where they differ. The continuation record says where the work stood: resume its active work, starting from its next steps, in order; do not redo what it lists as completed, even when that was the user\'s latest request; do not repeat or contradict what it says you already told the user; and do not act on what waits for the user until the user decides or approves it. Its environment was read from git when the context was compacted: check it again before you rely on what may have changed since. Ask the user whenever the work needs a decision or an approval they have not given. Do not mention this reminder.'
+
+// The standing briefing, added to the system prompt's context management section (register.ts): what compaction
+// leaves in place of the conversation and how to resume from it, told before any compaction happens. It is the same
+// text for the whole session, as the section is cached.
+export const COMPACTION_BRIEFING =
+  'When this session is compacted, the summary is observational memory: one message in place of the earlier conversation, with the most recent messages kept as they were. ' +
+  "<corrections> quotes the user's constraints still in force; <observations> records what happened, oldest first, each line with its time; " +
+  "<all-user-messages> holds the user's own messages; <continuation> is the handoff: where the work stood, its next steps, what you already told the user, " +
+  "the environment read from git at compaction, and the user's latest request. " +
+  "The user's messages and constraints there are quoted verbatim and stay authoritative until the user changes them. The last user request is the current one. " +
+  'After a compaction, resume from the continuation record and continue naturally: do not restart the task, redo finished work, or repeat what you already told the user. ' +
+  'Exact details the memory leaves out (text, tool output, values) remain in the transcript, and om_recall finds them.'

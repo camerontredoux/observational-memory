@@ -180,6 +180,7 @@ describe('the om chain through hooks/register.ts', () => {
     on('skill.prompt', ($, e) => ({ text: e.text }))
     const observed: string[][] = []
     on('process.run', ($, e) => {
+      if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } } // outside a repository
       const prompt = e.init?.stdin ?? ''
       const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
       observed.push(words)
