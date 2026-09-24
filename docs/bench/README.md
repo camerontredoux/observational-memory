@@ -124,7 +124,8 @@ then), so this is not a built-in baseline. No built-in numbers exist until the l
 | om-v04 | 9 | 42/50 (84%) | all, at every boundary |
 | firstmate-11 | 11 | 22/41 (54%) | all, at every boundary; the one reversed constraint never shown as in force |
 
-The constraints hold because observational memory copies the user's messages into the memory by code.
+Every memory held every constraint in force: the memory keeps the user's own words (its corrections are never
+reflected, and the current build copies every user message into it by code).
 
 ### The dry run: what a full run would spend
 
