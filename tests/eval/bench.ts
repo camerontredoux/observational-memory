@@ -8,7 +8,8 @@
 // Scoring is deterministic: regular expressions over the assistant's replies and tool calls after the continuation
 // prompt, and over what `om_recall` returned. No check is model-graded; a report says so. A run is scored only when it
 // is valid: its history holds the scenario's setup (the tool calls the continuation depends on), the continuation got
-// a response, every scenario compaction happened, the compaction ran the path its
+// a response, every scenario compaction happened (in a scenario that grows until Claude Code compacts on its own: at
+// least one compaction, each with the `auto` trigger of its `compact_boundary` row), the compaction ran the path its
 // configuration names (an `om` run whose compaction fell back to the built-in summary measures the built-in one, so
 // it is reported as invalid, not scored as observational memory), and a configuration without recall did not call
 // it. Invalid runs are counted and listed with their reasons, never dropped.
@@ -229,7 +230,7 @@ export type RunScore = {
   /** Why the run cannot be scored as its configuration; empty when valid. */
   invalid: string[]
   checks: CheckResult[]
-  /** Valid, and no check failed other than a retrieval one: whether recall found the evidence is scored apart. */
+  /** Valid, and no check failed other than a retrieval or abstention one: those outcomes are reported apart. */
   taskSuccess: boolean
   /** The fraction of correctness checks that passed. */
   correctness: number
@@ -295,9 +296,18 @@ function checkOne(c: Check, reply: string, calls: Extract<Entry, { kind: 'tool' 
 
 export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stats?: OmStats): RunScore {
   const invalid: string[] = []
-  const expected = s.steps.filter((x) => 'compact' in x).length
   const boundaries = t.entries.flatMap((e, i) => (e.kind === 'boundary' ? [{ e, i }] : []))
-  if (boundaries.length !== expected) invalid.push(`the scenario schedules ${expected} compaction(s); the transcript has ${boundaries.length}`)
+  if (s.steps.some((x) => 'grow' in x)) {
+    // Claude Code compacts on its own: any number of times, never by a manual `/compact`.
+    if (!boundaries.length) invalid.push('no compaction happened before the continuation')
+    boundaries.forEach(({ e }, i) => {
+      const trigger = (e as Extract<Entry, { kind: 'boundary' }>).trigger
+      if (trigger !== 'auto') invalid.push(`compaction ${i + 1} was ${trigger ?? 'of no recorded trigger'}, not automatic`)
+    })
+  } else {
+    const expected = s.steps.filter((x) => 'compact' in x).length
+    if (boundaries.length !== expected) invalid.push(`the scenario schedules ${expected} compaction(s); the transcript has ${boundaries.length}`)
+  }
 
   const compactions: CompactionScore[] = boundaries.map(({ e, i }) => {
     const next = t.entries.slice(i + 1).find((x) => x.kind === 'summary' || x.kind === 'boundary')
@@ -339,7 +349,15 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
 
   const recallIds = new Set(calls.filter((e) => e.name === RECALL_TOOL).map((e) => e.id))
   const recalls = after.flatMap((e) => (e.kind === 'result' && recallIds.has(e.id) ? [e.text] : []))
-  const checks = s.checks.map((c) => checkOne(c, reply, calls, recalls, results))
+  // Retrieval is not applicable where om_recall is not offered: a missing call there is the configuration, not a miss.
+  const scored = s.checks.map((c) =>
+    c.category === 'retrieval' && !recallAvailable(config)
+      ? { id: c.id, category: c.category, description: c.description, outcome: 'n/a' as const, evidence: `${config} does not offer om_recall` }
+      : checkOne(c, reply, calls, recalls, results),
+  )
+  // Abstaining is the honest outcome only when the answer was not given: a reply that gave it did not need to.
+  const answered = scored.some((c) => c.category === 'correctness') && scored.every((c) => c.category !== 'correctness' || c.outcome === 'pass')
+  const checks = scored.map((c) => (c.category === 'abstention' && answered ? { ...c, outcome: 'n/a' as const, evidence: `every correctness check passed: ${c.evidence}` } : c))
   const failed = (cat: CheckCategory) => checks.filter((c) => c.category === cat && c.outcome === 'fail').length
   const correctnessChecks = checks.filter((c) => c.category === 'correctness')
   const retrievalChecks = checks.filter((c) => c.category === 'retrieval' && c.outcome !== 'n/a')
@@ -349,7 +367,7 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
     valid: invalid.length === 0,
     invalid,
     checks,
-    taskSuccess: invalid.length === 0 && checks.every((c) => c.category === 'retrieval' || c.outcome !== 'fail'),
+    taskSuccess: invalid.length === 0 && checks.every((c) => c.category === 'retrieval' || c.category === 'abstention' || c.outcome !== 'fail'),
     correctness: correctnessChecks.length ? correctnessChecks.filter((c) => c.outcome === 'pass').length / correctnessChecks.length : 1,
     violations: failed('violation'),
     repeatedWork: failed('repeated-work'),
@@ -430,8 +448,9 @@ export type ReportOptions = { versions?: readonly string[] }
 /**
  * A markdown report of the results: live and offline runs apart; per plugin version and configuration the run count,
  * valid runs, and each measure's mean ± sample standard deviation [min–max]; task success per scenario; what carried
- * each fact through observational compaction; every invalid or incomplete run and every failed check with its
- * evidence; and, given the expected versions and scenarios, every live cell that has not run.
+ * each fact through observational compaction; honest abstention, apart; every invalid or incomplete run and every
+ * failed check with its evidence; and, given the expected versions and scenarios, every live cell without a valid
+ * run (not run, or "0 of N valid").
  */
 export function renderReport(records: readonly RunRecord[], options: ReportOptions = {}): string {
   const live = records.filter((r) => r.mode === 'live')
@@ -457,14 +476,23 @@ export function renderReport(records: readonly RunRecord[], options: ReportOptio
     if (rs.length) out.push('', `## ${title}`, '', ...section(rs, rs === live ? 'live' : 'offline'))
   if (options.versions) {
     const missing = options.versions.flatMap((v) =>
-      CONFIGURATIONS.flatMap((c) => SCENARIOS.map((s) => s.id).filter((s) => !live.some((r) => r.version === v && r.configuration === c && r.scenario === s && r.score?.valid)).map((s) => `- ${v} ${c} ${s}: not run live`)),
+      CONFIGURATIONS.flatMap((c) =>
+        SCENARIOS.flatMap((s) => {
+          const ran = live.filter((r) => r.version === v && r.configuration === c && r.scenario === s.id)
+          if (ran.some((r) => r.score?.valid)) return []
+          return [`- ${v} ${c} ${s.id}: ${ran.length ? validOf(ran) : 'not run live'}`]
+        }),
+      ),
     )
-    out.push('', '## Not run', '', ...(missing.length ? missing : ['Every expected live cell has at least one valid run.']))
+    out.push('', '## Not run, or no valid run', '', ...(missing.length ? missing : ['Every expected live cell has at least one valid run.']))
   }
   const limits = SCENARIOS.filter((s) => s.limits && records.some((r) => r.scenario === s.id))
   if (limits.length) out.push('', '## Scenario limits', '', ...limits.map((s) => `- ${s.id}: ${s.limits}`))
   return out.join('\n') + '\n'
 }
+
+// A cell that ran but has no valid run says so: its runs are listed under "Invalid and incomplete runs".
+const validOf = (rs: readonly RunRecord[]) => `${rs.filter((r) => r.score?.valid).length} of ${rs.length} valid`
 
 const groupKey = (r: RunRecord) => `${r.version}\u0000${r.configuration}`
 function groups(rs: readonly RunRecord[]) {
@@ -515,8 +543,28 @@ function section(rs: readonly RunRecord[], mode: 'live' | 'offline'): string[] {
   for (const s of scenarios)
     out.push(`| ${s.id} | ${gs.map((g) => {
       const v = g.valid.filter((r) => r.scenario === s.id)
-      return v.length ? `${v.filter((r) => r.score!.taskSuccess).length}/${v.length}` : 'not run'
+      const ran = g.runs.filter((r) => r.scenario === s.id)
+      return v.length ? `${v.filter((r) => r.score!.taskSuccess).length}/${v.length}` : ran.length ? validOf(ran) : 'not run'
     }).join(' | ')} |`)
+
+  // Honest abstention, apart from task success: of the valid runs that did not give the answer, those that said so.
+  const abstaining = scenarios.filter((s) => s.checks.some((c) => c.category === 'abstention'))
+  if (abstaining.length) {
+    out.push(
+      '',
+      '### Honest abstention',
+      '',
+      'Not task success: of the valid runs that did not give the answer, how many said they could not find it (a regular expression over the reply; the failed-checks list keeps the replies that read as neither).',
+      '',
+      `| scenario | ${gs.map((g) => `${g.version} ${g.configuration}`).join(' | ')} |`,
+      `|---|${gs.map(() => '---').join('|')}|`,
+    )
+    for (const s of abstaining)
+      out.push(`| ${s.id} | ${gs.map((g) => {
+        const outcomes = g.valid.filter((r) => r.scenario === s.id).flatMap((r) => r.score!.checks.filter((c) => c.category === 'abstention' && c.outcome !== 'n/a'))
+        return outcomes.length ? `${outcomes.filter((c) => c.outcome === 'pass').length} of ${outcomes.length}` : '–'
+      }).join(' | ')} |`)
+  }
 
   // Overlapping protections, measured rather than assumed: which parts of the memory message held each fact.
   const carried = gs.filter((g) => usesObservationalCompaction(g.configuration)).flatMap((g) =>
