@@ -43,3 +43,11 @@ pass or at compaction, do not see each other's. When one sets a constraint and t
 the second cannot name the first by its id, and both stand as constraints in force, the reversal after it: nothing is
 dropped, and the memory shows both, newest last. The continuation record is that of the newest chunk that writes one, so a gate or a
 completed request that only the chunk before it recorded drops out of the record; the observations still hold it.
+
+## A short conversation falls back to the built-in compaction, and the screen says the Observer failed
+
+When every message fits the raw tail (under `KEEP_RAW_TOKENS`), nothing lies before it to observe, so `build()` throws
+"nothing observed and nothing to observe before the raw tail" and the built-in compaction runs. The screen then says
+"Observation failed", though no Observer call was made. The live benchmark hit this in 12 of about 60 om runs, in both
+versions, whenever the model grepped a document instead of reading it whole. Two open points: the screen text should
+name the real cause, and whether `/compact` on so short a conversation should fall back at all is a design decision.
