@@ -350,7 +350,7 @@ function splitSource(text: string): { line: string; source?: Source } {
   return a === undefined || b === undefined || b < a ? { line } : { line, source: { from: a, to: b } }
 }
 
-// The tag must start a line, as Mastra parses it.
+// The tag must start a line.
 const tag = (text: string, name: string) =>
   text.match(new RegExp(`^[ \\t]*<${name}>([\\s\\S]*?)^[ \\t]*</${name}>`, 'im'))?.[1]?.trim() || undefined
 // A reply read line by line: a section runs from its tag to its closing tag or the next section's tag, so a tag Luna
@@ -381,8 +381,8 @@ function realTime(y: number, mo: number, d: number, h: number, mi: number) {
     : undefined
 }
 
-// Observation lines as `<marker> YYYY-MM-DD HH:MM <text>`: the timestamp read from the line, or from a Mastra
-// `Date:` header and `(HH:MM)`; checked against `bounds` and clamped into them, a line without a real one given
+// Observation lines as `<marker> YYYY-MM-DD HH:MM <text>`: the timestamp read from the line, or from an older
+// reply's `Date:` header and `(HH:MM)`; checked against `bounds` and clamped into them, a line without a real one given
 // the latest time the source shows. Without bounds a time is kept only if real, and never invented. Unmarked lines continue the one before.
 function parseLines(text: string, bounds: Bounds, stripTimes = false) {
   const lines: string[] = []

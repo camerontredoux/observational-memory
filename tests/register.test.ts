@@ -706,7 +706,7 @@ describe('register', () => {
     const seen = pi(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(100 + n) : undefined),
       reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🔴 2026-09-22 15:00 Saw b\n</observations>`),
-      reflect: (n) => (n === 1 ? big : '<observations>\nDate: Sep 22, 2026\n* 🔴 (14:30) Explored the auth module\n</observations>'),
+      reflect: (n) => (n === 1 ? big : '<observations>\n* 🔴 2026-09-22 14:30 Explored the auth module\n</observations>'),
     })
     const runTurn = live(on, clock, history)
 
@@ -836,6 +836,21 @@ describe('register', () => {
       expect(observer).toContain(`\n  ${marker}`)
       expect(reflector).toContain(`\n  ${marker}`)
     }
+  })
+
+  test('a reflection in the older date-group form, which the prompts no longer ask for, is still read', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    pi(on, {
+      reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
+      reflect: () => '<observations>\nDate: Sep 22, 2026\n* 🟡 (14:30) Read files\n</observations>',
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect((stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)).toEqual(['🟡 2026-09-22 14:30 Read files'])
   })
 
   test('a reflection still over its target at the last compression level replaces nothing', async ($, on) => {
