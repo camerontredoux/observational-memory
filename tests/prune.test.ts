@@ -12,18 +12,29 @@ const session = (id: string, at: number, extra = 'x') => ({
 
 // A store the test can read (with the engine's 4 MiB cap), a clock, and what the plugin logs.
 // `alive` lists the sessions whose process runs (pid 100 + index, started at tick 5000 + index); `env` adds variables.
-function world(on: On, entries: Record<string, unknown> = {}, keys = true, alive: string[] = [], env: Record<string, string> = {}, o: { listFails?: boolean; setFails?: boolean; id?: () => string } = {}) {
+// `onList` runs before the nth listing of the sessions folder answers, to change the world between the pruner's reads.
+function world(
+  on: On,
+  entries: Record<string, unknown> = {},
+  keys = true,
+  alive: string[] = [],
+  env: Record<string, string> = {},
+  o: { listFails?: boolean; setFails?: boolean; id?: () => string; onList?: (n: number) => void } = {},
+) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/u', ...env })
   const files: Record<string, string> = {}
-  alive.forEach((id, i) => {
-    files[`/home/u/.claude/sessions/${100 + i}.json`] = JSON.stringify({ pid: 100 + i, sessionId: id, procStart: String(5000 + i) })
-    files[`/proc/${100 + i}/stat`] = `${100 + i} (claude code) S ${Array.from({ length: 18 }, (_, n) => n + 4).join(' ')} ${5000 + i} 0 0`
-  })
+  const run = (id: string, pid: number, start: number) => {
+    files[`/home/u/.claude/sessions/${pid}.json`] = JSON.stringify({ pid, sessionId: id, procStart: String(start) })
+    files[`/proc/${pid}/stat`] = `${pid} (claude code) S ${Array.from({ length: 18 }, (_, n) => n + 4).join(' ')} ${start} 0 0`
+  }
+  alive.forEach((id, i) => run(id, 100 + i, 5000 + i))
   files['/proc/self/stat'] = '1 (x) S'
   const dirs = () => new Set(['/home/u/.claude/sessions', ...Object.keys(files).flatMap((p) => p.split('/').slice(1, -1).map((_, n, a) => `/${a.slice(0, n + 1).join('/')}`))])
+  let lists = 0
   on('fs.list', ($, e) => {
     if (o.listFails) throw new Error('EACCES')
+    if (e.path === '/home/u/.claude/sessions') o.onList?.(++lists)
     if (!dirs().has(e.path)) throw new Error(`ENOENT: ${e.path}`)
     return { value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`) && !p.slice(e.path.length + 1).includes('/')).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, isLink: false })) }
   })
@@ -58,7 +69,7 @@ function world(on: On, entries: Record<string, unknown> = {}, keys = true, alive
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   // Starts a session and lets the background pruner run to its end.
   const start = async ($: Engine) => (await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false }), await clock.settle())
-  return { clock, stored, logs, screen, start, files }
+  return { clock, stored, logs, screen, start, files, run }
 }
 
 describe('register', () => {
@@ -167,6 +178,53 @@ describe('register', () => {
     const w = world(on, session('old', NOW - 60 * DAY), true, [], {}, { id: () => (calls++ ? 'old' : 'session-1') })
     await w.start($)
     expect(w.stored['ledger:old']).toBeDefined()
+  })
+
+  test("activity a candidate's subagent records after the scan keeps the session; a stale one is still pruned", async ($, on) => {
+    const w = world(on, { ...session('old', NOW - 60 * DAY), ...session('old/agent-1', NOW - 60 * DAY), ...session('older', NOW - 60 * DAY), ...session('stale', NOW - 60 * DAY) }, true, [], {}, {
+      onList: (n) => {
+        if (n > 1) return
+        w.stored['times:old/agent-1'] = [{ i: 0, hash: 'h', at: NOW }] // a subagent of a resumed session steps
+        w.stored['ledger:older/agent-2'] = { entries: [] } // a new subagent's first key
+      },
+    })
+    await w.start($)
+    expect(w.stored['ledger:old']).toBeDefined()
+    expect(w.stored['ledger:old/agent-1']).toBeDefined()
+    expect(w.stored['ledger:older']).toBeDefined()
+    expect(w.stored['ledger:stale']).toBeUndefined()
+    expect(w.logs).toEqual(['pruned 1 session(s) untouched for 30 days: stale (3 keys)'])
+  })
+
+  test('a session resumed between the first liveness check and its deletion is kept; the check is made again for each', async ($, on) => {
+    const w = world(on, { ...session('old', NOW - 60 * DAY), ...session('stale', NOW - 60 * DAY) }, true, [], {}, {
+      onList: (n) => n === 2 && w.run('old', 200, 7000), // resumed after the first listing
+    })
+    await w.start($)
+    expect(w.stored['ledger:old']).toBeDefined()
+    expect(w.stored['ledger:stale']).toBeUndefined()
+  })
+
+  test('when liveness cannot be told again before a deletion, nothing more is deleted', async ($, on) => {
+    const w = world(on, { ...session('a', NOW - 60 * DAY), ...session('b', NOW - 60 * DAY) }, true, [], {}, {
+      onList: (n) => {
+        if (n === 3) throw new Error('EACCES')
+      },
+    })
+    await w.start($)
+    expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:b'])
+    expect(w.logs).toEqual(['pruned 1 session(s) untouched for 30 days: a (3 keys)', 'could not prune old sessions (no implementation for fs.list)'])
+  })
+
+  test('a write over the cap keeps a session resumed after the cap was hit and drops the next oldest instead', async ($, on) => {
+    const big = 'y'.repeat(900_000)
+    const w = world(on, { ...session('a', NOW - 3 * DAY, big), ...session('b', NOW - 2 * DAY, big), ...session('c', NOW - DAY, big), ...session('session-1', NOW, big) }, true, [], {}, {
+      onList: (n) => n === 2 && w.run('a', 200, 7000),
+    })
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    await $.skill.prompt({ skill: 'huge', text: big })
+    expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:a', 'ledger:c', 'ledger:session-1'])
+    expect(w.stored['skills:session-1']).toEqual([{ skill: 'huge', text: big, at: NOW }])
   })
 
   test('keys with no colon are not sessions', async ($, on) => {
