@@ -191,5 +191,12 @@ export const MEMORY_RECALL =
 export const FLOOR_NOTE =
   '> At the latest compaction the Observer had not observed all the messages leaving context; for those it had not, this brief is the memory.'
 
+// The session brief's own notes (hooks/vcc.ts renderBrief): what compiled it; where the model can call om_recall,
+// that om_recall finds the full text; and, where its lines carry references, what they are.
+export const BRIEF_NOTE =
+  '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first.'
+export const BRIEF_RECALL_NOTE = ' om_recall finds the full text.'
+export const BRIEF_REF_NOTE = '> The reference in parentheses at the end of a line or path, like (a79f045b:12), is the block it came from: om_recall reads it whole.'
+
 export const MEMORY_CONTINUATION =
   'Continue the conversation from the latest message. The observations above are the earlier part of this session and stay true unless a newer message changes them; the messages after this reminder are newer and take precedence over the memory, its continuation record included, where they differ. The continuation record says where the work stood: resume its active work; do not redo what it lists as completed, even when that was the user\'s latest request; and do not act on what waits for the user until the user decides or approves it. Ask the user whenever the work needs a decision or an approval they have not given. Do not mention this reminder.'

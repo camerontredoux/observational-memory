@@ -363,7 +363,7 @@ describe('recall', () => {
     ]
     const listed = await run({ mode: 'files' }, session(rows))
     expect(listed.split('\n')).toEqual([
-      'Files named by the Read, Edit, Write and NotebookEdit calls of 1 transcript file (bbbbbbbb), newest first: 3 files. Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.',
+      'Files named by the Read, Edit, MultiEdit, Write, NotebookRead, NotebookEdit calls of 1 transcript file (bbbbbbbb), newest first: 3 files. Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.',
       '/p/src/a.ts: read bbbbbbbb:1, bbbbbbbb:11; edited bbbbbbbb:3',
       '/p/missing.ts: edit failed bbbbbbbb:7',
       '/p/notes.md: wrote bbbbbbbb:5',

@@ -846,6 +846,10 @@ function outlineLine(b: Block) {
   return `${at} ${b.tool ?? 'tool'} result: ${oneLine(b.text, 120)}` // its call is not in the transcript
 }
 
+// Where the main thread's blocks come from, as outline and files name it.
+const mainSource = (c: Corpus) =>
+  c.live ? `the live history${c.note ? ` (${c.note})` : ''}` : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})${c.note ? ` (${c.note})` : ''}`
+
 async function outline(c: Corpus, input: Input): Promise<RecallResult> {
   const t = await threadFor(c, input.from ?? input.to ?? input.ref)
   const r = range(t, input.from, input.to)
@@ -871,12 +875,7 @@ async function outline(c: Corpus, input: Input): Promise<RecallResult> {
   const all = t.blocks.filter(visible)
   const times = t.blocks.flatMap((b) => (b.time === undefined ? [] : [b.time]))
   const span = times.length ? `, ${stamp(times[0]!)} to ${stamp(times.at(-1)!)}` : ''
-  const source =
-    t === c.main
-      ? c.live
-        ? `the live history${c.note ? ` (${c.note})` : ''}`
-        : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})${c.note ? ` (${c.note})` : ''}`
-      : `${t.label}`
+  const source = t === c.main ? mainSource(c) : t.label
   const subs = t === c.main && c.subagents.length ? `; ${plural(c.subagents.length, 'subagent transcript')} (${c.subagents.map((s) => s.tag).join(', ')})` : ''
   const head = `Outline of ${source}: ${plural(all.length, 'entry', 'entries')}${span}${subs}. Tool calls point → at their results; read a block only for what this lacks: {"mode": "read", "ref": "<ref>"}.`
   const out = [head, ...(lines.length ? lines : ['(nothing in this range)'])]
@@ -918,15 +917,13 @@ async function files(c: Corpus, input: Input): Promise<RecallResult> {
       const file = touched.get(path) ?? { last: 0, refs: new Map() }
       file.last = ++order
       file.refs.set(did, [...(file.refs.get(did) ?? []), b.ref])
-      touched.delete(path)
       touched.set(path, file)
     }
   const listed = [...touched].sort((a, b) => b[1].last - a[1].last)
-  const source = c.live ? `the live history${c.note ? ` (${c.note})` : ''}` : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})${c.note ? ` (${c.note})` : ''}`
   const subs = input.subagents && c.subagents.length ? ` and ${plural(c.subagents.length, 'subagent transcript')}` : ''
   const which = input.query ? ` whose path holds "${input.query}"` : ''
   const head =
-    `Files named by the Read, Edit, Write and NotebookEdit calls of ${source}${subs}, newest first: ${plural(listed.length, 'file')}${which}. ` +
+    `Files named by the ${Object.keys(FILE_TOOLS).join(', ')} calls of ${mainSource(c)}${subs}, newest first: ${plural(listed.length, 'file')}${which}. ` +
     'Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.'
   const lines: string[] = []
   let chars = 0

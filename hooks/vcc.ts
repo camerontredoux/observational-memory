@@ -8,6 +8,7 @@
 // Code's rows: a tool call carries its own result, and Bash commands are read for the files they write.
 // See THIRD_PARTY_NOTICES.md and LICENSES/pi-vcc-MIT.txt.
 import type { SessionMessage } from 'claude-code'
+import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE } from './prompts'
 
 export const BRIEF_MAX_TOKENS = 3_000 // the whole section, a hard cap
 const TRANSCRIPT_MAX_TOKENS = 2_000 // pi-vcc's ranked-transcript ceiling (briefBudgetCeilingTokens), across compactions
@@ -33,7 +34,7 @@ export type Brief = {
 }
 export const emptyBrief = (): Brief => ({ modified: [], created: [], earlierModified: 0, earlierCreated: 0, commits: [], outstanding: [], transcript: [], omitted: 0 })
 
-// ── normalization ──
+// ---- Normalization ----------------------------------------------------------------------------------------------
 
 type Result = { text: string; isError: boolean }
 // `ref`: the om_recall block the event came from, when the caller can name it.
@@ -43,7 +44,7 @@ type Block =
   | { kind: 'tool'; i: number; at?: number; ref?: string; name: string; input: Record<string, unknown>; result?: Result }
 // The om_recall reference of row `row` of the span, or of its tool call `callId`: `<file>:<line>` as search and
 // outline give it. None when the row is in no transcript file.
-export type RefOf = (row: number, callId?: string) => string | undefined
+type RefOf = (row: number, callId?: string) => string | undefined
 
 // A line's reference comes last, in parentheses; lines compare, merge and collapse without it.
 const REF_TAIL = / \((?:#|[\w.-]+:)\d+(?:\.\d+)?\)$/
@@ -95,7 +96,7 @@ function normalize(rows: readonly SessionMessage[], at: readonly (number | undef
   return blocks
 }
 
-// ── shell reading ──
+// ---- Shell reading ----------------------------------------------------------------------------------------------
 
 const HEREDOC_OPEN = /(?<![\w)])<<-?\s*["']?([A-Za-z_]\w*)["']?/
 // The line index a heredoc opened on `lines[i]` closes on, or -1 (pi-vcc's hardened heredocCloseIndex).
@@ -343,7 +344,7 @@ export function compressBash(raw: string) {
   return clip(oneLine(chosen.join('; ')), BASH_CAP)
 }
 
-// ── extraction ──
+// ---- Extraction -------------------------------------------------------------------------------------------------
 
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
 const pathOf = (input: Record<string, unknown>) => {
@@ -353,7 +354,7 @@ const pathOf = (input: Record<string, unknown>) => {
 const commandOf = (b: Block) => (b.kind === 'tool' && b.name === 'Bash' && typeof b.input.command === 'string' ? b.input.command : undefined)
 
 // How a path reads in the brief: under the session's directory, relative to it; under home, from `~`.
-export function displayPath(path: string, cwd: string, home?: string) {
+function displayPath(path: string, cwd: string, home?: string) {
   const dir = cwd.replace(/\/$/, '')
   if (path.startsWith(`${dir}/`)) return path.slice(dir.length + 1)
   if (home && path.startsWith(`${home.replace(/\/$/, '')}/`)) return `~${path.slice(home.replace(/\/$/, '').length)}`
@@ -386,7 +387,7 @@ function extractFiles(blocks: readonly Block[], cwd: string, home?: string) {
 }
 
 // `git commit -m "..."`, `-m '...'`, and the `-m "$(cat <<'EOF' ... EOF)"` form, with the hash its result prints.
-export function extractCommits(blocks: readonly Block[]) {
+function extractCommits(blocks: readonly Block[]) {
   const commits: string[] = []
   for (const b of blocks) {
     const command = commandOf(b)
@@ -467,7 +468,7 @@ function eventText(b: Block, cwd: string, home?: string) {
 }
 const eventLine = (b: Block, cwd: string, home?: string) => withRef(`- ${b.at === undefined ? '' : `${hhmm(b.at)} `}${clip(eventText(b, cwd, home), LINE_CHARS)}`, b)
 
-// ── Outstanding Context ──
+// ---- Outstanding Context ----------------------------------------------------------------------------------------
 
 const BLOCKER =
   /\b(fail(ed|s|ure|ing)?|broken|cannot|can't|won't work|does not work|doesn't work|still (broken|failing|wrong)|blocked|blocker|not (fixed|resolved|working)|crash(es|ed|ing)?)\b/i
@@ -519,7 +520,7 @@ function extractOutstanding(blocks: readonly Block[], cwd: string, home?: string
   return [...new Set(items)].slice(-OUTSTANDING_MAX)
 }
 
-// ── ranked transcript (pi-vcc rank.ts) ──
+// ---- Ranked transcript (pi-vcc rank.ts) -------------------------------------------------------------------------
 
 type Ranked = { b: Block; score: number; important: boolean }
 // Scored over the whole span, typed prompts included, so an answer that closes a turn is known by what follows it.
@@ -612,7 +613,7 @@ function selectTranscript(blocks: readonly Block[], modified: ReadonlySet<string
   return out
 }
 
-// ── compile, merge, cap ──
+// ---- Compile, merge, cap ----------------------------------------------------------------------------------------
 
 // The brief of rows [0, n) of a compaction's span: `rows` in call order, `at` each row's time.
 export function compileBrief(rows: readonly SessionMessage[], at: readonly (number | undefined)[], cwd: string, home?: string, refOf?: RefOf): Brief {
@@ -698,12 +699,8 @@ export function capBrief(brief: Brief): Brief {
   return b
 }
 
-// ── render and parse ──
+// ---- Render and parse -------------------------------------------------------------------------------------------
 
-export const BRIEF_NOTE =
-  '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first.'
-const RECALL_NOTE = ' om_recall finds the full text.'
-const REF_NOTE = '> The reference in parentheses at the end of a line or path, like (a79f045b:12), is the block it came from: om_recall reads it whole.'
 const FILES = '[Files And Changes]'
 const COMMITS = '[Commits]'
 const OUTSTANDING = '[Outstanding Context]'
@@ -723,7 +720,7 @@ export function renderBrief(b: Brief, recall = true) {
   if (b.outstanding.length) parts.push(OUTSTANDING, ...b.outstanding)
   if (b.transcript.length) parts.push(TRANSCRIPT, ...(b.omitted ? [`> ${b.omitted} earlier lines omitted`] : []), ...b.transcript)
   const refs = parts.some((l) => REF_TAIL.test(l) || / \((?:#|[\w.-]+:)\d+(?:\.\d+)?\),/.test(l))
-  return parts.length ? [`${BRIEF_NOTE}${recall ? RECALL_NOTE : ''}`, ...(refs && recall ? [REF_NOTE] : []), ...parts].join('\n') : ''
+  return parts.length ? [`${BRIEF_NOTE}${recall ? BRIEF_RECALL_NOTE : ''}`, ...(refs && recall ? [BRIEF_REF_NOTE] : []), ...parts].join('\n') : ''
 }
 
 export function parseBrief(body: string): Brief {

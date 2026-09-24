@@ -677,7 +677,7 @@ const OVER_BUDGET = 'the compacted context is over its budget'
 // The user's constraints in force over CONSTRAINTS_MAX_TOKENS: shown whole or not at all, so the built-in compaction runs.
 const OVER_CAP = "the user's constraints are over their cap"
 // A context that is the memory message alone: nothing for the floor to compile either.
-const NOTHING = 'nothing to compact after the memory message'
+const MEMORY_ALONE = 'nothing to compact after the memory message'
 const overLimit = (what: string, tokens: number, limit: number) => `${what}: ~${tokens} tokens, ~${limit} allowed`
 
 // A memory with its skills as lines and its user messages the brief alone, the rest counted.
@@ -1239,7 +1239,7 @@ export const register: Register = (on) => {
       sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - started }
       settled.forEach((r, i) => {
         if (r.status === 'fulfilled') return void (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length))
-        log($, `observation of rows ${gaps[i]![0]}-${gaps[i]![1]} at compaction failed (${errorText(r.reason)}); kept raw`)
+        log($, `observation of rows ${gaps[i]![0]}-${gaps[i]![1]} at compaction failed (${errorText(r.reason)}); left unobserved`)
         failures.push({ rows: gaps[i]![1] - gaps[i]![0], why: reason(r.reason, OBSERVER_TIMEOUT_MS) })
       })
     }
@@ -1274,8 +1274,9 @@ export const register: Register = (on) => {
     const density = measured === undefined ? 1 : Math.max(1, (measured - overhead) / Math.max(1, tokensBetween(v, 0, messages.length)))
 
     // Rows [from, to) as the session brief compiles them, each line with its om_recall reference when the model can
-    // read it: the transcript file is read once, and only when a brief is compiled.
+    // read it: the transcript file, the session's directory and home are read once, and only when a brief is compiled.
     let corpus: Promise<Awaited<ReturnType<typeof loadTranscript>> | undefined> | undefined
+    let dirs: Promise<[string, string | undefined]> | undefined
     const compile = async (from: number, to: number) => {
       const rows = messages.slice(from, to)
       let refOf
@@ -1284,8 +1285,9 @@ export const register: Register = (on) => {
         const c = await corpus
         refOf = c && (await refsOf(c, rows, e.agentId).catch(() => undefined))
       }
-      const [cwd, home] = await Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').catch(() => undefined)])
-      return compileBrief(rows, v.at.slice(from, to), cwd, home ?? undefined, refOf)
+      dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
+      const [cwd, home] = await dirs
+      return compileBrief(rows, v.at.slice(from, to), cwd, home, refOf)
     }
 
     // The memory message from the ledger once this compaction's chunks commit: cut at the watermark, as observed.
@@ -1301,7 +1303,8 @@ export const register: Register = (on) => {
       const attempt = async (cut: number, floor: boolean) => {
         const tail = messages.slice(cut)
         // The brief carried from the memory message, with the rows leaving context merged in: those the floor
-        // compiles, or with OM_BRIEF=always every one.
+        // compiles, or with OM_BRIEF=always every one. A brief is carried even where the Observer's memory stands again:
+        // it holds rows the Observer never observed, which no observation covers.
         const from = always ? base : floor ? observed : cut
         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
         let memory: Memory = {
@@ -1350,7 +1353,7 @@ export const register: Register = (on) => {
       let last
       if (observed > base && (last = await attempt(observed, false)).tokens <= budget) return stands(last)
       for (const cut of floorCuts(v, observed)) if ((last = await attempt(cut, true)).tokens <= budget) return stands(last)
-      if (!last) throw new Error(NOTHING)
+      if (!last) throw new Error(MEMORY_ALONE)
       throw new Error(overLimit(OVER_BUDGET, last.tokens, budget))
     }
     // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
@@ -1420,7 +1423,7 @@ export const register: Register = (on) => {
     if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
     log($, `${next.error.message}; using the built-in compaction`)
     const message = next.error.message ?? ''
-    const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message.startsWith(OVER_CAP) ? 'Constraints over their cap' : message === NOTHING ? 'Nothing to compact' : 'Compaction failed'
+    const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message.startsWith(OVER_CAP) ? 'Constraints over their cap' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
     show($, `${why}. Using built-in compaction`, e.agentId)
     return delegateToBuiltin($, e, next, true)
   })
