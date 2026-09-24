@@ -124,6 +124,53 @@ export function parseTranscript(jsonl: string | readonly Raw[]): Transcript {
   return { cwd: raw.find((r) => typeof r.cwd === 'string')?.cwd, events, spans, boundaries }
 }
 
+// ---- A chain of transcripts: one long session ----
+
+/**
+ * Several transcripts as one continued session, in the order given (issue: the Reflector never ran on a real
+ * session, none of which grew its memory to REFLECT_AT_TOKENS). Each transcript's rows follow the one before, and
+ * every one but the last has its timestamps shifted back so it ends `gapMs` before the next one starts; the last
+ * keeps its own, so nothing lands after the newest real row (a question session resumed on a seeded copy appends
+ * rows stamped now, which must come after every seeded one). The order within each is kept. `offsets[i]` is how
+ * many boundaries come before transcript i's first: its boundary n is the chain's boundary offsets[i] + n, and its
+ * span k the chain's span offsets[i] + k (its span 0 continues the last span of the one before).
+ */
+export function chainTranscripts(texts: readonly string[], gapMs = 3_600_000): { text: string; offsets: number[] } {
+  const members = texts.map((text) => {
+    const rows = rawRows(text)
+    const times = rows.map((r) => Date.parse(r.timestamp ?? '')).filter(Number.isFinite)
+    return { rows, first: Math.min(...times), last: Math.max(...times), shift: 0 }
+  })
+  // From the last back: each one ends gapMs before the (shifted) start of the one after it.
+  for (let i = members.length - 2; i >= 0; i--) {
+    const m = members[i]!
+    const next = members[i + 1]!
+    if (Number.isFinite(m.last) && Number.isFinite(next.first)) m.shift = next.first + next.shift - gapMs - m.last
+  }
+  const lines: string[] = []
+  const offsets: number[] = []
+  let boundaries = 0
+  for (const { rows, shift } of members) {
+    offsets.push(boundaries)
+    for (const r of rows) {
+      const at = Date.parse(r.timestamp ?? '')
+      lines.push(JSON.stringify(Number.isFinite(at) && shift ? { ...r, timestamp: new Date(at + shift).toISOString() } : r))
+      if (r.type === 'system' && r.subtype === 'compact_boundary') boundaries++
+    }
+  }
+  return { text: lines.join('\n') + '\n', offsets }
+}
+
+/** The chain's spec: each member's constraints and questions at its offset, each id prefixed with the member's name. */
+export function chainSpec(members: readonly { name: string; offset: number; spec?: ReplaySpec }[]): ReplaySpec {
+  return {
+    constraints: members.flatMap(({ name, offset, spec }) =>
+      (spec?.constraints ?? []).map((c) => ({ ...c, id: `${name}-${c.id}`, setIn: c.setIn + offset, ...(c.reversal ? { reversal: { ...c.reversal, in: c.reversal.in + offset } } : {}) })),
+    ),
+    questions: members.flatMap(({ name, offset, spec }) => (spec?.questions ?? []).map((q) => ({ ...q, id: `${name}-${q.id}`, from: q.from + offset }))),
+  }
+}
+
 /** A message's text, tool calls and tool results, as a context holds them. */
 export const messageText = (m: Pick<SessionMessage, 'text' | 'toolUses' | 'toolResults'>) =>
   [m.text, ...m.toolUses.map((u) => `${u.tool}(${JSON.stringify(u.input)})`), ...(m.toolResults ?? []).map((r) => r.text)].filter(Boolean).join('\n')
@@ -326,10 +373,7 @@ export type DriftPoint = { boundary: number; identifiers: { held: number; total:
  * A boundary with no context for the configuration is left out.
  */
 export function drift(t: Transcript, specs: readonly ConstraintSpec[], contexts: readonly (Context | undefined)[]): DriftPoint[] {
-  const early = new Set<string>()
-  for (const row of t.spans[0] ?? []) for (const key of identifiersIn(messageText(row)).keys()) early.add(key)
-  const tracked = new Map<string, Needed>()
-  for (let n = 1; n <= t.boundaries.length; n++) for (const x of neededIdentifiers(t, n)) if (early.has(x.key) && !tracked.has(x.key)) tracked.set(x.key, x)
+  const tracked = earlyNeeded(t)
   const standing = specs.filter((c) => c.setIn === 0 && !c.reversal)
   return contexts.flatMap((context, i) => {
     if (!context) return []
@@ -337,11 +381,145 @@ export function drift(t: Transcript, specs: readonly ConstraintSpec[], contexts:
     return [
       {
         boundary: i + 1,
-        identifiers: { held: [...tracked.values()].filter((x) => holds(text, x.key, x.kind)).length, total: tracked.size },
+        identifiers: { held: tracked.filter((x) => holds(text, x.key, x.kind)).length, total: tracked.length },
         constraints: { held: standing.filter((c) => matches(text, c.held)).length, total: standing.length },
       },
     ]
   })
+}
+
+/** The identifiers first seen in span 0 that some later boundary needs, each once: what drift tracks. */
+function earlyNeeded(t: Transcript): Needed[] {
+  const early = new Set<string>()
+  for (const row of t.spans[0] ?? []) for (const key of identifiersIn(messageText(row)).keys()) early.add(key)
+  const tracked = new Map<string, Needed>()
+  for (let n = 1; n <= t.boundaries.length; n++) for (const x of neededIdentifiers(t, n)) if (early.has(x.key) && !tracked.has(x.key)) tracked.set(x.key, x)
+  return [...tracked.values()]
+}
+
+// ---- Reflections ----
+
+/** An observation as the ledger holds it: its line, and the transcript times it was drawn from. */
+export type Observation = { id: string; line: string; source?: { from: number; to: number } }
+/** The ledger's observations and the user's constraints in force (its corrections), at one moment. */
+export type MemoryState = { entries: readonly Observation[]; corrections: readonly string[] }
+/**
+ * One reflection in a replay: the ledger just before it replaced observations and just after, when it landed (the
+ * virtual clock), how many compactions had run by then, and what the plugin logged of it.
+ */
+export type Reflection = {
+  at: number
+  afterBoundary: number
+  before: MemoryState
+  after: MemoryState
+  logged?: { tokensBefore: number; tokensAfter: number; level: number }
+}
+
+export type ReflectionScore = {
+  /** Observations the reflection replaced, the ones it wrote in their place, and the newer ones it left alone. */
+  lines: { replaced: number; written: number; untouched: number }
+  /** 🔴 lines (the user's constraints as the Observer marked them) among those replaced, and among those written. */
+  red: { replaced: number; written: number }
+  /** The corrections section passes through the reflection unchanged, as the plugin promises. */
+  correctionsUnchanged: boolean
+  /** Constraints in force at the next boundary, held by the whole memory (corrections and observations). */
+  constraints: { before: number; after: number; total: number; lost: string[] }
+  /** The same, in the observations alone: what the corrections section does not carry. */
+  constraintsInObservations: { before: number; after: number; lost: string[] }
+  /** Identifiers needed at a boundary after the reflection that the memory held before it, and those it still held after. */
+  identifiers: { heldBefore: number; keptAfter: number; lost: Needed[] }
+  /** Identifiers first seen in span 0 that some boundary needs (as drift tracks them), held before and after. */
+  early: { total: number; heldBefore: number; keptAfter: number }
+  /**
+   * Source ranges: of the lines written, how many have one, how many have exactly the whole span of the lines
+   * replaced (the plugin's fallback when the Reflector gave none it could keep: om_recall then searches the whole
+   * span), and the median width in minutes of the replaced lines' ranges and of the written lines'.
+   */
+  sources: { replaced: number; written: number; wholeSpan: number; medianMinutes: { replaced: number; written: number } }
+}
+
+const memoryText = (m: MemoryState, corrections = true) => [...(corrections ? m.corrections : []), ...m.entries.map((e) => e.line)].join('\n')
+const median = (xs: number[]) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]! : 0)
+
+/**
+ * What one reflection kept of what the memory held, scored with no model: constraints in force at the next boundary
+ * (in the whole memory and in the observations alone), needed identifiers of every later boundary, the early facts
+ * drift tracks, 🔴 lines, and source ranges.
+ */
+export function scoreReflection(t: Transcript, spec: ReplaySpec | undefined, r: Reflection): ReflectionScore {
+  const beforeIds = new Set(r.before.entries.map((e) => e.id))
+  const afterIds = new Set(r.after.entries.map((e) => e.id))
+  const replaced = r.before.entries.filter((e) => !afterIds.has(e.id))
+  const written = r.after.entries.filter((e) => !beforeIds.has(e.id))
+  const red = (es: readonly Observation[]) => es.filter((e) => e.line.startsWith('🔴')).length
+  const whole = { before: normalize(memoryText(r.before)), after: normalize(memoryText(r.after)) }
+  const obs = { before: normalize(memoryText(r.before, false)), after: normalize(memoryText(r.after, false)) }
+  const next = r.afterBoundary + 1
+  const inForce = (spec?.constraints ?? []).filter((c) => c.setIn < next && !(c.reversal && c.reversal.in < next))
+  const shows = (text: string, c: ConstraintSpec) => matches(text, c.held)
+  const needed = new Map<string, Needed>()
+  for (let n = next; n <= t.boundaries.length; n++) for (const x of neededIdentifiers(t, n)) if (!needed.has(x.key) && holds(whole.before, x.key, x.kind)) needed.set(x.key, x)
+  const kept = [...needed.values()].filter((x) => holds(whole.after, x.key, x.kind))
+  const early = earlyNeeded(t)
+  const sources = (es: readonly Observation[]) => es.flatMap((e) => (e.source ? [e.source] : []))
+  const span = sources(replaced).reduce<{ from: number; to: number } | undefined>((s, x) => (s ? { from: Math.min(s.from, x.from), to: Math.max(s.to, x.to) } : { ...x }), undefined)
+  const minutes = (es: readonly Observation[]) => median(sources(es).map((s) => (s.to - s.from) / 60_000))
+  return {
+    lines: { replaced: replaced.length, written: written.length, untouched: r.after.entries.length - written.length },
+    red: { replaced: red(replaced), written: red(written) },
+    correctionsUnchanged: r.before.corrections.join('\n') === r.after.corrections.join('\n'),
+    constraints: {
+      before: inForce.filter((c) => shows(whole.before, c)).length,
+      after: inForce.filter((c) => shows(whole.after, c)).length,
+      total: inForce.length,
+      lost: inForce.filter((c) => shows(whole.before, c) && !shows(whole.after, c)).map((c) => c.id),
+    },
+    constraintsInObservations: {
+      before: inForce.filter((c) => shows(obs.before, c)).length,
+      after: inForce.filter((c) => shows(obs.after, c)).length,
+      lost: inForce.filter((c) => shows(obs.before, c) && !shows(obs.after, c)).map((c) => c.id),
+    },
+    identifiers: { heldBefore: needed.size, keptAfter: kept.length, lost: [...needed.values()].filter((x) => !kept.includes(x)) },
+    early: { total: early.length, heldBefore: early.filter((x) => holds(whole.before, x.key, x.kind)).length, keptAfter: early.filter((x) => holds(whole.after, x.key, x.kind)).length },
+    sources: {
+      replaced: sources(replaced).length,
+      written: sources(written).length,
+      wholeSpan: span ? written.filter((e) => e.source?.from === span.from && e.source?.to === span.to).length : 0,
+      medianMinutes: { replaced: minutes(replaced), written: minutes(written) },
+    },
+  }
+}
+
+/**
+ * The reflections of one replay, a row each, then (unless private) the constraints and identifiers each one lost.
+ * `target` is the size a reflection must come under (REFLECT_TARGET_TOKENS).
+ */
+export function renderReflections(r: { name: string; t: Transcript; spec?: ReplaySpec; reflections: readonly Reflection[]; target: number; private?: boolean }): string {
+  const out = [`## Reflections: ${r.name}`, '']
+  if (!r.reflections.length) return [...out, 'No reflection ran.', ''].join('\n')
+  const scores = r.reflections.map((x) => scoreReflection(r.t, r.spec, x))
+  out.push(
+    '| # | after boundary | tokens before → after (target) | level | lines replaced → written (untouched) | 🔴 replaced → written | corrections unchanged | constraints in force held before → after | in observations alone | needed identifiers kept | early identifiers | written lines with a source (whole span) | median source minutes |',
+    '|---:|---:|---|---:|---|---|---|---|---|---|---|---|---|',
+    ...r.reflections.map((x, i) => {
+      const s = scores[i]!
+      const size = x.logged ? `${grouped(x.logged.tokensBefore)} → ${grouped(x.logged.tokensAfter)} (${grouped(r.target)})` : '–'
+      return (
+        `| ${i + 1} | ${x.afterBoundary} | ${size} | ${x.logged?.level ?? '–'} | ${s.lines.replaced} → ${s.lines.written} (${s.lines.untouched}) | ${s.red.replaced} → ${s.red.written} | ${s.correctionsUnchanged ? 'yes' : 'NO'} | ` +
+        `${s.constraints.before} → ${s.constraints.after} of ${s.constraints.total} | ${s.constraintsInObservations.before} → ${s.constraintsInObservations.after} | ${pct(s.identifiers.keptAfter, s.identifiers.heldBefore)} | ` +
+        `${s.early.heldBefore} → ${s.early.keptAfter} of ${s.early.total} | ${s.sources.written}/${s.lines.written} (${s.sources.wholeSpan}) | ${Math.round(s.sources.medianMinutes.replaced)} → ${Math.round(s.sources.medianMinutes.written)} |`
+      )
+    }),
+    '',
+  )
+  if (!r.private)
+    scores.forEach((s, i) =>
+      out.push(
+        `- Reflection ${i + 1}: constraints lost ${s.constraints.lost.join(', ') || 'none'}; from the observations alone ${s.constraintsInObservations.lost.join(', ') || 'none'}; ` +
+          `identifiers lost ${s.identifiers.lost.map((x) => x.key).join(', ') || 'none'}`,
+      ),
+    )
+  return [...out, ''].join('\n')
 }
 
 // ---- The question stage ----

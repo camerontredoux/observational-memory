@@ -1,6 +1,8 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import {
+  chainSpec,
+  chainTranscripts,
   checkAnswer,
   checkSpec,
   contextOf,
@@ -19,16 +21,18 @@ import {
   planQuestionSession,
   questionSeedRows,
   recallCallsIn,
+  renderReflections,
   renderTranscript,
   replayChain,
   scoreAnswers,
   scoreConstraints,
   scoreIdentifiers,
+  scoreReflection,
   seedRows,
   tallyQuestions,
   uncompacted,
 } from './eval/replay'
-import type { ConstraintSpec, Context, QuestionResult, ReplaySpec } from './eval/replay'
+import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } from './eval/replay'
 
 // Synthetic transcripts in Claude Code's JSONL shape. A compaction is a `compact_boundary` row, then its summary and
 // the rows it kept raw, both stamped before the boundary (as Claude Code writes them), then the session goes on.
@@ -584,5 +588,114 @@ describe('the plan and the report', () => {
     expect(text).not.toContain('hooks/register.ts')
     expect(text).not.toContain('worktrees')
     expect(text).toContain('### Needed identifiers held')
+  })
+})
+
+describe('a chain of transcripts', () => {
+  // Another session's rows, with uuids of their own (session() numbers every session's alike).
+  const second = () => ({ text: () => session().user('Second session: start on issue #7.').reply('On #7.').compact('S').user('bye').text().replace(/"uuid":"/g, '"uuid":"2-') })
+
+  test('joins them into one session, each before the last shifted back to end before the next one starts', () => {
+    const first = threeBoundaries().text()
+    const { text, offsets } = chainTranscripts([first, second().text()], 60_000)
+    expect(offsets).toEqual([0, 3])
+    const t = parseTranscript(text)
+    expect(t.boundaries.map((b) => b.n)).toEqual([1, 2, 3, 4])
+    // The second's span 0 continues the first's last span, and its boundary 1 is the chain's boundary 4.
+    expect(t.spans[3]!.map((r) => r.text)).toEqual(['thanks', 'Done with #13.', 'Second session: start on issue #7.', 'On #7.'])
+    expect(t.boundaries[3]!.summary).toBe('S')
+    const times = t.events.map((e) => e.at)
+    expect(times).toEqual([...times].sort((a, b) => a - b))
+    // The last keeps its own times; the first now ends a minute before it starts.
+    const own = parseTranscript(second().text())
+    expect(t.spans[3]![2]!.at).toBe(own.spans[0]![0]!.at)
+    expect(Math.max(...t.spans[3]!.slice(0, 2).map((r) => r.at))).toBe(own.spans[0]![0]!.at - 60_000)
+    // The rows a compaction kept raw stay stamped before its boundary, so they are still its output.
+    expect(t.boundaries[3]!.kept).toEqual([])
+    expect(chainTranscripts([first]).text).toBe(first)
+  })
+
+  test("shifts each member's spec to its boundaries, its ids prefixed with its name", () => {
+    const { text, offsets } = chainTranscripts([threeBoundaries().text(), second().text()])
+    const one: ReplaySpec = { constraints: [{ id: 'budget', quote: 'Spend at most $30', setIn: 0, held: ['\\$30'], reversal: { quote: 'spend up to $50', in: 1, held: ['\\$50'] } }], questions: [{ id: 'q', ask: '?', from: 1 }] }
+    const two: ReplaySpec = { constraints: [{ id: 'issue', quote: 'start on issue #7', setIn: 0, held: ['#7'] }], questions: [{ id: 'q', ask: '?', from: 1 }] }
+    const spec = chainSpec([
+      { name: 'a', offset: offsets[0]!, spec: one },
+      { name: 'b', offset: offsets[1]!, spec: two },
+      { name: 'c', offset: 4 },
+    ])
+    expect(spec.constraints.map((c) => [c.id, c.setIn, c.reversal?.in])).toEqual([
+      ['a-budget', 0, 1],
+      ['b-issue', 3, undefined],
+    ])
+    expect(spec.questions.map((q) => [q.id, q.from])).toEqual([
+      ['a-q', 1],
+      ['b-q', 4],
+    ])
+    expect(checkSpec(parseTranscript(text), spec)).toEqual([])
+  })
+})
+
+describe('reflections', () => {
+  const t = () => parseTranscript(threeBoundaries().text())
+  const worktrees: ConstraintSpec = { id: 'worktrees', quote: 'Worktrees go in .worktrees.', setIn: 0, held: ['\\.worktrees'] }
+  const spec: ReplaySpec = { constraints: [worktrees], questions: [] }
+  const corrections = ['🔴 2026-09-24 12:00 User: "Worktrees go in .worktrees."']
+  // Three observations replaced by two, a newer one left alone.
+  const reflection: Reflection = {
+    at: 0,
+    afterBoundary: 1,
+    before: {
+      corrections,
+      entries: [
+        { id: 'o1', line: '🔴 2026-09-24 12:00 User wants worktrees in .worktrees', source: { from: 0, to: 60_000 } },
+        { id: 'o2', line: '🟡 2026-09-24 12:02 Assistant read hooks/register.ts at 1a2b3c4d; git log showed 9f8e7d6c', source: { from: 120_000, to: 240_000 } },
+        { id: 'o3', line: '🟢 2026-09-24 12:03 Assistant listed files' },
+        { id: 'o4', line: '🟡 2026-09-24 12:10 User asked about issue #13', source: { from: 600_000, to: 660_000 } },
+      ],
+    },
+    after: {
+      corrections,
+      entries: [
+        { id: 'o5', line: '🟡 2026-09-24 12:02 Assistant worked in hooks/register.ts', source: { from: 0, to: 240_000 } },
+        { id: 'o6', line: '🟢 2026-09-24 12:03 Assistant listed files', source: { from: 0, to: 60_000 } },
+        { id: 'o4', line: '🟡 2026-09-24 12:10 User asked about issue #13', source: { from: 600_000, to: 660_000 } },
+      ],
+    },
+    logged: { tokensBefore: 41_000, tokensAfter: 18_000, level: 2 },
+  }
+
+  test('scores what a reflection kept of the memory before it', () => {
+    const s = scoreReflection(t(), spec, reflection)
+    expect(s.lines).toEqual({ replaced: 3, written: 2, untouched: 1 })
+    expect(s.red).toEqual({ replaced: 1, written: 0 })
+    expect(s.correctionsUnchanged).toBe(true)
+    // The corrections still hold the constraint; the observations alone lost it.
+    expect(s.constraints).toEqual({ before: 1, after: 1, total: 1, lost: [] })
+    expect(s.constraintsInObservations).toEqual({ before: 1, after: 0, lost: ['worktrees'] })
+    // Boundaries 2 and 3 need hooks/register.ts, 9f8e7d6 and #13, all held before; the reflection lost the hash.
+    expect(s.identifiers.heldBefore).toBe(3)
+    expect(s.identifiers.keptAfter).toBe(2)
+    expect(s.identifiers.lost.map((x) => x.key)).toEqual(['9f8e7d6'])
+    expect(s.early).toEqual({ total: 3, heldBefore: 3, keptAfter: 1 })
+    // o5 got the whole span of what it replaced (the plugin's fallback), o6 a range of its own.
+    expect(s.sources).toEqual({ replaced: 2, written: 2, wholeSpan: 1, medianMinutes: { replaced: 2, written: 4 } })
+  })
+
+  test('a changed corrections section shows', () => {
+    const changed = { ...reflection, after: { ...reflection.after, corrections: [] } }
+    const s = scoreReflection(t(), spec, changed)
+    expect(s.correctionsUnchanged).toBe(false)
+    expect(s.constraints.lost).toEqual(['worktrees'])
+  })
+
+  test('renders a row per reflection, and a private replay without what was lost', () => {
+    const text = renderReflections({ name: 'demo', t: t(), spec, reflections: [reflection], target: 20_000 })
+    expect(text).toContain('| 1 | 1 | 41,000 → 18,000 (20,000) | 2 | 3 → 2 (1) | 1 → 0 | yes | 1 → 1 of 1 | 1 → 0 | 2/3 (67%) | 3 → 1 of 3 | 2/2 (1) | 2 → 4 |')
+    expect(text).toContain('from the observations alone worktrees; identifiers lost 9f8e7d6')
+    const quiet = renderReflections({ name: 'demo', t: t(), spec, reflections: [reflection], target: 20_000, private: true })
+    expect(quiet).not.toContain('9f8e7d6')
+    expect(quiet).not.toContain('worktrees')
+    expect(renderReflections({ name: 'demo', t: t(), reflections: [], target: 20_000 })).toContain('No reflection ran.')
   })
 })

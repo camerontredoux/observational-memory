@@ -164,3 +164,21 @@ everything else are estimates.
 Not run yet: the om replay with real Observer and Reflector calls (`--pi live`), the live built-in chain, and the
 question stage. Whether Claude Code resumes a session whose rows another writer appended is the first thing the
 built-in chain has to show; if it cannot, the chain stops and says which step failed.
+
+### 2026-09-24, the Reflector on real data
+
+`2026-09-24-reflector.md` gives the details. No real session grows the memory to the Reflector's 40k threshold. The
+replay therefore chains four real sessions into one: `om-v04+om-orchestration+firstmate-11+firstmate-6`, with 31
+compactions. It ran with the real Observer and Reflector twice. It includes private transcripts, so only aggregate
+numbers are given here.
+
+- The Reflector triggered naturally once per run, after boundary 22. It condensed ~40.3k tokens of observations to
+  2.9k and 3.7k at level 1, with 658 and 669 lines down to 38 and 50. There were no failures and no retries.
+- It overshot the 20k target about fivefold. It compressed the newest lines as hard as the oldest, and kept 0 of 8
+  and 1 of 10 of the identifiers the next boundaries needed.
+- Every constraint in force stayed in the memory, because the corrections section passed through unchanged. The
+  observations alone lost 9 to 11 of them. Every written line kept a source range, but the ranges were wider
+  (median 12 → 32–42 min).
+- Sonnet's answers from what the user said did not degrade after the reflection. Questions on identifiers the
+  reflection dropped went to 0/5 with om alone. om+recall recovered 3/5, with 8 to 14 om_recall calls.
+- The replays cost $0.85 in pi and $6.07 in question sessions.
