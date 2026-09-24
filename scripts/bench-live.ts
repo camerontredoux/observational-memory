@@ -6,7 +6,7 @@
 //   bun scripts/bench-live.ts list
 //   bun scripts/bench-live.ts run --config om+recall --version new --scenario absent-fact --run 1 --pane w1:p2 \
 //     --budget-usd 20 [--dry-run] [--plugin-root DIR] [--results FILE] [--timeout-ms 600000] [--settle-ms 30000]
-//     [--ceiling-usd 1] [--start-timeout-ms 60000]
+//     [--ceiling-usd 1] [--start-timeout-ms 60000] [--brief always]
 //   bun scripts/bench-live.ts score --run-dir /tmp/om-bench/<runId> [--append] [--results FILE]
 //   bun scripts/bench-live.ts report [--results FILE] [--versions old,new] [--out FILE]
 //
@@ -39,6 +39,10 @@
 // every protection in place. To weigh removing one, build that variant in its own worktree and run it as another
 // version (--version no-user-messages --plugin-root <worktree>): the report sets it beside new, run for run. Nothing
 // removes a protection by default.
+//
+// The always-on brief (OM_BRIEF=always, off by default): `--brief always` puts it in the session's settings, for om or
+// om+recall under a version label of its own (--version new-brief; the plugin root defaults to the main checkout), so
+// the report sets the variant beside new rather than mixing its runs in. The run's meta.json records it.
 //
 // score: rescores a run directory from its meta.json (after a run that stopped before scoring, or a scorer change).
 // report: the markdown report of the results: per plugin version and configuration n, mean and spread; live and
@@ -154,10 +158,13 @@ async function run(o: Record<string, string | true>) {
   const runNo = num(o, 'run') ?? fail('--run: the run number')
   const pane = str(o, 'pane') ?? fail('--pane: an existing herdr pane at a shell prompt (herdr pane list)')
   const dry = o['dry-run'] === true
+  const briefFlag = o['brief']
+  if (briefFlag !== undefined && briefFlag !== 'always') fail('--brief: always, or leave it out')
+  const brief = briefFlag === 'always' ? ('always' as const) : undefined
   const budget = num(o, 'budget-usd') ?? (dry ? undefined : fail('--budget-usd: the total the live runs may cost'))
   const results = str(o, 'results') ?? `${BENCH_ROOT}/results.jsonl`
   const main = mainCheckout()
-  const pluginRoot = resolve(str(o, 'plugin-root') ?? (version === 'new' ? main : version === 'old' ? `${main}/.worktrees/bench-old` : fail('--plugin-root: needed for a version other than old or new')))
+  const pluginRoot = resolve(str(o, 'plugin-root') ?? (version === 'new' || brief ? main : version === 'old' ? `${main}/.worktrees/bench-old` : fail('--plugin-root: needed for a version other than old or new')))
   const plan: Plan = planRun({
     config,
     version,
@@ -171,6 +178,7 @@ async function run(o: Record<string, string | true>) {
     timeoutMs: num(o, 'timeout-ms', 600_000)!,
     settleMs: num(o, 'settle-ms', 30_000)!,
     startTimeoutMs: num(o, 'start-timeout-ms', 60_000)!,
+    ...(brief ? { brief } : {}),
   })
   console.log(describePlan(plan))
   const userSettings = `${process.env.HOME}/.claude/settings.json`
@@ -210,6 +218,7 @@ async function run(o: Record<string, string | true>) {
     stats: `${plan.statsDir}/${plan.input.sessionId}.json`,
     pluginRoot,
     pluginCommit: commitOf(pluginRoot),
+    ...(brief ? { brief } : {}),
     admission: { budgetUsd: budget!, spentUsd: admission.spentUsd, reserveUsd: admission.reserveUsd },
   }
   writeFileSync(`${plan.runDir}/meta.json`, JSON.stringify(meta, null, 2) + '\n')
