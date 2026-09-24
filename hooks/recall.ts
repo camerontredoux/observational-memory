@@ -75,7 +75,7 @@ const isMemoryText = (text: string) => text.startsWith(MEMORY_HEADER) || text.st
 // `mcp-resource-update` and `mcp-polling-update` carry attributes (`server=`, `uri=`, ...) before their closing
 // `>`, so the tag alone is optionally followed by an attribute list, for every name here.
 export const INJECTED_WRAPPER =
-  /^<(?:task-notification|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args|fork-boilerplate|bash-stdout|bash-input|bash-stderr|cross-session-message|teammate-message|user-memory-input|mcp-resource-update|mcp-polling-update)(?:\s[^>]*)?>/
+  /^<(?:task-notification|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args|fork-boilerplate|bash-stdout|bash-input|bash-stderr|cross-session-message|teammate-message|user-memory-input|mcp-resource-update|mcp-polling-update|channel)(?:\s[^>]*)?>/
 // What the user typed: not an injected block (a system reminder, a named wrapper, image note).
 function typedText(text: string) {
   const t = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
