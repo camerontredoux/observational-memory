@@ -208,3 +208,94 @@ about to do at boundary N, and what it had last told the user.
   control, were incomplete: Sonnet redirected `logs.sh` to a file and read its last line, so the context never
   reached the auto-compact threshold. `logs.sh` now refuses a redirect or pipe (`92e3cba`); the run after the fix
   succeeded. Live runs cost $12.02.
+
+## 2026-09-24, fork handoff (issue #16)
+
+`2026-09-24-fork.{jsonl,md}`. The fork plugin (`tests/eval/fork-plugin/`) is an evaluation-only compaction plugin, as
+Codex does it. At about 85% of the auto-compact threshold it calls `$.model.fork`: the session's own model, over its
+own cached transcript, with no tools, writes a handoff to itself. At compaction it uses that handoff if it is still
+fresh, or forks then. The compacted context is the user's messages verbatim, the handoff, and the newest messages
+(about 6k tokens). If a fork fails, it falls back to the built-in compaction. `fork+recall` adds `om_recall`.
+
+- 69 live runs (Sonnet 5), all valid. `fork` and `fork+recall`: 3 runs of each of the 10 scenarios. `om+recall` on
+  v1.3.0 and `builtin`: 3 runs each of the new scenarios. The `.jsonl` holds only these runs. The `.md` report sets
+  them beside the earlier baselines: v1.3.0 and v1.2.0 om+recall, v1.0.0 built-in, built-in+recall and om+recall
+  (with the 2026-09-24 recall-required runs), and v1.1.0 built-in+recall. The `.md` labels the earlier built-in runs
+  `v100` and `v110`, and the new built-in runs `cc`.
+- Two new scenarios:
+  - `multi-step-plan`: a release of five dependent steps, compacted after steps 1 and 2 and a change to step 4. The
+    continuation must resume at step 3, run step 4 as changed, and stop before step 5, which waits for approval.
+  - `planning-session`: a design conversation. The user makes decisions, replaces one, refines it with a caveat,
+    changes another, rejects two options with reasons, and leaves two questions open. Handbook reads come between
+    them, and a `/compact` follows. The continuation asks for the current plan. The history must not write the plan
+    to a file.
+- Token-equivalent spend: $40.15 in total. That is $32.70 for these runs, $5.67 for 13 `planning-session` runs set
+  aside (see below), and $1.78 for one probe run set aside.
+
+Task success (successful runs out of valid runs):
+
+| scenario | fork | fork+recall | om+recall v1.3.0 | built-in (new) | built-in v1.0.0 | built-in+recall v1.0.0 |
+|---|---|---|---|---|---|---|
+| the seven issue #9 scenarios | 21/21 | 20/21 | 3/3 (3 run) | not run | 21/21 | 20/21 |
+| `multi-step-plan` | 2/3 | 1/3 | 3/3 | not run | not run | not run |
+| `planning-session` | 2/3 | 1/3 | 3/3 | 3/3 | not run | not run |
+| `recall-required` | 0/3 | 3/3 | 3/3 | not run | 0/3 | 0/3 (v1.1.0: 3/3) |
+
+Compaction cost and latency:
+
+| | fork, forked at `/compact` | fork, early handoff (auto) | om+recall v1.3.0 | built-in |
+|---|---|---|---|---|
+| compactions | 66 | 6 | 14 | 3 new, 48 v1.0.0 |
+| compaction time | 15.8 s mean (6.2–24.1 s) | 40 ms mean (35–42 ms) | 8.5 s mean | 35.0 s new, 27.2 s v1.0.0 |
+| model cost per compaction | about $0.04 | about $0.04 | $0.0067 per run (Observer) | not in the transcript |
+| cache-read tokens per fork | 39.6k mean | 136.6k mean | – | – |
+
+- A fork's cost is almost all cache reads: about 630 uncached input tokens and 1.5k output tokens per fork. An early
+  fork reads the whole context at 85% of the threshold, about 137k tokens. It costs the same as a fork at a manual
+  `/compact` of a 40k-token context, because the output tokens cost more than the cache reads.
+- No fork failed and no compaction fell back to the built-in summary: 72 of 72 compactions used the handoff.
+- The early handoff makes auto compaction almost free in time: 40 ms against 8.5 s for om and about 30 s for
+  built-in. A manual `/compact` has no early handoff (the context is below 85%), so the fork runs then and takes
+  about 16 s.
+
+What it shows:
+
+- Handoff quality on `multi-step-plan`: all 6 handoffs held the merge commit id, the change to step 4, the approval
+  gate on step 5, and which steps were done. In 3 of 6 runs the continuation still stopped after step 3 and asked
+  before running step 4. That failed the `benchmarks` check. om+recall v1.3.0 ran step 4 in 3 of 3 runs, although
+  its memory held `--runs 5` in only 1 of 3. The handoffs listed the user's global CLAUDE.md rules ("ask when...",
+  "get approval before acting") as "rules in force". This is a possible cause of the extra caution. It is not
+  measured.
+- `planning-session`: every fork reply had the latest decisions, the rejection reasons, and the open questions.
+  3 of 6 fork runs listed the handbooks' review rule ("every change is reviewed by two engineers and rolled out
+  behind a flag") as a decision. The handoffs had put that research under "rules in force" beside the user's
+  decisions. om+recall and built-in did this in 0 of 6 runs. The om memory did not carry the later decisions: its
+  raw tail of recent messages did, because the whole session was about 43k tokens. This scenario does not test om's
+  observations.
+- `recall-required`: the handoff does not keep a single record from 200 lines of output, as the built-in summary
+  does not. Without `om_recall`, all 3 fork runs said honestly that they could not give the checksum. With it,
+  3 of 3 recalled the checksum.
+- `reversed-constraint`: the one fork+recall failure wrote a literal `\t` into the Edit. The handoff held the tabs
+  rule.
+
+Harness changes during the run:
+
+- The first `recall-required` fork probe recomputed the checksum from the formula in `shards.sh`. The allow list lets
+  `sha256sum` run as a read-only command. Its no-rerun check also failed a `cat shards.sh`. The checksum key now
+  lives in `.audit-key`, which the first run deletes; `merge.sh` reads its commit id from `.merge-ref` in the same
+  way. The no-rerun checks match a command that runs the script, not one that reads it (`fc20db7`). The probe run is
+  set aside.
+- `planning-session`'s first wording said "do not run anything". Two built-in runs took that to forbid reading, so
+  their histories held no research. The prompt now says reading is fine, and the setup needs the three reads. The
+  13 runs made with the first wording (all configurations) are set aside, and all 12 were run again.
+- `no-research-as-decision` first matched the review rule anywhere in the reply. It now matches only in the reply's
+  decided part, so a side note or an open question about the rule passes. All `planning-session` runs were scored
+  with the final checks.
+
+Limits:
+
+- 3 runs per cell. The differences on the two new scenarios are 1 or 2 runs out of 3. They show a pattern, not a rate.
+- The fork plugin is an evaluation build, not tuned. Its handoff prompt does not separate the user's decisions from
+  research or from the host's standing instructions.
+- The scenarios are small (40k–45k tokens at a manual `/compact`), except `recall-required`. Only `recall-required`
+  used the early handoff.
