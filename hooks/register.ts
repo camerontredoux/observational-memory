@@ -176,10 +176,14 @@ const truncate = (text: string, maxTokens: number) =>
 const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
 // What truncate leaves of a text given no room: its note alone.
 const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
-// An oversized command result, bounded at both ends: a final error or test summary usually sits at the start or
-// the end, never only in the middle. The omission is marked explicitly, never silently dropped; om_recall can
-// still find the full result in the transcript. The tail starts at a line boundary so its first line is whole.
-function excerpt(text: string, maxTokens: number) {
+// An oversized command result or brief, bounded at both ends: a final error or test summary, or a brief's reporting
+// and acceptance rules, usually sits at the start or the end, never only in the middle. The omission is marked
+// explicitly, never silently dropped; om_recall can still find the full `what` in the transcript. The tail starts at
+// a line boundary so its first line is whole.
+const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
+// The marker excerpt leaves in a brief it cut (see capUserMessages).
+const BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/
+function excerpt(text: string, maxTokens: number, what: 'result' | 'message' = 'result') {
   if (text.length <= maxTokens * 4) return text
   const room = maxTokens * 4
   const headChars = Math.floor(room / 2)
@@ -187,7 +191,7 @@ function excerpt(text: string, maxTokens: number) {
   const nl = text.indexOf('\n', rawTailStart)
   const tailStart = nl === -1 || nl >= text.length - 1 ? rawTailStart : nl + 1
   const omitted = estimateTokens(text.slice(headChars, tailStart))
-  return `${text.slice(0, headChars)}\n... [~${omitted} tokens omitted; om_recall can retrieve the full result] ...\n${text.slice(tailStart)}`
+  return `${text.slice(0, headChars)}${omissionMarker(omitted, what)}${text.slice(tailStart)}`
 }
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
@@ -725,15 +729,16 @@ function parseContinuation(text: string, from: number) {
 }
 
 // The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
-// oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS, and the
-// newest over what remains is cut; the newest is always kept.
+// oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS,
+// keeping its head and its tail, and the newest over what remains is cut; the newest is always kept.
 function capUserMessages(messages: readonly UserMessage[]) {
   const [first, ...rest] = messages
   if (!first) return []
-  // A brief an earlier compaction cut keeps the note that counts what it lost.
+  // A brief an earlier compaction cut is kept as it was, with the marker that counts what it lost: cut again, its
+  // count would be lost. A head-only cut is an older plugin version's.
   const briefMax = USER_MESSAGES_MAX_TOKENS - NEWEST_RESERVE_TOKENS
-  const wasCut = TRUNCATED.test(first.text) && first.text.replace(TRUNCATED, '').length <= briefMax * 4
-  const brief = { ...first, text: wasCut ? first.text : truncate(first.text, briefMax) }
+  const wasCut = [BRIEF_CUT, TRUNCATED].some((cut) => cut.test(first.text) && first.text.replace(cut, '').length <= briefMax * 4)
+  const brief = { ...first, text: wasCut ? first.text : excerpt(first.text, briefMax, 'message') }
   let left = USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text)
   const kept: UserMessage[] = []
   for (const m of [...rest].reverse()) {

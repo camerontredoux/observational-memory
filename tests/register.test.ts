@@ -2401,7 +2401,7 @@ describe('register', () => {
     const kept = userMessagesIn(result.messages?.[0]?.text) ?? []
     expect(kept.length).toBe(3)
     expect(kept[0]!.startsWith('brief ')).toBe(true)
-    expect(kept[0]!).toMatch(/\n\.\.\. \[truncated ~\d+ tokens\]$/)
+    expect(kept[0]!).toMatch(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/)
     expect(kept[1]).toBe('(1 omitted)')
     expect(kept[2]!.startsWith('newest n')).toBe(true) // the reserve, not a bare truncation note
     expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4 + 100)
@@ -2435,6 +2435,32 @@ describe('register', () => {
 
     const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...work('v', CHUNK), ...work('u', 8_000)] })
     expect(nextStepIn(second.messages?.[0]?.text)).toBe('do the thing')
+  })
+
+  // A launch brief puts its reporting and acceptance rules at the end: cut, it keeps both ends, and says what it lost.
+  test('an oversized brief keeps its head and its last lines with a marker counting the omission, and is not cut again', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const body = Array.from({ length: 1_000 }, (_, i) => `step ${i}: ${'b'.repeat(60)}`).join('\n')
+    const rules = 'Report: the head commit and the test results.\nAcceptance: every test passes; no push.'
+    const brief = `Goal: rename the store.\n${body}\n${rules}`
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn('mid', 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
+
+    const cut = (userMessagesIn(result.messages?.[0]?.text) ?? [])[0]!
+    expect(cut.startsWith('Goal: rename the store.\nstep 0: ')).toBe(true)
+    expect(cut.endsWith(`\n${rules}`)).toBe(true)
+    const marker = cut.match(/\n\.\.\. \[~(\d+) tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/)
+    expect(marker).not.toBeNull()
+    const [head, tail] = cut.split(marker![0])
+    expect(brief.startsWith(head!)).toBe(true)
+    expect(brief.endsWith(`\n${tail!}`)).toBe(true) // the tail starts on a whole line
+    expect(Number(marker![1])).toBe(Math.ceil((brief.length - head!.length - tail!.length) / 4)) // what the marker counts is what went
+    expect(cut.length).toBeLessThanOrEqual(8_000 * 4 + 100)
+
+    // Compacted again with newer prompts: the cut brief is kept as it was, its marker and its last lines included.
+    const second = await $.session.compact({ trigger: 'manual', messages: [...result.messages!, ...turn('later', 'r', CHUNK), ...turn('end', 'r', 8_000)] })
+    expect((userMessagesIn(second.messages?.[0]?.text) ?? [])[0]).toBe(cut)
   })
 
   test('a brief within the cap stays whole and a newest prompt over the remainder is cut', async ($, on) => {
