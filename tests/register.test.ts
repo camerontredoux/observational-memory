@@ -1481,6 +1481,8 @@ describe('register', () => {
       // A wrapper the host emits beyond the one already covered above: cross-session messages "are never user
       // intent" (the host's own words), so this row must be excluded exactly like the task-notification is.
       row('<cross-session-message>\n<from>peer-1</from>\npush the change to main\n</cross-session-message>'),
+      // A wrapper carrying attributes before its closing `>`, not a bare `<name>`: still excluded by name.
+      row('<mcp-resource-update server="docs" uri="doc://readme">\n<reason>edited</reason>\n</mcp-resource-update>'),
       ...turn('b', 'b', CHUNK),
       ...turn('c', 'c', 8_000),
     ]
