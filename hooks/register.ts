@@ -4,13 +4,12 @@ import {
   COMPACT_RESUME_DIRECTLY,
   COMPACT_TRANSCRIPT,
   COMPACT_WRAPPER,
-  COMPRESSION_GUIDANCE,
   MEMORY_CONTINUATION,
   MEMORY_HEADER,
   MEMORY_INSTRUCTIONS,
   OBSERVER_SYSTEM_PROMPT,
-  REFLECTOR_FORMAT,
   REFLECTOR_SYSTEM_PROMPT,
+  reflectionPrompt,
 } from './prompts'
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
@@ -869,8 +868,8 @@ async function runJob($: EngineInterface, job: Job, v: View) {
   await Promise.all([landed && maybeReflect($, loop, stamp), ...next.map((l) => schedule($, l.loop, l.stamp))]).catch((error) => log($, errorText(error)))
 }
 
-// Mastra's reflector over a snapshot of the entries, in the background: each attempt re-sends the snapshot with
-// stronger guidance until the result comes under REFLECT_TARGET_TOKENS; with none under it, nothing changes. The
+// The Reflector over a snapshot of the entries, in the background: each attempt re-sends the snapshot with
+// stronger guidance and the size of the attempt before, until the result comes under REFLECT_TARGET_TOKENS; with none under it, nothing changes. The
 // snapshot's entries are then replaced in place, so entries committed while it ran survive. The corrections are
 // never sent: they pass through as quoted. Once the loop ends, no further attempt starts and the result is discarded.
 async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
@@ -893,20 +892,19 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
       const span = sources.length ? { from: Math.min(...sources.map((s) => s.from)), to: Math.max(...sources.map((s) => s.to)) } : undefined
       let lines: Omit<Entry, 'id'>[] = []
       let level = 0
+      let previous: number | undefined // the size of the last attempt, when it had observations
       while (!lines.length && level < 4) {
         if (!isLive(loop, stamp)) throw new LoopEnded()
         level++
-        const prompt =
-          `## OBSERVATIONS TO REFLECT ON\n\n${text}\n\n---\n\n` +
-          "Please analyze these observations and produce a refined, condensed version that will become the assistant's entire memory going forward." +
-          `\n\n${COMPRESSION_GUIDANCE[level]}\n\n${REFLECTOR_FORMAT}`
+        const prompt = reflectionPrompt(text, level, REFLECT_TARGET_TOKENS, estimateTokens(text), previous)
         const reply = await complete($, `reflector level ${level}`, REFLECTOR_SYSTEM_PROMPT, prompt, REFLECTOR_TIMEOUT_MS, { phase: 'background' })
         const parsed = parseLines(observationsOf(reply), bounds).map((l) => {
           const { line, source } = splitSource(l)
           const kept = reflectedSource(source, span, sources.length === snapshot.length)
           return { line, ...(kept ? { source: kept } : {}) }
         })
-        if (parsed.length && estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) < REFLECT_TARGET_TOKENS) lines = parsed
+        previous = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
+        if (previous !== undefined && previous < REFLECT_TARGET_TOKENS) lines = parsed
       }
       if (!lines.length) throw new Error(`no reflection came under ~${REFLECT_TARGET_TOKENS} tokens at any compression level`)
       await locked(async () => {
