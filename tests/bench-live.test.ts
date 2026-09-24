@@ -115,7 +115,7 @@ describe('checking what a session will load', () => {
 
 describe('checking the assembled recall-only plugin', () => {
   // As `claude plugin validate` prints it.
-  const validated = (hooks: string) => `  ❯ ./register.ts hooks: ${hooks}\n  ❯ ./register.ts calls: $.tool.register\n\n✔ Validation passed\n`
+  const validated = (hooks: string) => `Validating hooks: /tmp/p/hooks/hooks.json\n\n  ❯ ./register.ts hooks: ${hooks}\n  ❯ ./register.ts calls: $.tool.register\n\n✔ Validation passed\n`
 
   test('passes a plugin that handles om_recall and records the transcript path, nothing else', () => {
     expect(checkRecallOnly(validated(`session.start, tool.call{tool=${RECALL_TOOL}}, classic.SessionStart, classic.Stop`))).toEqual([])

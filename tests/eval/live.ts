@@ -226,7 +226,7 @@ const RECALL_ONLY_HOOKS = ['session.start', `tool.call{tool=${RECALL_TOOL}}`, 'c
 /** Problems with `claude plugin validate` of an assembled recall-only plugin: it must pass and handle om_recall alone. */
 export function checkRecallOnly(validateOutput: string): string[] {
   const problems = /Validation passed/.test(validateOutput) ? [] : ['claude plugin validate did not pass']
-  const hooks = [...validateOutput.matchAll(/hooks: (.*)$/gm)].flatMap((m) => m[1]!.split(', ').map((h) => h.trim()))
+  const hooks = [...validateOutput.matchAll(/^\s*❯ .* hooks: (.*)$/gm)].flatMap((m) => m[1]!.split(', ').map((h) => h.trim()))
   const extra = hooks.filter((h) => !RECALL_ONLY_HOOKS.includes(h))
   if (!hooks.includes(`tool.call{tool=${RECALL_TOOL}}`)) problems.push('it handles no om_recall call')
   if (extra.length) problems.push(`it handles more than om_recall: ${extra.join(', ')}`)
