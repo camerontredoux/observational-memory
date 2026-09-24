@@ -316,13 +316,8 @@ export const SCENARIOS: readonly Scenario[] = [
     // A large session that Claude Code compacts on its own, and a detail no summary keeps: only om_recall gives the
     // answer; without it the honest reply is "I cannot find it" (scored apart, as abstention).
     //
-    // The threshold is the session's own: the run sets no autocompact window (its --settings file has no
-    // autoCompactWindow, no CLAUDE_CODE_AUTO_COMPACT_WINDOW; no --autocompact flag). Claude Code's docs (model-config,
-    // "Default auto-compact thresholds") give Sonnet 5, the model `sonnet` answers with, about 967k tokens by default;
-    // `autoCompactWindow` is an any-file setting, so the user's ~/.claude/settings.json value, 190000 on the machine
-    // this was written on, stays in force under --settings. The dry run prints which applies. On that machine, real
-    // automatic compactions (`compact_boundary` rows with `trigger: "auto"`, followed by the plugin's memory message)
-    // came at ~157k tokens (their `preTokens`). The v1.0.0 runs' manual compactions were at 35k-71k context tokens.
+    // The threshold is the session's own: the run sets no autocompact window (the live.ts header says what applies
+    // instead, and the dry run prints it). The v1.0.0 runs' manual compactions were at 35k-71k context tokens.
     //
     // shards.sh prints 200 records (22,836 characters, within Claude Code's inline Bash output limit,
     // bashOutputMaxChars, default 30,000) with checksums from sha256sum, which the allow list does not let the session
@@ -330,8 +325,8 @@ export const SCENARIOS: readonly Scenario[] = [
     // (excerpt() in hooks/register.ts keeps the first 10,000 and the last ~10,000 characters), so the memory holds it
     // only if the Observer's excerpt changes; the user never names it before the continuation. A second run refuses
     // and prints no checksum. Each run of logs.sh prints the next ~27,600 characters of worker log (roughly 8k-12k
-    // tokens), so 12-19 growth prompts reach a 190k setting; the cap of 30 stops a run whose threshold is higher (the
-    // 967k default among them): it is recorded as incomplete, not scored.
+    // tokens), so 12-19 growth prompts reach a 190k threshold; the cap of 30 stops a run whose threshold is higher: it
+    // is recorded as incomplete, not scored.
     //
     // Expected cost per run, at the Sonnet prices in bench.ts and a 190k threshold: about 36 requests (a tool call and
     // a reply per growth prompt) reading on average ~110k-120k cached tokens, about 4.3M cache reads = $1.30; ~190k
@@ -391,7 +386,7 @@ export const SCENARIOS: readonly Scenario[] = [
       { id: 'called-recall', category: 'retrieval', description: 'called om_recall', kind: 'tool', tool: '^mcp__observational-memory__om_recall$', expect: 'present' },
       { id: 'recall-finds', category: 'retrieval', description: 'om_recall returned the checksum', kind: 'recall', pattern: 'ck-d3e5a2bc17ea3a55' },
       {
-        id: 'abstains',
+        id: 'says-not-found',
         category: 'abstention',
         description: 'says it cannot find the checksum',
         kind: 'reply',
@@ -408,3 +403,6 @@ export const SCENARIOS: readonly Scenario[] = [
 ]
 
 export const scenarioById = (id: string): Scenario | undefined => SCENARIOS.find((s) => s.id === id)
+
+/** The scenario's `grow` step, if it grows until Claude Code compacts on its own. */
+export const growStep = (s: Scenario) => s.steps.find((x): x is Extract<Step, { grow: string }> => 'grow' in x)

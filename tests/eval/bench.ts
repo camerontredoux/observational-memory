@@ -23,7 +23,7 @@
 
 import type { Configuration, Measurement } from './runner'
 import { CONFIGURATIONS, estimated, measured, recallAvailable, unavailable, usesObservationalCompaction } from './runner'
-import { SCENARIOS, scenarioById } from './scenarios'
+import { growStep, SCENARIOS, scenarioById } from './scenarios'
 import type { Check, CheckCategory, Scenario } from './scenarios'
 
 // ---- VERIFY BEFORE A LIVE RUN: list prices in USD per million tokens, matched against each message's model id. ----
@@ -297,7 +297,7 @@ function checkOne(c: Check, reply: string, calls: Extract<Entry, { kind: 'tool' 
 export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stats?: OmStats): RunScore {
   const invalid: string[] = []
   const boundaries = t.entries.flatMap((e, i) => (e.kind === 'boundary' ? [{ e, i }] : []))
-  if (s.steps.some((x) => 'grow' in x)) {
+  if (growStep(s)) {
     // Claude Code compacts on its own: any number of times, never by a manual `/compact`.
     if (!boundaries.length) invalid.push('no compaction happened before the continuation')
     boundaries.forEach(({ e }, i) => {
@@ -355,12 +355,23 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
       ? { id: c.id, category: c.category, description: c.description, outcome: 'n/a' as const, evidence: `${config} does not offer om_recall` }
       : checkOne(c, reply, calls, recalls, results),
   )
-  // Abstaining is the honest outcome only when the answer was not given: a reply that gave it did not need to.
+  // Abstaining is the honest outcome only when the answer was not given (a reply that gave it did not need to) and no
+  // other value was: a reply that hedges and then invents one is not honest.
   const answered = scored.some((c) => c.category === 'correctness') && scored.every((c) => c.category !== 'correctness' || c.outcome === 'pass')
-  const checks = scored.map((c) => (c.category === 'abstention' && answered ? { ...c, outcome: 'n/a' as const, evidence: `every correctness check passed: ${c.evidence}` } : c))
+  const invented = scored.filter((c) => c.category === 'unsupported-claim' && c.outcome === 'fail').map((c) => c.id)
+  const checks = scored.map((c) =>
+    c.category !== 'abstention'
+      ? c
+      : answered
+        ? { ...c, outcome: 'n/a' as const, evidence: `every correctness check passed: ${c.evidence}` }
+        : invented.length && c.outcome === 'pass'
+          ? { ...c, outcome: 'fail' as const, evidence: `${invented.join(', ')} failed: ${c.evidence}` }
+          : c,
+  )
   const failed = (cat: CheckCategory) => checks.filter((c) => c.category === cat && c.outcome === 'fail').length
   const correctnessChecks = checks.filter((c) => c.category === 'correctness')
-  const retrievalChecks = checks.filter((c) => c.category === 'retrieval' && c.outcome !== 'n/a')
+  // Recall hits: whether a result held the evidence, not whether om_recall was called (`retrieval.calls` counts that).
+  const retrievalChecks = checks.filter((c, i) => s.checks[i]!.kind === 'recall' && c.outcome !== 'n/a')
   const startAt = start < 0 ? undefined : t.entries[start]!.at
   const endAt = after.findLast((e) => e.at !== undefined)?.at
   return {

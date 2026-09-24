@@ -53,8 +53,8 @@ export type PlanInput = {
 export type PlanStep =
   | { kind: 'herdr'; argv: string[]; purpose: string; prompt?: string; stallOk?: boolean }
   | { kind: 'settle'; ms: number; purpose: string }
-  /** Send `argv` (a prompt) again after each turn until the transcript has a new compaction, at most `max` times. */
-  | { kind: 'grow'; argv: string[]; purpose: string; prompt: string; max: number }
+  /** Send `argv` (a prompt), after a `settleMs` pause, again after each turn until the transcript has a new compaction, at most `max` times. */
+  | { kind: 'grow'; argv: string[]; purpose: string; prompt: string; max: number; settleMs: number }
 
 /** The session's `--settings` file. */
 export type Settings = { env: { CLAUDE_CODE_PLUGIN_DIRS: string; OM_STATS_DIR: string }; permissions: { allow: string[] } }
@@ -142,7 +142,8 @@ export function planRun(input: PlanInput): Plan {
         argv: promptArgv(st.grow),
         prompt: st.grow,
         max: st.max,
-        purpose: `growth prompt, repeated until Claude Code compacts on its own (a new compact_boundary row in the transcript), at most ${st.max} times; after ${st.max} without one the run stops incomplete`,
+        settleMs: input.settleMs,
+        purpose: `growth prompt, each after a ${input.settleMs / 1000} s pause for background work (as a pausing user would), repeated until Claude Code compacts on its own (a new compact_boundary row in the transcript), at most ${st.max} times; after ${st.max} without one the run stops incomplete`,
       })
     compactions++
     steps.push({ kind: 'settle', ms: input.settleMs, purpose: 'let background work finish before compacting, as a pausing user would' })

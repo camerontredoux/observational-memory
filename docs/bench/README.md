@@ -23,7 +23,8 @@ test this: its compactions were manual `/compact` commands at 35k–71k context 
 
 1. `shards.sh` prints 200 shard records once. The continuation later asks for the checksum of one of them.
 2. The growth prompt runs `logs.sh`, about 27,600 characters of log per run. `bench-live.ts` sends it again after each
-   turn until the transcript has a new `compact_boundary` row, at most 30 times.
+   turn until the transcript has a new `compact_boundary` row, at most 30 times. Before each send it waits
+   `--settle-ms` (default 30 s) so the plugin's background work can finish, as it does before a manual `/compact`.
 3. The continuation asks for the checksum verbatim.
 
 The run sets no autocompact window. The session compacts at its own threshold: your `autoCompactWindow` in

@@ -53,8 +53,7 @@ import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, descr
 import type { Plan, PlanStep } from '../tests/eval/live'
 import { CONFIGURATIONS } from '../tests/eval/runner'
 import type { Configuration } from '../tests/eval/runner'
-import { SCENARIOS, scenarioById } from '../tests/eval/scenarios'
-import type { Step } from '../tests/eval/scenarios'
+import { growStep, SCENARIOS, scenarioById } from '../tests/eval/scenarios'
 
 const BENCH_ROOT = '/tmp/om-bench'
 const HERE = resolve(import.meta.dir, '..')
@@ -133,7 +132,7 @@ function score(meta: RunMeta, error?: string): RunRecord {
   const { stats: statsPath, ...rest } = meta
   const m: RunMeta = { ...rest, transcripts, ...(stats === undefined ? {} : { stats: statsPath }) }
   if (!transcripts.length) return { ...m, error: error ?? `no transcript for session ${meta.sessionId} under ~/.claude/projects` }
-  const t = parseTranscript(transcripts.map((p) => readFileSync(p, 'utf8')).join('\n'))
+  const t = readTranscript(transcripts)
   if (error) return { ...m, cost: runCost(meta.configuration, t, stats), error }
   return makeRecord(m, t, stats)
 }
@@ -226,15 +225,19 @@ async function run(o: Record<string, string | true>) {
     if (st.kind === 'grow') {
       // Claude Code compacts on its own when the context passes its threshold: send the prompt until a new
       // compact_boundary row shows in the transcript (the turn that compacted has then ended), at most st.max times.
+      // Each waits first, as the manual path does before /compact, so the plugin's background work can finish.
       const before = compactionsIn(plan.input.sessionId)
+      let now = before
       let sent = 0
-      while (!error && sent < st.max && compactionsIn(plan.input.sessionId) === before) {
+      while (!error && sent < st.max && now === before) {
         sent++
         console.log(`  growth prompt ${sent}/${st.max}`)
+        await Bun.sleep(st.settleMs)
         const failed = await send(st, `${head}: growth prompt ${sent}/${st.max}`, pane!, log)
         if (failed) error = `step ${i + 1} (growth prompt ${sent}) failed: ${failed}`
+        now = compactionsIn(plan.input.sessionId)
       }
-      if (!error && compactionsIn(plan.input.sessionId) === before) error = `step ${i + 1}: no compaction after ${st.max} growth prompts: the session's autocompact threshold is above what they reach`
+      if (!error && now === before) error = `step ${i + 1}: no compaction after ${st.max} growth prompts: the session's autocompact threshold is above what they reach`
       if (!error) appendFileSync(log, `the session compacted after ${sent} growth prompt(s)\n\n`)
     } else {
       const failed = await send(st, head, pane!, log)
@@ -284,10 +287,13 @@ async function send(st: Exclude<PlanStep, { kind: 'settle' }>, head: string, pan
   return `exit ${r.status}: ${out.slice(0, 500)}`
 }
 
+function readTranscript(files: readonly string[]) {
+  return parseTranscript(files.map((p) => readFileSync(p, 'utf8')).join('\n'))
+}
+
 // How many compactions the session's transcript (and any file it continued in) records so far.
 function compactionsIn(sessionId: string): number {
-  const files = findTranscripts(sessionId)
-  return files.length ? parseTranscript(files.map((p) => readFileSync(p, 'utf8')).join('\n')).entries.filter((e) => e.kind === 'boundary').length : 0
+  return readTranscript(findTranscripts(sessionId)).entries.filter((e) => e.kind === 'boundary').length
 }
 
 function herdr(argv: string[]) {
@@ -318,7 +324,7 @@ const o = options(rest)
 if (command === 'list') {
   console.log(`Configurations: ${CONFIGURATIONS.join(', ')}`)
   for (const s of SCENARIOS) {
-    const grow = s.steps.find((x): x is Extract<Step, { grow: string }> => 'grow' in x)
+    const grow = growStep(s)
     console.log(`${s.id}: ${s.title} (${grow ? `compacts on its own, within ${grow.max} growth prompts` : `${s.steps.filter((x) => 'compact' in x).length} compaction(s)`})`)
   }
 } else if (command === 'run') await run(o)

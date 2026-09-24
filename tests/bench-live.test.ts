@@ -5,7 +5,7 @@ import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, descr
 import type { PlanInput } from './eval/live'
 import { CONFIGURATIONS } from './eval/runner'
 import type { Configuration } from './eval/runner'
-import { scenarioById } from './eval/scenarios'
+import { growStep, scenarioById } from './eval/scenarios'
 
 const SESSION = '0f1e2d3c-4b5a-4968-8776-655443322110'
 const input = (config: Configuration, extra: Partial<PlanInput> = {}): PlanInput => ({
@@ -99,13 +99,13 @@ describe('the live run plan', () => {
 describe('the live plan of a scenario that compacts on its own', () => {
   const rr = scenarioById('recall-required')!
   const plan = planRun(input('om+recall', { scenario: rr }))
-  const grow = rr.steps.find((x) => 'grow' in x) as { grow: string; max: number }
+  const grow = growStep(rr)!
 
   test('repeats the growth prompt until a compaction shows in the transcript, capped, with no manual /compact', () => {
     const sent = plan.steps.flatMap((st) => (st.kind !== 'settle' && st.argv[1] === 'prompt' ? [st.argv[3]!] : []))
     expect(sent).toEqual([(rr.steps[0] as { prompt: string }).prompt, grow.grow, rr.continuation])
     const step = plan.steps.find((st) => st.kind === 'grow')!
-    expect(step).toMatchObject({ kind: 'grow', prompt: grow.grow, max: 30, argv: ['agent', 'prompt', plan.agent, grow.grow, '--wait', '--timeout', '600000'] })
+    expect(step).toMatchObject({ kind: 'grow', prompt: grow.grow, max: 30, settleMs: plan.input.settleMs, argv: ['agent', 'prompt', plan.agent, grow.grow, '--wait', '--timeout', '600000'] })
     expect(plan.steps.some((st) => st.kind !== 'settle' && st.argv[3] === '/compact')).toBe(false)
     expect(plan.steps.filter((st) => st.kind === 'settle')).toHaveLength(1) // the one after /exit
   })
@@ -118,7 +118,7 @@ describe('the live plan of a scenario that compacts on its own', () => {
   test('the dry run shows the growth loop, its cap and the per-run ceiling', () => {
     const text = describePlan(plan)
     expect(text).toContain(`herdr ${shellLine(plan.steps.find((st) => st.kind === 'grow')!.argv)}`)
-    expect(text).toContain('repeated until Claude Code compacts on its own (a new compact_boundary row in the transcript), at most 30 times')
+    expect(text).toContain('(as a pausing user would), repeated until Claude Code compacts on its own (a new compact_boundary row in the transcript), at most 30 times')
     expect(text).toContain('Per-run ceiling: $5')
     expect(describePlan(planRun(input('om')))).toContain('Per-run ceiling: --ceiling-usd (default $1) until a live run completes')
   })
