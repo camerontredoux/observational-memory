@@ -325,7 +325,9 @@ export const SCENARIOS: readonly Scenario[] = [
     // (excerpt() in hooks/register.ts keeps the first 10,000 and the last ~10,000 characters), so the memory holds it
     // only if the Observer's excerpt changes; the user never names it before the continuation. A second run refuses
     // and prints no checksum. Each run of logs.sh prints the next ~27,600 characters of worker log (roughly 8k-12k
-    // tokens), so 12-19 growth prompts reach a 190k threshold; the cap of 30 stops a run whose threshold is higher: it
+    // tokens), so 12-19 growth prompts reach a 190k threshold. Sonnet 5 took to redirecting it to a file and printing the last
+    // line (2 of 4 v1.3.0 runs and a v1.2.0 control on 2026-09-24), which kept the context near 60k-95k, so logs.sh refuses
+    // unless its stdout is Claude Code's Bash output file (/tmp/claude-<uid>/.../tasks/<id>.output); the cap of 30 stops a run whose threshold is higher: it
     // is recorded as incomplete, not scored.
     //
     // Expected cost per run, at the Sonnet prices in bench.ts and a 190k threshold: about 36 requests (a tool call and
@@ -354,6 +356,8 @@ export const SCENARIOS: readonly Scenario[] = [
       'logs.sh': [
         '#!/usr/bin/env bash',
         '# Synthetic worker log: each run prints the next part (about 27,600 characters) and counts it in .logs-part.',
+        "# It refuses unless its output goes to Claude Code's own Bash output file, so a redirect or a pipe cannot keep it out of the context.",
+        'case "$(readlink /proc/$$/fd/1)" in */tasks/*.output) ;; *) echo "error: logs.sh must print straight to the Bash tool: run exactly bash logs.sh, with no redirect or pipe"; exit 1 ;; esac',
         'part=$(( $(cat .logs-part 2>/dev/null || echo 0) + 1 ))',
         'echo "$part" > .logs-part',
         'queues=(ingest billing search notifications exports scheduler auth reporting)',
