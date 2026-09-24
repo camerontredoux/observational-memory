@@ -102,3 +102,44 @@ What it shows:
   visible and the recall note at the end of the memory, and it carries to the built-in summary, which has the same
   tool and note.
 - 3 and 6 runs are small samples. They show the change, not a rate.
+
+## Retention over many real compactions
+
+`scripts/bench-replay.ts` (its header gives the usage) replays three long real sessions at their own compaction
+points, 5 to 11 compactions at about 158k tokens each, and chains each configuration's compaction through them. It
+scores every compacted context with no model: the identifiers the assistant went on to use, the user's constraints
+in force, and how both drift from boundary 1 on. The transcripts are private copies in the main checkout's
+`tests/fixtures/replay/`. The constraint lists and questions for the two `om-*` sessions are in
+`tests/eval/replay-specs/`; firstmate-11's stays local, and only its aggregate numbers are committed.
+
+### 2026-09-24, the sessions' own compactions
+
+`2026-09-24-replay-recorded.md` scores the compaction each session made as it ran. Every compaction in these
+sessions was observational memory's (om-orchestration on v1.0, om-v04 on v0.4, firstmate-11 on the build it had
+then), so this is not a built-in baseline. No built-in numbers exist until the live built-in chain runs.
+
+| transcript | compactions | needed identifiers held | constraints in force held |
+|---|---:|---:|---:|
+| om-orchestration | 5 | 42/55 (76%) | all, at every boundary |
+| om-v04 | 9 | 42/50 (84%) | all, at every boundary |
+| firstmate-11 | 11 | 22/41 (54%) | all, at every boundary; the one reversed constraint never shown as in force |
+
+The constraints hold because observational memory copies the user's messages into the memory by code.
+
+### The dry run: what a full run would spend
+
+`bun scripts/bench-replay.ts dry-run` lists every model call a full run would make over the three transcripts, and
+spends nothing. Observer calls are counted from a stub replay of the checkout (`om --pi stub`); reflections and
+everything else are estimates.
+
+| configuration | calls | est. cost (a shared compaction counted in each) |
+|---|---:|---:|
+| builtin | 46 | $18.96 |
+| builtin+recall | 46 | $23.38 |
+| om | 130 | $4.46 |
+| om+recall | 130 | $12.41 |
+| all (each call once) | 218 | $41.87 |
+
+Not run yet: the om replay with real Observer and Reflector calls (`--pi live`), the live built-in chain, and the
+question stage. Whether Claude Code resumes a session whose rows another writer appended is the first thing the
+built-in chain has to show; if it cannot, the chain stops and says which step failed.

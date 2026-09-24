@@ -503,6 +503,12 @@ async function report(o: Record<string, string | true>) {
       if (only && !only.includes(config)) continue
       const path = `${OUT_ROOT}/${name}/${dir}`
       if (results.some((r) => r.config === config) || !existsSync(`${path}/compaction-1.md`)) continue
+      // A cached or live replay whose pi calls failed compacted on the floor or with what it had: not om's measurement.
+      const failed = dir === 'om-stub' ? 0 : ((existsSync(`${path}/summary.json`) ? JSON.parse(readFileSync(`${path}/summary.json`, 'utf8')) : { luna: { failed: -1 } }).luna?.failed ?? -1)
+      if (failed !== 0) {
+        console.error(`${name}: ${path} left out: ${failed < 0 ? 'no summary.json' : `${failed} pi call(s) failed`}`)
+        continue
+      }
       results.push({ config, source, contexts: readContexts(path, t.boundaries.length) })
     }
     parts.push(renderTranscript({ name, t, results, bytes, private: PRIVATE.has(name), ...(spec ? { spec } : {}) }))
