@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
 import { COMPACT_WRAPPER, MEMORY_HEADER, MEMORY_RECALL } from '../hooks/prompts'
+import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -174,6 +175,15 @@ function gates() {
     return held.get(n)!
   }
   return { gate, open: (n: number) => (gate(n), release.get(n)!()) }
+}
+
+// The recall-only eval plugin's hooks by event, the last registered for each, to run with a `$` the test builds: the
+// test kit loads an inline plugin from its register function alone, which this one's top-level helpers are not in,
+// and the test's own `$` makes no call a plugin alone makes, such as `$.tool.register`.
+function recallOnlyHooks() {
+  const hooks = new Map<string, (...args: any[]) => Promise<unknown>>()
+  recallOnly(((event: string, ...rest: unknown[]) => void hooks.set(event, rest.at(-1) as never)) as unknown as On, {} as never)
+  return hooks
 }
 
 // A turn's work after its prompt: no new prompt.
@@ -1125,6 +1135,21 @@ describe('register', () => {
     )
     const whole = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', ref: '#33', lines: '1' })).result)
     expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines \(1,031 characters\); only if you still need them: \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
+  })
+
+  test('the recall-only eval plugin registers om_recall exactly as the plugin does, so built-in+recall is offered the same tool', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const registered: { name: string }[] = []
+    on('tool.register', ($, e) => (registered.push(e), { value: { tool: `mcp__observational-memory__${e.name}` } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+    const evaluated: unknown[] = []
+    const tool = { register: async (spec: unknown) => (evaluated.push(spec), { tool: 'mcp__observational-memory__om_recall' }) }
+    await recallOnlyHooks().get('session.start')!({ tool }, { cwd: '/tmp' }, (e: unknown) => e)
+
+    expect(evaluated).toEqual([registered.find((r) => r.name === 'om_recall')])
   })
 
   test('om_recall labels tool results with the tool that produced them', async ($, on) => {
