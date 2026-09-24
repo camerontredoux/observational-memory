@@ -4,6 +4,7 @@ import {
   COMPACT_RESUME,
   COMPACT_TRANSCRIPT,
   COMPACT_WRAPPER,
+  COMPACTION_BRIEFING,
   FLOOR_NOTE,
   MEMORY_CONTINUATION,
   MEMORY_HEADER,
@@ -59,6 +60,10 @@ const RECALL_TOOL_NAME = `mcp__observational-memory__${RECALL_TOOL}` // as the m
 const STATS_TOOL = 'om_stats'
 const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
 const NEXT_STEP_MAX_TOKENS = 2_000 // the latest request the continuation record quotes
+const HANDOFF_FIELD_MAX_TOKENS = 500 // each of the continuation record's Next steps and Told the user
+const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
+const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the rest counted
+const ENV_LINE_MAX_CHARS = 200 // each line of the environment
 const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force, shown whole or not at all
 const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
 const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say, or for a subagent's model: the smallest in use
@@ -107,6 +112,7 @@ type Memory = {
   skills: Skill[]
   userMessages: UserMessage[]
   nextStep?: string // the user's latest request, verbatim
+  environment?: string // the working directory and git state at compaction (see environmentOf)
   brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
   transcript?: string
@@ -170,10 +176,14 @@ const truncate = (text: string, maxTokens: number) =>
 const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
 // What truncate leaves of a text given no room: its note alone.
 const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
-// An oversized command result, bounded at both ends: a final error or test summary usually sits at the start or
-// the end, never only in the middle. The omission is marked explicitly, never silently dropped; om_recall can
-// still find the full result in the transcript. The tail starts at a line boundary so its first line is whole.
-function excerpt(text: string, maxTokens: number) {
+// An oversized command result or brief, bounded at both ends: a final error or test summary, or a brief's reporting
+// and acceptance rules, usually sits at the start or the end, never only in the middle. The omission is marked
+// explicitly, never silently dropped; om_recall can still find the full `what` in the transcript. The tail starts at
+// a line boundary so its first line is whole.
+const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
+// The marker excerpt leaves in a brief it cut (see capUserMessages).
+const BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/
+function excerpt(text: string, maxTokens: number, what: 'result' | 'message' = 'result') {
   if (text.length <= maxTokens * 4) return text
   const room = maxTokens * 4
   const headChars = Math.floor(room / 2)
@@ -181,7 +191,7 @@ function excerpt(text: string, maxTokens: number) {
   const nl = text.indexOf('\n', rawTailStart)
   const tailStart = nl === -1 || nl >= text.length - 1 ? rawTailStart : nl + 1
   const omitted = estimateTokens(text.slice(headChars, tailStart))
-  return `${text.slice(0, headChars)}\n... [~${omitted} tokens omitted; om_recall can retrieve the full result] ...\n${text.slice(tailStart)}`
+  return `${text.slice(0, headChars)}${omissionMarker(omitted, what)}${text.slice(tailStart)}`
 }
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
@@ -421,6 +431,36 @@ const correctionsOf = (text: string) => (sectionsOf(text).corrections ?? []).joi
 // Where the work stands: the Observer's <continuation>, or an older reply's or memory message's <current-task>.
 const stateOf = (text: string) => tag(text, 'continuation') ?? tag(text, 'current-task')
 
+// A record's fields, in its order: a line that opens no field continues the one before, or leads the record.
+const FIELD = /^[ \t]*(?:[-*][ \t]+)?(active|completed|blocked|waiting for user|next steps|told the user)[ \t]*:(.*)$/i
+type Field = { name: string; value: string; lines: string[] }
+function fieldsOf(state: string) {
+  const fields: Field[] = []
+  for (const line of state.split('\n')) {
+    const m = line.match(FIELD)
+    if (m || !fields.length) fields.push({ name: m?.[1]!.toLowerCase() ?? '', value: m?.[2] ?? line, lines: [line] })
+    else fields.at(-1)!.lines.push(line), (fields.at(-1)!.value += `\n${line}`)
+  }
+  return fields
+}
+// The fields a newer record keeps from the one before it until it gives its own: the handoff's next steps and what
+// the user was told. Each is bounded, and one that says "none" is dropped.
+const HANDOFF = ['next steps', 'told the user']
+const NONE = /^\s*(?:none|nothing)[\s.]*$/i
+const cap = (text: string, chars: number) => (text.length <= chars ? text : `${text.slice(0, chars - 1)}…`)
+// Where the work stands after `newer`, the record of the rows after those `before` covers.
+function carry(before: string | undefined, newer: string | undefined) {
+  if (newer === undefined) return before
+  const fresh = fieldsOf(newer)
+  const kept = before === undefined ? [] : fieldsOf(before).filter((f) => HANDOFF.includes(f.name) && !fresh.some((g) => g.name === f.name))
+  const text = [...fresh, ...kept]
+    .filter((f) => !(HANDOFF.includes(f.name) && NONE.test(f.value)))
+    .map((f) => (HANDOFF.includes(f.name) ? cap(f.lines.join('\n'), HANDOFF_FIELD_MAX_TOKENS * 4) : f.lines.join('\n')))
+    .join('\n')
+    .trim()
+  return text || undefined
+}
+
 // The user's constraints in force are correction lines, `🔴 [time] User: "…"` as the Observer quotes them, oldest
 // first. A line's key is its words without its time or the note of what it replaced: the same words said again are
 // one constraint, kept where they were said last, and a constraint said again after another stays after it. A
@@ -467,7 +507,7 @@ function beforeRows(ledger: Ledger, from: number): Before {
   const earlier = [...ledger.chunks].filter((c) => c.to <= from).sort((a, b) => a.from - b.from)
   return {
     constraints: applyConstraints(ledger.corrections, earlier.flatMap((c) => c.corrections)),
-    state: earlier.reduce((state, c) => c.currentTask ?? state, ledger.currentTask),
+    state: earlier.reduce((state, c) => carry(state, c.currentTask), ledger.currentTask),
   }
 }
 
@@ -564,6 +604,33 @@ async function complete($: EngineInterface, role: string, system: string, prompt
 
 type Call = { phase: LunaCall['phase']; chunkTokens?: number }
 
+// The working directory and its git state, read by code at compaction for the continuation record: the branch, HEAD
+// and the uncommitted files, the first ENV_FILES_MAX of them. Outside a repository, or when git fails or times out,
+// there is none, and compaction goes on without it.
+async function environmentOf($: EngineInterface) {
+  try {
+    const cwd = await $.session.cwd()
+    const git = (...args: string[]) =>
+      $.process.run(['git', '--no-optional-locks', ...args], { cwd, timeoutMs: GIT_TIMEOUT_MS }).then((r) => {
+        if (r.exitCode !== 0) throw new Error(`git ${args[0]} exited ${r.exitCode}`)
+        return r.stdout
+      })
+    const [status, head] = await Promise.all([git('status', '--short', '--branch'), git('log', '-1', '--format=%h%x09%s')])
+    const [branch, ...files] = status.split('\n').filter((l) => l.trim())
+    const line = (text: string) => cap(text.replace(/[\t\r]+/g, ' ').trimEnd(), ENV_LINE_MAX_CHARS)
+    return [
+      line(`Working directory: ${cwd}`),
+      ...(branch?.startsWith('## ') ? [line(`Branch: ${branch.slice(3)}`)] : []),
+      ...(head.trim() ? [line(`HEAD: ${head.trim()}`)] : []),
+      ...(files.length
+        ? [`Uncommitted changes (git status --short, ${plural(files.length, 'file')}):`, ...files.slice(0, ENV_FILES_MAX).map(line), ...(files.length > ENV_FILES_MAX ? [`... and ${files.length - ENV_FILES_MAX} more`] : [])]
+        : ['Uncommitted changes: none']),
+    ].join('\n')
+  } catch {
+    return undefined
+  }
+}
+
 // A chunk's observations count once it lands; a discarded one counts only its call.
 const noteObservations = ($: EngineInterface, sessionId: string, phase: Call['phase'], n: number) =>
   record(statsIo($), sessionId, (s, at) => add(s, `observer.${phase}.observations`, n, at))
@@ -641,33 +708,37 @@ function parseUserMessages(text: string) {
 // The continuation record: where the work stood, then the user's latest request that left context, quoted after a
 // header giving its length, last, so no text inside can be read as the state.
 const CONTINUATION = '\n\n<continuation>\n'
+// The environment, read afresh at each compaction, sits between them and is never read back as the state.
 const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+const ENVIRONMENT = 'Environment at compaction, read from git by code, not by a model'
 const LATEST = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
 function renderContinuation(memory: Memory) {
   const state = memory.currentTask ? `${WHERE}${memory.stateAt ? ` (${memory.stateAt})` : ''}:\n${memory.currentTask}\n` : ''
+  const environment = memory.environment ? `${ENVIRONMENT}:\n${memory.environment}\n` : ''
   const latest = memory.nextStep && truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)
-  return state || latest ? `${CONTINUATION}${state}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
+  return state || environment || latest ? `${CONTINUATION}${state}${environment}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
 }
 // The state of the work a record gives, read from `from` on, past the user's text.
 function parseContinuation(text: string, from: number) {
   const start = text.indexOf(CONTINUATION, from)
   if (start < 0) return undefined
   const body = text.slice(start + CONTINUATION.length)
-  const end = [body.indexOf(`\n${LATEST} (`), body.indexOf('\n</continuation>')].filter((i) => i >= 0)
+  const end = [`\n${ENVIRONMENT}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
   const lines = body.slice(0, end.length ? Math.min(...end) : 0).split('\n')
   return (lines[0]?.startsWith(WHERE) ? lines.slice(1) : lines).join('\n').trim() || undefined
 }
 
 // The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
-// oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS, and the
-// newest over what remains is cut; the newest is always kept.
+// oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS,
+// keeping its head and its tail, and the newest over what remains is cut; the newest is always kept.
 function capUserMessages(messages: readonly UserMessage[]) {
   const [first, ...rest] = messages
   if (!first) return []
-  // A brief an earlier compaction cut keeps the note that counts what it lost.
+  // A brief an earlier compaction cut is kept as it was, with the marker that counts what it lost: cut again, its
+  // count would be lost. A head-only cut is an older plugin version's.
   const briefMax = USER_MESSAGES_MAX_TOKENS - NEWEST_RESERVE_TOKENS
-  const wasCut = TRUNCATED.test(first.text) && first.text.replace(TRUNCATED, '').length <= briefMax * 4
-  const brief = { ...first, text: wasCut ? first.text : truncate(first.text, briefMax) }
+  const wasCut = [BRIEF_CUT, TRUNCATED].some((cut) => cut.test(first.text) && first.text.replace(cut, '').length <= briefMax * 4)
+  const brief = { ...first, text: wasCut ? first.text : excerpt(first.text, briefMax, 'message') }
   let left = USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text)
   const kept: UserMessage[] = []
   for (const m of [...rest].reverse()) {
@@ -791,7 +862,7 @@ function commit(ledger: Ledger, v: View): Ledger {
     entries = [...entries, ...c.lines.map((line) => ({ id: `o${seq++}`, line, ...(c.source ? { source: c.source } : {}) }))]
     corrections = applyConstraints(corrections, c.corrections)
     watermark = range(v, watermark.from, c.to)
-    currentTask = c.currentTask ?? currentTask
+    currentTask = carry(currentTask, c.currentTask)
   }
   return { ...ledger, watermark, entries, corrections, seq, currentTask, chunks: waiting.filter((c) => c.from >= watermark.to) }
 }
@@ -1223,13 +1294,14 @@ export const register: Register = (on) => {
     const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
-    const [sessionId, started, usage, recall, always] = await Promise.all([
+    const [sessionId, started, usage, recall, always, environment] = await Promise.all([
       $.session.id(),
       $.clock.now(),
       $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
       // Not the model's with --disallowed-tools, or when its registration failed; assumed so when the host cannot tell.
       $.tool.list().then((tools) => tools.some((t) => t.name === RECALL_TOOL_NAME), () => true),
       briefAlways($),
+      environmentOf($),
     ])
     const loop = loopOf(sessionId, e.agentId)
     const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
@@ -1355,6 +1427,7 @@ export const register: Register = (on) => {
           // would send the agent back to the top of its brief.
           // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
           nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
+          ...(environment ? { environment } : {}),
           ...(brief ? { brief } : {}),
           ...(floor ? { floor } : {}),
           transcript,
@@ -1463,6 +1536,13 @@ export const register: Register = (on) => {
     const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message.startsWith(OVER_CAP) ? 'Constraints over their cap' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
     show($, `${why}. Using built-in compaction`, e.agentId)
     return delegateToBuiltin($, e, next, true)
+  })
+
+  // The standing compaction briefing, after core's context management text: the same for the whole session, so the
+  // section stays cached.
+  on('prompt.section', { name: 'context_management' }, async ($, e, next) => {
+    const { text } = await next(e)
+    return { text: text ? `${text}\n\n${COMPACTION_BRIEFING}` : `# Context management\n${COMPACTION_BRIEFING}` }
   })
 
   on('session.start', async ($, e, next) => {
