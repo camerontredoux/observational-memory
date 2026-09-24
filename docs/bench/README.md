@@ -102,3 +102,23 @@ What it shows:
   visible and the recall note at the end of the memory, and it carries to the built-in summary, which has the same
   tool and note.
 - 3 and 6 runs are small samples. They show the change, not a rate.
+
+## 2026-09-24, v1.2.0
+
+- 21 live runs of om+recall (Sonnet 5) on v1.2.0 (`ca43bce`). Token-equivalent cost: $12.90.
+  - `v120`: 3 runs each of the four scenarios that fell back in v1.0.0 (`omitted-identifier`,
+    `failure-in-long-output`, `repeated-compaction`, `pending-approval`), and 3 of `recall-required`.
+  - `v120-brief`: the same build with `OM_BRIEF=always`, 3 runs each of `omitted-identifier` and
+    `repeated-compaction`.
+- Scored with the checks at `fa17073`, which makes `omitted-identifier`'s setup need the deploy to run: one run only
+  `cat`'d `deploy.sh`, found the id in its source, and without the fix counted as valid. It is invalid.
+
+What it shows:
+
+- No compaction fell back to the built-in summary: 0 of 33. In v1.0.0, 7 of 42 new om runs fell back, all 3 om+recall
+  `omitted-identifier` runs among them. The floor stood in for 4 compactions, in 4 runs, and each of those runs
+  succeeded.
+- Task success on every valid run: v120 14 of 14 (`recall-required` 3 of 3, so the whole-term ranking did not break
+  the v1.1.0 result); v120-brief 6 of 6.
+- The always-on brief showed no gain here, because the default already succeeded every time. These scenarios cannot
+  tell whether it helps; the real-transcript replay (#13) is the place to measure it.
