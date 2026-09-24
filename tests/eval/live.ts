@@ -109,7 +109,7 @@ export function planRun(input: PlanInput): Plan {
   const files: Record<string, string> = Object.fromEntries(Object.entries(s.files).map(([p, text]) => [`${projectDir}/${p}`, text]))
   files[settingsPath] = JSON.stringify(settings, null, 2) + '\n'
 
-  const agent = `bench-${runId.replace(/\./g, '-')}`
+  const agent = `bench-${input.sessionId.slice(0, 8)}` // herdr names are at most 32 characters; a run id can be longer
   const { pane, timeoutMs } = input
   const prompt = (text: string, purpose: string, stallOk = false): PlanStep => ({
     kind: 'herdr',

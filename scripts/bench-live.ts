@@ -218,10 +218,28 @@ async function run(o: Record<string, string | true>) {
       await Bun.sleep(st.ms)
       continue
     }
+    const starting = st.argv[0] === 'agent' && st.argv[1] === 'start'
+    if (starting) await Bun.sleep(1_000) // the `cd` before it leaves the pane briefly busy: `agent start` wants an idle shell
     const r = spawnSync('herdr', st.argv, { encoding: 'utf8' })
     const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
     appendFileSync(log, `${new Date().toISOString()} ${head}\n$ herdr ${shellLine(st.argv)}\nexit ${r.status}\n${out}\n\n`)
     if (r.status === 0) continue
+    // Each run's sandbox is a new folder, so Claude Code asks whether to trust it: accept, then wait for the prompt.
+    if (starting && /agent_not_ready/.test(out) && /trust this folder/.test(herdr(['pane', 'read', pane!]))) {
+      herdr(['pane', 'send-keys', pane!, 'down', 'enter'])
+      const w = spawnSync('herdr', ['agent', 'wait', st.argv[2]!, '--until', 'idle', '--timeout', '60000'], { encoding: 'utf8' })
+      appendFileSync(log, `accepted the folder trust prompt; agent wait exit ${w.status}\n\n`)
+      await Bun.sleep(3_000) // the prompt box redraws after the trust dialog closes, and drops keys sent while it does
+      if (w.status === 0) continue
+    }
+    // A prompt typed while the prompt box redraws is lost: herdr then sees no work start. Send it again once.
+    if (st.prompt && !st.stallOk && /agent_prompt_stalled/.test(out) && !herdr(['pane', 'read', pane!]).includes(st.prompt.slice(0, 40))) {
+      await Bun.sleep(2_000)
+      const again = spawnSync('herdr', st.argv, { encoding: 'utf8' })
+      const out2 = `${again.stdout ?? ''}${again.stderr ?? ''}`.trim()
+      appendFileSync(log, `the prompt did not reach the session; sent it again: exit ${again.status}\n${out2}\n\n`)
+      if (again.status === 0) continue
+    }
     if (st.stallOk && /agent_prompt_stalled/.test(out)) {
       console.log('  herdr saw no working state (a fast compaction); carrying on')
       continue
@@ -235,6 +253,11 @@ async function run(o: Record<string, string | true>) {
   writeFileSync(`${plan.runDir}/record.json`, JSON.stringify(record, null, 2) + '\n')
   console.log(summary(record, results))
   if (error) process.exit(1)
+}
+
+function herdr(argv: string[]) {
+  const r = spawnSync('herdr', argv, { encoding: 'utf8' })
+  return `${r.stdout ?? ''}${r.stderr ?? ''}`
 }
 
 function rescore(o: Record<string, string | true>) {
