@@ -37,8 +37,15 @@ const MAX_PARALLEL = 4 // background Observer calls in flight at once, across th
 const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
 const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
 const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
+// The observations alone, as the memory renders them. The memory message also holds the corrections, skills, user
+// messages and continuation record, which a reflection does not condense, so it passes this size sooner.
 const REFLECT_AT_TOKENS = 40_000
 const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so the next chunk does not reflect again
+// The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
+// whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
+const REFLECT_KEEP_TOKENS = 12_000
+const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
+const REFLECT_ATTEMPTS = 4
 const SKILLS_MAX_TOKENS = 15_000
 const SKILLS_WHOLE_TURNS = 3 // a skill invoked in the last this many main-thread turns, the running one counted, keeps its text
 const TOOL_ARGS_MAX_TOKENS = 2_000
@@ -352,17 +359,29 @@ function sourceOf(v: View, from: number, to: number): Source | undefined {
 // A line's source, rendered after it: both ends as om_recall's `from` and `to` take them.
 const SOURCE_TRAILER = /\s*\(source:? ([^()]*)\)$/
 const renderSource = (s: Source) => `(source ${stamp(s.from)} to ${stamp(s.to)})`
-// The source of a line reflected from lines whose sources span `span`: the one it gives, cut to that span; with
-// none, or one outside it, the whole span. When some of those lines had no source, what they came from is unknown:
-// a line keeps only a source inside the span, and is given none.
+// The source of a line reflected from lines whose sources span `span`: the one it gives, cut to that span. A line
+// that gives none, or one outside the span, gets none: the whole span would say nothing about where it came from.
+// When some of those lines had no source, what they came from is unknown: a line keeps only a source inside the span.
 function reflectedSource(given: Source | undefined, span: Source | undefined, allKnown: boolean): Source | undefined {
-  if (!span) return undefined
-  if (given && allKnown) {
-    const cut = { from: Math.max(given.from, span.from), to: Math.min(given.to, span.to) }
-    if (minute(cut.from) <= minute(cut.to)) return cut
+  if (!span || !given) return undefined
+  if (!allKnown) return minute(given.from) >= minute(span.from) && minute(given.to) <= minute(span.to) ? given : undefined
+  const cut = { from: Math.max(given.from, span.from), to: Math.min(given.to, span.to) }
+  return minute(cut.from) <= minute(cut.to) ? cut : undefined
+}
+
+// `red` placed among `lines` in time order, each before the first line later than it; one without a time goes where
+// the one before it did.
+function interleave(lines: Omit<Entry, 'id'>[], red: Entry[]) {
+  const timeOf = (e: { line: string }) => e.line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1]
+  const out: Omit<Entry, 'id'>[] = []
+  let i = 0
+  let t = ''
+  for (const r of red) {
+    t = timeOf(r) ?? t
+    while (i < lines.length && (timeOf(lines[i]!) ?? '') <= t) out.push(lines[i++]!)
+    out.push(r)
   }
-  if (given && minute(given.from) >= minute(span.from) && minute(given.to) <= minute(span.to)) return given
-  return allKnown ? span : undefined
+  return [...out, ...lines.slice(i)]
 }
 
 // A line and the source range it ends with. A trailer that is not a range of times is part of the line; a range
@@ -995,10 +1014,13 @@ async function runJob($: EngineInterface, job: Job, v: View) {
   await Promise.all([landed && maybeReflect($, loop, stamp), ...next.map((l) => schedule($, l.loop, l.stamp))]).catch((error) => log($, errorText(error)))
 }
 
-// The Reflector over a snapshot of the entries, in the background: each attempt re-sends the snapshot with
-// stronger guidance and the size of the attempt before, until the result comes under REFLECT_TARGET_TOKENS; with none under it, nothing changes. The
-// snapshot's entries are then replaced in place, so entries committed while it ran survive. The corrections are
-// never sent: they pass through as quoted. Once the loop ends, no further attempt starts and the result is discarded.
+// The Reflector over a snapshot of the entries, in the background. The newest, up to REFLECT_KEEP_TOKENS, and every
+// 🔴 line (exact repeats once) pass through unchanged; the Reflector condenses the rest into what is left of
+// REFLECT_TARGET_TOKENS, and a 🔴 line it writes is kept as 🟡. A result over that target is tried again with stronger
+// compression, one under REFLECT_FLOOR of it with a request for more detail, up to REFLECT_ATTEMPTS; with none in
+// range, nothing changes. The replaced entries are then replaced in place, so entries committed while it ran survive.
+// The corrections are never sent: they pass through as quoted. Once the loop ends, no further attempt starts and the
+// result is discarded.
 async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
   const { sessionId, key } = loop
   if (reflecting.has(key)) return
@@ -1010,51 +1032,66 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
   $.clock.after(0, () => {
     const run = async () => {
       const started = await $.clock.now()
-      const times = snapshot.flatMap((e) => {
+      let recent = snapshot.length
+      for (let chars = -1; recent > 0; recent--) {
+        chars += renderLines([snapshot[recent - 1]!]).length + 1
+        if (Math.ceil(chars / 4) > REFLECT_KEEP_TOKENS) break
+      }
+      const older = snapshot.slice(0, recent)
+      const kept = snapshot.slice(recent)
+      const isRed = (e: Entry) => e.line.startsWith('🔴')
+      const red = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
+      const sent = older.filter((e) => !isRed(e))
+      const target = REFLECT_TARGET_TOKENS - estimateTokens(renderLines([...red, ...kept]))
+      const floor = Math.ceil(REFLECT_FLOOR * target)
+      if (target < 1_000) throw new Error(`the 🔴 lines and the newest observations leave ~${target} tokens of the ~${REFLECT_TARGET_TOKENS}-token target`)
+      const input = renderLines(sent)
+      const times = sent.flatMap((e) => {
         const m = e.line.match(/^\S+ (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) /)
         return m ? [new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])).getTime()] : []
       })
       const bounds = times.length ? { lo: Math.min(...times), hi: Math.max(...times), latest: Math.max(...times) } : undefined
-      const sources = snapshot.flatMap((e) => (e.source ? [e.source] : []))
+      const sources = sent.flatMap((e) => (e.source ? [e.source] : []))
       const span = sources.length ? { from: Math.min(...sources.map((s) => s.from)), to: Math.max(...sources.map((s) => s.to)) } : undefined
       let lines: Omit<Entry, 'id'>[] = []
-      let level = 0
-      let previous: number | undefined // the size of the last attempt, when it had observations
-      while (!lines.length && level < 4) {
+      let level = 1
+      let retry: { tokens?: number } | undefined
+      for (let attempt = 1; !lines.length && attempt <= REFLECT_ATTEMPTS; attempt++) {
         if (!isLive(loop, stamp)) throw new LoopEnded()
-        level++
-        const prompt = reflectionPrompt(text, level, REFLECT_TARGET_TOKENS, estimateTokens(text), previous)
+        if (retry) level = retry.tokens !== undefined && retry.tokens < floor ? Math.max(1, level - 1) : Math.min(4, level + 1)
+        const prompt = reflectionPrompt(input, level, target, floor, estimateTokens(input), retry)
         const reply = await complete($, `reflector level ${level}`, REFLECTOR_SYSTEM_PROMPT, prompt, REFLECTOR_TIMEOUT_MS, { phase: 'background' })
         const parsed = parseLines(observationsOf(reply), bounds).map((l) => {
           const { line, source } = splitSource(l)
-          const kept = reflectedSource(source, span, sources.length === snapshot.length)
-          return { line, ...(kept ? { source: kept } : {}) }
+          const kept = reflectedSource(source, span, sources.length === sent.length)
+          return { line: isRed({ id: '', line }) ? `🟡${line.slice('🔴'.length)}` : line, ...(kept ? { source: kept } : {}) }
         })
-        previous = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
-        if (previous !== undefined && previous < REFLECT_TARGET_TOKENS) lines = parsed
+        const tokens = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
+        if (tokens !== undefined && tokens <= target && tokens >= floor) lines = parsed
+        retry = { tokens }
       }
-      if (!lines.length) throw new Error(`no reflection came under ~${REFLECT_TARGET_TOKENS} tokens at any compression level`)
+      if (!lines.length) throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
       await locked(async () => {
         const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
         if (!isLive(loop, stamp)) throw new LoopEnded()
-        const ids = new Set(snapshot.map((e) => e.id))
+        const ids = new Set(older.map((e) => e.id))
         const at = ledger?.entries.findIndex((e) => ids.has(e.id)) ?? -1
         if (!ledger || at < 0 || ledger.entries.filter((e) => ids.has(e.id)).length !== ids.size) {
           log($, 'the ledger changed under the reflection; discarded')
           return
         }
         let seq = ledger.seq
-        const reflected = lines.map((e) => ({ id: `o${seq++}`, ...e }))
+        const reflected = interleave(lines, red).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
         const rest = ledger.entries.filter((e) => !ids.has(e.id))
         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
+        const after = estimateTokens(renderLines([...reflected, ...kept]))
         await $.store.set(ledgerKey(key), { ...ledger, entries, seq })
-        record(statsIo($), sessionId, (s, at) =>
-          addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: estimateTokens(renderLines(reflected)), level }, at))
+        record(statsIo($), sessionId, (s, at) => addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: after, level }, at))
         log(
           $,
-          `reflected ${snapshot.length} observations (~${estimateTokens(text)} tokens) into ${reflected.length} ` +
-            `(~${estimateTokens(renderLines(reflected))} tokens) at compression level ${level}; ` +
-            `${entries.length - reflected.length} newer kept`,
+          `reflected ${snapshot.length} observations (~${estimateTokens(text)} tokens) into ${reflected.length + kept.length} ` +
+            `(~${after} tokens) at compression level ${level}; ${sent.length} condensed into ${lines.length}, ` +
+            `${red.length} 🔴 and ${kept.length} recent kept as they were, ${entries.length - reflected.length - kept.length} newer kept`,
         )
         show($, `Condensed memory in ${duration((await $.clock.now()) - started)} · ${grouped(ledger.entries.length)} → ${plural(entries.length, 'note')}`, loop.agentId)
       })
