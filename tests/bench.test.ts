@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { MEMORY_MARK, PRICES_USD_PER_MTOK, RECALL_TOOL, makeRecord, parseTranscript, renderReport, runCost, scoreRun } from './eval/bench'
+import { FLOOR_MARK, MEMORY_MARK, PRICES_USD_PER_MTOK, RECALL_TOOL, makeRecord, parseStats, parseTranscript, renderReport, runCost, scoreRun } from './eval/bench'
+import { FLOOR_NOTE } from '../hooks/prompts'
 import type { RunRecord } from './eval/bench'
 import { runIdOf } from './eval/live'
 import type { Configuration } from './eval/runner'
@@ -155,6 +156,9 @@ const SETUP: Record<string, (h: ReturnType<typeof history>) => void> = {
 // A scenario run as a transcript: its prompts (the first followed by its setup) and compactions in order, then the
 // continuation and `answer` to it.
 const OM_SUMMARY = (body: string) => `This session is being continued from a previous conversation that ran out of context.\n\n${MEMORY_MARK}: what happened...\n\n<observations>\n${body}\n</observations>\n\n<all-user-messages>\n* User: Run bash deploy.sh\n</all-user-messages>`
+// A memory message the floor made: the Observer had not observed what left context; a brief compiled by code stands in.
+const FLOOR_SUMMARY = (brief: string) =>
+  `This session is being continued from a previous conversation that ran out of context.\n\n${MEMORY_MARK}: what happened...\n\n<observations>\n\n</observations>\n\n<session-brief>\n${FLOOR_NOTE}\n${brief}\n</session-brief>\n\n<all-user-messages>\n* User: Run bash deploy.sh\n</all-user-messages>`
 const BUILTIN_SUMMARY = (body: string) => `This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n${body}`
 // A growth step is two turns that each run the log script; Claude Code compacts on its own inside the second.
 function run(s: Scenario, summary: (i: number) => string, answer: (h: ReturnType<typeof history>) => void, setup = SETUP[s.id]) {
@@ -385,8 +389,26 @@ describe('run validity', () => {
     expect(score.taskSuccess).toBe(false)
   })
 
+  test('an om run whose compaction used the floor is valid observational compaction, with its own path; the brief carries facts', () => {
+    expect(FLOOR_NOTE).toContain(FLOOR_MARK) // copied, not imported: it must stay the note's words
+    const score = scoreRun(s, 'om', run(s, () => FLOOR_SUMMARY('- 12:00 Bash "bash deploy.sh" → id=dep-7f3a91c4e2b8'), answered))
+    expect(score.invalid).toEqual([])
+    expect(score.compactions.map((c) => c.path)).toEqual(['floor'])
+    expect(score.compactions[0]!.carriers['dep-7f3a91c4e2b8']).toEqual(['session-brief'])
+    // The floor's stats are no fallback; a built-in run given the floor's message had the plugin loaded.
+    expect(scoreRun(s, 'om', run(s, () => FLOOR_SUMMARY('x'), answered), { memoryUsd: 0, memoryCalls: 0, reflections: 0, fellBack: 0, floor: 1, failures: 0 }).valid).toBe(true)
+    expect(scoreRun(s, 'builtin', run(s, () => FLOOR_SUMMARY('x'), answered)).invalid.join()).toMatch(/plugin/)
+    // A memory with a brief that is no floor's (OM_BRIEF=always) is the observational path.
+    expect(scoreRun(s, 'om', run(s, () => OM_SUMMARY('x').replace('<all-user-messages>', '<session-brief>\n> Compiled by code\n</session-brief>\n\n<all-user-messages>'), answered)).compactions[0]!.path).toBe('observational')
+  })
+
+  test('the stats file counts floor compactions apart from fallbacks', () => {
+    const stats = parseStats(JSON.stringify({ counts: { 'compaction.auto.floor': 2, 'compaction.subagent.floor': 1, 'compaction.manual.fellBack': 1 }, metrics: {} }))
+    expect(stats).toMatchObject({ floor: 3, fellBack: 1 })
+  })
+
   test("the stats file's fallback count invalidates an om run too", () => {
-    const score = scoreRun(s, 'om', run(s, () => OM_SUMMARY('x'), answered), { memoryUsd: 0, memoryCalls: 0, reflections: 0, fellBack: 1, failures: 0 })
+    const score = scoreRun(s, 'om', run(s, () => OM_SUMMARY('x'), answered), { memoryUsd: 0, memoryCalls: 0, reflections: 0, fellBack: 1, floor: 0, failures: 0 })
     expect(score.invalid.join()).toMatch(/fell back/)
   })
 
@@ -468,6 +490,17 @@ describe('the report', () => {
     expect(report).toContain('dep-91d4be20c6aa')
     expect(report).toContain('/fixtures/builtin-0.jsonl')
     expect(report).toContain('fell-back (om, new, omitted-identifier): compaction 1 fell back to the built-in summary')
+  })
+
+  test('reports which path each observational compaction ran: the memory, the floor, or a fallback that made its run invalid', () => {
+    const floor = makeRecord({ ...record('om', 1, true), runId: 'floor' }, run(s, () => FLOOR_SUMMARY('deploy accepted'), (h) => h.reply('dep-7f3a91c4e2b8')))
+    const fellBack = makeRecord({ ...record('om', 2, true), runId: 'fell-back' }, run(s, () => BUILTIN_SUMMARY('x'), (h) => h.reply('dep-7f3a91c4e2b8')))
+    const report = renderReport([record('om', 0, true), floor, fellBack, record('builtin', 0, true)])
+    const paths = report.slice(report.indexOf('### Compaction paths'))
+    expect(paths).toContain('| version | configuration | compactions | observational memory | floor (brief compiled by code) | built-in (fell back: run invalid) |')
+    expect(paths).toContain('| new | om | 3 | 1 | 1 | 1 |')
+    expect(paths).not.toContain('| new | builtin |')
+    expect(report.split('\n').find((l) => l.startsWith('| new | om | 3 |'))).toContain('| 3 | 2 | 100% |') // the floor's run is valid
   })
 
   test('a run that did not complete counts as a failure to run, never as a success', () => {

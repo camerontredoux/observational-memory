@@ -187,7 +187,7 @@ export const MEMORY_RECALL =
   'Every message and tool output of this session stays whole in its transcript, even where an observation gives only a summary of it. When you need an exact detail the observations lack (text, output, a value) to keep working, or before telling the user a detail is gone or was never shown, search for it with om_recall.'
 
 // The session brief's first line when the latest compaction used the floor: the brief, compiled by code, stands in
-// for messages the Observer had not observed.
+// for messages the Observer had not observed (tests/eval/bench.ts FLOOR_MARK tells the floor's path by it).
 export const FLOOR_NOTE =
   '> At the latest compaction the Observer had not observed all the messages leaving context; for those it had not, this brief is the memory.'
 
