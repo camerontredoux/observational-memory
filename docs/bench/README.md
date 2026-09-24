@@ -202,3 +202,9 @@ about to do at boundary N, and what it had last told the user.
   66% → 56%, chain 54% → 49%. The chain's loss came mostly before the reflection. om-v04's fact answers fell
   (om 25 → 23 of 27, om+recall 26 → 19). Each version has one run, so these moves may be Observer variance.
 - Question sessions cost $20.93; the pi replays cost $0.76.
+- Live runs (`2026-09-24-v1.3.0.{jsonl,md}`, om+recall only, Sonnet 5): 6 of 6 valid runs succeeded
+  (`recall-required` 3/3, `repeated-compaction`, `reversed-constraint`, `pending-approval`), with no fallback to the
+  built-in summary over 8 compactions (one on the floor). Three `recall-required` runs, two on v1.3.0 and a v1.2.0
+  control, were incomplete: Sonnet redirected `logs.sh` to a file and read its last line, so the context never
+  reached the auto-compact threshold. `logs.sh` now refuses a redirect or pipe (`92e3cba`); the run after the fix
+  succeeded. Live runs cost $12.02.
