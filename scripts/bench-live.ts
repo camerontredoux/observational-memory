@@ -87,6 +87,14 @@ function mainCheckout() {
   return dirname(r.stdout.trim())
 }
 
+// The checkout's commit, marked `-dirty` when it has uncommitted changes: what a version label stood for in this run.
+function commitOf(root: string): string {
+  const head = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+  if (head.status !== 0) return 'unknown (not a git checkout)'
+  const dirty = spawnSync('git', ['-C', root, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' }).stdout.trim()
+  return `${head.stdout.trim()}${dirty ? '-dirty' : ''}`
+}
+
 function readRecords(path: string): RunRecord[] {
   if (!existsSync(path)) return []
   return readFileSync(path, 'utf8')
@@ -196,8 +204,11 @@ async function run(o: Record<string, string | true>) {
     sessionId: plan.input.sessionId,
     transcripts: [],
     stats: `${plan.statsDir}/${plan.input.sessionId}.json`,
+    pluginRoot,
+    pluginCommit: commitOf(pluginRoot),
+    admission: { budgetUsd: budget!, spentUsd: admission.spentUsd, reserveUsd: admission.reserveUsd },
   }
-  writeFileSync(`${plan.runDir}/meta.json`, JSON.stringify({ ...meta, pluginRoot }, null, 2) + '\n')
+  writeFileSync(`${plan.runDir}/meta.json`, JSON.stringify(meta, null, 2) + '\n')
   const log = `${plan.runDir}/steps.log`
   let error: string | undefined
   for (const [i, st] of plan.steps.entries()) {
@@ -228,7 +239,7 @@ async function run(o: Record<string, string | true>) {
 
 function rescore(o: Record<string, string | true>) {
   const dir = str(o, 'run-dir') ?? fail('--run-dir: a run directory under /tmp/om-bench')
-  const { pluginRoot: _, ...meta } = JSON.parse(readFileSync(`${dir}/meta.json`, 'utf8')) as RunMeta & { pluginRoot?: string }
+  const meta = JSON.parse(readFileSync(`${dir}/meta.json`, 'utf8')) as RunMeta
   const record = score(meta)
   const results = str(o, 'results') ?? `${BENCH_ROOT}/results.jsonl`
   if (o.append === true) appendFileSync(results, JSON.stringify(record) + '\n')

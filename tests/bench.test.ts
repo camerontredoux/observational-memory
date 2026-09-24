@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { MEMORY_MARK, PRICES_USD_PER_MTOK, RECALL_TOOL, makeRecord, parseTranscript, renderReport, runCost, scoreRun } from './eval/bench'
 import type { RunRecord } from './eval/bench'
+import { runIdOf } from './eval/live'
 import type { Configuration } from './eval/runner'
+import { usesObservationalCompaction } from './eval/runner'
 import { scenarioById } from './eval/scenarios'
 import type { Scenario } from './eval/scenarios'
 
@@ -97,10 +99,13 @@ describe('token-equivalent cost', () => {
     expect(cost.mainLoop).toEqual({ status: 'estimated', value: p.input + p.output + p.cacheRead + p.cacheWrite1h })
   })
 
-  test('is unavailable when a message names a model the table does not price, and skips synthetic messages', () => {
-    const h = history().prompt('go').reply('a', {}, '<synthetic>').reply('b', {}, 'some-unknown-model')
-    const cost = runCost('builtin', parseTranscript(h.text()))
-    expect(cost.mainLoop.status).toBe('unavailable')
+  test("skips the host's synthetic messages, and is unavailable when a message names a model the table does not price", () => {
+    const synthetic = history().prompt('go').reply('a', { input: 1_000_000 }, '<synthetic>').reply('b', { input: 0, output: 0, read: 0, write: 0 })
+    const cost = runCost('builtin', parseTranscript(synthetic.text()))
+    expect(cost.tokens.input).toBe(0)
+    expect(cost.mainLoop).toEqual({ status: 'estimated', value: 0 })
+    const unknown = history().prompt('go').reply('b', {}, 'some-unknown-model')
+    expect(runCost('builtin', parseTranscript(unknown.text())).mainLoop.status).toBe('unavailable')
   })
 
   test("takes the Observer and Reflector's cost from the plugin's stats file, or reports it unavailable", () => {
@@ -130,13 +135,26 @@ describe('token-equivalent cost', () => {
   })
 })
 
-// A scenario run as a transcript: its prompts and compactions in order, then the continuation and `answer` to it.
+// The tool calls each scenario's setup needs, made after its first prompt, as a live history would make them.
+const SETUP: Record<string, (h: ReturnType<typeof history>) => void> = {
+  'completed-work': (h) => h.tool('Write', { file_path: '/p/db/migrations/0003_orders_customer_index.sql', content: 'CREATE INDEX idx_orders_customer_id ON orders (customer_id);' }, 'ok'),
+  'failure-in-long-output': (h) => h.tool('Bash', { command: 'bash run-tests.sh' }, 'PASSED ...\nFAILED tests/test_headers.py::test_request_id_header - AssertionError: expected header X-Request-Id, got X-Req-Id', { isError: true }),
+  'omitted-identifier': (h) => h.tool('Bash', { command: 'bash deploy.sh' }, 'deployment accepted: id=dep-7f3a91c4e2b8 region=eu-west-2'),
+  'pending-approval': (h) => h.tool('Write', { file_path: '/p/scripts/purge-cache.sh', content: 'rm -rf tmp/cache/*' }, 'ok'),
+}
+// A scenario run as a transcript: its prompts (the first followed by its setup) and compactions in order, then the
+// continuation and `answer` to it.
 const OM_SUMMARY = (body: string) => `This session is being continued from a previous conversation that ran out of context.\n\n${MEMORY_MARK}: what happened...\n\n<observations>\n${body}\n</observations>\n\n<all-user-messages>\n* User: Run bash deploy.sh\n</all-user-messages>`
 const BUILTIN_SUMMARY = (body: string) => `This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n${body}`
-function run(s: Scenario, summary: (i: number) => string, answer: (h: ReturnType<typeof history>) => void) {
+function run(s: Scenario, summary: (i: number) => string, answer: (h: ReturnType<typeof history>) => void, setup = SETUP[s.id]) {
   const h = history()
   let point = 0
-  for (const step of s.steps) 'prompt' in step ? h.prompt(step.prompt).reply('ok') : h.compact(summary(point++), { durationMs: 1200 + point })
+  s.steps.forEach((step, i) => {
+    if (!('prompt' in step)) return h.compact(summary(point++), { durationMs: 1200 + point })
+    h.prompt(step.prompt)
+    if (i === 0) setup?.(h)
+    h.reply('ok')
+  })
   h.prompt(s.continuation)
   answer(h)
   return parseTranscript(h.text())
@@ -158,6 +176,16 @@ describe('scoring a continuation', () => {
     expect(score.retrieval.resultTokens.status).toBe('estimated')
   })
 
+  test('a recall that missed is a retrieval failure, not a task failure', () => {
+    const t = run(ids, () => OM_SUMMARY('* deploy.sh accepted the deployment'), (h) =>
+      h.tool(RECALL_TOOL, { query: 'deploy' }, 'no matches').reply('The deployment id was dep-7f3a91c4e2b8.'),
+    )
+    const score = scoreRun(ids, 'om+recall', t)
+    expect(score.checks.find((c) => c.id === 'recall-finds')!.outcome).toBe('fail')
+    expect(score.retrieval).toMatchObject({ calls: 1, hits: 0, checked: 1 })
+    expect(score.taskSuccess).toBe(true)
+  })
+
   test('a false identifier, a repeated deploy and an unused recall are failures with their evidence kept', () => {
     const t = run(ids, () => BUILTIN_SUMMARY('Ran deploy.sh; it was accepted.'), (h) =>
       h.tool('Bash', { command: 'bash deploy.sh' }, 'error: a deployment is already in progress').reply('It was dep-3c9e0a51b7d2.'),
@@ -174,13 +202,15 @@ describe('scoring a continuation', () => {
     expect(score.checks.find((c) => c.id === 'recall-finds')!.outcome).toBe('n/a')
   })
 
-  test('tool checks read the written file: a reversed constraint followed, or the superseded one applied', () => {
+  test('tool checks read what the call writes, not what an Edit replaces: a reversed constraint followed, or the superseded one applied', () => {
     const s = scenario('reversed-constraint')
-    const edit = (body: string) => (h: ReturnType<typeof history>) => h.tool('Edit', { file_path: '/tmp/x/src/textutil.py', old_string: '', new_string: body }, 'ok').reply('Done.')
-    const good = scoreRun(s, 'om', run(s, () => OM_SUMMARY('* 🔴 user: 4 spaces, never tabs'), edit('\ndef slugify(text):\n    return "-".join(text.lower().split())\n')))
+    // The replaced text is 4-space indented: were it read, the tabs edit would fail no-spaces.
+    const edit = (body: string) => (h: ReturnType<typeof history>) =>
+      h.tool('Edit', { file_path: '/tmp/x/src/textutil.py', old_string: 'SHOUT_SUFFIX = "!"\n    # old', new_string: `SHOUT_SUFFIX = "!"\n${body}` }, 'ok').reply('Done.')
+    const good = scoreRun(s, 'om', run(s, () => OM_SUMMARY('* 🔴 user: tabs, never spaces'), edit('\ndef slugify(text):\n\treturn "-".join(text.lower().split())\n')))
     expect(good.taskSuccess).toBe(true)
-    const bad = scoreRun(s, 'om', run(s, () => OM_SUMMARY('* 🔴 user: tabs'), edit('\ndef slugify(text):\n\treturn "-".join(text.lower().split())\n')))
-    expect(bad.checks.filter((c) => c.outcome === 'fail').map((c) => c.id)).toEqual(['spaces', 'no-tabs'])
+    const bad = scoreRun(s, 'om', run(s, () => OM_SUMMARY('* 🔴 user: 4 spaces'), edit('\ndef slugify(text):\n    return "-".join(text.lower().split())\n')))
+    expect(bad.checks.filter((c) => c.outcome === 'fail').map((c) => c.id)).toEqual(['tabs', 'no-spaces'])
     expect(bad.violations).toBe(1)
   })
 
@@ -253,6 +283,16 @@ describe('run validity', () => {
     expect(scoreRun(s, 'om', recalled).invalid.join()).toMatch(/om_recall/)
   })
 
+  test('a history that lacks the setup the continuation depends on is invalid, not scored as memory', () => {
+    const done = scenario('completed-work')
+    const score = scoreRun(done, 'builtin', run(done, () => BUILTIN_SUMMARY('x'), (h) => h.reply('ok'), () => {}))
+    expect(score.invalid.join()).toMatch(/lacks its setup: step 1 wrote the migration/)
+    // A command that ran but did not return what the continuation asks about is no setup either.
+    const failing = scenario('failure-in-long-output')
+    const denied = (h: ReturnType<typeof history>) => h.tool('Bash', { command: 'bash run-tests.sh 2>&1' }, 'Permission to use Bash has been denied.', { isError: true })
+    expect(scoreRun(failing, 'builtin', run(failing, () => BUILTIN_SUMMARY('x'), (h) => h.reply('ok'), denied)).invalid.join()).toMatch(/lacks its setup/)
+  })
+
   test('a transcript without the continuation prompt is invalid', () => {
     const h = history().prompt('something else').reply('ok')
     expect(scoreRun(s, 'builtin', parseTranscript(h.text())).invalid.join()).toMatch(/continuation prompt/)
@@ -263,12 +303,12 @@ describe('the report', () => {
   const s = scenarioById('omitted-identifier')!
   // One offline run: the continuation recalls the id (or not) after an om or a built-in compaction.
   function record(config: Configuration, i: number, correct: boolean, mode: 'live' | 'offline' = 'offline', version = 'new'): RunRecord {
-    const summary = config.startsWith('om') ? () => OM_SUMMARY('* deploy accepted') : () => BUILTIN_SUMMARY('deploy accepted')
-    const t = run(s, summary, (h) => h.reply(correct ? 'dep-7f3a91c4e2b8' : 'dep-91d4be20c6aa'))
+    const om = usesObservationalCompaction(config)
+    const t = run(s, om ? () => OM_SUMMARY('* deploy accepted') : () => BUILTIN_SUMMARY('deploy accepted'), (h) => h.reply(correct ? 'dep-7f3a91c4e2b8' : 'dep-91d4be20c6aa'))
     return makeRecord(
-      { runId: `${s.id}.${config.replace('+', '-')}.${version}.r${i}`, mode, configuration: config, version, scenario: s.id, run: i, startedAt: '2026-09-24T12:00:00Z', model: 'sonnet', transcripts: [`/fixtures/${config}-${i}.jsonl`] },
+      { runId: runIdOf(config, version, s.id, i), mode, configuration: config, version, scenario: s.id, run: i, startedAt: '2026-09-24T12:00:00Z', model: 'sonnet', transcripts: [`/fixtures/${config}-${i}.jsonl`], pluginCommit: 'abc1234' },
       t,
-      config.startsWith('om') ? JSON.stringify({ counts: {}, metrics: { 'observer.background.cost': { count: 1, sum: 0.01 } } }) : undefined,
+      om ? JSON.stringify({ counts: {}, metrics: { 'observer.background.cost': { count: 1, sum: 0.01 }, 'reflection.ms': { count: i, sum: 900 * i } } }) : undefined,
     )
   }
 
@@ -278,11 +318,11 @@ describe('the report', () => {
     const row = (config: string) => report.split('\n').find((l) => l.startsWith(`| new | ${config} |`))!
     expect(row('builtin+recall')).toContain('| 3 | 3 | 100% |')
     expect(row('om+recall')).toContain('| 3 | 3 | 33% |')
-    expect(report).toContain('Highest task success (offline, new): builtin+recall at 100% (3 valid runs); om+recall 33%')
+    expect(report).toContain('Highest task success (offline, new): builtin+recall 100% (3 of 3 runs valid); om+recall 33% (3 of 3 runs valid).')
   })
 
   test('labels offline results as offline and never claims a live comparison that did not run', () => {
-    const report = renderReport([record('builtin', 0, true)], { versions: ['old', 'new'], scenarios: ['omitted-identifier'] })
+    const report = renderReport([record('builtin', 0, true)], { versions: ['old', 'new'] })
     expect(report).toContain('Live runs: 0. Offline runs: 1.')
     expect(report).toContain('No live run is recorded: nothing here is evidence of live model quality.')
     expect(report).toMatch(/## Offline runs/)
@@ -323,7 +363,18 @@ describe('the report', () => {
     const report = renderReport([record('om', 0, true), { ...noStats, cost: { ...noStats.cost!, memoryModel: { status: 'unavailable', reason: 'no stats file' } } }])
     expect(report).toContain('| new | om | omitted-identifier | dep-7f3a91c4e2b8 | 0 of 2 |')
     expect(report).toMatch(/memory model \(USD, measured\)/)
-    expect(report).toContain('memory model cost unavailable in 1 run(s)')
+    expect(report).toContain('memory model cost and reflections unavailable in 1 run(s)')
     expect(report).toMatch(/cost \(USD, estimated\)/)
+    // Without a host cost record, a built-in run's cost leaves its compactor out, and the report says so.
+    expect(renderReport([record('builtin', 0, true)])).toContain("Built-in compaction runs without a host cost record: 1; their cost leaves the compactor's request out.")
+  })
+
+  test("shows the reflections the plugin's stats recorded, the models that answered and each version's commit", () => {
+    const report = renderReport([record('om', 0, true), record('om', 2, true)])
+    const header = report.split('\n').find((l) => l.startsWith('| version |'))!.split(' | ')
+    const row = report.split('\n').find((l) => l.startsWith('| new | om |'))!.split(' | ')
+    expect(row[header.indexOf('reflections (measured)')]).toBe('1.00 ± 1.41 [0.00–2.00]')
+    expect(report).toContain('Models that answered: claude-sonnet-4-5 (sessions started with sonnet).')
+    expect(report).toContain('Plugin version new: commit abc1234.')
   })
 })

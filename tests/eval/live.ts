@@ -43,12 +43,15 @@ export type PlanInput = {
   /** The pause before each `/compact`, so every configuration's background work (the Observer's) has time to finish. */
   settleMs: number
   /** How long `herdr agent start` waits for Claude Code to be ready. */
-  startTimeoutMs?: number
+  startTimeoutMs: number
 }
 
-export type Step =
+export type PlanStep =
   | { kind: 'herdr'; argv: string[]; purpose: string; prompt?: string; stallOk?: boolean }
   | { kind: 'settle'; ms: number; purpose: string }
+
+/** The session's `--settings` file. */
+export type Settings = { env: { CLAUDE_CODE_PLUGIN_DIRS: string; OM_STATS_DIR: string }; permissions: { allow: string[] } }
 
 export type Plan = {
   input: PlanInput
@@ -57,7 +60,7 @@ export type Plan = {
   projectDir: string
   settingsPath: string
   statsDir: string
-  settings: object
+  settings: Settings
   claudeArgs: string[]
   /** Directories and files copied before the run, in order. */
   copies: { from: string; to: string }[]
@@ -66,7 +69,7 @@ export type Plan = {
   agent: string
   /** The observational-memory plugin directory the session must load, or undefined for none. */
   expectedPlugin?: string
-  steps: Step[]
+  steps: PlanStep[]
 }
 
 const SAFE = /^[a-z0-9][a-z0-9-]*$/
@@ -87,7 +90,7 @@ export function planRun(input: PlanInput): Plan {
   const statsDir = `${runDir}/stats`
   const recallDir = `${runDir}/recall-plugin`
   const expectedPlugin = config === 'builtin' ? undefined : config === 'builtin+recall' ? recallDir : pluginRoot.replace(/\/$/, '')
-  const settings = {
+  const settings: Settings = {
     env: { CLAUDE_CODE_PLUGIN_DIRS: expectedPlugin ?? '', OM_STATS_DIR: statsDir },
     permissions: { allow: ['Read', 'Glob', 'Grep', 'Write', 'Edit', ...s.commands.map((c) => `Bash(${c})`), ...(recallAvailable(config) ? [RECALL_TOOL] : [])] },
   }
@@ -108,18 +111,18 @@ export function planRun(input: PlanInput): Plan {
 
   const agent = `bench-${runId.replace(/\./g, '-')}`
   const { pane, timeoutMs } = input
-  const prompt = (text: string, purpose: string, stallOk = false): Step => ({
+  const prompt = (text: string, purpose: string, stallOk = false): PlanStep => ({
     kind: 'herdr',
     argv: ['agent', 'prompt', agent, text, '--wait', '--timeout', String(timeoutMs)],
     purpose,
     prompt: text,
     ...(stallOk ? { stallOk } : {}),
   })
-  const steps: Step[] = [
+  const steps: PlanStep[] = [
     { kind: 'herdr', argv: ['pane', 'run', pane, `cd '${projectDir}'`], purpose: 'enter the sandbox project' },
     {
       kind: 'herdr',
-      argv: ['agent', 'start', agent, '--kind', 'claude', '--pane', pane, '--timeout', String(input.startTimeoutMs ?? 60_000), '--', ...claudeArgs],
+      argv: ['agent', 'start', agent, '--kind', 'claude', '--pane', pane, '--timeout', String(input.startTimeoutMs), '--', ...claudeArgs],
       purpose: 'start Claude Code with this configuration',
     },
   ]
@@ -157,7 +160,7 @@ export function describePlan(plan: Plan): string {
     'The session should have loaded:',
     `- ${loaded}`,
     `- om_recall: ${recall ? `offered and allowed, as ${RECALL_TOOL}` : input.config === 'om' ? `not offered (--disallowed-tools ${RECALL_TOOL})` : 'not offered (no plugin registers it)'}`,
-    `- model ${MODEL}; permission mode dontAsk; allowed: ${(plan.settings as { permissions: { allow: string[] } }).permissions.allow.join(', ')}`,
+    `- model ${MODEL}; permission mode dontAsk; allowed: ${plan.settings.permissions.allow.join(', ')}`,
     `- no other observational-memory plugin: not the user's inline one`,
     `Checked before starting (zero tokens), from ${plan.projectDir}: claude --settings ${plan.settingsPath} plugin list --json`,
     'In the pane, /plugin (or /mcp for the om_recall server) shows the same.',
@@ -172,7 +175,7 @@ export function describePlan(plan: Plan): string {
     'Prompts, in order:',
     ...plan.steps.flatMap((st) => (st.kind === 'herdr' && st.prompt ? [`- ${st.prompt}`] : [])),
     '',
-    `If Claude Code asks whether to trust ${plan.projectDir}, answer it in the pane within ${(input.startTimeoutMs ?? 60_000) / 1000} s.`,
+    `If Claude Code asks whether to trust ${plan.projectDir}, answer it in the pane within ${input.startTimeoutMs / 1000} s.`,
   ]
   return out.join('\n') + '\n'
 }

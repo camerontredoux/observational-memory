@@ -7,7 +7,8 @@
 //
 // Scoring is deterministic: regular expressions over the assistant's replies and tool calls after the continuation
 // prompt, and over what `om_recall` returned. No check is model-graded; a report says so. A run is scored only when it
-// is valid: the continuation got a response, every scenario compaction happened, the compaction ran the path its
+// is valid: its history holds the scenario's setup (the tool calls the continuation depends on), the continuation got
+// a response, every scenario compaction happened, the compaction ran the path its
 // configuration names (an `om` run whose compaction fell back to the built-in summary measures the built-in one, so
 // it is reported as invalid, not scored as observational memory), and a configuration without recall did not call
 // it. Invalid runs are counted and listed with their reasons, never dropped.
@@ -15,12 +16,13 @@
 // Cost: subscription sessions report no dollars, so cost is token-equivalent: each assistant message's usage (counted
 // once, however many rows streaming wrote for it) times `PRICES_USD_PER_MTOK`. The built-in compactor's own request
 // is not written as a transcript message; when the host writes its `cost-state` record, its total is reported beside
-// ours as `hostReported`. The plugin's Observer and Reflector calls are its own model (pi); their cost is the sum of
+// ours as `hostReported`; without that record a built-in run's total leaves its compaction out, and the report says
+// how many runs that is. The plugin's Observer and Reflector calls are its own model (pi); their cost is the sum of
 // the `*.cost` metrics the plugin's stats file records, or unavailable without that file.
 
 import type { Configuration, Measurement } from './runner'
 import { CONFIGURATIONS, estimated, measured, recallAvailable, unavailable, usesObservationalCompaction } from './runner'
-import { SCENARIOS } from './scenarios'
+import { SCENARIOS, scenarioById } from './scenarios'
 import type { Check, CheckCategory, Scenario } from './scenarios'
 
 // ---- VERIFY BEFORE A LIVE RUN: list prices in USD per million tokens, matched against each message's model id. ----
@@ -227,7 +229,7 @@ export type RunScore = {
   /** Why the run cannot be scored as its configuration; empty when valid. */
   invalid: string[]
   checks: CheckResult[]
-  /** Valid, and no check failed. */
+  /** Valid, and no check failed other than a retrieval one: whether recall found the evidence is scored apart. */
   taskSuccess: boolean
   /** The fraction of correctness checks that passed. */
   correctness: number
@@ -243,8 +245,15 @@ export type RunScore = {
 
 const normalize = (s: string) => s.replace(/\s+/g, ' ').trim()
 const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}...` : s)
+// The text a tool call writes or runs: every string in its input except what an Edit replaces.
 const strings = (v: unknown): string[] =>
-  typeof v === 'string' ? [v] : Array.isArray(v) ? v.flatMap(strings) : v && typeof v === 'object' ? Object.values(v).flatMap(strings) : []
+  typeof v === 'string'
+    ? [v]
+    : Array.isArray(v)
+      ? v.flatMap(strings)
+      : v && typeof v === 'object'
+        ? Object.entries(v).flatMap(([k, x]) => (k === 'old_string' ? [] : strings(x)))
+        : []
 const describeCall = (e: Extract<Entry, { kind: 'tool' }>) => `${e.name} ${cut(JSON.stringify(e.input), 400)} (transcript line ${e.line})`
 
 // The tagged parts of a compaction's first message; the rest of it counts as `summary`.
@@ -255,7 +264,7 @@ function sections(text: string, path: CompactionPath): { name: string; text: str
   return [...found, { name: 'summary', text: rest }]
 }
 
-function checkOne(c: Check, reply: string, calls: Extract<Entry, { kind: 'tool' }>[], recalls: string[]): CheckResult {
+function checkOne(c: Check, reply: string, calls: Extract<Entry, { kind: 'tool' }>[], recalls: string[], results: ReadonlyMap<string, string> = new Map()): CheckResult {
   const flags = c.flags ?? 'i'
   const head = { id: c.id, category: c.category, description: c.description }
   if (c.kind === 'recall') {
@@ -274,12 +283,13 @@ function checkOne(c: Check, reply: string, calls: Extract<Entry, { kind: 'tool' 
     const input = (e.input ?? {}) as Record<string, unknown>
     const target = [input.file_path, input.path, input.notebook_path, input.command].find((v) => typeof v === 'string') as string | undefined
     if (c.path && !(target !== undefined && new RegExp(c.path, flags).test(target))) return false
-    return !c.text || new RegExp(c.text, flags).test(strings(input).join('\n'))
+    if (c.text && !new RegExp(c.text, flags).test(strings(input).join('\n'))) return false
+    return !c.result || new RegExp(c.result, flags).test(results.get(e.id) ?? '')
   })
   const pass = c.expect === 'present' ? matching.length > 0 : matching.length === 0
   const evidence = matching.length
     ? matching.map(describeCall).join('\n')
-    : `no call to /${c.tool}/${c.path ? ` on /${c.path}/` : ''}${c.text ? ` with /${c.text}/` : ''} among ${calls.length} tool call(s)${calls.length ? `: ${calls.map(describeCall).join('\n')}` : ''}`
+    : `no call to /${c.tool}/${c.path ? ` on /${c.path}/` : ''}${c.text ? ` with /${c.text}/` : ''}${c.result ? ` returning /${c.result}/` : ''} among ${calls.length} tool call(s)${calls.length ? `: ${calls.map(describeCall).join('\n')}` : ''}`
   return { ...head, outcome: pass ? 'pass' : 'fail', evidence }
 }
 
@@ -310,6 +320,14 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
   if (usesObservationalCompaction(config) && stats?.fellBack) invalid.push(`the plugin's stats record ${stats.fellBack} compaction(s) that fell back to the built-in one`)
   if (!recallAvailable(config) && t.entries.some((e) => e.kind === 'tool' && e.name === RECALL_TOOL)) invalid.push(`om_recall was called although ${config} does not offer it`)
 
+  // The history the first compaction had to carry: without its setup the run measures a failed history, not memory.
+  const history = t.entries.slice(0, boundaries[0]?.i ?? t.entries.length)
+  const results = new Map(t.entries.flatMap((e) => (e.kind === 'result' ? [[e.id, e.text] as const] : [])))
+  for (const c of s.setup ?? []) {
+    const r = checkOne(c, '', history.filter((e): e is Extract<Entry, { kind: 'tool' }> => e.kind === 'tool'), [], results)
+    if (r.outcome === 'fail') invalid.push(`the history before the first compaction lacks its setup: ${c.description} (${r.evidence})`)
+  }
+
   const want = normalize(s.continuation)
   const start = t.entries.findLastIndex((e) => e.kind === 'prompt' && normalize(e.text).includes(want))
   if (start < 0) invalid.push('the continuation prompt is not in the transcript')
@@ -321,7 +339,7 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
 
   const recallIds = new Set(calls.filter((e) => e.name === RECALL_TOOL).map((e) => e.id))
   const recalls = after.flatMap((e) => (e.kind === 'result' && recallIds.has(e.id) ? [e.text] : []))
-  const checks = s.checks.map((c) => checkOne(c, reply, calls, recalls))
+  const checks = s.checks.map((c) => checkOne(c, reply, calls, recalls, results))
   const failed = (cat: CheckCategory) => checks.filter((c) => c.category === cat && c.outcome === 'fail').length
   const correctnessChecks = checks.filter((c) => c.category === 'correctness')
   const retrievalChecks = checks.filter((c) => c.category === 'retrieval' && c.outcome !== 'n/a')
@@ -331,7 +349,7 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
     valid: invalid.length === 0,
     invalid,
     checks,
-    taskSuccess: invalid.length === 0 && checks.every((c) => c.outcome !== 'fail'),
+    taskSuccess: invalid.length === 0 && checks.every((c) => c.category === 'retrieval' || c.outcome !== 'fail'),
     correctness: correctnessChecks.length ? correctnessChecks.filter((c) => c.outcome === 'pass').length / correctnessChecks.length : 1,
     violations: failed('violation'),
     repeatedWork: failed('repeated-work'),
@@ -361,25 +379,32 @@ export type RunMeta = {
   scenario: string
   run: number
   startedAt: string
+  /** The model the session was started with (an alias such as `sonnet`); the record's `models` are what answered. */
   model: string
   sessionId?: string
   transcripts: string[]
   stats?: string
+  /** The plugin checkout the version label named, and its commit (`-dirty` when it had uncommitted changes). */
+  pluginRoot?: string
+  pluginCommit?: string
+  /** What the budget admitted the run under. */
+  admission?: { budgetUsd: number; spentUsd: number; reserveUsd: number }
 }
 /** One line of the results JSONL. A run that did not complete has `error` and no score. */
-export type RunRecord = RunMeta & { score?: RunScore; cost?: RunCost; memory?: OmStats; error?: string }
+export type RunRecord = RunMeta & { score?: RunScore; cost?: RunCost; memory?: OmStats; models?: string[]; error?: string }
+
+/** The model ids that answered in a transcript, as the host resolved them. */
+export const modelsOf = (t: Transcript) => [...new Set([...t.messages.values()].map((m) => m.model).filter((m) => m && m !== '<synthetic>'))]
 
 export function makeRecord(meta: RunMeta, t: Transcript, statsJson?: string): RunRecord {
-  const s = SCENARIOS.find((x) => x.id === meta.scenario)
+  const s = scenarioById(meta.scenario)
   if (!s) throw new Error(`unknown scenario ${meta.scenario}`)
   const memory = statsJson === undefined ? undefined : parseStats(statsJson)
-  const { runId, mode, configuration, version, scenario, run, startedAt, model, sessionId, transcripts, stats } = meta
   return {
-    ...{ runId, mode, configuration, version, scenario, run, startedAt, model, transcripts },
-    ...(sessionId ? { sessionId } : {}),
-    ...(stats ? { stats } : {}),
-    score: scoreRun(s, configuration, t, memory),
-    cost: runCost(configuration, t, statsJson),
+    ...meta,
+    models: modelsOf(t),
+    score: scoreRun(s, meta.configuration, t, memory),
+    cost: runCost(meta.configuration, t, statsJson),
     ...(memory ? { memory } : {}),
   }
 }
@@ -400,7 +425,7 @@ function cell(xs: readonly number[], f: (x: number) => string): string {
 }
 const values = (ms: readonly Measurement<number>[]) => ms.flatMap((m) => (m.status === 'unavailable' ? [] : [m.value]))
 
-export type ReportOptions = { versions?: readonly string[]; scenarios?: readonly string[] }
+export type ReportOptions = { versions?: readonly string[] }
 
 /**
  * A markdown report of the results: live and offline runs apart; per plugin version and configuration the run count,
@@ -417,17 +442,22 @@ export function renderReport(records: readonly RunRecord[], options: ReportOptio
   out.push(
     '',
     'Scoring: deterministic checks (regular expressions over the replies and tool calls after the continuation prompt, and over what om_recall returned); no model grading was used. A transport or prompt-format success is not a task success: a run that did not complete, or is invalid, never counts as one.',
-    `Cost: token-equivalent, an estimate: each assistant message's exact usage times PRICES_USD_PER_MTOK in tests/eval/bench.ts (${PRICES_USD_PER_MTOK.map((p) => `${p.model.source} $${p.input}/$${p.output} in/out, $${p.cacheRead} cache read, $${p.cacheWrite5m}–$${p.cacheWrite1h} cache write`).join('; ')} per million tokens). The memory model is the plugin's own Observer and Reflector, as its stats file measured it. Latencies are measured: the host's compaction duration and the transcript's timestamps.`,
+    `Cost: token-equivalent, an estimate: each assistant message's exact usage times PRICES_USD_PER_MTOK in tests/eval/bench.ts (${PRICES_USD_PER_MTOK.map((p) => `${p.model.source} $${p.input}/$${p.output} in/out, $${p.cacheRead} cache read, $${p.cacheWrite5m}–$${p.cacheWrite1h} cache write`).join('; ')} per million tokens). The memory model is the plugin's own Observer and Reflector, as its stats file measured it. The built-in compactor's own request is not a transcript message: a built-in run's cost includes it only through the host's cost-state record, so without one it leaves compaction out while an observational run's includes the Observer. Latencies are measured: the host's compaction duration and the transcript's timestamps.`,
   )
+  const models = [...new Set(records.flatMap((r) => r.models ?? []))]
+  out.push(`Models that answered: ${models.join(', ') || 'none recorded'} (sessions started with ${[...new Set(records.map((r) => r.model))].join(', ')}).`)
+  for (const v of [...new Set(records.map((r) => r.version))]) {
+    const commits = [...new Set(records.filter((r) => r.version === v).map((r) => r.pluginCommit ?? 'not recorded'))]
+    out.push(`Plugin version ${v}: commit ${commits.join(', ')}.`)
+  }
   for (const [title, rs] of [
     ['Live runs', live],
     ['Offline runs (synthetic or supplied transcripts, not live results)', offline],
   ] as const)
     if (rs.length) out.push('', `## ${title}`, '', ...section(rs, rs === live ? 'live' : 'offline'))
   if (options.versions) {
-    const scenarios = options.scenarios ?? SCENARIOS.map((s) => s.id)
     const missing = options.versions.flatMap((v) =>
-      CONFIGURATIONS.flatMap((c) => scenarios.filter((s) => !live.some((r) => r.version === v && r.configuration === c && r.scenario === s && r.score?.valid)).map((s) => `- ${v} ${c} ${s}: not run live`)),
+      CONFIGURATIONS.flatMap((c) => SCENARIOS.map((s) => s.id).filter((s) => !live.some((r) => r.version === v && r.configuration === c && r.scenario === s && r.score?.valid)).map((s) => `- ${v} ${c} ${s}: not run live`)),
     )
     out.push('', '## Not run', '', ...(missing.length ? missing : ['Every expected live cell has at least one valid run.']))
   }
@@ -453,34 +483,31 @@ function section(rs: readonly RunRecord[], mode: 'live' | 'offline'): string[] {
     '',
     'Each measure over the valid runs: mean ± sample standard deviation [min–max], or the value alone for one run.',
     '',
-    '| version | configuration | runs | valid | task success | correctness | violations | repeated work | unsupported claims | recall calls | recall hits | recall result tokens (estimated) | cost (USD, estimated) | memory model (USD, measured) | compaction ms (measured) | continuation ms (measured) |',
-    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
+    '| version | configuration | runs | valid | task success | correctness | violations | repeated work | unsupported claims | recall calls | recall hits | recall result tokens (estimated) | cost (USD, estimated) | memory model (USD, measured) | reflections (measured) | compaction ms (measured) | continuation ms (measured) |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
   )
   for (const g of gs) {
     const sc = g.valid.map((r) => r.score!)
     const hits = sc.reduce((t, s) => t + s.retrieval.hits, 0)
     const checked = sc.reduce((t, s) => t + s.retrieval.checked, 0)
     out.push(
-      `| ${g.version} | ${g.configuration} | ${g.runs.length} | ${g.valid.length} | ${sc.length ? pct(sc.filter((s) => s.taskSuccess).length / sc.length) : '–'} | ${cell(sc.map((s) => s.correctness), pct)} | ${cell(sc.map((s) => s.violations), fixed(2))} | ${cell(sc.map((s) => s.repeatedWork), fixed(2))} | ${cell(sc.map((s) => s.unsupportedClaims), fixed(2))} | ${cell(sc.map((s) => s.retrieval.calls), fixed(2))} | ${checked ? `${hits}/${checked}` : '–'} | ${cell(values(sc.map((s) => s.retrieval.resultTokens)), fixed(0))} | ${cell(values(g.valid.map((r) => r.cost?.total ?? unavailable('no cost'))), fixed(4))} | ${cell(values(g.valid.map((r) => r.cost?.memoryModel ?? unavailable('no cost'))), fixed(4))} | ${cell(values(sc.flatMap((s) => s.compactions.map((c) => c.durationMs))), fixed(0))} | ${cell(values(sc.map((s) => s.continuationMs)), fixed(0))} |`,
+      `| ${g.version} | ${g.configuration} | ${g.runs.length} | ${g.valid.length} | ${sc.length ? pct(sc.filter((s) => s.taskSuccess).length / sc.length) : '–'} | ${cell(sc.map((s) => s.correctness), pct)} | ${cell(sc.map((s) => s.violations), fixed(2))} | ${cell(sc.map((s) => s.repeatedWork), fixed(2))} | ${cell(sc.map((s) => s.unsupportedClaims), fixed(2))} | ${cell(sc.map((s) => s.retrieval.calls), fixed(2))} | ${checked ? `${hits}/${checked}` : '–'} | ${cell(values(sc.map((s) => s.retrieval.resultTokens)), fixed(0))} | ${cell(values(g.valid.map((r) => r.cost?.total ?? unavailable('no cost'))), fixed(4))} | ${cell(values(g.valid.map((r) => r.cost?.memoryModel ?? unavailable('no cost'))), fixed(4))} | ${cell(g.valid.flatMap((r) => (r.memory ? [r.memory.reflections] : [])), fixed(2))} | ${cell(values(sc.flatMap((s) => s.compactions.map((c) => c.durationMs))), fixed(0))} | ${cell(values(sc.map((s) => s.continuationMs)), fixed(0))} |`,
     )
   }
   const noMemory = rs.filter((r) => usesObservationalCompaction(r.configuration) && r.cost?.memoryModel.status === 'unavailable').length
   const noTotal = rs.filter((r) => r.cost?.total.status === 'unavailable').length
-  if (noMemory) out.push('', `Observational runs without a stats file: memory model cost unavailable in ${noMemory} run(s); their cost column leaves it out.`)
+  if (noMemory) out.push('', `Observational runs without a stats file: memory model cost and reflections unavailable in ${noMemory} run(s); their cost column leaves the memory model out.`)
+  const noCompactor = rs.filter((r) => !usesObservationalCompaction(r.configuration) && r.cost && r.cost.hostReported.status === 'unavailable').length
+  if (noCompactor) out.push('', `Built-in compaction runs without a host cost record: ${noCompactor}; their cost leaves the compactor's request out.`)
   if (noTotal) out.push('', `Cost unavailable in ${noTotal} run(s) (a model the price table does not price).`)
   for (const v of [...new Set(gs.map((g) => g.version))]) {
     const ranked = gs
       .filter((g) => g.version === v && g.valid.length)
       .map((g) => ({ g, rate: g.valid.filter((r) => r.score!.taskSuccess).length / g.valid.length }))
       .sort((a, b) => b.rate - a.rate)
-    if (ranked.length)
-      out.push(
-        '',
-        `Highest task success (${mode}, ${v}): ${ranked[0]!.g.configuration} at ${pct(ranked[0]!.rate)} (${ranked[0]!.g.valid.length} valid runs)${ranked
-          .slice(1)
-          .map((x) => `; ${x.g.configuration} ${pct(x.rate)}`)
-          .join('')}.`,
-      )
+    // Each beside its valid runs: an om run that fell back is invalid, so a low valid count is part of the result.
+    const of = (x: (typeof ranked)[number]) => `${x.g.configuration} ${pct(x.rate)} (${x.g.valid.length} of ${x.g.runs.length} runs valid)`
+    if (ranked.length) out.push('', `Highest task success (${mode}, ${v}): ${ranked.map(of).join('; ')}.`)
   }
 
   const scenarios = SCENARIOS.filter((s) => rs.some((r) => r.scenario === s.id))

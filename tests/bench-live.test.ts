@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { RECALL_TOOL } from './eval/bench'
 import type { RunRecord } from './eval/bench'
-import { admitRun, checkPluginList, checkRecallOnly, describePlan, planRun, runIdOf } from './eval/live'
+import { admitRun, checkPluginList, checkRecallOnly, describePlan, planRun, runIdOf, shellLine } from './eval/live'
 import type { PlanInput } from './eval/live'
 import { CONFIGURATIONS } from './eval/runner'
 import type { Configuration } from './eval/runner'
@@ -20,9 +20,10 @@ const input = (config: Configuration, extra: Partial<PlanInput> = {}): PlanInput
   sessionId: SESSION,
   timeoutMs: 600_000,
   settleMs: 30_000,
+  startTimeoutMs: 60_000,
   ...extra,
 })
-const env = (config: Configuration) => (planRun(input(config)).settings as { env: Record<string, string> }).env
+const env = (config: Configuration) => planRun(input(config)).settings.env
 
 describe('the live run plan', () => {
   test('names each run from its scenario, configuration, version and run number, in characters safe for a path', () => {
@@ -43,7 +44,7 @@ describe('the live run plan', () => {
     for (const config of CONFIGURATIONS) {
       const plan = planRun(input(config))
       expect(plan.claudeArgs.includes('--disallowed-tools')).toBe(config === 'om')
-      const allow = (plan.settings as { permissions: { allow: string[] } }).permissions.allow
+      const allow = plan.settings.permissions.allow
       expect(allow.includes(RECALL_TOOL)).toBe(config.endsWith('+recall'))
     }
     expect(planRun(input('om')).claudeArgs.join(' ')).toContain(`--disallowed-tools ${RECALL_TOOL}`)
@@ -87,7 +88,7 @@ describe('the live run plan', () => {
   test('the dry run shows every command, every prompt and what the session should have loaded', () => {
     const plan = planRun(input('om'))
     const text = describePlan(plan)
-    for (const st of plan.steps) if (st.kind === 'herdr') expect(text).toContain(st.argv[0]!)
+    for (const st of plan.steps) if (st.kind === 'herdr') expect(text).toContain(`herdr ${shellLine(st.argv)}`)
     for (const x of scenarioById('repeated-compaction')!.steps) if ('prompt' in x) expect(text).toContain(x.prompt)
     expect(text).toContain('observational-memory from /repo')
     expect(text).toContain('om_recall: not offered')
