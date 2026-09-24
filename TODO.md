@@ -35,10 +35,11 @@ only. The pruner (`hooks/prune.ts`) checks a session's keys, their times and the
 deleting it, but a process that writes to that session between the last check and the deletes can still lose the
 write. Two processes can also both pass the daily `prune:last` check; that repeats the work and deletes nothing more.
 
-## A reversal in a chunk observed beside the constraint's own chunk replaces nothing
+## Chunks observed side by side do not see each other's constraints or continuation record
 
-The Observer is shown the constraints in force before its chunk: the ledger's and those of the chunks already landed
-before it (`constraintsBefore` in `hooks/register.ts`). Chunks observed in parallel, in one scheduling pass or at
-compaction, do not see each other's, so when one sets a constraint and the next reverses it, the Observer of the second
-cannot name the first by its id and both stand as constraints in force, the reversal after it. Nothing is dropped; the
-memory shows both, newest last.
+The Observer is shown the constraints in force and where the work stood before its chunk: the ledger's and those of the
+chunks already landed before it (`beforeRows` in `hooks/register.ts`). Chunks observed in parallel, in one scheduling
+pass or at compaction, do not see each other's. When one sets a constraint and the next reverses it, the Observer of
+the second cannot name the first by its id, and both stand as constraints in force, the reversal after it: nothing is
+dropped, and the memory shows both, newest last. The continuation record is that of the newest chunk that writes one, so a gate or a
+completed request that only the chunk before it recorded drops out of the record; the observations still hold it.
