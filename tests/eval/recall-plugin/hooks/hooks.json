@@ -1,5 +1,5 @@
 {
-  "description": "session.start and tool.call: the om_recall tool only; classic.SessionStart and classic.Stop: record the transcript path it reads",
+  "description": "session.start and tool.call: the om_recall tool only; tool.describe: moves it from behind ToolSearch into the tool list once a compaction has run; classic.SessionStart and classic.Stop: record the transcript path it reads, and a compaction asks for om_recall to be described again",
   "modules": [
     "./register.ts"
   ]

@@ -1436,8 +1436,21 @@ export const register: Register = (on) => {
   on('tool.call', { tool: 'mcp__observational-memory__om_stats' }, async ($, e) => ({ result: await report(statsIo($), e) }))
   on('command.run', { command: 'om-stats' }, async ($, e) => ({ text: await report(statsIo($), parseArgs(e.args)) }))
 
+  // om_recall waits behind ToolSearch, its description unread, until a compaction removes what it finds; from then on
+  // it is in the tool list. The answer holds for the session, so a compaction's SessionStart has it asked again, when
+  // the prompt is rebuilt anyway. A resumed session that was compacted has a summary in its history too.
+  on('tool.describe', { tool: RECALL_TOOL_NAME }, async ($, e, next) => {
+    const described = await next(e)
+    const compacted = await $.session.messages().then((rows) => rows.some(isSummary), () => false)
+    return compacted ? { ...described, isDeferred: false } : described
+  })
+
   // Where the transcript file is, for om_recall and the memory message: known at start and after every turn.
-  on('classic.SessionStart', async ($, e, next) => (await noteTranscript($, e), next(e)))
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'compact') $.ui.invalidate('tool.describe')
+    await noteTranscript($, e)
+    return next(e)
+  })
   on('classic.Stop', async ($, e, next) => (await noteTranscript($, e), next(e)))
 
   // Subagents raise no turn.start, so each is the main conversation's prompt.

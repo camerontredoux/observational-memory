@@ -4,6 +4,7 @@
 // prompts.ts beside it. Kept in step with hooks/register.ts's `session.start` registration (tests/register.test.ts checks
 // they register the same om_recall) and `tool.call` handler.
 import type { EngineInterface, Register } from 'claude-code'
+import { COMPACT_WRAPPER } from './prompts'
 import { liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
 
@@ -89,6 +90,17 @@ export const register: Register = (on) => {
     return { result: found.text }
   })
 
-  on('classic.SessionStart', async ($, e, next) => (await noteTranscript($, e), next(e)))
+  // As hooks/register.ts's: om_recall joins the tool list once a compaction has run.
+  on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => {
+    const described = await next(e)
+    const compacted = await $.session.messages().then((rows) => rows.some((m) => m.role === 'user' && m.text.startsWith(COMPACT_WRAPPER)), () => false)
+    return compacted ? { ...described, isDeferred: false } : described
+  })
+
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'compact') $.ui.invalidate('tool.describe')
+    await noteTranscript($, e)
+    return next(e)
+  })
   on('classic.Stop', async ($, e, next) => (await noteTranscript($, e), next(e)))
 }

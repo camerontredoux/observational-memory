@@ -1152,6 +1152,40 @@ describe('register', () => {
     expect(evaluated).toEqual([registered.find((r) => r.name === 'om_recall')])
   })
 
+  test('om_recall waits behind ToolSearch until the first compaction, then is described again into the tool list, in the eval plugin too', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    const invalidated: string[] = []
+    on('ui.invalidate', ($, e) => (invalidated.push(e.event), { value: undefined }))
+    on('classic.SessionStart', () => ({}))
+    // The engine's own answer: an MCP tool is deferred.
+    const engine = (e: { description: string; isDeferred?: true }) => ({ description: e.description, ...(e.isDeferred ? { isDeferred: e.isDeferred } : {}) })
+    on('tool.describe', ($, e) => engine(e))
+    const input = { tool: 'mcp__observational-memory__om_recall', description: 'Searches', isDeferred: true as const, provider: { plugin: 'observational-memory', tier: 'user' as const } }
+    // The recall-only eval plugin's hooks, with the same history and invalidation.
+    const evalHooks = recallOnlyHooks()
+    const evalInvalidated: string[] = []
+    const evalWorld = { session: { messages: async () => history }, ui: { invalidate: (event: string) => void evalInvalidated.push(event) } }
+    const evalDescribe = () => evalHooks.get('tool.describe')!(evalWorld, input, engine)
+    const compactStart = { source: 'compact' as const, session_id: 'session-1', transcript_path: '' }
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
+
+    const before = await $.tool.describe(input)
+    const evalBefore = await evalDescribe()
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    history.push(...result.messages!) // written after the boundary, as the engine does
+    await $.classic.SessionStart(compactStart)
+    await evalHooks.get('classic.SessionStart')!(evalWorld, compactStart, (e: unknown) => e)
+
+    expect(before).toEqual({ description: 'Searches', isDeferred: true })
+    expect(evalBefore).toEqual(before)
+    expect(invalidated).toEqual(['tool.describe'])
+    expect(evalInvalidated).toEqual(['tool.describe'])
+    expect(await $.tool.describe(input)).toEqual({ description: 'Searches', isDeferred: false })
+    expect(await evalDescribe()).toEqual({ description: 'Searches', isDeferred: false })
+  })
+
   test('om_recall labels tool results with the tool that produced them', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)

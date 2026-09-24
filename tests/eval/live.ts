@@ -259,7 +259,7 @@ export function autoCompactThreshold(userSettingsJson: string | undefined, envWi
   return `${head} Claude Code's default for the model (about 967k tokens for Sonnet 5): a growth cap far below that ends the run incomplete.`
 }
 
-const RECALL_ONLY_HOOKS = ['session.start', `tool.call{tool=${RECALL_TOOL}}`, 'classic.SessionStart', 'classic.Stop']
+const RECALL_ONLY_HOOKS = ['session.start', `tool.call{tool=${RECALL_TOOL}}`, `tool.describe{tool=${RECALL_TOOL}}`, 'classic.SessionStart', 'classic.Stop']
 
 /** Problems with `claude plugin validate` of an assembled recall-only plugin: it must pass and handle om_recall alone. */
 export function checkRecallOnly(validateOutput: string): string[] {

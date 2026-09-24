@@ -154,8 +154,8 @@ describe('checking the assembled recall-only plugin', () => {
   // As `claude plugin validate` prints it.
   const validated = (hooks: string) => `Validating hooks: /tmp/p/hooks/hooks.json\n\n  ❯ ./register.ts hooks: ${hooks}\n  ❯ ./register.ts calls: $.tool.register\n\n✔ Validation passed\n`
 
-  test('passes a plugin that handles om_recall and records the transcript path, nothing else', () => {
-    expect(checkRecallOnly(validated(`session.start, tool.call{tool=${RECALL_TOOL}}, classic.SessionStart, classic.Stop`))).toEqual([])
+  test('passes a plugin that handles om_recall, describes it, and records the transcript path, nothing else', () => {
+    expect(checkRecallOnly(validated(`session.start, tool.call{tool=${RECALL_TOOL}}, tool.describe{tool=${RECALL_TOOL}}, classic.SessionStart, classic.Stop`))).toEqual([])
   })
 
   test('fails one that would also compact, or does not pass validation', () => {
