@@ -10,7 +10,7 @@ A Claude Code function-hooks plugin that replaces compaction with observational 
 - `.claude/types/` holds the plugin API types. Claude Code writes these files. Do not edit them.
 - `scripts/` holds developer tools. They are not part of the plugin. Each file's header gives its usage.
 - `tests/eval/runner.ts` replays one scenario through the four configurations built-in, built-in+recall, om, and om+recall compaction, and records reproducible, machine-readable measurements of what each cost (not how good its output was: that is the continuation-quality benchmark). Its header gives its usage and the live-transport limitation.
-- The continuation-quality benchmark: `tests/eval/scenarios.ts` holds its seven scenarios, `tests/eval/bench.ts` scores a run's transcript and renders the report, `tests/eval/live.ts` plans a live run, and `scripts/bench-live.ts` drives one in a herdr pane (its header gives the usage). `tests/eval/recall-plugin/` is the evaluation-only plugin with `om_recall` alone, for the built-in+recall configuration.
+- The continuation-quality benchmark: `tests/eval/scenarios.ts` holds its seven scenarios, `tests/eval/bench.ts` scores a run's transcript and renders the report, `tests/eval/live.ts` plans a live run, and `scripts/bench-live.ts` drives one in a herdr pane (its header gives the usage). `tests/eval/recall-plugin/` is the evaluation-only plugin with `om_recall` alone, for the built-in+recall configuration. `docs/bench/` keeps past results as baselines.
 
 ### Code rules
 
