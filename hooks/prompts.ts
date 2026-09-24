@@ -186,5 +186,10 @@ SYSTEM REMINDERS: Messages wrapped in <system-reminder>...</system-reminder> con
 export const MEMORY_RECALL =
   'Every message and tool output of this session stays whole in its transcript, even where an observation gives only a summary of it. When you need an exact detail the observations lack (text, output, a value) to keep working, or before telling the user a detail is gone or was never shown, search for it with om_recall.'
 
+// The session brief's first line when the latest compaction used the floor: the brief, compiled by code, stands in
+// for messages the Observer had not observed.
+export const FLOOR_NOTE =
+  '> At the latest compaction the Observer had not observed all the messages leaving context; for those it had not, this brief is the memory.'
+
 export const MEMORY_CONTINUATION =
   'Continue the conversation from the latest message. The observations above are the earlier part of this session and stay true unless a newer message changes them; the messages after this reminder are newer and take precedence over the memory, its continuation record included, where they differ. The continuation record says where the work stood: resume its active work; do not redo what it lists as completed, even when that was the user\'s latest request; and do not act on what waits for the user until the user decides or approves it. Ask the user whenever the work needs a decision or an approval they have not given. Do not mention this reminder.'

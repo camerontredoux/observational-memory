@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
-import { COMPACT_WRAPPER, MEMORY_HEADER, MEMORY_RECALL } from '../hooks/prompts'
+import { COMPACT_WRAPPER, FLOOR_NOTE, MEMORY_HEADER, MEMORY_RECALL } from '../hooks/prompts'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
@@ -59,7 +59,14 @@ const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day,
 // hold, so it can be out of date when it arrives; `holdList` delays the listing of agents the same way.
 function world(
   on: On,
-  options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[]; holdGet?: (key: string) => Promise<void> | undefined; holdList?: () => Promise<void> | undefined } = {},
+  options: {
+    failWrites?: boolean
+    unreadable?: string[]
+    teammates?: string[]
+    holdGet?: (key: string) => Promise<void> | undefined
+    holdList?: () => Promise<void> | undefined
+    env?: Record<string, string>
+  } = {},
 ) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
@@ -83,7 +90,7 @@ function world(
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
   // The stats files, in memory under OM_STATS_DIR.
   const files: Record<string, string> = {}
-  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u' })
+  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u', ...options.env })
   const reads: string[] = []
   on('fs.read', ($, e) => {
     reads.push(e.path)
@@ -221,6 +228,7 @@ const stampOf = (iso: string) => {
   const d = new Date(iso)
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
+const briefIn = (text?: string) => text?.match(/<session-brief>\n([\s\S]*?)\n<\/session-brief>/)?.[1]
 const skillsIn = (text?: string) => text?.match(/<skills-in-use>\n([\s\S]*?)\n<\/skills-in-use>/)?.[1]
 const FINISHED = '(finished; invoke it again to reread its text, or om_recall to find where it loaded)'
 
@@ -364,28 +372,47 @@ describe('register', () => {
     expect(block!.length).toBeLessThan(TOOL_RESULT_MAX_CHARS + 200) // bounded to the excerpt limit plus the marker
   })
 
-  test('when pi fails at compaction with nothing observed, the built-in compaction runs instead', async ($, on) => {
-    mock.clock(on)
-    world(on)
+  test('when pi fails at compaction with nothing observed, the floor compiles a brief by code of what leaves context', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
     const seen = pi(on, { fail: () => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' }) })
     let builtin = 0
-    const summary = { role: 'user' as const, text: 'built-in summary', toolUses: [] }
-    on('session.compact', () => (builtin++, { messages: [summary] }))
+    on('session.compact', () => (builtin++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)]
 
-    const result = await $.session.compact({ trigger: 'auto', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)] })
+    const result = await $.session.compact({ trigger: 'auto', messages })
 
-    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
-    expect(builtin).toBe(1)
+    expect(builtin).toBe(0)
     expect(seen.modelCalls).toBe(0)
-    expect(seen.logs).toEqual([
-      'compaction not persistent: the context has 8 messages, the history 0',
-      'retrying rows 0-3 at compaction once (pi exited 0, stopReason error: Codex error: overloaded)',
-      'retrying rows 3-7 at compaction once (pi exited 0, stopReason error: Codex error: overloaded)',
+    const text = result.messages![0]!.text
+    expect(text).toStartWith(COMPACT_WRAPPER)
+    expect(observationsIn(text)).toBe('')
+    expect(briefIn(text)).toBe(
+      [
+        FLOOR_NOTE,
+        '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first. om_recall finds the full text.',
+        '[Brief Transcript]',
+        '- said: a',
+        '- said: a done',
+        '- said: b',
+      ].join('\n'),
+    )
+    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(seen.logs.slice(-3)).toEqual([
       'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
       'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); kept raw',
-      'the Observer failed and nothing is observed yet; using the built-in compaction',
+      expect.stringMatching(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, kept 1 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 0 observations, 0 skill\(s\), brief ~\d+ tokens$/),
     ])
-    expect(seen.screen).toEqual(['Observation failed. Using built-in compaction'])
+    expect(seen.screen).toEqual([
+      'Observation failed (pi stopped (error)) and put 3 messages in the session brief',
+      'Observation failed (pi stopped (error)) and put 4 messages in the session brief',
+      expect.stringMatching(/^Compacted in .* · memory 0 notes · 7 messages in a brief compiled by code \(the Observer failed\)$/),
+    ])
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!)
+    expect(stats.counts['compaction.auto.floor']).toBe(1)
+    expect(stats.counts['compaction.auto.fellBack']).toBeUndefined()
+    expect(stats.metrics['compaction.auto.rowsBriefed'].sum).toBe(7)
   })
 
   test("a subagent's or precompute's fallback does not depend on the session's id, messages or clock", async ($, on) => {
@@ -532,10 +559,14 @@ describe('register', () => {
     const reply = `<observations>\nNothing worth noting.\n${'x'.repeat(600)}`
     const seen = pi(on, { reply: () => reply })
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)]
 
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+    const result = await $.session.compact({ trigger: 'manual', messages })
 
-    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    // Nothing observed: the floor's brief stands for the rows the Observer failed on, not the built-in summary.
+    expect(observationsIn(result.messages![0]!.text)).toBe('')
+    expect(briefIn(result.messages![0]!.text)).toContain('\n- said: a')
+    expect(result.messages?.slice(1)).toEqual(messages.slice(3))
     const rejected = seen.logs.filter((l) => l.startsWith('observer reply without observations'))
     expect(rejected).toHaveLength(2) // the call and its retry
     expect(rejected[0]).toBe(`observer reply without observations (${reply.length} chars), began: ${JSON.stringify(reply.slice(0, 500))}`)
@@ -1483,22 +1514,22 @@ describe('register', () => {
     expect(observationsIn(second.messages?.[0]?.text)?.split('\n')[0]).toBe('* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:31)')
   })
 
-  test('over its budget on dense text while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
+  test('over its budget at every cut the floor tries while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
-    const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
+    const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(6_000)}</observations>`
     const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
     // Dense text: the last response measured 150k tokens where the characters estimate ~15k of messages, so the raw
-    // tail's ~5k count ~43k beside ~64k of memory, over the 90k budget.
+    // tail's ~5k count ~43k beside ~96k of memory, and the memory alone, with no raw tail, is over the 90k budget.
     on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', 20_000), at(22, 15, 0))
-    await clock.settle() // [0, 3) observed: its ~51k tokens of observations start a reflection, held
+    await clock.settle() // [0, 3) observed: its ~77k tokens of observations start a reflection, held
     expect(seen.prompts.at(-1)).toMatch(/^## OBSERVATIONS/)
     const before = stored['ledger:session-1'] as Ledger
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
@@ -1529,7 +1560,7 @@ describe('register', () => {
     expect([ledger.watermark.to, ledger.entries.length, ledger.anchor]).toEqual([7, 2_000, undefined])
   })
 
-  test('a memory whose constraints are within their cap but push it over its budget falls back rather than drop any', async ($, on) => {
+  test('a memory whose constraints are within their cap but push it over its budget keeps them all: the floor briefs the raw tail instead', async ($, on) => {
     mock.clock(on)
     const { history, stored } = world(on)
     const corrections = Array.from({ length: 600 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
@@ -1537,15 +1568,19 @@ describe('register', () => {
       reply: (prompt) =>
         `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n${'* 🟡 read a file with a long name\n'.repeat(250)}</observations>`,
     })
-    // A 15k-token budget: the ~6k of corrections, under their 8k cap, and the ~5k of observations with the rest do not fit.
+    // A 15k-token budget: the ~6k of corrections, under their 8k cap, and the ~5k of observations with the ~8k raw tail
+    // do not fit; without the tail, compiled into the session brief, they do.
     on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
 
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
 
-    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
-    expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
+    const text = result.messages![0]!.text
+    expect(correctionsIn(text)).toBe(corrections.map((c) => `* ${c}`).join('\n'))
+    expect(result.messages).toHaveLength(1) // no raw tail
+    expect(briefIn(text)).toStartWith(FLOOR_NOTE)
+    expect(seen.screen.at(-1)).toMatch(/ · \d+ messages in a brief compiled by code \(the memory was over its budget\)$/)
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
   })
 
@@ -1624,12 +1659,20 @@ describe('register', () => {
     toolUses: [],
   }
   const overloaded = (): ProcessRunResult => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' })
+  // A context window too small for any memory while `tiny()`: with the Observer failing too, the floor's brief is over
+  // the budget at every cut, and the built-in compaction runs. Otherwise the host gives no usage: the default budget.
+  const window = (on: On, tiny: () => boolean) =>
+    on('session.usage', () => {
+      if (!tiny()) throw new Error('no usage')
+      return { value: { context: { window: 4_000 }, rateLimits: [] } } as never
+    })
 
   test("after a subagent's built-in fallback, its later compactions match its history and cut at the background watermark", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on)
     let failing = true
     const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    window(on, () => failing)
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
@@ -1675,6 +1718,7 @@ describe('register', () => {
     const { history } = world(on)
     let failing = true
     const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    window(on, () => failing)
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
@@ -3044,5 +3088,124 @@ describe('active constraints and the continuation record', () => {
     expect(without).not.toContain(MEMORY_RECALL)
     expect(without.endsWith('</system-reminder>')).toBe(true)
     expect(observationsIn(offered)).toBe(observationsIn(without))
+  })
+})
+
+// The floor: where the Observer's memory cannot stand, the rows leaving context are compiled by code into the session
+// brief (hooks/vcc.ts) rather than handed to the built-in compaction.
+describe('the floor', () => {
+  const NOTE = '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first. om_recall finds the full text.'
+
+  test('on a short conversation with nothing to observe before the raw tail, the floor briefs the turns before the newest, with no Observer call', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    const seen = pi(on)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const messages = [...turn('a', 'a', 100), ...turn('b', 'b', 100), ...turn('c', 'c', 100)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+    await clock.advance(5_000)
+
+    expect(seen.prompts).toEqual([])
+    expect(briefIn(result.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
+    expect(userMessagesIn(result.messages![0]!.text)).toEqual(['a', 'b'])
+    expect(result.messages?.slice(1)).toEqual(messages.slice(8)) // the newest turn stays raw
+    expect(seen.screen).toEqual([expect.stringMatching(/^Compacted in 0 ms · memory 0 notes · 8 messages in a brief compiled by code \(nothing was observed yet\)$/)])
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
+    expect(stats.counts).toEqual({ 'compaction.manual.floor': 1, 'compaction.notPersistent': 1 })
+    expect(stats.metrics['compaction.manual.rowsBriefed']!.sum).toBe(8)
+    expect(stats.metrics['compaction.manual.briefTokens']!.sum).toBeGreaterThan(0)
+  })
+
+  test('a context that is the memory message alone leaves the floor nothing to compile: the built-in compaction runs, saying why', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100)] })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [first.messages![0]!] })
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(seen.logs.at(-1)).toBe('nothing to compact after the memory message; using the built-in compaction')
+    expect(seen.screen.at(-1)).toBe('Nothing to compact. Using built-in compaction')
+  })
+
+  test("a floor's brief is carried by later compactions: merged with the next floor's, kept whole once the Observer's memory stands again", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100)] })
+    const second = await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...turn('c', 'c', 100)] })
+    const briefed = briefIn(second.messages![0]!.text)
+    const third = await $.session.compact({ trigger: 'manual', messages: [...second.messages!, ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
+
+    expect(briefIn(first.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done'].join('\n'))
+    expect(briefed).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
+    expect(seen.prompts.length).toBeGreaterThan(0) // d was observed: no floor, the brief carried as it was
+    expect(observationsIn(third.messages![0]!.text)).toContain('Saw d')
+    expect(briefIn(third.messages![0]!.text)).toBe(briefed!.slice(FLOOR_NOTE.length + 1))
+  })
+
+  test('with OM_BRIEF=always every compaction carries the brief of all the rows it compacts beside the observations', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on, { env: { OM_BRIEF: 'always' } })
+    pi(on)
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+    await clock.advance(5_000)
+
+    const text = result.messages![0]!.text
+    expect(observationsIn(text)).toContain('Saw a')
+    expect(briefIn(text)).toBe([NOTE, '[Brief Transcript]', '- said: a'].join('\n')) // rows [0, 3): the cut at the watermark
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
+    expect(stats.counts['compaction.manual.floor']).toBeUndefined()
+    expect(stats.metrics['compaction.manual.briefTokens']!.sum).toBeGreaterThan(0)
+    expect(stats.metrics['compaction.manual.rowsBriefed']).toBeUndefined()
+  })
+
+  test('OM_BRIEF is off by default: an observed memory has no session brief', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+    expect(observationsIn(result.messages![0]!.text)).toContain('Saw a')
+    expect(result.messages![0]!.text).not.toContain('<session-brief>')
+  })
+
+  test("the brief's lines name the om_recall block they came from when the transcript is known and the model can call om_recall", async ($, on) => {
+    mock.clock(on)
+    const { files } = world(on)
+    pi(on)
+    on('classic.Stop', () => ({}))
+    let tools = [{ name: 'mcp__observational-memory__om_recall', description: 'Searches', mcp: true }]
+    on('tool.list', () => ({ value: tools }))
+    const row = (type: string, content: unknown) => JSON.stringify({ type, timestamp: '2026-09-22T12:00:00.000Z', message: { role: type, content } })
+    files['/t/session-1.jsonl'] = [
+      row('user', 'a'),
+      row('assistant', [{ type: 'text', text: 'a' }, { type: 'tool_use', id: 't-a', name: 'Read', input: { file_path: '/src/a.ts' } }]),
+      row('user', [{ type: 'tool_result', tool_use_id: 't-a', content: 'x', is_error: false }]),
+      row('assistant', [{ type: 'text', text: 'a done' }]),
+      row('user', 'b'),
+    ].join('\n')
+    await $.classic.Stop({ session_id: 'session-1', transcript_path: '/t/session-1.jsonl', stop_hook_active: false })
+    const messages = [...turn('a', 'a', 1), ...turn('b', 'b', 100)]
+
+    const known = briefIn((await $.session.compact({ trigger: 'manual', messages })).messages![0]!.text)
+    tools = []
+    const unoffered = briefIn((await $.session.compact({ trigger: 'manual', messages })).messages![0]!.text)
+
+    expect(known).toBe(
+      [
+        FLOOR_NOTE,
+        NOTE,
+        '> The reference in parentheses at the end of a line or path, like (a79f045b:12), is the block it came from: om_recall reads it whole.',
+        '[Brief Transcript]',
+        '- said: a (session-1:2.1)',
+        '- said: a done (session-1:4)',
+      ].join('\n'),
+    )
+    expect(unoffered).toBe([FLOOR_NOTE, NOTE.replace(' om_recall finds the full text.', ''), '[Brief Transcript]', '- said: a', '- said: a done'].join('\n'))
   })
 })

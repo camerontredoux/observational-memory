@@ -701,7 +701,8 @@ export function capBrief(brief: Brief): Brief {
 // ── render and parse ──
 
 export const BRIEF_NOTE =
-  '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first. om_recall finds the full text.'
+  '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first.'
+const RECALL_NOTE = ' om_recall finds the full text.'
 const REF_NOTE = '> The reference in parentheses at the end of a line or path, like (a79f045b:12), is the block it came from: om_recall reads it whole.'
 const FILES = '[Files And Changes]'
 const COMMITS = '[Commits]'
@@ -710,7 +711,8 @@ const TRANSCRIPT = '[Brief Transcript]'
 const earlierNote = (n: number) => (n ? ` (+${n} earlier)` : '')
 
 // The section's body; every line starts with `>`, `[`, `-` or `@`, so no line inside it can open or close a tag.
-export function renderBrief(b: Brief) {
+// Without `recall`, the model has no om_recall: the note does not send it there.
+export function renderBrief(b: Brief, recall = true) {
   const parts: string[] = []
   if (b.modified.length || b.created.length) {
     parts.push(FILES)
@@ -721,7 +723,7 @@ export function renderBrief(b: Brief) {
   if (b.outstanding.length) parts.push(OUTSTANDING, ...b.outstanding)
   if (b.transcript.length) parts.push(TRANSCRIPT, ...(b.omitted ? [`> ${b.omitted} earlier lines omitted`] : []), ...b.transcript)
   const refs = parts.some((l) => REF_TAIL.test(l) || / \((?:#|[\w.-]+:)\d+(?:\.\d+)?\),/.test(l))
-  return parts.length ? [BRIEF_NOTE, ...(refs ? [REF_NOTE] : []), ...parts].join('\n') : ''
+  return parts.length ? [`${BRIEF_NOTE}${recall ? RECALL_NOTE : ''}`, ...(refs && recall ? [REF_NOTE] : []), ...parts].join('\n') : ''
 }
 
 export function parseBrief(body: string): Brief {
