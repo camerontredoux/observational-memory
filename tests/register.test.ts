@@ -53,8 +53,9 @@ const TOOL_RESULT_MAX_CHARS = 5_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/r
 const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
 
 // The main conversation's history, grown as the engine would, each listed subagent's under `agents` (any other id
-// is denied), a store the test can read, and a context size.
-function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[] } = {}) {
+// is denied), a store the test can read, and a context size. `holdGet` delays a store read's answer, read before the
+// hold, so it can be out of date when it arrives.
+function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[]; holdGet?: (key: string) => Promise<void> | undefined } = {}) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
@@ -64,7 +65,11 @@ function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; t
   on('agent.list', () => ({ value: listed().map((id) => ({ id, description: id, type: type(id), status: 'running' })) }))
   const stored: Record<string, unknown> = {}
   on('store.keys', () => ({ value: Object.keys(stored) }))
-  on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
+  on('store.get', async ($, e) => {
+    const value = stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key]))
+    await options.holdGet?.(e.key)
+    return { value }
+  })
   on('store.set', ($, e) => ((stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
   // The stats files, in memory under OM_STATS_DIR.
@@ -1452,6 +1457,111 @@ describe('register', () => {
     stored['ledger:session-2/agent-7'] = { entries: [] }
     await $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1', 'ledger:session-2/agent-7', 'times:session-1', 'turns:session-1'])
+  })
+
+  test('a scheduling pass waiting on its ledger read when its subagent finishes writes nothing and starts no Observer call', async ($, on) => {
+    const clock = mock.clock(on)
+    const { gate, open } = gates()
+    const { agents, stored } = world(on, { holdGet: (key) => (key === 'ledger:session-1/agent-1' ? gate(1) : undefined) })
+    const seen = pi(on, { reply: readsIn })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 6; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
+
+    await step($, 's', 0, agents['agent-1'].length, 'agent-1')
+    await clock.settle() // past the step's check that the subagent runs, its pass waits on the ledger
+    const finished = $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    await clock.settle()
+    open(1)
+    await finished
+    await clock.settle()
+
+    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
+    expect(seen.prompts).toEqual([])
+  })
+
+  test("a reflection whose ledger read is held when its subagent finishes writes nothing back", async ($, on) => {
+    const clock = mock.clock(on)
+    const { gate, open } = gates()
+    let reflected = false // the reflector has answered: the next read of the ledger is the reflection's commit
+    let held = false
+    const { agents, stored } = world(on, {
+      holdGet: (key) => (key === 'ledger:session-1/agent-1' && reflected && !held ? ((held = true), gate(1)) : undefined),
+    })
+    const big = `<observations>\n${'* 🟡 2026-09-23 10:00 read a file with a long name\n'.repeat(4_000)}</observations>`
+    const seen = pi(on, { reply: () => big, reflect: () => ((reflected = true), '<observations>\n* 🔴 2026-09-23 10:00 Condensed\n</observations>') })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 4; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
+
+    await clock.set(at(23, 10, 0))
+    await step($, 's', 0, agents['agent-1'].length, 'agent-1')
+    await clock.settle()
+    expect(held).toBe(true)
+    const calls = seen.prompts.length
+    const finished = $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    await clock.settle()
+    open(1)
+    await finished
+    await clock.settle()
+
+    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
+    expect(seen.prompts).toHaveLength(calls)
+    expect(seen.logs).toContain('a reflection outlived its loop; discarded')
+  })
+
+  test('/clear while the reflector runs: no further compression level is tried and the cleared ledger stays gone', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const { gate, open } = gates()
+    const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
+    const seen = pi(on, { hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined), reply: () => big, reflect: () => big })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+    const reflectAt = seen.prompts.findIndex((p) => p.startsWith('## OBSERVATIONS')) + 1
+    expect(reflectAt).toBeGreaterThan(0)
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    open(reflectAt)
+    await clock.settle()
+
+    expect(seen.prompts).toHaveLength(reflectAt) // level 1 answered over its target: no level 2
+    expect(stored['ledger:session-1']).toBeUndefined()
+    expect(seen.logs).toContain('a reflection outlived its loop; discarded')
+  })
+
+  test("a finished subagent's calls hold their slots until they return, then a waiting main loop is observed", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, agents, stored } = world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const step = steps(on)
+    const runTurn = live(on, clock, history)
+    agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 16; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
+    await clock.set(at(23, 9, 0))
+    await step($, 's', 0, agents['agent-1'].length, 'agent-1')
+    await clock.settle()
+    expect(seen.inFlight).toBe(4)
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 30)) // no slot: main waits
+
+    await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    await runTurn($, turn('c', 'c', 8_000), at(23, 9, 40)) // main's pass after the subagent ends: still no slot
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(4)
+    for (let n = 1; n <= 4; n++) open(n)
+    await clock.settle()
+    for (let n = 5; n <= seen.prompts.length; n++) open(n)
+    await clock.settle()
+
+    expect(seen.maxInFlight).toBe(4)
+    expect(seen.prompts.length).toBeGreaterThan(4)
+    expect(seen.prompts.slice(4).some((p) => readers(p).has('one'))).toBe(false) // the rest read main's rows
+    expect((stored['ledger:session-1'] as Ledger).entries.length).toBeGreaterThan(0)
+    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
   })
 
   test("a teammate's turn.complete is one of many: its keys stay, and a pass runs as main's does", async ($, on) => {
