@@ -6,7 +6,7 @@ A Claude Code function-hooks plugin that replaces compaction with observational 
 
 - `hooks/register.ts` registers every hook. It holds the ledger, the background observation and reflection, and compaction. `hooks/hooks.json` lists the events it handles.
 - `hooks/recall.ts` is the `om_recall` tool. `hooks/stats.ts` is `om_stats` and `/om-stats`. `hooks/prune.ts` prunes old sessions from `$.store`.
-- `hooks/prompts.ts` holds the model prompts and the compaction texts. Its header names the prompts copied from other sources. Regenerate the generated ones from their source rather than editing them.
+- `hooks/prompts.ts` holds the model prompts and the compaction texts. The Observer and Reflector prompts are the plugin's own; edit them there. Its header names the texts copied from other sources. Copy those again from their source rather than editing them.
 - `.claude/types/` holds the plugin API types. Claude Code writes these files. Do not edit them.
 - `scripts/` holds developer tools. They are not part of the plugin. Each file's header gives its usage.
 - `tests/eval/runner.ts` replays one scenario through the four configurations built-in, built-in+recall, om, and om+recall compaction, and records reproducible, machine-readable measurements of what each cost (not how good its output was: that is the continuation-quality benchmark). Its header gives its usage and the live-transport limitation.
