@@ -26,3 +26,11 @@ Tried on branch `sched-reset`:
 With the usual 190k window a background chunk has minutes to land before the next compaction. If it matters later:
 keep `675d1e3` and observe on the spot when cutting at the watermark would keep too much of the window raw (window size
 from `$.session.usage()`).
+
+## Store writes are not atomic across processes
+
+Every Claude Code process shares the plugin's one store file, which offers single-key get, set, delete and keys and no
+transaction or compare-and-set. The ledger lock and the loop stamps in `hooks/register.ts` order one process's work
+only. The pruner (`hooks/prune.ts`) checks a session's keys, their times and the sessions registry again just before
+deleting it, but a process that writes to that session between the last check and the deletes can still lose the
+write. Two processes can also both pass the daily `prune:last` check; that repeats the work and deletes nothing more.

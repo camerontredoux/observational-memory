@@ -2,6 +2,14 @@ import type { EngineInterface, On, SessionStartInput, SessionStartResult } from 
 import { brief } from './stats'
 
 // `$.store` is one JSON file capped at 4 MiB, and each session leaves its keys (`<kind>:<sessionId>`) behind.
+//
+// Every Claude Code process shares that file, and the store offers only single-key get, set, delete and keys: no
+// transaction and no compare-and-set. So pruning is not atomic across processes. It narrows the window instead: just
+// before deleting a session it lists and reads the session's keys again, its subagents' included, and asks the
+// sessions registry again which sessions run, deleting nothing when that cannot be told. A process that writes to a
+// session between that last check and the deletes can still lose what it wrote; the ledger lock in register.ts is
+// one process's alone and does not close this. The daily run is shared the same way: two processes starting within
+// the same instant can both prune, which deletes nothing more.
 const PRUNE_AFTER_DAYS = 30
 const DAY = 24 * 60 * 60 * 1000
 const STORE_CAP = 4 * 1024 * 1024
@@ -11,6 +19,12 @@ const LAST_RUN = 'prune:last' // outside KINDS: shared by every process, never p
 const CAP_ERROR = /the store would be \d+ characters, over the \d+ limit/
 
 type Session = { id: string; keys: string[]; at?: number; bytes: number }
+
+// The session a key belongs to, or none: a subagent's keys, `<kind>:<session>/<agent>`, go with its session.
+function sessionOf(key: string) {
+  const at = key.indexOf(':')
+  return at < 1 || !KINDS.includes(key.slice(0, at)) ? undefined : { kind: key.slice(0, at), id: key.slice(at + 1).split('/')[0]! }
+}
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 const size = (value: unknown) => JSON.stringify(value)?.length ?? 0
@@ -25,11 +39,9 @@ const latest = (times: number[]) => (times.length ? Math.max(...times) : undefin
 async function sessions($: EngineInterface, withSizes: boolean) {
   const all = new Map<string, Session & { times: number[] }>()
   for (const key of await $.store.keys()) {
-    const at = key.indexOf(':')
-    if (at < 1) continue
-    const kind = key.slice(0, at)
-    if (!KINDS.includes(kind)) continue
-    const id = key.slice(at + 1).split('/')[0]! // a subagent's keys, `<kind>:<session>/<agent>`, go with its session
+    const of = sessionOf(key)
+    if (!of) continue
+    const { kind, id } = of
     const s = all.get(id) ?? all.set(id, { id, keys: [], bytes: 0, times: [] }).get(id)!
     s.keys.push(key)
     if (!withSizes && kind !== 'times' && kind !== 'seen') continue
@@ -68,22 +80,33 @@ async function isAlive($: EngineInterface, pid: unknown, procStart: unknown) {
   return started === undefined || started === procStart
 }
 
-// Deletes each session unless, read again just before, it is the current one or `stale` no longer holds of its time.
+// Deletes each session unless, checked again just before, it is the current one, has a key the scan did not list
+// (a subagent started since), `stale` no longer holds of its newest time across its own and its subagents' keys, or
+// it runs now (resumed since). When which sessions run cannot be told, it stops and rejects, deleting no more.
 async function drop($: EngineInterface, gone: Session[], why: string, stale: (s: Session, at: number | undefined) => boolean) {
   const dropped: Session[] = []
-  for (const s of gone) {
-    if (s.id === (await $.session.id())) continue
-    const [times, seen] = await Promise.all([$.store.get(`times:${s.id}`), $.store.get(`seen:${s.id}`)])
-    if (!stale(s, latest([...timesOf('times', times), ...timesOf('seen', seen)]))) continue
-    for (const key of s.keys) await $.store.delete(key)
-    dropped.push(s)
+  try {
+    for (const s of gone) {
+      if (s.id === (await $.session.id())) continue
+      const keys = (await $.store.keys()).filter((k) => sessionOf(k)?.id === s.id)
+      if (keys.some((k) => !s.keys.includes(k))) continue
+      const times: number[] = []
+      for (const key of keys) {
+        const { kind } = sessionOf(key)!
+        if (kind === 'times' || kind === 'seen') times.push(...timesOf(kind, await $.store.get(key)))
+      }
+      if (!stale(s, latest(times)) || (await liveSessions($)).has(s.id)) continue
+      for (const key of keys) await $.store.delete(key)
+      dropped.push(s)
+    }
+  } finally {
+    if (dropped.length)
+      $.ui.log(
+        `pruned ${dropped.length} session(s) ${why}: ${dropped.map((s) => s.id).join(', ')} ` +
+          `(${dropped.reduce((n, s) => n + s.keys.length, 0)} keys${why.includes('cap') ? `, ~${Math.round(dropped.reduce((n, s) => n + s.bytes, 0) / 1024)} KiB` : ''})`,
+        { to: 'debug' },
+      )
   }
-  if (dropped.length)
-    $.ui.log(
-      `pruned ${dropped.length} session(s) ${why}: ${dropped.map((s) => s.id).join(', ')} ` +
-        `(${dropped.reduce((n, s) => n + s.keys.length, 0)} keys${why.includes('cap') ? `, ~${Math.round(dropped.reduce((n, s) => n + s.bytes, 0) / 1024)} KiB` : ''})`,
-      { to: 'debug' },
-    )
 }
 
 // Drops every session untouched for PRUNE_AFTER_DAYS but the current one and those still running; one with no
@@ -137,7 +160,8 @@ export function registerPrune(on: On) {
         gone.push(s)
         total -= s.bytes
       }
-      await drop($, gone, 'to fit the store under its size cap', (s, at) => at !== undefined && at <= s.at!)
+      // Liveness that cannot be told again stops the drops; the write is tried with the room already made.
+      await drop($, gone, 'to fit the store under its size cap', (s, at) => at !== undefined && at <= s.at!).catch(() => {})
       return next(e)
     }
   })
