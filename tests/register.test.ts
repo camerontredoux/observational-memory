@@ -1124,7 +1124,7 @@ describe('register', () => {
     const loose = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'auth.ts nothing-like-this', limit: 3 })
 
     // No field is required: a query alone still searches, a ref alone reads, neither outlines.
-    expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ properties: expect.objectContaining({ query: expect.anything(), ref: expect.anything(), mode: expect.anything() }) }) }), expect.objectContaining({ name: 'om_stats' })])
+    expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ properties: expect.objectContaining({ query: expect.anything(), ref: expect.anything(), mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: expect.any(String) } }) }) }), expect.objectContaining({ name: 'om_stats' })])
     expect(registered[0]).not.toHaveProperty('inputSchema.required')
     const text = String(found.result)
     // The newest prompt, note 29, is the one that asked: it is never a match. Hits are cut by the size cap, newest kept.

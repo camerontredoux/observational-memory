@@ -20,6 +20,8 @@ const NEIGHBORS_MAX = 5 // blocks before or after a read block
 const NEIGHBOR_MAX_CHARS = 1_000
 const OUTLINE_MAX_LINES = 120
 const OUTLINE_MAX_CHARS = 12_000
+const FILES_MAX_LINES = 100
+const FILES_REFS = 5 // the newest blocks shown per file and action; the rest counted
 const WRAP = 1_000 // a longer line counts as several, so every line fits a page
 const RESPONSE_MAX_CHARS = 16_000 // all of one call's response, about 4k tokens
 const ARG_MAX_CHARS = 500
@@ -45,7 +47,7 @@ export type RecallInput = {
   to?: unknown
   subagents?: unknown
 }
-export type Mode = 'search' | 'read' | 'outline'
+export type Mode = 'search' | 'read' | 'outline' | 'files'
 export type RecallResult = { mode: Mode; text: string; matches: number }
 
 type Kind = 'user' | 'assistant' | 'call' | 'result' | 'memory' | 'summary'
@@ -55,6 +57,8 @@ type Block = {
   text: string
   time?: number
   tool?: string
+  input?: unknown // a call's
+  callId?: string // a call's tool_use id
   error?: boolean
   meta?: boolean // a row the engine injected, as an image's note
   own?: boolean // om_recall's own call or result
@@ -174,10 +178,12 @@ function pairUp(seen: Seen, b: Block, callId: string) {
 }
 
 type Part = { b: Omit<Block, 'ref'>; callId?: string; resultOf?: string }
-const callBlock = (base: Partial<Block>, tool: string, input: unknown): Omit<Block, 'ref'> => ({
+const callBlock = (base: Partial<Block>, tool: string, input: unknown, callId?: string): Omit<Block, 'ref'> => ({
   ...base,
   kind: 'call',
   tool,
+  input,
+  ...(callId ? { callId } : {}),
   text: renderInput(input),
   ...(tool.endsWith(`__${RECALL_TOOL}`) ? { own: true } : {}),
 })
@@ -236,7 +242,7 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean) {
       if (p.type === 'text' && p.text) {
         const kind: Kind = r.type === 'assistant' ? 'assistant' : isMemoryText(p.text) ? 'memory' : summary || r.isCompactSummary ? 'summary' : 'user'
         made.push({ b: { ...base, kind, text: p.text } })
-      } else if (p.type === 'tool_use' || p.type === 'server_tool_use') made.push({ b: callBlock(base, p.name ?? 'tool', p.input), callId: p.id })
+      } else if (p.type === 'tool_use' || p.type === 'server_tool_use') made.push({ b: callBlock(base, p.name ?? 'tool', p.input, p.id), callId: p.id })
       else if (p.type.endsWith('tool_result'))
         made.push({ b: { ...base, kind: 'result', text: resultText(p.content), ...(p.is_error ? { error: true } : {}) }, resultOf: p.tool_use_id })
     }
@@ -381,7 +387,7 @@ export function liveTranscript(rows: readonly SessionMessage[], times: readonly 
       const kind: Kind = m.role === 'assistant' ? 'assistant' : isMemoryText(m.text) ? 'memory' : m.text.startsWith(COMPACT_WRAPPER) ? 'summary' : 'user'
       made.push({ b: { ...base, kind, text: m.text } })
     }
-    for (const u of m.toolUses) made.push({ b: callBlock(base, u.tool, u.input), callId: u.tool_use_id })
+    for (const u of m.toolUses) made.push({ b: callBlock(base, u.tool, u.input, u.tool_use_id), callId: u.tool_use_id })
     for (const r of m.toolResults ?? []) made.push({ b: { ...base, kind: 'result', text: r.text, ...(r.isError ? { error: true } : {}) }, resultOf: r.tool_use_id })
     addParts(`#${i}`, made, seen, blocks)
   })
@@ -861,6 +867,66 @@ async function outline(c: Corpus, input: Input): Promise<RecallResult> {
   return { mode: 'outline', text: out.join('\n'), matches: lines.length }
 }
 
+// ---- Files ------------------------------------------------------------------------------------------------------
+
+// The file tools, by the path field each names and what a call did to it. Bash commands are left to search: what one
+// reads or writes is not known without running it.
+const FILE_TOOLS: Record<string, { field: string; did: 'read' | 'edited' | 'wrote' }> = {
+  Read: { field: 'file_path', did: 'read' },
+  Edit: { field: 'file_path', did: 'edited' },
+  MultiEdit: { field: 'file_path', did: 'edited' },
+  Write: { field: 'file_path', did: 'wrote' },
+  NotebookRead: { field: 'notebook_path', did: 'read' },
+  NotebookEdit: { field: 'notebook_path', did: 'edited' },
+}
+const FAILED = { read: 'read failed', edited: 'edit failed', wrote: 'write failed' } as const
+const ACTIONS = ['read', 'edited', 'wrote', FAILED.read, FAILED.edited, FAILED.wrote]
+
+// Each file a file tool named, the most recently touched first: what each call did to it, and the call's block.
+async function files(c: Corpus, input: Input): Promise<RecallResult> {
+  const threads = [c.main, ...(input.subagents ? c.subagents : [])]
+  for (const t of threads) await c.load(t)
+  const touched = new Map<string, { last: number; refs: Map<string, string[]> }>()
+  let order = 0
+  for (const t of threads)
+    for (const b of t.blocks) {
+      const how = b.kind === 'call' && b.tool ? FILE_TOOLS[b.tool] : undefined
+      const path = how && b.input && typeof b.input === 'object' ? (b.input as Record<string, unknown>)[how.field] : undefined
+      if (typeof path !== 'string' || !path.trim()) continue
+      if (input.query && !path.toLowerCase().includes(input.query.toLowerCase())) continue
+      const did = b.pair?.error ? FAILED[how!.did] : how!.did
+      const file = touched.get(path) ?? { last: 0, refs: new Map() }
+      file.last = ++order
+      file.refs.set(did, [...(file.refs.get(did) ?? []), b.ref])
+      touched.delete(path)
+      touched.set(path, file)
+    }
+  const listed = [...touched].sort((a, b) => b[1].last - a[1].last)
+  const source = c.live ? `the live history${c.note ? ` (${c.note})` : ''}` : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})${c.note ? ` (${c.note})` : ''}`
+  const subs = input.subagents && c.subagents.length ? ` and ${plural(c.subagents.length, 'subagent transcript')}` : ''
+  const which = input.query ? ` whose path holds "${input.query}"` : ''
+  const head =
+    `Files named by the Read, Edit, Write and NotebookEdit calls of ${source}${subs}, newest first: ${plural(listed.length, 'file')}${which}. ` +
+    'Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.'
+  const lines: string[] = []
+  let chars = 0
+  for (const [path, file] of listed) {
+    const acts = ACTIONS.flatMap((a) => {
+      const refs = file.refs.get(a)
+      if (!refs) return []
+      const earlier = refs.length > FILES_REFS ? ` (+${refs.length - FILES_REFS} earlier)` : ''
+      return [`${a}${earlier} ${refs.slice(-FILES_REFS).join(', ')}`]
+    })
+    const line = `${oneLine(path, 300)}: ${acts.join('; ')}`
+    if (lines.length >= FILES_MAX_LINES || chars + line.length > OUTLINE_MAX_CHARS) break
+    lines.push(line)
+    chars += line.length + 1
+  }
+  const more = listed.length - lines.length
+  const tail = more ? [`${plural(more, 'more file')}; narrow with a query: {"mode": "files", "query": "<part of a path>"}.`] : []
+  return { mode: 'files', text: [head, ...(lines.length ? lines : ['(no file named)']), ...tail].join('\n'), matches: lines.length }
+}
+
 // ---- Entry ------------------------------------------------------------------------------------------------------
 
 type Input = { mode: Mode; query?: string; limit?: number; ref?: string; lines?: string; before?: number; after?: number; from?: string; to?: string; subagents: boolean }
@@ -880,7 +946,7 @@ export function parseInput(e: RecallInput): Input | string {
   const query = str(e.query)
   const ref = str(e.ref)
   const mode = str(e.mode) ?? (ref && !query ? 'read' : query ? 'search' : 'outline')
-  if (mode !== 'search' && mode !== 'read' && mode !== 'outline') return `om_recall: mode is search, read or outline.`
+  if (mode !== 'search' && mode !== 'read' && mode !== 'outline' && mode !== 'files') return `om_recall: mode is search, read, outline or files.`
   if (mode === 'search' && !query) return 'om_recall: give a query.'
   if (mode === 'read' && !ref) return 'om_recall: give the ref of the block to read, from a search or an outline.'
   const limit = num(e.limit)
@@ -906,8 +972,11 @@ function answeredThisTurn(t: Thread) {
 
 export async function recall(c: Corpus, e: RecallInput): Promise<RecallResult> {
   const input = parseInput(e)
-  if (typeof input === 'string') return { mode: str(e.mode) === 'read' ? 'read' : str(e.mode) === 'outline' ? 'outline' : 'search', text: input, matches: 0 }
-  const found = await (input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : outline(c, input))
+  if (typeof input === 'string') {
+    const asked = str(e.mode)
+    return { mode: asked === 'read' || asked === 'outline' || asked === 'files' ? asked : 'search', text: input, matches: 0 }
+  }
+  const found = await (input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : input.mode === 'files' ? files(c, input) : outline(c, input))
   const calls = answeredThisTurn(c.main)
   const nudge = calls >= TURN_CALLS ? `\nThis is om_recall call ${calls + 1} this turn: answer from what you have found unless a specific fact is still missing.` : ''
   // Each mode keeps under the cap; this holds it whatever the input.

@@ -167,7 +167,7 @@ describe('recall', () => {
     expect(parseInput({})).toMatchObject({ mode: 'outline' })
     expect(parseInput({ query: 'x', limit: 99 })).toMatchObject({ limit: 20 })
     expect(parseInput({ mode: 'search' })).toBe('om_recall: give a query.')
-    expect(parseInput({ mode: 'nope' })).toBe('om_recall: mode is search, read or outline.')
+    expect(parseInput({ mode: 'nope' })).toBe('om_recall: mode is search, read, outline or files.')
     const found = await run({ query: 'kiwi job', limit: 5 })
     expect(found).toMatch(/^1 match\(es\) for "kiwi job" in 6 blocks of 2 transcript files\.\n\[aaaaaaaa:1 · [\d-]+ [\d:]+ · user\] 1 line\n  1: start the KIWI job\n/)
   })
@@ -344,6 +344,41 @@ describe('recall', () => {
     expect(found).not.toContain('more matching line')
     // A compound no line holds whole is still excerpted by its parts.
     expect(await run({ query: 'shard-verified' }, io())).toMatch(/\n {2}1: shard-001 [^\n]*\n[^\n]*\n[^\n]*\n  … 198 more matching lines\n/)
+  })
+
+  test('files: each file the session read, edited or wrote, newest first, with the blocks that touched it', async () => {
+    const tool = (m: number, id: string, name: string, input: Record<string, unknown>, text: string, error = false) => [
+      msg('assistant', m, [{ type: 'tool_use', id, name, input }]),
+      msg('user', m, [{ type: 'tool_result', tool_use_id: id, content: text, ...(error ? { is_error: true } : {}) }]),
+    ]
+    const rows = [
+      ...tool(1, 't1', 'Read', { file_path: '/p/src/a.ts' }, '1\tconst a = 1'), // lines 1-2
+      ...tool(2, 't2', 'Edit', { file_path: '/p/src/a.ts', old_string: '1', new_string: '2' }, 'updated'), // 3-4
+      ...tool(3, 't3', 'Write', { file_path: '/p/notes.md', content: 'x' }, 'File created successfully at: /p/notes.md'), // 5-6
+      ...tool(4, 't4', 'Edit', { file_path: '/p/missing.ts', old_string: 'a', new_string: 'b' }, 'File does not exist.', true), // 7-8
+      ...tool(5, 't5', 'Bash', { command: 'cat /p/src/a.ts' }, 'const a = 2'), // 9-10
+      ...tool(6, 't6', 'Read', { file_path: '/p/src/a.ts' }, '1\tconst a = 2'), // 11-12
+      ...tool(7, 't7', 'mcp__observational-memory__om_recall', { mode: 'files' }, 'files'), // 13-14
+    ]
+    const listed = await run({ mode: 'files' }, session(rows))
+    expect(listed.split('\n')).toEqual([
+      'Files named by the Read, Edit, Write and NotebookEdit calls of 1 transcript file (bbbbbbbb), newest first: 3 files. Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.',
+      '/p/src/a.ts: read bbbbbbbb:1, bbbbbbbb:11; edited bbbbbbbb:3',
+      '/p/missing.ts: edit failed bbbbbbbb:7',
+      '/p/notes.md: wrote bbbbbbbb:5',
+    ])
+    // A query narrows the list to the paths that hold it.
+    expect(await run({ mode: 'files', query: 'notes' }, session(rows))).toContain('1 file whose path holds "notes"')
+    expect(await run({ mode: 'files', query: 'notes' }, session(rows))).not.toContain('a.ts')
+
+    // Many files and many touches stay within the bounds: the oldest refs of a file are counted, the oldest files too.
+    const many = Array.from({ length: 300 }, (_, k) => tool(k % 50, `m${k}`, 'Read', { file_path: `/p/dir/file-${k % 150}.ts` }, 'x')).flat()
+    const big = await run({ mode: 'files' }, session(many))
+    expect(big.length).toBeLessThan(16_000)
+    expect(big).toMatch(/^Files named by .*: 150 files\./)
+    expect(big).toMatch(/\n\d+ more files; narrow with a query: \{"mode": "files", "query": "<part of a path>"\}\.$/)
+    const reads = Array.from({ length: 12 }, (_, k) => tool(k, `r${k}`, 'Read', { file_path: '/p/hot.ts' }, 'x')).flat()
+    expect(await run({ mode: 'files' }, session(reads))).toContain('/p/hot.ts: read (+7 earlier) bbbbbbbb:15, bbbbbbbb:17, bbbbbbbb:19, bbbbbbbb:21, bbbbbbbb:23')
   })
 
   test('every mode keeps its whole response under one size cap', async () => {
