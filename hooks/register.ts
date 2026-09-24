@@ -327,7 +327,7 @@ function sourceOf(v: View, from: number, to: number): Source | undefined {
 
 // A line's source, rendered after it: both ends as om_recall's `from` and `to` take them.
 const SOURCE_TRAILER = /\s*\(source:? ([^()]*)\)$/
-const renderSource = (s: Source) => `(source ${stamp(s.from)}${minute(s.to) === minute(s.from) ? '' : ` to ${stamp(s.to)}`})`
+const renderSource = (s: Source) => `(source ${stamp(s.from)} to ${stamp(s.to)})`
 // The source of a line reflected from lines whose sources span `span`: the one it gives, cut to that span; with
 // none, or one outside it, the whole span. When some of those lines had no source, what they came from is unknown:
 // a line keeps only a source inside the span, and is given none.
@@ -341,13 +341,15 @@ function reflectedSource(given: Source | undefined, span: Source | undefined, al
   return allKnown ? span : undefined
 }
 
-// A line and the source it ends with, if both its times are real ones.
+// A line and the source range it ends with. A trailer that is not a range of times is part of the line; a range
+// that runs backwards is cut off and gives no source.
 function splitSource(text: string): { line: string; source?: Source } {
   const m = text.match(SOURCE_TRAILER)
   if (!m) return { line: text }
-  const line = text.slice(0, m.index).trimEnd()
   const [a, b = a] = m[1]!.split(' to ').map((t) => unstamp(t.trim()))
-  return a === undefined || b === undefined || b < a ? { line } : { line, source: { from: a, to: b } }
+  if (a === undefined || b === undefined) return { line: text }
+  const line = text.slice(0, m.index).trimEnd()
+  return b < a ? { line } : { line, source: { from: a, to: b } }
 }
 
 // The tag must start a line.
@@ -1163,11 +1165,8 @@ export const register: Register = (on) => {
       // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
       // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
       // find; the corrections, observations and next step stay whole. Still over it, the built-in compaction runs.
-      const bare = (m: Memory): Memory => ({ ...m, observations: renderLines(ledger.entries, false) })
-      const cuts: [string, (m: Memory) => Memory][] = [
-        ...(ledger.entries.some((e) => e.source) ? [['source ranges left out', bare] as [string, typeof bare]] : []),
-        ['skills kept as lines, user messages as the brief', briefer],
-      ]
+      const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', briefer]]
+      if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ({ ...m, observations: renderLines(ledger.entries, false) })])
       const over = contextTokens(message)
       let tokens = over
       const made: string[] = []

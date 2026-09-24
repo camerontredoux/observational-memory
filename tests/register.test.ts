@@ -273,7 +273,7 @@ describe('register', () => {
     const text = result.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b') // untimed history: no invented times
     expect(text).toContain('<current-task>\nPrimary: b\n</current-task>')
-    expect(text).toContain('AUTHORITATIVE HISTORY')
+    expect(text).toContain('SESSION HISTORY: The observations are this same conversation')
     expect(text).not.toContain('only as background')
     expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
     expect(seen.screen).toEqual(['Compacted in 0 ms · observed 7 messages on the spot · memory 2 notes'])
@@ -811,7 +811,7 @@ describe('register', () => {
     )
   })
 
-  test('a reflection with no observations is tried again at the next level, which says so; the observer and reflector mark priority alike', async ($, on) => {
+  test('a reflection with no observations is tried again at the next level, which says so', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const seen = pi(on, {
@@ -830,12 +830,22 @@ describe('register', () => {
     const ledger = stored['ledger:session-1'] as Ledger
     expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-22 14:30 Read files'])
     expect(ledger.corrections).toEqual([]) // the Reflector's is not the user's
+  })
+
+  test('the observer and reflector are given the same priority markers', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>` })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    const markers = (system: string) => system.split('\n').filter((l) => /^  (🔴|🟡|🟢|✅) /u.test(l))
     const [observer, reflector] = [seen.systems[0]!, seen.systems.at(-1)!]
-    expect(reflector).not.toBe(observer)
-    for (const marker of ["🔴 The user's constraints:", '🟡 What else is worth keeping:', '🟢 Minor details', '✅ Verified:']) {
-      expect(observer).toContain(`\n  ${marker}`)
-      expect(reflector).toContain(`\n  ${marker}`)
-    }
+    expect(reflector).toContain('You are the reflection agent')
+    expect(markers(reflector)).toHaveLength(4)
+    expect(markers(reflector)).toEqual(markers(observer))
   })
 
   test('a reflection in the older date-group form, which the prompts no longer ask for, is still read', async ($, on) => {
@@ -952,6 +962,18 @@ describe('register', () => {
     expect(lines.slice(0, 2).join('\n')).toBe(observed)
     expect(lines.length).toBeGreaterThan(2)
     for (const line of lines.slice(2)) expect(line).toMatch(/^\* 🟡 Read \w+$/)
+  })
+
+  test('an observation that ends in a parenthetical that is not a source range keeps it', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Read config.ts (source of truth for ports)\n* 🟡 Cited the RFC (source: IETF)\n</observations>' })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+
+    expect(observationsIn(result.messages?.[0]?.text)).toBe(
+      '* 🟡 Read config.ts (source of truth for ports)\n* 🟡 Cited the RFC (source: IETF)',
+    )
   })
 
   test("an observation's source range, given to om_recall as from and to, finds the rows it was observed from", async ($, on) => {
@@ -2649,7 +2671,7 @@ describe('register', () => {
     const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
     await clock.advance(5_000)
 
-    expect(observationsIn(first.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a (source 2026-09-22 14:30)')
+    expect(observationsIn(first.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 Saw a (source 2026-09-22 14:30 to 2026-09-22 14:30)')
     expect(second.messages?.[0]?.text).toContain('Saw c')
     // A hook that throws is skipped, so the engine reports the write as unanswered.
     expect(seen.logs.filter((l) => l.startsWith('stats not saved'))).toEqual(['stats not saved (no implementation for fs.write); carrying on without them'])
