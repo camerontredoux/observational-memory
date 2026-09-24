@@ -11,8 +11,10 @@
 // a response, every scenario compaction happened (in a scenario that grows until Claude Code compacts on its own: at
 // least one compaction, each with the `auto` trigger of its `compact_boundary` row), the compaction ran the path its
 // configuration names (an `om` run whose compaction fell back to the built-in summary measures the built-in one, so
-// it is reported as invalid, not scored as observational memory), and a configuration without recall did not call
-// it. Invalid runs are counted and listed with their reasons, never dropped.
+// it is reported as invalid, not scored as observational memory; one whose memory message the floor made, a brief
+// compiled by code where the Observer had nothing to give, is observational compaction, reported as its own path),
+// and a configuration without recall did not call it. Invalid runs are counted and listed with their reasons, never
+// dropped.
 //
 // Cost: subscription sessions report no dollars, so cost is token-equivalent: each assistant message's usage (counted
 // once, however many rows streaming wrote for it) times `PRICES_USD_PER_MTOK`. The built-in compactor's own request
@@ -38,6 +40,8 @@ export const PRICES_USD_PER_MTOK: readonly { model: RegExp; input: number; outpu
 // The first words of the observational-memory message, identical in c6c86a3 and main (hooks/prompts.ts
 // MEMORY_HEADER). Copied, not imported: the scorer does not depend on the module it evaluates.
 export const MEMORY_MARK = 'The following observations block is your memory of this session'
+// The first words of the session brief's note when the floor made the memory message (hooks/prompts.ts FLOOR_NOTE).
+export const FLOOR_MARK = 'At the latest compaction the Observer had not observed'
 export const RECALL_TOOL = 'mcp__observational-memory__om_recall'
 
 // ---- Transcript ----
@@ -144,7 +148,7 @@ export function parseTranscript(jsonl: string): Transcript {
 
 // ---- Cost ----
 
-export type OmStats = { memoryUsd: number; memoryCalls: number; reflections: number; fellBack: number; failures: number }
+export type OmStats = { memoryUsd: number; memoryCalls: number; reflections: number; fellBack: number; floor: number; failures: number }
 
 /** The plugin's stats file (hooks/stats.ts SessionStats, the same metric names in c6c86a3 and main). */
 export function parseStats(json: string): OmStats | undefined {
@@ -162,6 +166,7 @@ export function parseStats(json: string): OmStats | undefined {
     memoryCalls: costs.reduce((t, [, m]) => t + num(m.count), 0),
     reflections: num(s.metrics?.['reflection.ms']?.count),
     fellBack: counts.filter(([k]) => /^compaction\.[\w-]+\.fellBack$/.test(k)).reduce((t, [, n]) => t + num(n), 0),
+    floor: counts.filter(([k]) => /^compaction\.[\w-]+\.floor$/.test(k)).reduce((t, [, n]) => t + num(n), 0),
     failures: counts.filter(([k]) => /\.failed\./.test(k)).reduce((t, [, n]) => t + num(n), 0),
   }
 }
@@ -216,7 +221,8 @@ export function runCost(config: Configuration, t: Transcript, statsJson?: string
 // ---- Scoring ----
 
 export type CheckResult = { id: string; category: CheckCategory; description: string; outcome: 'pass' | 'fail' | 'n/a'; evidence: string }
-export type CompactionPath = 'observational' | 'built-in'
+/** `floor`: the memory message, its brief compiled by code for rows the Observer had not observed. */
+export type CompactionPath = 'observational' | 'floor' | 'built-in'
 export type CompactionScore = {
   path: CompactionPath
   durationMs: Measurement<number>
@@ -312,7 +318,8 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
   const compactions: CompactionScore[] = boundaries.map(({ e, i }) => {
     const next = t.entries.slice(i + 1).find((x) => x.kind === 'summary' || x.kind === 'boundary')
     const text = next?.kind === 'summary' ? next.text : ''
-    const path: CompactionPath = text.includes(MEMORY_MARK) ? 'observational' : 'built-in'
+    const brief = text.match(/<session-brief>\n([\s\S]*?)<\/session-brief>/)?.[1] ?? ''
+    const path: CompactionPath = !text.includes(MEMORY_MARK) ? 'built-in' : brief.includes(FLOOR_MARK) ? 'floor' : 'observational'
     const parts = sections(text, path)
     const b = e as Extract<Entry, { kind: 'boundary' }>
     return {
@@ -325,7 +332,7 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
   })
   compactions.forEach((c, i) => {
     if (usesObservationalCompaction(config) && c.path === 'built-in') invalid.push(`compaction ${i + 1} fell back to the built-in summary`)
-    if (!usesObservationalCompaction(config) && c.path === 'observational') invalid.push(`compaction ${i + 1} returned the observational-memory message: the plugin was loaded`)
+    if (!usesObservationalCompaction(config) && c.path !== 'built-in') invalid.push(`compaction ${i + 1} returned the observational-memory message: the plugin was loaded`)
   })
   if (usesObservationalCompaction(config) && stats?.fellBack) invalid.push(`the plugin's stats record ${stats.fellBack} compaction(s) that fell back to the built-in one`)
   if (!recallAvailable(config) && t.entries.some((e) => e.kind === 'tool' && e.name === RECALL_TOOL)) invalid.push(`om_recall was called although ${config} does not offer it`)
@@ -416,6 +423,8 @@ export type RunMeta = {
   /** The plugin checkout the version label named, and its commit (`-dirty` when it had uncommitted changes). */
   pluginRoot?: string
   pluginCommit?: string
+  /** `always`: the session ran with OM_BRIEF=always (a variant under its own version label). */
+  brief?: 'always'
   /** What the budget admitted the run under. */
   admission?: { budgetUsd: number; spentUsd: number; reserveUsd: number }
 }
@@ -533,6 +542,23 @@ function section(rs: readonly RunRecord[], mode: 'live' | 'offline'): string[] {
       `| ${g.version} | ${g.configuration} | ${g.runs.length} | ${g.valid.length} | ${sc.length ? pct(sc.filter((s) => s.taskSuccess).length / sc.length) : '–'} | ${cell(sc.map((s) => s.correctness), pct)} | ${cell(sc.map((s) => s.violations), fixed(2))} | ${cell(sc.map((s) => s.repeatedWork), fixed(2))} | ${cell(sc.map((s) => s.unsupportedClaims), fixed(2))} | ${cell(sc.map((s) => s.retrieval.calls), fixed(2))} | ${checked ? `${hits}/${checked}` : '–'} | ${cell(values(sc.map((s) => s.retrieval.resultTokens)), fixed(0))} | ${cell(values(g.valid.map((r) => r.cost?.total ?? unavailable('no cost'))), fixed(4))} | ${cell(values(g.valid.map((r) => r.cost?.memoryModel ?? unavailable('no cost'))), fixed(4))} | ${cell(g.valid.flatMap((r) => (r.memory ? [r.memory.reflections] : [])), fixed(2))} | ${cell(values(sc.flatMap((s) => s.compactions.map((c) => c.durationMs))), fixed(0))} | ${cell(values(sc.map((s) => s.continuationMs)), fixed(0))} |`,
     )
   }
+  // Every scored run's compactions, valid or not: a fallback makes its run invalid, and is counted here too.
+  const paths = gs.filter((g) => usesObservationalCompaction(g.configuration)).flatMap((g) => {
+    const cs = g.runs.flatMap((r) => r.score?.compactions ?? [])
+    const n = (p: CompactionPath) => cs.filter((c) => c.path === p).length
+    return cs.length ? [`| ${g.version} | ${g.configuration} | ${cs.length} | ${n('observational')} | ${n('floor')} | ${n('built-in')} |`] : []
+  })
+  if (paths.length)
+    out.push(
+      '',
+      '### Compaction paths',
+      '',
+      "Which path each observational configuration's compactions ran, over every scored run: the Observer's memory, the floor (a memory whose brief, compiled by code, stands in for what the Observer had not observed; valid), or the built-in summary it fell back to (its run invalid).",
+      '',
+      '| version | configuration | compactions | observational memory | floor (brief compiled by code) | built-in (fell back: run invalid) |',
+      '|---|---|---|---|---|---|',
+      ...paths,
+    )
   const noMemory = rs.filter((r) => usesObservationalCompaction(r.configuration) && r.cost?.memoryModel.status === 'unavailable').length
   const noTotal = rs.filter((r) => r.cost?.total.status === 'unavailable').length
   if (noMemory) out.push('', `Observational runs without a stats file: memory model cost and reflections unavailable in ${noMemory} run(s); their cost column leaves the memory model out.`)

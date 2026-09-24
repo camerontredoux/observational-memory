@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { MEMORY_HEADER } from '../hooks/prompts'
 import { legacyRecall } from './eval/legacy-recall'
-import { liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
+import { liveTranscript, loadTranscript, parseInput, recall, refsOf } from '../hooks/recall'
+import type { SessionMessage } from 'claude-code'
 import type { RecallInput, RecallIo } from '../hooks/recall'
 
 const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
@@ -167,7 +168,7 @@ describe('recall', () => {
     expect(parseInput({})).toMatchObject({ mode: 'outline' })
     expect(parseInput({ query: 'x', limit: 99 })).toMatchObject({ limit: 20 })
     expect(parseInput({ mode: 'search' })).toBe('om_recall: give a query.')
-    expect(parseInput({ mode: 'nope' })).toBe('om_recall: mode is search, read or outline.')
+    expect(parseInput({ mode: 'nope' })).toBe('om_recall: mode is search, read, outline or files.')
     const found = await run({ query: 'kiwi job', limit: 5 })
     expect(found).toMatch(/^1 match\(es\) for "kiwi job" in 6 blocks of 2 transcript files\.\n\[aaaaaaaa:1 · [\d-]+ [\d:]+ · user\] 1 line\n  1: start the KIWI job\n/)
   })
@@ -325,6 +326,86 @@ describe('recall', () => {
     const found = await run({ query: 'RAW_TOKEN' }, io)
     expect(found).toMatch(/^1 match\(es\) for "RAW_TOKEN" in 2 blocks of 1 transcript file; no block holds every term, so these hold some, chosen by the rarest\.\n\[bbbbbbbb:1 [^\n]*\n  1: the RAW TRACE TOKEN is 7f3a\n/)
     expect(await run({ query: 'RAW_TOKEN zebra' }, io)).toContain('\nNo occurrences in this session of: zebra.\n')
+  })
+
+  // recall-required.om-recall.new.r3: `shard-101` showed lines 10 and 19, whose byte counts hold 101 inside 101047290
+  // and 101989851, beside line 101, the only one that holds shard-101, with "10 more matching lines" after it.
+  test('a line that holds a compound term whole outranks lines that hold only its parts', async () => {
+    const regions = ['eu-west-2', 'us-east-1', 'ap-south-1', 'eu-central-1']
+    // tests/eval/scenarios.ts's shards.sh, its checksums made up.
+    const audit = Array.from({ length: 200 }, (_, k) => {
+      const n = k + 1
+      const i = String(n).padStart(3, '0')
+      return `shard-${i} region=${regions[n % 4]} objects=${(n * 7919) % 90000 + 10000} bytes=${(n * 104729) % 900000000 + 100000000} replicas=${(n % 3) + 2} checksum=ck-${i}0000000000000 status=verified`
+    })
+    const io = () => session(result(20, 'shards', [...audit, 'audit complete: 200 shards verified'].join('\n')))
+    const found = await run({ query: 'shard-101' }, io())
+    expect(found).toContain('  101: shard-101 region=us-east-1 objects=89819 ')
+    expect(found).not.toMatch(/\n {2}(10|19): /)
+    expect(found).not.toContain('more matching line')
+    // A compound no line holds whole is still excerpted by its parts.
+    expect(await run({ query: 'shard-verified' }, io())).toMatch(/\n {2}1: shard-001 [^\n]*\n[^\n]*\n[^\n]*\n  … 198 more matching lines\n/)
+  })
+
+  test('files: each file the session read, edited or wrote, newest first, with the blocks that touched it', async () => {
+    const tool = (m: number, id: string, name: string, input: Record<string, unknown>, text: string, error = false) => [
+      msg('assistant', m, [{ type: 'tool_use', id, name, input }]),
+      msg('user', m, [{ type: 'tool_result', tool_use_id: id, content: text, ...(error ? { is_error: true } : {}) }]),
+    ]
+    const rows = [
+      ...tool(1, 't1', 'Read', { file_path: '/p/src/a.ts' }, '1\tconst a = 1'), // lines 1-2
+      ...tool(2, 't2', 'Edit', { file_path: '/p/src/a.ts', old_string: '1', new_string: '2' }, 'updated'), // 3-4
+      ...tool(3, 't3', 'Write', { file_path: '/p/notes.md', content: 'x' }, 'File created successfully at: /p/notes.md'), // 5-6
+      ...tool(4, 't4', 'Edit', { file_path: '/p/missing.ts', old_string: 'a', new_string: 'b' }, 'File does not exist.', true), // 7-8
+      ...tool(5, 't5', 'Bash', { command: 'cat /p/src/a.ts' }, 'const a = 2'), // 9-10
+      ...tool(6, 't6', 'Read', { file_path: '/p/src/a.ts' }, '1\tconst a = 2'), // 11-12
+      ...tool(7, 't7', 'mcp__observational-memory__om_recall', { mode: 'files' }, 'files'), // 13-14
+    ]
+    const listed = await run({ mode: 'files' }, session(rows))
+    expect(listed.split('\n')).toEqual([
+      'Files named by the Read, Edit, MultiEdit, Write, NotebookRead, NotebookEdit calls of 1 transcript file (bbbbbbbb), newest first: 3 files. Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.',
+      '/p/src/a.ts: read bbbbbbbb:1, bbbbbbbb:11; edited bbbbbbbb:3',
+      '/p/missing.ts: edit failed bbbbbbbb:7',
+      '/p/notes.md: wrote bbbbbbbb:5',
+    ])
+    // A query narrows the list to the paths that hold it.
+    expect(await run({ mode: 'files', query: 'notes' }, session(rows))).toContain('1 file whose path holds "notes"')
+    expect(await run({ mode: 'files', query: 'notes' }, session(rows))).not.toContain('a.ts')
+
+    // Many files and many touches stay within the bounds: the oldest refs of a file are counted, the oldest files too.
+    const many = Array.from({ length: 300 }, (_, k) => tool(k % 50, `m${k}`, 'Read', { file_path: `/p/dir/file-${k % 150}.ts` }, 'x')).flat()
+    const big = await run({ mode: 'files' }, session(many))
+    expect(big.length).toBeLessThan(16_000)
+    expect(big).toMatch(/^Files named by .*: 150 files\./)
+    expect(big).toMatch(/\n\d+ more files; narrow with a query: \{"mode": "files", "query": "<part of a path>"\}\.$/)
+    const reads = Array.from({ length: 12 }, (_, k) => tool(k, `r${k}`, 'Read', { file_path: '/p/hot.ts' }, 'x')).flat()
+    expect(await run({ mode: 'files' }, session(reads))).toContain('/p/hot.ts: read (+7 earlier) bbbbbbbb:15, bbbbbbbb:17, bbbbbbbb:19, bbbbbbbb:21, bbbbbbbb:23')
+  })
+
+  test("refsOf: a compacted row's block, by its tool call's id or its text; none for the live history", async () => {
+    const sub = `${DIR}/${NEW}/subagents`
+    const rows = [
+      msg('user', 1, 'start the PEAR job'), // line 1
+      msg('assistant', 2, [{ type: 'text', text: 'Running it.' }]), // 2
+      msg('assistant', 2, [{ type: 'tool_use', id: 'p1', name: 'Bash', input: { command: 'make pear' } }]), // 3
+      msg('user', 3, [{ type: 'tool_result', tool_use_id: 'p1', content: 'ok' }]), // 4
+    ]
+    const io = memoryIo({
+      [`${DIR}/${NEW}.jsonl`]: rows.join('\n'),
+      [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: [msg('assistant', 4, [{ type: 'tool_use', id: 's1', name: 'Read', input: { file_path: '/p/x' } }], { isSidechain: true })].join('\n'),
+    })
+    const corpus = await loadTranscript(io, `${DIR}/${NEW}.jsonl`)
+    const live: SessionMessage[] = [
+      { role: 'user', text: 'start the PEAR job', toolUses: [] },
+      { role: 'assistant', text: 'Running it.', toolUses: [{ tool_use_id: 'p1', tool: 'Bash', input: { command: 'make pear' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'p1', text: 'ok', isError: false }] },
+      { role: 'assistant', text: 'Not in the file.', toolUses: [] },
+    ]
+    const refOf = await refsOf(corpus, live)
+    expect([refOf(0), refOf(1), refOf(1, 'p1'), refOf(3), refOf(1, 'nope')]).toEqual(['bbbbbbbb:1', 'bbbbbbbb:2', 'bbbbbbbb:3', undefined, undefined])
+    // A subagent's rows are found in its own transcript.
+    expect((await refsOf(corpus, [], 'a1b2c3d4e5f6a7b8c'))(0, 's1')).toBe('a1b2c3d4:1')
+    expect((await refsOf(liveTranscript(live, [], false), live))(1, 'p1')).toBeUndefined()
   })
 
   test('every mode keeps its whole response under one size cap', async () => {

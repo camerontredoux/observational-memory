@@ -20,6 +20,8 @@ const NEIGHBORS_MAX = 5 // blocks before or after a read block
 const NEIGHBOR_MAX_CHARS = 1_000
 const OUTLINE_MAX_LINES = 120
 const OUTLINE_MAX_CHARS = 12_000
+const FILES_MAX_LINES = 100
+const FILES_REFS = 5 // the newest blocks shown per file and action; the rest counted
 const WRAP = 1_000 // a longer line counts as several, so every line fits a page
 const RESPONSE_MAX_CHARS = 16_000 // all of one call's response, about 4k tokens
 const ARG_MAX_CHARS = 500
@@ -45,7 +47,7 @@ export type RecallInput = {
   to?: unknown
   subagents?: unknown
 }
-export type Mode = 'search' | 'read' | 'outline'
+export type Mode = 'search' | 'read' | 'outline' | 'files'
 export type RecallResult = { mode: Mode; text: string; matches: number }
 
 type Kind = 'user' | 'assistant' | 'call' | 'result' | 'memory' | 'summary'
@@ -55,6 +57,8 @@ type Block = {
   text: string
   time?: number
   tool?: string
+  input?: unknown // a call's
+  callId?: string // a call's tool_use id
   error?: boolean
   meta?: boolean // a row the engine injected, as an image's note
   own?: boolean // om_recall's own call or result
@@ -174,10 +178,12 @@ function pairUp(seen: Seen, b: Block, callId: string) {
 }
 
 type Part = { b: Omit<Block, 'ref'>; callId?: string; resultOf?: string }
-const callBlock = (base: Partial<Block>, tool: string, input: unknown): Omit<Block, 'ref'> => ({
+const callBlock = (base: Partial<Block>, tool: string, input: unknown, callId?: string): Omit<Block, 'ref'> => ({
   ...base,
   kind: 'call',
   tool,
+  input,
+  ...(callId ? { callId } : {}),
   text: renderInput(input),
   ...(tool.endsWith(`__${RECALL_TOOL}`) ? { own: true } : {}),
 })
@@ -236,7 +242,7 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean) {
       if (p.type === 'text' && p.text) {
         const kind: Kind = r.type === 'assistant' ? 'assistant' : isMemoryText(p.text) ? 'memory' : summary || r.isCompactSummary ? 'summary' : 'user'
         made.push({ b: { ...base, kind, text: p.text } })
-      } else if (p.type === 'tool_use' || p.type === 'server_tool_use') made.push({ b: callBlock(base, p.name ?? 'tool', p.input), callId: p.id })
+      } else if (p.type === 'tool_use' || p.type === 'server_tool_use') made.push({ b: callBlock(base, p.name ?? 'tool', p.input, p.id), callId: p.id })
       else if (p.type.endsWith('tool_result'))
         made.push({ b: { ...base, kind: 'result', text: resultText(p.content), ...(p.is_error ? { error: true } : {}) }, resultOf: p.tool_use_id })
     }
@@ -381,7 +387,7 @@ export function liveTranscript(rows: readonly SessionMessage[], times: readonly 
       const kind: Kind = m.role === 'assistant' ? 'assistant' : isMemoryText(m.text) ? 'memory' : m.text.startsWith(COMPACT_WRAPPER) ? 'summary' : 'user'
       made.push({ b: { ...base, kind, text: m.text } })
     }
-    for (const u of m.toolUses) made.push({ b: callBlock(base, u.tool, u.input), callId: u.tool_use_id })
+    for (const u of m.toolUses) made.push({ b: callBlock(base, u.tool, u.input, u.tool_use_id), callId: u.tool_use_id })
     for (const r of m.toolResults ?? []) made.push({ b: { ...base, kind: 'result', text: r.text, ...(r.isError ? { error: true } : {}) }, resultOf: r.tool_use_id })
     addParts(`#${i}`, made, seen, blocks)
   })
@@ -393,6 +399,26 @@ export function liveTranscript(rows: readonly SessionMessage[], times: readonly 
     live: true,
     ...(capped ? { note: `only the newest ${grouped(rows.length)} messages of the live history are readable` } : {}),
     load: async () => {},
+  }
+}
+
+// The om_recall reference of each row of a compacted span, for the session brief: a tool call by its id, a message
+// by its text (the newest block that reads the same). `agentId` names a subagent's own transcript. None from the live
+// history, whose `#<row>` a compaction moves, nor for a row the transcript files do not hold.
+export async function refsOf(c: Corpus, rows: readonly SessionMessage[], agentId?: string): Promise<(row: number, callId?: string) => string | undefined> {
+  if (c.live) return () => undefined
+  const t = agentId === undefined ? c.main : c.subagents.find((s) => s.tag === tagFor(agentId))
+  if (!t) return () => undefined
+  await c.load(t)
+  const calls = new Map<string, string>()
+  const texts = new Map<string, string>()
+  for (const b of t.blocks)
+    if (b.kind === 'call' && b.callId) calls.set(b.callId, b.ref)
+    else if (b.kind === 'user' || b.kind === 'assistant') texts.set(`${b.kind}\n${b.text.trim()}`, b.ref)
+  return (row, callId) => {
+    if (callId !== undefined) return calls.get(callId)
+    const m = rows[row]
+    return m && m.text.trim() ? texts.get(`${m.role}\n${m.text.trim()}`) : undefined
   }
 }
 
@@ -561,7 +587,7 @@ function held(m: Matcher, text: string, lower = text.toLowerCase()): Held[] {
   return m.terms.map((t) => (flat.includes(t.word) ? 'whole' : t.parts.length && t.parts.every((p) => lower.includes(p)) ? 'parts' : undefined))
 }
 
-type Excerpt = { text: string; best: number; lead: number; lines: number }
+type Excerpt = { text: string; best: number; whole: number; lead: number; lines: number }
 
 // A phrase held only whole-block (its words fall on different display lines: a real newline, or just a display wrap
 // of one long line) is not on any single line to score or cut around. Locate it in the raw text instead, and report
@@ -609,20 +635,25 @@ function spanning(b: Block, starts: readonly number[], heldPerLine: readonly Hel
   return spans
 }
 
-// A hit's lines to show: those holding the most terms, then the rarest in the block (on the fewest of its lines), each
-// more than SEARCH_LINE_GAP from another, the farthest from those taken on a tie. Each is cut around its rarest term.
-// `best`, the most terms one line holds, ranks the hit; `lead` is the line taken first.
+// A hit's lines to show: those holding the most terms whole, then the most terms, then the rarest in the block (on the
+// fewest of its lines), each more than SEARCH_LINE_GAP from another, the farthest from those taken on a tie. Each is
+// cut around its rarest term. A compound's parts count on a line only when no line holds it whole: `101` inside
+// `101047290` is not `shard-101`. `whole` and `best`, the most terms one line holds whole and at all, rank the hit;
+// `lead` is the line taken first.
 function excerpt(b: Block, m: Matcher): Excerpt {
   const { lines, starts } = splitLines(b.text)
   const lowers = lines.map((l) => l.toLowerCase())
   const atoms = [...new Set(m.terms.flatMap((t) => [t.word, ...t.parts]))]
   const freq = new Map(atoms.map((a) => [a, lowers.filter((l) => l.includes(a)).length]))
   const heldPerLine = lines.map((l, i) => held(m, l, lowers[i]))
+  const wholeSomewhere = (k: number) => heldPerLine.some((h) => h[k] === 'whole')
+  const counted = heldPerLine.map((h) => h.map((x, k) => (x === 'parts' && wholeSomewhere(k) ? undefined : x)))
   const spans = spanning(b, starts, heldPerLine, m)
-  type Line = { i: number; terms: number; rarity: number; span: number }
+  type Line = { i: number; whole: number; terms: number; rarity: number; span: number }
   const scored: Line[] = lines.map((l, i) => ({
     i,
-    terms: heldPerLine[i]!.filter(Boolean).length + (spans.has(i) ? 1 : 0),
+    whole: counted[i]!.filter((x) => x === 'whole').length + (spans.has(i) ? 1 : 0),
+    terms: counted[i]!.filter(Boolean).length + (spans.has(i) ? 1 : 0),
     rarity: atoms.reduce((s, a) => s + (lowers[i]!.includes(a) ? 1 / freq.get(a)! : 0), 0),
     span: spans.get(i) ?? 1,
   }))
@@ -633,7 +664,7 @@ function excerpt(b: Block, m: Matcher): Excerpt {
   while (taken.length < SEARCH_LINES_PER_HIT) {
     const open = pool.filter((s) => !taken.length || gap(s) > SEARCH_LINE_GAP)
     if (!open.length) break
-    open.sort((x, y) => y.terms - x.terms || y.rarity - x.rarity || (taken.length ? gap(y) - gap(x) : 0) || x.i - y.i)
+    open.sort((x, y) => y.whole - x.whole || y.terms - x.terms || y.rarity - x.rarity || (taken.length ? gap(y) - gap(x) : 0) || x.i - y.i)
     taken.push(open[0]!)
   }
   const lead = taken[0]?.i ?? 0
@@ -653,7 +684,7 @@ function excerpt(b: Block, m: Matcher): Excerpt {
     })
   if (!found.length) found.push(`  1: ${oneLine(lines[0] ?? '', SEARCH_LINE_CHARS)}`) // a match on the tool's name alone
   if (pool.length > taken.length) found.push(`  … ${plural(pool.length - taken.length, 'more matching line')}`)
-  return { text: `[${label(b)}] ${plural(lines.length, 'line')}\n${found.join('\n')}`, best: Math.max(0, ...pool.map((s) => s.terms)), lead, lines: lines.length }
+  return { text: `[${label(b)}] ${plural(lines.length, 'line')}\n${found.join('\n')}`, best: Math.max(0, ...pool.map((s) => s.terms)), whole: Math.max(0, ...pool.map((s) => s.whole)), lead, lines: lines.length }
 }
 
 async function search(c: Corpus, input: Input): Promise<RecallResult> {
@@ -687,8 +718,9 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
     h.score = h.held.reduce((s, x, k) => s + (x ? weight[k]! : 0), 0)
   }
   const byTime = (a: Hit, b: Hit) => a.time - b.time || (a.t === b.t ? a.i - b.i : 0)
-  // The rarest terms first when no block holds every term, then the most terms on one line, then the newest.
-  const ranked = [...hits].sort((a, b) => (loose ? b.score - a.score : 0) || b.x!.best - a.x!.best || byTime(b, a))
+  // The rarest terms first when no block holds every term, then the most terms whole on one line, the most terms on
+  // one line, then the newest.
+  const ranked = [...hits].sort((a, b) => (loose ? b.score - a.score : 0) || b.x!.whole - a.x!.whole || b.x!.best - a.x!.best || byTime(b, a))
   const shown: Hit[] = []
   let chars = 0
   for (const h of ranked) {
@@ -814,6 +846,10 @@ function outlineLine(b: Block) {
   return `${at} ${b.tool ?? 'tool'} result: ${oneLine(b.text, 120)}` // its call is not in the transcript
 }
 
+// Where the main thread's blocks come from, as outline and files name it.
+const mainSource = (c: Corpus) =>
+  c.live ? `the live history${c.note ? ` (${c.note})` : ''}` : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})${c.note ? ` (${c.note})` : ''}`
+
 async function outline(c: Corpus, input: Input): Promise<RecallResult> {
   const t = await threadFor(c, input.from ?? input.to ?? input.ref)
   const r = range(t, input.from, input.to)
@@ -839,12 +875,7 @@ async function outline(c: Corpus, input: Input): Promise<RecallResult> {
   const all = t.blocks.filter(visible)
   const times = t.blocks.flatMap((b) => (b.time === undefined ? [] : [b.time]))
   const span = times.length ? `, ${stamp(times[0]!)} to ${stamp(times.at(-1)!)}` : ''
-  const source =
-    t === c.main
-      ? c.live
-        ? `the live history${c.note ? ` (${c.note})` : ''}`
-        : `${plural(c.files.length, 'transcript file')} (${c.files.join(' → ')})${c.note ? ` (${c.note})` : ''}`
-      : `${t.label}`
+  const source = t === c.main ? mainSource(c) : t.label
   const subs = t === c.main && c.subagents.length ? `; ${plural(c.subagents.length, 'subagent transcript')} (${c.subagents.map((s) => s.tag).join(', ')})` : ''
   const head = `Outline of ${source}: ${plural(all.length, 'entry', 'entries')}${span}${subs}. Tool calls point → at their results; read a block only for what this lacks: {"mode": "read", "ref": "<ref>"}.`
   const out = [head, ...(lines.length ? lines : ['(nothing in this range)'])]
@@ -853,6 +884,64 @@ async function outline(c: Corpus, input: Input): Promise<RecallResult> {
     out.push(`${plural(left, 'more entry', 'more entries')}; only if you still need them: {"mode": "outline", "from": "${next.ref}"${input.to ? `, "to": "${input.to}"` : ''}}.`)
   }
   return { mode: 'outline', text: out.join('\n'), matches: lines.length }
+}
+
+// ---- Files ------------------------------------------------------------------------------------------------------
+
+// The file tools, by the path field each names and what a call did to it. Bash commands are left to search: what one
+// reads or writes is not known without running it.
+const FILE_TOOLS: Record<string, { field: string; did: 'read' | 'edited' | 'wrote' }> = {
+  Read: { field: 'file_path', did: 'read' },
+  Edit: { field: 'file_path', did: 'edited' },
+  MultiEdit: { field: 'file_path', did: 'edited' },
+  Write: { field: 'file_path', did: 'wrote' },
+  NotebookRead: { field: 'notebook_path', did: 'read' },
+  NotebookEdit: { field: 'notebook_path', did: 'edited' },
+}
+const FAILED = { read: 'read failed', edited: 'edit failed', wrote: 'write failed' } as const
+const ACTIONS = ['read', 'edited', 'wrote', FAILED.read, FAILED.edited, FAILED.wrote]
+
+// Each file a file tool named, the most recently touched first: what each call did to it, and the call's block.
+async function files(c: Corpus, input: Input): Promise<RecallResult> {
+  const threads = [c.main, ...(input.subagents ? c.subagents : [])]
+  for (const t of threads) await c.load(t)
+  const touched = new Map<string, { last: number; refs: Map<string, string[]> }>()
+  let order = 0
+  for (const t of threads)
+    for (const b of t.blocks) {
+      const how = b.kind === 'call' && b.tool ? FILE_TOOLS[b.tool] : undefined
+      const path = how && b.input && typeof b.input === 'object' ? (b.input as Record<string, unknown>)[how.field] : undefined
+      if (typeof path !== 'string' || !path.trim()) continue
+      if (input.query && !path.toLowerCase().includes(input.query.toLowerCase())) continue
+      const did = b.pair?.error ? FAILED[how!.did] : how!.did
+      const file = touched.get(path) ?? { last: 0, refs: new Map() }
+      file.last = ++order
+      file.refs.set(did, [...(file.refs.get(did) ?? []), b.ref])
+      touched.set(path, file)
+    }
+  const listed = [...touched].sort((a, b) => b[1].last - a[1].last)
+  const subs = input.subagents && c.subagents.length ? ` and ${plural(c.subagents.length, 'subagent transcript')}` : ''
+  const which = input.query ? ` whose path holds "${input.query}"` : ''
+  const head =
+    `Files named by the ${Object.keys(FILE_TOOLS).join(', ')} calls of ${mainSource(c)}${subs}, newest first: ${plural(listed.length, 'file')}${which}. ` +
+    'Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.'
+  const lines: string[] = []
+  let chars = 0
+  for (const [path, file] of listed) {
+    const acts = ACTIONS.flatMap((a) => {
+      const refs = file.refs.get(a)
+      if (!refs) return []
+      const earlier = refs.length > FILES_REFS ? ` (+${refs.length - FILES_REFS} earlier)` : ''
+      return [`${a}${earlier} ${refs.slice(-FILES_REFS).join(', ')}`]
+    })
+    const line = `${oneLine(path, 300)}: ${acts.join('; ')}`
+    if (lines.length >= FILES_MAX_LINES || chars + line.length > OUTLINE_MAX_CHARS) break
+    lines.push(line)
+    chars += line.length + 1
+  }
+  const more = listed.length - lines.length
+  const tail = more ? [`${plural(more, 'more file')}; narrow with a query: {"mode": "files", "query": "<part of a path>"}.`] : []
+  return { mode: 'files', text: [head, ...(lines.length ? lines : ['(no file named)']), ...tail].join('\n'), matches: lines.length }
 }
 
 // ---- Entry ------------------------------------------------------------------------------------------------------
@@ -874,7 +963,7 @@ export function parseInput(e: RecallInput): Input | string {
   const query = str(e.query)
   const ref = str(e.ref)
   const mode = str(e.mode) ?? (ref && !query ? 'read' : query ? 'search' : 'outline')
-  if (mode !== 'search' && mode !== 'read' && mode !== 'outline') return `om_recall: mode is search, read or outline.`
+  if (mode !== 'search' && mode !== 'read' && mode !== 'outline' && mode !== 'files') return `om_recall: mode is search, read, outline or files.`
   if (mode === 'search' && !query) return 'om_recall: give a query.'
   if (mode === 'read' && !ref) return 'om_recall: give the ref of the block to read, from a search or an outline.'
   const limit = num(e.limit)
@@ -900,8 +989,11 @@ function answeredThisTurn(t: Thread) {
 
 export async function recall(c: Corpus, e: RecallInput): Promise<RecallResult> {
   const input = parseInput(e)
-  if (typeof input === 'string') return { mode: str(e.mode) === 'read' ? 'read' : str(e.mode) === 'outline' ? 'outline' : 'search', text: input, matches: 0 }
-  const found = await (input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : outline(c, input))
+  if (typeof input === 'string') {
+    const asked = str(e.mode)
+    return { mode: asked === 'read' || asked === 'outline' || asked === 'files' ? asked : 'search', text: input, matches: 0 }
+  }
+  const found = await (input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : input.mode === 'files' ? files(c, input) : outline(c, input))
   const calls = answeredThisTurn(c.main)
   const nudge = calls >= TURN_CALLS ? `\nThis is om_recall call ${calls + 1} this turn: answer from what you have found unless a specific fact is still missing.` : ''
   // Each mode keeps under the cap; this holds it whatever the input.

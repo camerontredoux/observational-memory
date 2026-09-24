@@ -31,6 +31,7 @@ export type Compaction = {
   trigger: string
   ms: number
   fellBack: boolean
+  floor?: boolean // the memory stood with a brief compiled by code for rows the Observer had not observed
   tokensBefore?: number
   tokensAfter?: number
   estTokensAfter?: number
@@ -39,6 +40,8 @@ export type Compaction = {
   rowsObservedNow?: number
   rowsObservedBefore?: number
   memoryTokens?: number
+  rowsBriefed?: number // rows the floor compiled into the session brief, the Observer not having observed them
+  briefTokens?: number
   observations?: number
 }
 export type Reflection = { ms: number; tokensBefore: number; tokensAfter: number; level: number }
@@ -94,6 +97,7 @@ export function addLuna(s: SessionStats, c: LunaCall, at: number) {
 export function addCompaction(s: SessionStats, c: Compaction, at: number) {
   const key = `compaction.${c.trigger}`
   if (c.fellBack) count(s, `${key}.fellBack`)
+  if (c.floor) count(s, `${key}.floor`)
   add(s, `${key}.ms`, c.ms, at)
   add(s, `${key}.tokensBefore`, c.tokensBefore, at)
   add(s, `${key}.tokensAfter`, c.tokensAfter, at)
@@ -103,6 +107,8 @@ export function addCompaction(s: SessionStats, c: Compaction, at: number) {
   add(s, `${key}.rowsObservedNow`, c.rowsObservedNow, at)
   add(s, `${key}.rowsObservedBefore`, c.rowsObservedBefore, at)
   add(s, `${key}.memoryTokens`, c.memoryTokens, at)
+  add(s, `${key}.rowsBriefed`, c.rowsBriefed, at)
+  add(s, `${key}.briefTokens`, c.briefTokens, at)
   add(s, `${key}.observations`, c.observations, at)
 }
 
@@ -258,6 +264,9 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   }
   const fellBack = Object.entries(s.counts).reduce((t, [k, n]) => (/^compaction\.[\w-]+\.fellBack$/.test(k) ? t + n : t), 0)
   if (fellBack) row('  Fallbacks', `${grouped(fellBack)} used the built-in compaction`)
+  const floor = Object.entries(s.counts).reduce((t, [k, n]) => (/^compaction\.[\w-]+\.floor$/.test(k) ? t + n : t), 0)
+  const briefed = triggers.reduce((t, k) => t + (s.metrics[`compaction.${k}.rowsBriefed`]?.sum ?? 0), 0)
+  if (floor) row('  Floor', `${grouped(floor)} compiled a brief by code of ${plural(briefed, 'message')} the Observer had not observed`)
   if (main.context.length)
     row('Context', `after a main compaction: ~${grouped(median(main.context))} tokens (median)${main.notes.length ? `, ~${plural(median(main.notes), 'note')}` : ''}`)
   const background = s.metrics['observer.background.ms']
