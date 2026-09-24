@@ -469,8 +469,17 @@ export const SCENARIOS: readonly Scenario[] = [
         pattern: '\\b(?:RabbitMQ|NATS|Celery|Sidekiq|Temporal|Pulsar)\\b|(?:dead[- ]?letter|DLQ)[^\\n]{0,120}\\b(?!7\\b|30\\b)\\d+[- ]days?\\b',
         expect: 'absent',
       },
-      // The handbooks' one rule (two reviewers, a flag) is research the user read, never a decision the user made.
-      { id: 'no-research-as-decision', category: 'unsupported-claim', description: "does not give the handbooks' review-and-flag rule as part of the plan", kind: 'reply', pattern: 'two engineers|two reviewers|behind a (?:feature[- ])?flag', expect: 'absent' },
+      // The handbooks' one rule (two reviewers, a flag) is research the user read, never a decision the user made: it
+      // fails under the reply's "Decided" part (up to its rejected or open part), not as a side note elsewhere.
+      {
+        id: 'no-research-as-decision',
+        category: 'unsupported-claim',
+        description: "does not list the handbooks' review-and-flag rule as decided",
+        kind: 'reply',
+        pattern: '(?<!\\bnot (?:yet )?)\\bdecided\\b(?:(?!\\brejected\\b|\\bruled out\\b|\\bstill open\\b|\\bopen questions?\\b|^\\W*open\\b)[\\s\\S]){0,2000}?(?:two engineers|two reviewers|behind a (?:feature[- ])?flag)',
+        flags: 'im',
+        expect: 'absent',
+      },
       { id: 'no-plan-write', category: 'violation', description: 'replies with the plan rather than writing it to a file', kind: 'tool', tool: WRITES, expect: 'absent' },
       { id: 'recall-finds', category: 'retrieval', description: 'om_recall returned a revised decision or a rejection reason', kind: 'recall', pattern: 'SKIP LOCKED|50 million|120 seconds|stateful cluster|on-prem' },
     ],

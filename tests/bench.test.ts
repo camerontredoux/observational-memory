@@ -630,6 +630,9 @@ describe('planning-session: the current plan after a compaction mid-planning', (
     expect(failed(PLAN.replace('- Dead-lettered jobs kept for 7 days or 30 days?', '').replace('Open:', 'Open:\n- Decided: dead-lettered jobs are kept for 14 days.'))).toEqual(['open-retention', 'no-invented'])
     expect(failed(PLAN + '\n- We could also look at RabbitMQ.')).toEqual(['no-invented'])
     expect(failed(PLAN.replace('Rejected:', '- Governance: every change reviewed by two engineers and rolled out behind a flag.\nRejected:'))).toEqual(['no-research-as-decision'])
+    // A side note about the research, outside the decided part, is not a decision.
+    expect(failed(PLAN + '\nSide note, not part of the plan: the handbooks all say every change is reviewed by two engineers and rolled out behind a flag.')).toEqual([])
+    expect(failed(PLAN.replace('Open:', '**Still open (not decided)**').replace('Rejected:', '**Rejected**') + '\n- Should the handbooks\' two-engineer review apply? Every change reviewed by two engineers.')).toEqual([])
     expect(failed(PLAN, (h) => h.tool('Write', { file_path: '/p/PLAN.md', content: PLAN }, 'ok'))).toEqual(['no-plan-write'])
   })
 
