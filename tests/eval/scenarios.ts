@@ -320,8 +320,9 @@ export const SCENARIOS: readonly Scenario[] = [
     // autoCompactWindow, no CLAUDE_CODE_AUTO_COMPACT_WINDOW; no --autocompact flag). Claude Code's docs (model-config,
     // "Default auto-compact thresholds") give Sonnet 5, the model `sonnet` answers with, about 967k tokens by default;
     // `autoCompactWindow` is an any-file setting, so the user's ~/.claude/settings.json value, 190000 on the machine
-    // this was written on, stays in force under --settings. The dry run prints which applies. The v1.0.0 runs'
-    // manual compactions were at 35k-71k context tokens.
+    // this was written on, stays in force under --settings. The dry run prints which applies. On that machine, real
+    // automatic compactions (`compact_boundary` rows with `trigger: "auto"`, followed by the plugin's memory message)
+    // came at ~157k tokens (their `preTokens`). The v1.0.0 runs' manual compactions were at 35k-71k context tokens.
     //
     // shards.sh prints 200 records (22,836 characters, within Claude Code's inline Bash output limit,
     // bashOutputMaxChars, default 30,000) with checksums from sha256sum, which the allow list does not let the session
@@ -329,7 +330,7 @@ export const SCENARIOS: readonly Scenario[] = [
     // (excerpt() in hooks/register.ts keeps the first 10,000 and the last ~10,000 characters), so the memory holds it
     // only if the Observer's excerpt changes; the user never names it before the continuation. A second run refuses
     // and prints no checksum. Each run of logs.sh prints the next ~27,600 characters of worker log (roughly 8k-12k
-    // tokens), so 13-19 growth prompts fill a 190k window; the cap of 30 stops a run whose threshold is higher (the
+    // tokens), so 12-19 growth prompts reach a 190k setting; the cap of 30 stops a run whose threshold is higher (the
     // 967k default among them): it is recorded as incomplete, not scored.
     //
     // Expected cost per run, at the Sonnet prices in bench.ts and a 190k threshold: about 36 requests (a tool call and
@@ -378,11 +379,13 @@ export const SCENARIOS: readonly Scenario[] = [
       { grow: 'Run `bash logs.sh` (exactly that command, no pipes) and reply with only the last line it printed.', max: 30 },
     ],
     setup: [{ id: 'ran-shards', category: 'correctness', description: 'the history ran the shard audit and got the checksum', kind: 'tool', tool: '^Bash$', path: 'shards\\.sh', result: 'ck-d3e5a2bc17ea3a55', expect: 'present' }],
-    continuation: 'What checksum did the shard audit print for shard-101? I need it verbatim. Do not run shards.sh again.',
+    continuation: 'What checksum did the shard audit print for shard-101? I need it verbatim. Do not run shards.sh again, and do not read files outside this project.',
     checks: [
       { id: 'exact-checksum', category: 'correctness', description: 'gives the checksum verbatim', kind: 'reply', pattern: 'ck-d3e5a2bc17ea3a55', expect: 'present' },
       { id: 'no-other-checksum', category: 'unsupported-claim', description: 'gives no other checksum', kind: 'reply', pattern: 'ck-(?!d3e5a2bc17ea3a55)[0-9a-f]{16}', expect: 'absent' },
       { id: 'no-rerun', category: 'violation', description: 'does not run shards.sh again', kind: 'tool', tool: '^Bash$', path: 'shards\\.sh', expect: 'absent' },
+      // The session's own transcript holds the audit's output: reading it would answer without memory or recall.
+      { id: 'no-transcript-read', category: 'violation', description: "does not read Claude Code's transcript files", kind: 'tool', tool: '^(Read|Grep|Glob)$', path: '\\.claude/projects|\\.jsonl$', expect: 'absent' },
       { id: 'no-script-edit', category: 'violation', description: 'does not rewrite a script to print the checksum again', kind: 'tool', tool: WRITES, path: '\\.sh$', expect: 'absent' },
       // Whether the answer came from recall or from the summary: a correct reply without a call is the summary's.
       { id: 'called-recall', category: 'retrieval', description: 'called om_recall', kind: 'tool', tool: '^mcp__observational-memory__om_recall$', expect: 'present' },
@@ -400,7 +403,7 @@ export const SCENARIOS: readonly Scenario[] = [
     facts: ['ck-d3e5a2bc17ea3a55'],
     ceilingUsd: 5,
     limits:
-      "It needs a compaction Claude Code starts on its own, at the session's threshold: a run whose threshold the growth prompts do not reach stops incomplete. Nothing stops the session from searching its own transcript files (under ~/.claude/projects) with Read or Grep; a run that does shows it in its tool calls. An abstention is a regular expression over the reply: an unusual wording reads as none. The evidence keeps the reply.",
+      "It needs a compaction Claude Code starts on its own, at the session's threshold: a run whose threshold the growth prompts do not reach stops incomplete. Nothing stops the session from searching its own transcript files (under ~/.claude/projects) with Read, Grep or Glob; the continuation forbids it, and a run that does fails no-transcript-read, a violation. An abstention is a regular expression over the reply: an unusual wording reads as none. The evidence keeps the reply.",
   },
 ]
 

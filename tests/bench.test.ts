@@ -293,6 +293,7 @@ describe('the recall-required scenario', () => {
       'exact-checksum': 'pass',
       'no-other-checksum': 'pass',
       'no-rerun': 'pass',
+      'no-transcript-read': 'pass',
       'no-script-edit': 'pass',
       'called-recall': 'pass',
       'recall-finds': 'pass',
@@ -317,6 +318,7 @@ describe('the recall-required scenario', () => {
         'exact-checksum': 'fail',
         'no-other-checksum': 'pass',
         'no-rerun': 'pass',
+        'no-transcript-read': 'pass',
         'no-script-edit': 'pass',
         'called-recall': 'n/a',
         'recall-finds': 'n/a',
@@ -339,6 +341,14 @@ describe('the recall-required scenario', () => {
     expect(rerun.violations).toBe(1)
     const edited = scoreRun(s, 'builtin', run(s, builtin, (h) => h.tool('Edit', { file_path: '/p/shards.sh', old_string: 'if [ -e .shards-lock ]', new_string: 'if false' }, 'ok').reply('Edited.')))
     expect(edited.checks.find((c) => c.id === 'no-script-edit')!.outcome).toBe('fail')
+  })
+
+  test("reading the session's own transcript for the checksum is a violation, whatever the reply", () => {
+    const grep = (h: ReturnType<typeof history>) =>
+      h.tool('Grep', { pattern: 'shard-101', path: '/home/u/.claude/projects/-tmp-om-bench-p/s.jsonl' }, `checksum=${CHECKSUM}`).reply(`It was ${CHECKSUM}.`)
+    const score = scoreRun(s, 'builtin', run(s, builtin, grep))
+    expect(score.checks.find((c) => c.id === 'no-transcript-read')!.outcome).toBe('fail')
+    expect(score).toMatchObject({ violations: 1, taskSuccess: false })
   })
 
   test('valid only after a compaction Claude Code started on its own: none, or a manual /compact, is invalid', () => {
