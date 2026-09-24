@@ -625,6 +625,7 @@ describe('planning-session: the current plan after a compaction mid-planning', (
     expect(failed(PLAN.replace(': the ops team cannot run another stateful cluster.', '.'))).toEqual(['kafka-why'])
     expect(failed(PLAN.replace('- Dead-lettered jobs kept for 7 days or 30 days?', '').replace('Open:', 'Open:\n- Decided: dead-lettered jobs are kept for 14 days.'))).toEqual(['open-retention', 'no-invented'])
     expect(failed(PLAN + '\n- We could also look at RabbitMQ.')).toEqual(['no-invented'])
+    expect(failed(PLAN.replace('Rejected:', '- Governance: every change reviewed by two engineers and rolled out behind a flag.\nRejected:'))).toEqual(['no-research-as-decision'])
     expect(failed(PLAN, (h) => h.tool('Write', { file_path: '/p/PLAN.md', content: PLAN }, 'ok'))).toEqual(['no-plan-write'])
   })
 
