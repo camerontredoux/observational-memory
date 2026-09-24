@@ -236,7 +236,7 @@ Task success (successful runs out of valid runs):
 
 | scenario | fork | fork+recall | om+recall v1.3.0 | built-in (new) | built-in v1.0.0 | built-in+recall v1.0.0 |
 |---|---|---|---|---|---|---|
-| the seven issue #9 scenarios | 21/21 | 20/21 | 3/3 (3 run) | not run | 21/21 | 20/21 |
+| the seven issue #9 scenarios | 21/21 | 20/21 | 3/3 (3 of the 7, 1 run each) | not run | 21/21 | 20/21 |
 | `multi-step-plan` | 2/3 | 1/3 | 3/3 | not run | not run | not run |
 | `planning-session` | 2/3 | 1/3 | 3/3 | 3/3 | not run | not run |
 | `recall-required` | 0/3 | 3/3 | 3/3 | not run | 0/3 | 0/3 (v1.1.0: 3/3) |
@@ -247,12 +247,12 @@ Compaction cost and latency:
 |---|---|---|---|---|
 | compactions | 66 | 6 | 14 | 3 new, 48 v1.0.0 |
 | compaction time | 15.8 s mean (6.2–24.1 s) | 40 ms mean (35–42 ms) | 8.5 s mean | 35.0 s new, 27.2 s v1.0.0 |
-| model cost per compaction | about $0.04 | about $0.04 | $0.0067 per run (Observer) | not in the transcript |
+| model cost per compaction | $0.037 mean ($0.023–$0.050) | $0.065 mean ($0.062–$0.073) | $0.0067 per run (Observer) | not in the transcript |
 | cache-read tokens per fork | 39.6k mean | 136.6k mean | – | – |
 
-- A fork's cost is almost all cache reads: about 630 uncached input tokens and 1.5k output tokens per fork. An early
-  fork reads the whole context at 85% of the threshold, about 137k tokens. It costs the same as a fork at a manual
-  `/compact` of a 40k-token context, because the output tokens cost more than the cache reads.
+- A fork's input is almost all cache reads: about 590 uncached input tokens per fork, and about 1.5k output tokens.
+  At Sonnet prices the output is about $0.023 of each fork. An early fork reads the whole context at 85% of the
+  threshold, about 137k tokens, so it costs about twice a fork at a manual `/compact` of a 40k-token context.
 - No fork failed and no compaction fell back to the built-in summary: 72 of 72 compactions used the handoff.
 - The early handoff makes auto compaction almost free in time: 40 ms against 8.5 s for om and about 30 s for
   built-in. A manual `/compact` has no early handoff (the context is below 85%), so the fork runs then and takes
