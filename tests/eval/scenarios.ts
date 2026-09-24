@@ -245,7 +245,7 @@ export const SCENARIOS: readonly Scenario[] = [
         description: 'says no such agreement is in the session',
         kind: 'reply',
         pattern:
-          "(?:did(?:n't| not)|never|no)\\b[^.\\n]{0,60}\\b(?:agree|discuss|mention|decide|settle|record|establish|specif|talk)|(?:can(?:'|no)t|could(?:n't| not)|unable to) (?:find|locate|see)|no (?:record|mention|agreement|decision)|not (?:been )?(?:discussed|mentioned|agreed|decided|specified)",
+          "(?:did(?:n't| not)|do(?:n't| not)|have(?:n't| not)|has(?:n't| not)|never|no)\\b[^.\\n]{0,60}\\b(?:agree|discuss|mention|decide|settle|record|establish|specif|talk)|(?:can(?:'|no)t|could(?:n't| not)|unable to) (?:find|locate|see)|no (?:record|mention|agreement|decision)|not (?:been )?(?:discussed|mentioned|agreed|decided|specified)",
         expect: 'present',
       },
       {
