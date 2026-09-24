@@ -23,6 +23,8 @@ import {
   questionSeedRows,
   questionsAt,
   recallCallsIn,
+  answerTexts,
+  questionGroups,
   renderReflections,
   renderTranscript,
   replayChain,
@@ -394,6 +396,22 @@ describe('the question stage', () => {
     expect(questionsAt(spec, 3, /^(next|told)-/).map((q) => q.id)).toEqual(['next-3'])
   })
 
+  test("asks a boundary's handoff questions in a session of their own, apart from the standing fact questions", () => {
+    const qs = [
+      { id: 'fact', ask: '?', from: 1 },
+      { id: 'next-3', ask: '?', from: 3, to: 3 },
+      { id: 'told-3', ask: '?', from: 3, to: 3 },
+      { id: 'lost', ask: '?', from: 2 },
+    ]
+    // Asked together, Sonnet answered the handoff from the memory too, "unknown" included, and seldom searched.
+    expect(questionGroups(qs).map((g) => [g.group, g.questions.map((q) => q.id)])).toEqual([
+      ['facts', ['fact', 'lost']],
+      ['handoff', ['next-3', 'told-3']],
+    ])
+    expect(questionGroups(qs.slice(1, 3)).map((g) => g.group)).toEqual(['handoff'])
+    expect(questionGroups([])).toEqual([])
+  })
+
   test("asks om's configurations about the om run named, the live one unless another is, and the built-in ones about the built-in chain", () => {
     expect(['om', 'om+recall', 'builtin', 'builtin+recall'].map((c) => questionRun(c as Configuration))).toEqual(['om-live', 'om-live', 'builtin', 'builtin'])
     expect(['om', 'om+recall', 'builtin+recall'].map((c) => questionRun(c as Configuration, 'om-v130'))).toEqual(['om-v130', 'om-v130', 'builtin'])
@@ -414,6 +432,8 @@ describe('the question stage', () => {
     expect(recall.argv.slice(-8)).toEqual(['--tools', 'ToolSearch', '--permission-mode', 'dontAsk', '--resume', 'sid', '--allowedTools', 'mcp__observational-memory__om_recall'])
     expect(recall.settings.env.CLAUDE_CODE_PLUGIN_DIRS).toBe('/r/recall-plugin')
     expect(recall.seed).toEqual({ sessionId: 'sid', through: 2, summary: 'SUMMARY\n\nKEPT' })
+    // A handoff session has its own directory beside the facts one at the same boundary.
+    expect(planQuestionSession({ ...base, config: 'om', group: 'handoff' }).settingsPath).toBe('/r/q-om-2-handoff/settings.json')
   })
 
   test("a +recall session's seed is the transcript up to the boundary, then the context as a compaction", () => {
@@ -450,6 +470,27 @@ describe('question results', () => {
     ])
   })
 
+  test("a +recall session's answers come from every reply after its seeded compaction, a later reply's answer replacing an earlier one", () => {
+    const text = (id: string, t: string) => ({ type: 'assistant', uuid: id, message: { id, role: 'assistant', content: [{ type: 'text', text: t }] } })
+    const real = session().user('find it').reply('dir: from the real session').compact('real summary')
+    const rows = questionSeedRows(real.text(), { sessionId: 'q', through: 1, summary: 'CONTEXT' }, '/sandbox', { boundary: 'B', summary: 'S' })
+    const later = new Date(Date.UTC(2027, 0, 1)).toISOString()
+    rows.push(
+      { type: 'user', uuid: 'p', parentUuid: 'S', timestamp: later, message: { role: 'user', content: 'questions' } },
+      // Answers first, then a search for what it did not know, then only the answers it looked up.
+      { ...text('a1', 'dir: .worktrees\nissue: unknown'), parentUuid: 'p', timestamp: later },
+      { type: 'assistant', uuid: 'a2', parentUuid: 'a1', timestamp: later, message: { id: 'a2', role: 'assistant', content: [{ type: 'tool_use', id: 'c1', name: 'mcp__observational-memory__om_recall', input: { query: 'issue' } }] } },
+      { ...text('a3', 'issue: #13'), parentUuid: 'a2', timestamp: later },
+    )
+    expect(answerTexts(rows)).toEqual(['dir: .worktrees\nissue: unknown', 'issue: #13'])
+    expect(scoreAnswers(qs, answerTexts(rows))).toEqual([
+      { id: 'dir', answer: '.worktrees', check: 'pass' },
+      { id: 'issue', answer: '#13', check: 'pass' },
+      { id: 'why', answer: '', check: 'needs a model grader' },
+    ])
+    expect(answerTexts(session().reply('no compaction').rows)).toEqual([])
+  })
+
   test('tallies each configuration: the last session per boundary, exact answers, unscored ones, failed sessions and om_recall calls', () => {
     const tallies = tallyQuestions([
       result('om+recall', 1, 'dir: unknown', { recallCalls: 0 }),
@@ -461,6 +502,18 @@ describe('question results', () => {
     expect(tallies).toEqual([
       { config: 'om', boundaries: [1], sessions: 1, failed: 0, exact: { correct: 2, asked: 2 }, unscored: 1, costUsd: 0.25 },
       { config: 'om+recall', boundaries: [1, 2, 3], sessions: 3, failed: 1, exact: { correct: 3, asked: 4 }, unscored: 2, recall: { calling: 2, calls: 3 }, costUsd: 0.75 },
+    ])
+  })
+
+  test("counts a boundary's facts and handoff sessions apart, the last of each", () => {
+    const handoff = { group: 'handoff' as const }
+    const tallies = tallyQuestions([
+      result('om+recall', 1, 'dir: .worktrees', { recallCalls: 0 }),
+      result('om+recall', 1, 'issue: unknown', { ...handoff, recallCalls: 0 }),
+      result('om+recall', 1, 'issue: #13', { ...handoff, recallCalls: 3 }), // run again: this one counts
+    ])
+    expect(tallies).toEqual([
+      { config: 'om+recall', boundaries: [1], sessions: 2, failed: 0, exact: { correct: 2, asked: 4 }, unscored: 2, recall: { calling: 1, calls: 3 }, costUsd: 0.5 },
     ])
   })
 
@@ -549,6 +602,9 @@ describe('the plan and the report', () => {
     expect(calls.filter((c) => c.stage === 'question').map((c) => `${c.boundary} ${c.configs.join()}`)).toEqual(
       [2, 3].flatMap((b) => ['builtin', 'builtin+recall', 'om', 'om+recall'].map((config) => `${b} ${config}`)),
     )
+    // A boundary with handoff questions plans a second session per configuration.
+    const withHandoff = planCalls('t', t, { ...spec, questions: [...spec.questions, { id: 'next-3', ask: '?', from: 3, to: 3 }] })
+    expect(withHandoff.filter((c) => c.stage === 'question' && c.boundary === 3).length).toBe(8)
     const recall = calls.find((c) => c.stage === 'question' && c.configs[0] === 'om+recall')!
     const plain = calls.find((c) => c.stage === 'question' && c.configs[0] === 'om')!
     expect(recall.usd).toBeGreaterThan(plain.usd)

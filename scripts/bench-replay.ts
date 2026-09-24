@@ -6,7 +6,7 @@
 //
 //   bun scripts/bench-replay.ts dry-run [--transcripts om-orchestration,om-v04,firstmate-11] [--dir DIR]
 //   bun scripts/bench-replay.ts om --transcript NAME [--pi stub|strict|live] [--max-calls N] [--boundaries N]
-//     [--src DIR] [--out DIR]
+//     [--src DIR] [--cache DIR] [--out DIR]
 //   bun scripts/bench-replay.ts builtin --transcript NAME --pane w1:p2 --budget-usd N [--live] [--out DIR]
 //   bun scripts/bench-replay.ts questions --transcript NAME --budget-usd N [--configs om,om+recall,builtin,builtin+recall]
 //     [--boundaries 1,3,5] [--only REGEX] [--om-run om-live] [--live] [--out DIR]
@@ -33,7 +33,9 @@
 //   and Reflector calls go to pi through a response cache (/tmp/om-replay/luna-cache; the earlier prior-art
 //   replay's /tmp/om-vcc/luna-cache is read too when this machine still has it): --pi stub answers every call with
 //   a canned reply built from its prompt (free; checks the chain, not a measurement), --pi strict (the default)
-//   fails on a call not cached, --pi live runs pi on a miss, at most --max-calls times (default 0), and caches it. Writes compaction-N.md (the memory message), kept-N.json (the rows
+//   fails on a call not cached, --pi live runs pi on a miss, at most --max-calls times (default 0), and caches it.
+//   --cache DIR reads and writes that cache alone: a new one makes every pi call again, a second sample of the
+//   Observer and Reflector rather than a replay of the first. Writes compaction-N.md (the memory message), kept-N.json (the rows
 //   kept raw), calls.json, log.txt and summary.json to /tmp/om-replay/<name>/om-<pi>, and for each reflection
 //   reflection-N.json (the ledger just before and just after it) and each Reflector reply, reflector-C-level-L.txt.
 //   `$.session.messages()` answers the newest 4096 rows, as the engine's does.
@@ -46,20 +48,22 @@
 //   reaches half the appended rows' estimate (`uncompacted`); a failed step or check stops the chain and says which,
 //   rather than making up a summary.
 // questions: the question stage. For each configuration (default: all four) and boundary with questions (default:
-//   every one), a headless Sonnet session (planQuestionSession) is asked the boundary's questions about that
+//   every one), headless Sonnet sessions (planQuestionSession) are asked the boundary's questions about that
 //   configuration's context, read from the chained replay's results: om's from om-live, or the run --om-run names
 //   (om-v130, say; left out, as in the report, when its pi calls failed), builtin's from builtin; a +recall
-//   configuration uses its base's context. --only asks just the questions whose id the regular expression matches
-//   (`--only '(^|-)(next|told)-'` for the handoff questions): give it its own --out, since a (configuration,
-//   boundary) already in results.jsonl is not run again. A missing
-//   result is skipped and named. Without --live it prints each session and the estimated cost. With --live it refuses
+//   configuration uses its base's context. A boundary's standing fact questions and its handoff questions (those
+//   with a `to`) go to two sessions (questionGroups): asked in one, Sonnet answered the handoff from the memory and
+//   seldom searched. --only asks just the questions whose id the regular expression matches (`--only
+//   '(^|-)(next|told)-'` for the handoff questions): give it its own --out, since a (configuration, boundary, group)
+//   already in results.jsonl is not run again. A missing result is skipped and named. Without --live it prints each session and the estimated cost. With --live it refuses
 //   unless the estimate is within --budget-usd, stops before a session that could pass it and once the reported
 //   spend (total_cost_usd) reaches it. A plain session gets the context in its prompt, no plugin and no tool; a
 //   +recall one resumes a seeded copy of the transcript up to the boundary with the recall-only plugin assembled in
-//   <out>/recall-plugin, and its om_recall calls after the seed are counted. Exact-string answers are checked; the
+//   <out>/recall-plugin, and its om_recall calls after the seed are counted; its answers are read from every reply
+//   it wrote, a later one's replacing an earlier one's, not from the last alone. Exact-string answers are checked; the
 //   others are recorded unscored (no model grader). Each session's result is appended to <out>/results.jsonl
-//   (default /tmp/om-replay/<name>/questions); a (configuration, boundary) already there without an error is not run
-//   again. The budget is this invocation's.
+//   (default /tmp/om-replay/<name>/questions); a (configuration, boundary, group) already there without an error is
+//   not run again. The budget is this invocation's.
 // reflections: scores each reflection of an om replay (--run, default /tmp/om-replay/<name>/om-live) with no model:
 //   the memory just before against just after (scoreReflection), and lists the Reflector's calls.
 // report: scores, per transcript, the session's own compactions ("recorded") and every configuration with results
@@ -72,8 +76,9 @@ import { spawnSync } from 'child_process'
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { dirname, resolve } from 'path'
 import type { SessionMessage } from 'claude-code'
-import type { Boundary, ConfigResult, Context, Question, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
+import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
 import {
+  answerTexts,
   chainSpec,
   chainTranscripts,
   checkSpec,
@@ -88,6 +93,8 @@ import {
   planBuiltinChain,
   planCalls,
   planQuestionSession,
+  questionGroups,
+  questionKey,
   questionSeedRows,
   questionRun,
   questionsAt,
@@ -174,7 +181,7 @@ async function dryRun(o: Options) {
     if (spec && first)
       for (const config of CONFIGURATIONS) {
         const b = t.boundaries[first - 1]!
-        const q = planQuestionSession({ config, boundary: first, context: { summary: b.summary, kept: b.kept }, questions: questionsAt(spec, first), runDir: `${OUT_ROOT}/${name}/questions`, sessionId: '<session id>', recallPluginDir: `${OUT_ROOT}/${name}/questions/recall-plugin` })
+        const q = planQuestionSession({ config, boundary: first, context: { summary: b.summary, kept: b.kept }, questions: questionGroups(questionsAt(spec, first))[0]!.questions, runDir: `${OUT_ROOT}/${name}/questions`, sessionId: '<session id>', recallPluginDir: `${OUT_ROOT}/${name}/questions/recall-plugin` })
         console.log(`  question session, ${config} @${first}: ${shellLine(q.argv)} < <prompt: ${q.prompt.length} chars>${q.seed ? ` (resumes a seeded copy of spans 0-${first - 1})` : ''}; the session's own compaction stands in for the context`)
       }
   }
@@ -224,7 +231,9 @@ async function om(o: Options) {
   const out = str(o, 'out') ?? `${OUT_ROOT}/${name}/om-${piMode}`
   if (existsSync(out) && readdirSync(out).length) fail(`${out} exists: move it or pass another --out`)
   mkdirSync(`${out}/stats`, { recursive: true })
-  mkdirSync(CACHE, { recursive: true })
+  // --cache: a cache of this run's own, so a rerun makes its pi calls again (a second sample of the Observer).
+  const cache = str(o, 'cache') ?? CACHE
+  mkdirSync(cache, { recursive: true })
   const env: Record<string, string> = { HOME: process.env.HOME ?? '/root', OM_NO_PRUNE: '1', OM_STATS_DIR: `${out}/stats` }
 
   // The engine: a hand-built `$`, a virtual clock, and pi calls that land after a fixed virtual latency.
@@ -245,7 +254,7 @@ async function om(o: Options) {
   async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
     if (piMode === 'stub') return { r: stub(stdin), hit: false }
     const hash = createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
-    for (const dir of [CACHE, OLD_CACHE])
+    for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
       if (existsSync(`${dir}/${hash}.json`)) {
         const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
         return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
@@ -257,7 +266,7 @@ async function om(o: Options) {
     const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
     const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
     const ms = Date.now() - started
-    if (exitCode === 0) writeFileSync(`${CACHE}/${hash}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
+    if (exitCode === 0) writeFileSync(`${cache}/${hash}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
     return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
   }
 
@@ -626,12 +635,12 @@ async function questions(o: Options) {
   for (const b of boundaries) if (!Number.isInteger(b) || b < 1 || b > t.boundaries.length) fail(`--boundaries: ${b} is not a boundary of ${name} (1 to ${t.boundaries.length})`)
   const out = str(o, 'out') ?? `${OUT_ROOT}/${name}/questions`
   const results = questionsFile(out)
-  const recorded = new Set(readQuestionResults(results).filter((r) => !r.error).map((r) => `${r.config}@${r.boundary}`))
+  const recorded = new Set(readQuestionResults(results).filter((r) => !r.error).map(questionKey))
   const recallPluginDir = `${out}/recall-plugin`
   // A private transcript's questions and answers stay in `out`: the console shows counts only.
   const quiet = isPrivate(name)
 
-  type Planned = { config: Configuration; boundary: number; questions: Question[]; plan: QuestionSession; sessionId: string; usd: number }
+  type Planned = { config: Configuration; boundary: number; group: QuestionGroup; questions: Question[]; plan: QuestionSession; sessionId: string; usd: number }
   const planned: Planned[] = []
   for (const config of configs) {
     const dir = `${OUT_ROOT}/${name}/${questionRun(config, omRun)}`
@@ -645,24 +654,26 @@ async function questions(o: Options) {
       continue
     }
     const contexts = readContexts(dir, t.boundaries.length)
+    // Each boundary's facts and handoff questions go to separate sessions (questionGroups), so runs compare alike.
     for (const boundary of boundaries) {
-      const qs = questionsAt(spec, boundary, only)
-      const context = contexts[boundary - 1]
-      if (!qs.length) continue
-      if (!context) {
-        console.log(`${config} @${boundary}: skipped, no compaction-${boundary}.md in ${dir}`)
-        continue
+      for (const { group, questions: qs } of questionGroups(questionsAt(spec, boundary, only))) {
+        const context = contexts[boundary - 1]
+        const label = `${config} @${boundary}${group === 'handoff' ? ' handoff' : ''}`
+        if (!context) {
+          console.log(`${label}: skipped, no compaction-${boundary}.md in ${dir}`)
+          continue
+        }
+        if (recorded.has(questionKey({ config, boundary, group }))) {
+          console.log(`${label}: skipped, already in ${results}`)
+          continue
+        }
+        const sessionId = crypto.randomUUID()
+        const plan = planQuestionSession({ config, boundary, context, questions: qs, runDir: out, sessionId, recallPluginDir, group })
+        const contextTokens = estimateTokens([context.summary, ...context.kept.map(messageText)].join('\n\n'))
+        const { usd } = estimateQuestionSession(contextTokens, qs, !!plan.seed)
+        planned.push({ config, boundary, group, questions: qs, plan, sessionId, usd })
+        console.log(`${label}: ${qs.length} question(s), context ~${contextTokens} tokens, ~$${usd.toFixed(4)}: ${shellLine(plan.argv)} < <prompt: ${plan.prompt.length} chars>${plan.seed ? ` (resumes a seeded copy of spans 0-${boundary - 1})` : ''}`)
       }
-      if (recorded.has(`${config}@${boundary}`)) {
-        console.log(`${config} @${boundary}: skipped, already in ${results}`)
-        continue
-      }
-      const sessionId = crypto.randomUUID()
-      const plan = planQuestionSession({ config, boundary, context, questions: qs, runDir: out, sessionId, recallPluginDir })
-      const contextTokens = estimateTokens([context.summary, ...context.kept.map(messageText)].join('\n\n'))
-      const { usd } = estimateQuestionSession(contextTokens, qs, !!plan.seed)
-      planned.push({ config, boundary, questions: qs, plan, sessionId, usd })
-      console.log(`${config} @${boundary}: ${qs.length} question(s), context ~${contextTokens} tokens, ~$${usd.toFixed(4)}: ${shellLine(plan.argv)} < <prompt: ${plan.prompt.length} chars>${plan.seed ? ` (resumes a seeded copy of spans 0-${boundary - 1})` : ''}`)
     }
   }
   const estimate = planned.reduce((n, p) => n + p.usd, 0)
@@ -689,13 +700,14 @@ async function questions(o: Options) {
     writeFileSync(p.plan.settingsPath, JSON.stringify(p.plan.settings, null, 2) + '\n')
     const listed = spawnSync('claude', ['--settings', p.plan.settingsPath, 'plugin', 'list', '--json'], { encoding: 'utf8', cwd: projectDir })
     const problems = checkPluginList(listed.stdout ?? '', { expectedPlugin: p.plan.seed ? recallPluginDir : undefined })
-    if (problems.length) fail(`Not starting ${p.config} @${p.boundary}: the session would not load its configuration's plugin alone:\n- ${problems.join('\n- ')}`)
+    if (problems.length) fail(`Not starting ${p.config} @${p.boundary}${p.group === 'handoff' ? ' handoff' : ''}: the session would not load its configuration's plugin alone:\n- ${problems.join('\n- ')}`)
     if (p.plan.seed) {
       const rows = questionSeedRows(text, p.plan.seed, projectDir, { boundary: crypto.randomUUID(), summary: crypto.randomUUID() })
       mkdirSync(projectsDir(projectDir), { recursive: true })
       writeFileSync(`${projectsDir(projectDir)}/${p.sessionId}.jsonl`, rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
     }
-    console.log(`${p.config} @${p.boundary}: running`)
+    const label = `${p.config} @${p.boundary}${p.group === 'handoff' ? ' handoff' : ''}`
+    console.log(`${label}: running`)
     const r = spawnSync(p.plan.argv[0]!, p.plan.argv.slice(1), { cwd: projectDir, input: p.plan.prompt, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 900_000 })
     writeFileSync(`${dir}/output.json`, r.stdout ?? '')
     let json: { result?: string; total_cost_usd?: number; session_id?: string; is_error?: boolean; subtype?: string } | undefined
@@ -707,12 +719,15 @@ async function questions(o: Options) {
     const sessionId = json?.session_id ?? p.sessionId
     const error = !json ? `no JSON output (exit ${r.status}): ${(r.stderr || r.stdout || String(r.error ?? '')).slice(0, 300)}` : json.is_error ? `${json.subtype ?? 'error'}: ${String(json.result ?? '').slice(0, 300)}` : undefined
     const file = p.plan.seed ? findTranscripts(sessionId).at(-1) : undefined
+    // A +recall session may answer, search, and answer again: its answers are every reply's, read from its transcript.
+    const replies = file ? answerTexts(readFileSync(file, 'utf8')) : []
     const result: QuestionResult = {
       config: p.config,
       boundary: p.boundary,
+      ...(p.group === 'handoff' ? { group: 'handoff' as const } : {}),
       sessionId,
       costUsd,
-      answers: error ? [] : scoreAnswers(p.questions, json!.result ?? ''),
+      answers: error ? [] : scoreAnswers(p.questions, replies.length ? replies : json!.result ?? ''),
       // No transcript found: the calls are unknown, not none.
       ...(p.plan.seed && file ? { recallCalls: recallCallsIn(readFileSync(file, 'utf8')) } : {}),
       ...(error ? { error } : {}),
@@ -721,7 +736,7 @@ async function questions(o: Options) {
     spent += costUsd
     const exact = result.answers.filter((a) => a.check !== 'needs a model grader')
     console.log(
-      `${p.config} @${p.boundary}: ${error ? `failed: ${quiet ? 'see output.json' : error}` : `${exact.filter((a) => a.check === 'pass').length}/${exact.length} exact`}` +
+      `${label}: ${error ? `failed: ${quiet ? 'see output.json' : error}` : `${exact.filter((a) => a.check === 'pass').length}/${exact.length} exact`}` +
         `${p.plan.seed ? `, ${file ? `${result.recallCalls} om_recall call(s)` : 'om_recall calls unknown (no transcript found)'}` : ''}, $${costUsd.toFixed(4)} (spent $${spent.toFixed(4)})`,
     )
     if (spent >= budget) fail(`Stopped: $${spent.toFixed(4)} spent reaches --budget-usd ${budget}`)

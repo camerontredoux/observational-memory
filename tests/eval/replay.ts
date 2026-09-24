@@ -539,6 +539,20 @@ export function renderReflections(r: { name: string; t: Transcript; spec?: Repla
 /** The questions asked at boundary `n`; with `only`, just those whose id it matches (the handoff questions, say). */
 export const questionsAt = (spec: ReplaySpec | undefined, n: number, only?: RegExp) =>
   (spec?.questions ?? []).filter((q) => q.from <= n && (q.to === undefined || n <= q.to) && (!only || only.test(q.id)))
+/** Standing fact questions, or one boundary's handoff questions (those with a `to`): see `questionGroups`. */
+export type QuestionGroup = 'facts' | 'handoff'
+/**
+ * A boundary's questions split into the sessions that ask them: the standing facts, then the handoff questions, each
+ * group left out when empty. Asked in one session, Sonnet answered the handoff questions from the memory as it did
+ * the facts, "unknown" included, and seldom searched: v1.3.0's om+recall sessions called om_recall twice over the
+ * three transcripts, and 17 times with the handoff questions asked alone (v1.2.0: 26). Apart, every run asks alike.
+ */
+export function questionGroups(questions: readonly Question[]): { group: QuestionGroup; questions: Question[] }[] {
+  return (['facts', 'handoff'] as const).flatMap((group) => {
+    const qs = questions.filter((q) => (q.to === undefined) === (group === 'facts'))
+    return qs.length ? [{ group, questions: qs }] : []
+  })
+}
 /**
  * The result directory, under the transcript's, whose contexts a question configuration is asked about: a +recall
  * one shares its base's. `omRun` names the om replay's (`om-live` unless another run, `om-v130` say, is asked about).
@@ -594,9 +608,11 @@ export function planQuestionSession(input: {
   runDir: string
   sessionId: string
   recallPluginDir: string
+  /** A handoff session's directory is named apart from the facts one at the same boundary. */
+  group?: QuestionGroup
 }): QuestionSession {
   const recall = recallAvailable(input.config)
-  const dir = `${input.runDir}/q-${input.config}-${input.boundary}`
+  const dir = `${input.runDir}/q-${input.config}-${input.boundary}${input.group === 'handoff' ? '-handoff' : ''}`
   const settingsPath = `${dir}/settings.json`
   const asks = input.questions.map((q) => `${q.id}: ${q.ask}`).join('\n')
   const format = 'Answer each question below on one line, as `<id>: <answer>`, from what you know of this session. If you do not know, say `<id>: unknown`.'
@@ -623,6 +639,8 @@ export function planQuestionSession(input: {
 export type QuestionResult = {
   config: Configuration
   boundary: number
+  /** A session of handoff questions alone; left out for the facts (and for a session asked both, before they split). */
+  group?: 'handoff'
   sessionId: string
   costUsd: number
   /** Every question asked, with the session's answer (empty when it gave none) and its check. */
@@ -633,9 +651,14 @@ export type QuestionResult = {
   error?: string
 }
 
-/** A session's answers to `questions`, each checked; a question it did not answer fails its exact check. */
-export function scoreAnswers(questions: readonly Question[], text: string): QuestionResult['answers'] {
-  const answers = parseAnswers(text, questions)
+/**
+ * A session's answers to `questions`, each checked; a question it did not answer fails its exact check. `text` may be
+ * the session's replies in order: a later reply's answer replaces an earlier one's, as when a +recall session first
+ * answers what it knows, then searches and answers the rest.
+ */
+export function scoreAnswers(questions: readonly Question[], text: string | readonly string[]): QuestionResult['answers'] {
+  const answers = new Map<string, string>()
+  for (const t of typeof text === 'string' ? [text] : text) for (const [id, a] of parseAnswers(t, questions)) answers.set(id, a)
   return questions.map((q) => {
     const answer = answers.get(q.id) ?? ''
     return { id: q.id, answer, check: checkAnswer(q, answer) }
@@ -652,6 +675,16 @@ export function recallCallsIn(jsonl: string | readonly Raw[]): number {
   return (t.spans.at(-1) ?? []).reduce((n, row) => n + row.toolUses.filter((u) => u.tool === RECALL_TOOL).length, 0)
 }
 
+/**
+ * The text of each reply a resumed question session wrote after its seeded compaction, in order. Its JSON output's
+ * `result` holds the last reply alone, so answers given before an om_recall call would be lost from it.
+ */
+export function answerTexts(jsonl: string | readonly Raw[]): string[] {
+  const t = parseTranscript(jsonl)
+  if (!t.boundaries.length) return []
+  return (t.spans.at(-1) ?? []).filter((row) => row.role === 'assistant' && row.text.trim()).map((row) => row.text)
+}
+
 export type QuestionTally = {
   config: Configuration
   boundaries: number[]
@@ -666,10 +699,13 @@ export type QuestionTally = {
   costUsd: number
 }
 
-/** Each configuration's question results in all, the last session per boundary counted, in CONFIGURATIONS' order. */
+/** The key a question session is recorded under: its configuration, boundary and group. */
+export const questionKey = (r: { config: Configuration; boundary: number; group?: QuestionGroup }) => `${r.config}@${r.boundary}${r.group === 'handoff' ? '/handoff' : ''}`
+
+/** Each configuration's question results in all, the last session per boundary and group counted, in CONFIGURATIONS' order. */
 export function tallyQuestions(results: readonly QuestionResult[]): QuestionTally[] {
   const last = new Map<string, QuestionResult>()
-  for (const r of results) last.set(`${r.config}@${r.boundary}`, r)
+  for (const r of results) last.set(questionKey(r), r)
   return CONFIGURATIONS.flatMap((config) => {
     const rs = [...last.values()].filter((r) => r.config === config).sort((a, b) => a.boundary - b.boundary)
     if (!rs.length) return []
@@ -677,7 +713,7 @@ export function tallyQuestions(results: readonly QuestionResult[]): QuestionTall
     return [
       {
         config,
-        boundaries: rs.map((r) => r.boundary),
+        boundaries: [...new Set(rs.map((r) => r.boundary))],
         sessions: rs.length,
         failed: rs.filter((r) => r.error).length,
         exact: { correct: checks.filter((c) => c === 'pass').length, asked: checks.filter((c) => c !== 'needs a model grader').length },
@@ -765,19 +801,19 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
     calls.push({ transcript: name, configs: builtin, stage: 'compaction', boundary: b.n, model: MODEL, what: `/compact ${b.n} in the resumed session`, inTokens, outTokens: SUMMARY_TOKENS, usd: sonnetUsd(inTokens, SUMMARY_TOKENS) })
   }
   for (const b of t.boundaries) {
-    const qs = questionsAt(spec, b.n)
-    if (!qs.length) continue
-    for (const config of CONFIGURATIONS) {
-      const recall = recallAvailable(config)
-      calls.push({
-        transcript: name,
-        configs: [config],
-        stage: 'question',
-        boundary: b.n,
-        model: MODEL,
-        what: `${qs.length} question(s) at boundary ${b.n}${recall ? ', om_recall over the transcript' : ''} (${qs.filter((q) => !q.expect?.length).length} need a model grader)`,
-        ...estimateQuestionSession(config.startsWith('om') ? (b.postTokens ?? SUMMARY_TOKENS) : SUMMARY_TOKENS, qs, recall),
-      })
+    for (const { questions: qs } of questionGroups(questionsAt(spec, b.n))) {
+      for (const config of CONFIGURATIONS) {
+        const recall = recallAvailable(config)
+        calls.push({
+          transcript: name,
+          configs: [config],
+          stage: 'question',
+          boundary: b.n,
+          model: MODEL,
+          what: `${qs.length} question(s) at boundary ${b.n}${recall ? ', om_recall over the transcript' : ''} (${qs.filter((q) => !q.expect?.length).length} need a model grader)`,
+          ...estimateQuestionSession(config.startsWith('om') ? (b.postTokens ?? SUMMARY_TOKENS) : SUMMARY_TOKENS, qs, recall),
+        })
+      }
     }
   }
   return calls
@@ -1124,7 +1160,7 @@ export function renderTranscript(r: ReportInput): string {
       '',
     )
     if (!r.private) {
-      const last = new Map((r.questions ?? []).map((q) => [`${q.config}@${q.boundary}`, q]))
+      const last = new Map((r.questions ?? []).map((q) => [questionKey(q), q]))
       const misses = tallies.map((x) => {
         const ids = [...last.values()].filter((q) => q.config === x.config).flatMap((q) => q.answers.filter((a) => a.check === 'fail').map((a) => `${a.id} (@${q.boundary})`))
         return `- ${x.config}: ${ids.length ? ids.join(', ') : 'none'}`
