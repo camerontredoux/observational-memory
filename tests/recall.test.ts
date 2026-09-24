@@ -327,6 +327,25 @@ describe('recall', () => {
     expect(await run({ query: 'RAW_TOKEN zebra' }, io)).toContain('\nNo occurrences in this session of: zebra.\n')
   })
 
+  // recall-required.om-recall.new.r3: `shard-101` showed lines 10 and 19, whose byte counts hold 101 inside 101047290
+  // and 101989851, beside line 101, the only one that holds shard-101, with "10 more matching lines" after it.
+  test('a line that holds a compound term whole outranks lines that hold only its parts', async () => {
+    const regions = ['eu-west-2', 'us-east-1', 'ap-south-1', 'eu-central-1']
+    // tests/eval/scenarios.ts's shards.sh, its checksums made up.
+    const audit = Array.from({ length: 200 }, (_, k) => {
+      const n = k + 1
+      const i = String(n).padStart(3, '0')
+      return `shard-${i} region=${regions[n % 4]} objects=${(n * 7919) % 90000 + 10000} bytes=${(n * 104729) % 900000000 + 100000000} replicas=${(n % 3) + 2} checksum=ck-${i}0000000000000 status=verified`
+    })
+    const io = () => session(result(20, 'shards', [...audit, 'audit complete: 200 shards verified'].join('\n')))
+    const found = await run({ query: 'shard-101' }, io())
+    expect(found).toContain('  101: shard-101 region=us-east-1 objects=89819 ')
+    expect(found).not.toMatch(/\n {2}(10|19): /)
+    expect(found).not.toContain('more matching line')
+    // A compound no line holds whole is still excerpted by its parts.
+    expect(await run({ query: 'shard-verified' }, io())).toMatch(/\n {2}1: shard-001 [^\n]*\n[^\n]*\n[^\n]*\n  … 198 more matching lines\n/)
+  })
+
   test('every mode keeps its whole response under one size cap', async () => {
     const wide = (n: number) => Array.from({ length: n }, (_, i) => `${i} ${'w'.repeat(900)}`).join('\n')
     const io = session([

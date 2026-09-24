@@ -561,7 +561,7 @@ function held(m: Matcher, text: string, lower = text.toLowerCase()): Held[] {
   return m.terms.map((t) => (flat.includes(t.word) ? 'whole' : t.parts.length && t.parts.every((p) => lower.includes(p)) ? 'parts' : undefined))
 }
 
-type Excerpt = { text: string; best: number; lead: number; lines: number }
+type Excerpt = { text: string; best: number; whole: number; lead: number; lines: number }
 
 // A phrase held only whole-block (its words fall on different display lines: a real newline, or just a display wrap
 // of one long line) is not on any single line to score or cut around. Locate it in the raw text instead, and report
@@ -609,20 +609,25 @@ function spanning(b: Block, starts: readonly number[], heldPerLine: readonly Hel
   return spans
 }
 
-// A hit's lines to show: those holding the most terms, then the rarest in the block (on the fewest of its lines), each
-// more than SEARCH_LINE_GAP from another, the farthest from those taken on a tie. Each is cut around its rarest term.
-// `best`, the most terms one line holds, ranks the hit; `lead` is the line taken first.
+// A hit's lines to show: those holding the most terms whole, then the most terms, then the rarest in the block (on the
+// fewest of its lines), each more than SEARCH_LINE_GAP from another, the farthest from those taken on a tie. Each is
+// cut around its rarest term. A compound's parts count on a line only when no line holds it whole: `101` inside
+// `101047290` is not `shard-101`. `whole` and `best`, the most terms one line holds whole and at all, rank the hit;
+// `lead` is the line taken first.
 function excerpt(b: Block, m: Matcher): Excerpt {
   const { lines, starts } = splitLines(b.text)
   const lowers = lines.map((l) => l.toLowerCase())
   const atoms = [...new Set(m.terms.flatMap((t) => [t.word, ...t.parts]))]
   const freq = new Map(atoms.map((a) => [a, lowers.filter((l) => l.includes(a)).length]))
   const heldPerLine = lines.map((l, i) => held(m, l, lowers[i]))
+  const wholeSomewhere = (k: number) => heldPerLine.some((h) => h[k] === 'whole')
+  const counted = heldPerLine.map((h) => h.map((x, k) => (x === 'parts' && wholeSomewhere(k) ? undefined : x)))
   const spans = spanning(b, starts, heldPerLine, m)
-  type Line = { i: number; terms: number; rarity: number; span: number }
+  type Line = { i: number; whole: number; terms: number; rarity: number; span: number }
   const scored: Line[] = lines.map((l, i) => ({
     i,
-    terms: heldPerLine[i]!.filter(Boolean).length + (spans.has(i) ? 1 : 0),
+    whole: counted[i]!.filter((x) => x === 'whole').length + (spans.has(i) ? 1 : 0),
+    terms: counted[i]!.filter(Boolean).length + (spans.has(i) ? 1 : 0),
     rarity: atoms.reduce((s, a) => s + (lowers[i]!.includes(a) ? 1 / freq.get(a)! : 0), 0),
     span: spans.get(i) ?? 1,
   }))
@@ -633,7 +638,7 @@ function excerpt(b: Block, m: Matcher): Excerpt {
   while (taken.length < SEARCH_LINES_PER_HIT) {
     const open = pool.filter((s) => !taken.length || gap(s) > SEARCH_LINE_GAP)
     if (!open.length) break
-    open.sort((x, y) => y.terms - x.terms || y.rarity - x.rarity || (taken.length ? gap(y) - gap(x) : 0) || x.i - y.i)
+    open.sort((x, y) => y.whole - x.whole || y.terms - x.terms || y.rarity - x.rarity || (taken.length ? gap(y) - gap(x) : 0) || x.i - y.i)
     taken.push(open[0]!)
   }
   const lead = taken[0]?.i ?? 0
@@ -653,7 +658,7 @@ function excerpt(b: Block, m: Matcher): Excerpt {
     })
   if (!found.length) found.push(`  1: ${oneLine(lines[0] ?? '', SEARCH_LINE_CHARS)}`) // a match on the tool's name alone
   if (pool.length > taken.length) found.push(`  … ${plural(pool.length - taken.length, 'more matching line')}`)
-  return { text: `[${label(b)}] ${plural(lines.length, 'line')}\n${found.join('\n')}`, best: Math.max(0, ...pool.map((s) => s.terms)), lead, lines: lines.length }
+  return { text: `[${label(b)}] ${plural(lines.length, 'line')}\n${found.join('\n')}`, best: Math.max(0, ...pool.map((s) => s.terms)), whole: Math.max(0, ...pool.map((s) => s.whole)), lead, lines: lines.length }
 }
 
 async function search(c: Corpus, input: Input): Promise<RecallResult> {
@@ -687,8 +692,9 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
     h.score = h.held.reduce((s, x, k) => s + (x ? weight[k]! : 0), 0)
   }
   const byTime = (a: Hit, b: Hit) => a.time - b.time || (a.t === b.t ? a.i - b.i : 0)
-  // The rarest terms first when no block holds every term, then the most terms on one line, then the newest.
-  const ranked = [...hits].sort((a, b) => (loose ? b.score - a.score : 0) || b.x!.best - a.x!.best || byTime(b, a))
+  // The rarest terms first when no block holds every term, then the most terms whole on one line, the most terms on
+  // one line, then the newest.
+  const ranked = [...hits].sort((a, b) => (loose ? b.score - a.score : 0) || b.x!.whole - a.x!.whole || b.x!.best - a.x!.best || byTime(b, a))
   const shown: Hit[] = []
   let chars = 0
   for (const h of ranked) {
