@@ -3,13 +3,9 @@ import { brief } from './stats'
 
 // `$.store` is one JSON file capped at 4 MiB, and each session leaves its keys (`<kind>:<sessionId>`) behind.
 //
-// Every Claude Code process shares that file, and the store offers only single-key get, set, delete and keys: no
-// transaction and no compare-and-set. So pruning is not atomic across processes. It narrows the window instead: just
-// before deleting a session it lists and reads the session's keys again, its subagents' included, and asks the
-// sessions registry again which sessions run, deleting nothing when that cannot be told. A process that writes to a
-// session between that last check and the deletes can still lose what it wrote; the ledger lock in register.ts is
-// one process's alone and does not close this. The daily run is shared the same way: two processes starting within
-// the same instant can both prune, which deletes nothing more.
+// Every Claude Code process shares that file, so pruning is not atomic across them (see TODO.md). It narrows the
+// window instead: just before deleting a session it lists and reads the session's keys again, its subagents'
+// included, and asks the sessions registry again which sessions run, deleting nothing when that cannot be told.
 const PRUNE_AFTER_DAYS = 30
 const DAY = 24 * 60 * 60 * 1000
 const STORE_CAP = 4 * 1024 * 1024
@@ -97,7 +93,7 @@ async function drop($: EngineInterface, gone: Session[], why: string, stale: (s:
       }
       if (!stale(s, latest(times)) || (await liveSessions($)).has(s.id)) continue
       for (const key of keys) await $.store.delete(key)
-      dropped.push(s)
+      dropped.push({ ...s, keys })
     }
   } finally {
     if (dropped.length)
@@ -161,7 +157,9 @@ export function registerPrune(on: On) {
         total -= s.bytes
       }
       // Liveness that cannot be told again stops the drops; the write is tried with the room already made.
-      await drop($, gone, 'to fit the store under its size cap', (s, at) => at !== undefined && at <= s.at!).catch(() => {})
+      await drop($, gone, 'to fit the store under its size cap', (s, at) => at !== undefined && at <= s.at!).catch((error) =>
+        $.ui.log(`could not prune to fit the store under its size cap (${errorText(error)})`, { to: 'debug' }),
+      )
       return next(e)
     }
   })

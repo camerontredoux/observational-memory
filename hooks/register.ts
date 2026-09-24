@@ -124,7 +124,12 @@ function end(key: string) {
 }
 
 // Thrown to stop work whose loop ended under it.
-class LoopEnded extends Error {}
+const LOOP_ENDED = 'its loop ended'
+class LoopEnded extends Error {
+  constructor() {
+    super(LOOP_ENDED)
+  }
+}
 
 // Ledger reads and writes one at a time: Observer calls land out of order. The lock is this process's alone: two
 // Claude Code processes sharing the store are not serialized against each other (see hooks/prune.ts).
@@ -709,7 +714,8 @@ async function markTime($: EngineInterface, onlyPrompt: boolean, loop: Loop, sta
   return rows
 }
 
-// The loop a hook runs for, and its stamp, taken as the hook checks it runs.
+// The loop a hook runs for, and its stamp, taken before any check that the loop runs: a loop that ends during the
+// check leaves the stamp behind.
 async function current($: EngineInterface, agentId?: string) {
   const loop = loopOf(await $.session.id(), agentId)
   return { loop, stamp: stampOf(loop) }
@@ -725,10 +731,8 @@ async function markTurn($: EngineInterface) {
 // history has come in, so a long turn is observed while it runs (a crewmate's whole session is one turn, a subagent's
 // whole run too). A loop no listed agent runs (an engine fork) is left alone.
 async function onStep($: EngineInterface, agentId?: string) {
-  const [sessionId, agents] = await Promise.all([$.session.id(), agentId === undefined ? [] : $.agent.list()])
-  if (agentId !== undefined && !agents.some((a) => a.id === agentId && a.status === 'running')) return
-  const loop = loopOf(sessionId, agentId)
-  const stamp = stampOf(loop)
+  const { loop, stamp } = await current($, agentId)
+  if (agentId !== undefined && !(await $.agent.list()).some((a) => a.id === agentId && a.status === 'running')) return
   const rows = await markTime($, false, loop, stamp)
   if (!isLive(loop, stamp)) return
   const last = sinceScheduled.get(loop.key)
@@ -984,15 +988,17 @@ function notPersistent($: EngineInterface, sessionId: string, messages: readonly
 async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, next: (e: SessionCompactInput) => Promise<SessionCompactResult>, fellBack: boolean) {
   const installs = e.trigger !== 'precompute'
   const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
+  const loop = sessionId === undefined ? undefined : loopOf(sessionId, e.agentId)
+  const stamp = loop && stampOf(loop) // a loop that ends while the built-in compactor runs gets no record
   const r = await next(e)
   if (sessionId !== undefined && started !== undefined)
     record(statsIo($), sessionId, (s, at) =>
       addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
     )
   const [summary, ...kept] = r.messages ?? []
-  if (installs && summary && sessionId !== undefined) {
+  if (installs && summary && loop && isLive(loop, stamp!)) {
     const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
-    await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
+    await $.store.set(liveKey(loop.key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
   }
   return r
 }
@@ -1012,6 +1018,7 @@ export const register: Register = (on) => {
     const installs = e.trigger !== 'precompute'
     const [sessionId, started, usage] = await Promise.all([$.session.id(), $.clock.now(), $.session.usage({ breakdown: 'summary' }).catch(() => undefined)])
     const loop = loopOf(sessionId, e.agentId)
+    const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
     // the session cannot read, or a context that does not match) is compacted with no stored state.
     const history = await loopHistory($, loop).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
@@ -1049,6 +1056,7 @@ export const register: Register = (on) => {
           log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
           return observe($, v, from, to, 'compaction')
         })
+      if (!isLive(loop, life)) throw new LoopEnded()
       const settled = await Promise.allSettled(gaps.map(([from, to]) => once(from, to)))
       sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - started }
       settled.forEach((r, i) => {
@@ -1126,7 +1134,7 @@ export const register: Register = (on) => {
     // it are found again there. One that does not stand leaves the chunks committed, not installed.
     const settle = async (l: Ledger) => {
       const ledger = commit({ ...l, chunks: [...l.chunks, ...chunks] }, v)
-      const stores = persistent && ledger.watermark.to > base
+      const stores = persistent && ledger.watermark.to > base && isLive(loop, life) // under the lock, as a loop's end deletes
       let built
       try {
         built = build(ledger)
@@ -1167,7 +1175,7 @@ export const register: Register = (on) => {
       observations: ledger.entries.length,
     }
     record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
-    if (persistent && installs) void maybeReflect($, loop, stampOf(loop)).catch((error) => log($, errorText(error)))
+    if (persistent && installs) void maybeReflect($, loop, life).catch((error) => log($, errorText(error)))
     // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
     // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
     // In the context's own order.
@@ -1175,6 +1183,7 @@ export const register: Register = (on) => {
   }).catch(async ($, e, next) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
+    if (next.error.message === LOOP_ENDED) return { skip: `observational-memory: ${LOOP_ENDED}` } // nothing left to compact
     log($, `${next.error.message}; using the built-in compaction`)
     show($, next.error.message?.startsWith(OVER_BUDGET) ? 'Memory over its budget. Using built-in compaction' : 'Observation failed. Using built-in compaction', e.agentId)
     return delegateToBuiltin($, e, next, true)

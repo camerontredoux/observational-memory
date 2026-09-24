@@ -54,15 +54,22 @@ const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day,
 
 // The main conversation's history, grown as the engine would, each listed subagent's under `agents` (any other id
 // is denied), a store the test can read, and a context size. `holdGet` delays a store read's answer, read before the
-// hold, so it can be out of date when it arrives.
-function world(on: On, options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[]; holdGet?: (key: string) => Promise<void> | undefined } = {}) {
+// hold, so it can be out of date when it arrives; `holdList` delays the listing of agents the same way.
+function world(
+  on: On,
+  options: { failWrites?: boolean; unreadable?: string[]; teammates?: string[]; holdGet?: (key: string) => Promise<void> | undefined; holdList?: () => Promise<void> | undefined } = {},
+) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
   on('session.messages', ($, e) => ({ value: e.agentId === undefined ? history : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
   const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
   const type = (id: string) => (options.teammates?.includes(id) ? 'teammate' : 'general-purpose')
-  on('agent.list', () => ({ value: listed().map((id) => ({ id, description: id, type: type(id), status: 'running' })) }))
+  on('agent.list', async () => {
+    const value = listed().map((id) => ({ id, description: id, type: type(id), status: 'running' as const }))
+    await options.holdList?.()
+    return { value }
+  })
   const stored: Record<string, unknown> = {}
   on('store.keys', () => ({ value: Object.keys(stored) }))
   on('store.get', async ($, e) => {
@@ -1533,7 +1540,7 @@ describe('register', () => {
     expect(seen.logs).toContain('a reflection outlived its loop; discarded')
   })
 
-  test("a finished subagent's calls hold their slots until they return, then a waiting main loop is observed", async ($, on) => {
+  test("a finished subagent's calls hold their slots until they return, then a waiting main loop and sibling subagent are observed", async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
@@ -1542,11 +1549,15 @@ describe('register', () => {
     const runTurn = live(on, clock, history)
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
     for (let n = 0; n < 16; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
+    agents['agent-2'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 4; n++) agents['agent-2'].push(...agentCall('two', n, 16_000))
     await clock.set(at(23, 9, 0))
     await step($, 's', 0, agents['agent-1'].length, 'agent-1')
     await clock.settle()
     expect(seen.inFlight).toBe(4)
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 30)) // no slot: main waits
+    await step($, 's2', 0, agents['agent-2'].length, 'agent-2') // and so does the sibling
+    await clock.settle()
 
     await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
     await runTurn($, turn('c', 'c', 8_000), at(23, 9, 40)) // main's pass after the subagent ends: still no slot
@@ -1559,8 +1570,78 @@ describe('register', () => {
 
     expect(seen.maxInFlight).toBe(4)
     expect(seen.prompts.length).toBeGreaterThan(4)
-    expect(seen.prompts.slice(4).some((p) => readers(p).has('one'))).toBe(false) // the rest read main's rows
+    expect(seen.prompts.slice(4).some((p) => readers(p).has('one'))).toBe(false) // the rest read main's rows and the sibling's
     expect((stored['ledger:session-1'] as Ledger).entries.length).toBeGreaterThan(0)
+    expect((stored['ledger:session-1/agent-2'] as Ledger).entries.length).toBeGreaterThan(0)
+    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
+  })
+
+  test('a step whose subagent finishes while the step checks that it runs records nothing and starts no Observer call', async ($, on) => {
+    const clock = mock.clock(on)
+    const { gate, open } = gates()
+    let lists = 0
+    const { agents, stored } = world(on, { holdList: () => (++lists === 1 ? gate(1) : undefined) })
+    const seen = pi(on, { reply: readsIn })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 6; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
+
+    await step($, 's', 0, agents['agent-1'].length, 'agent-1')
+    await clock.settle() // the step's listing of agents, read while the subagent ran, is held
+    await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    open(1)
+    await clock.settle()
+
+    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
+    expect(seen.prompts).toEqual([])
+  })
+
+  test("an Observer call's landing, its ledger read held when its subagent finishes, is discarded", async ($, on) => {
+    const clock = mock.clock(on)
+    const { gate, open } = gates()
+    let observed = false // the Observer has answered: the next read of the ledger is the landing's
+    let held = false
+    const { agents, stored } = world(on, {
+      holdGet: (key) => (key === 'ledger:session-1/agent-1' && observed && !held ? ((held = true), gate(1)) : undefined),
+    })
+    const seen = pi(on, { reply: (prompt) => ((observed = true), readsIn(prompt)) })
+    const step = steps(on)
+    on('turn.complete', () => ({ text: '' }))
+    agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
+    for (let n = 0; n < 6; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
+
+    await step($, 's', 0, agents['agent-1'].length, 'agent-1')
+    await clock.settle()
+    expect(held).toBe(true)
+    const finished = $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    await clock.settle()
+    open(1)
+    await finished
+    await clock.settle()
+
+    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
+    expect(seen.logs).toContain('a background chunk landed after its loop ended; discarded')
+    expect(seen.logs.filter((l) => l.startsWith('Observed'))).toEqual([])
+  })
+
+  test("a subagent's compaction that outlives its session's end writes nothing back", async ($, on) => {
+    const clock = mock.clock(on)
+    const { agents, stored } = world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }])
+    for (let n = 0; n < 10; n++) rows.push(...agentCall('one', n, 16_000))
+
+    const compacting = $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
+    await clock.settle()
+    expect(seen.inFlight).toBeGreaterThan(0) // observing on the spot
+    await $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
+    for (let n = 1; n <= seen.prompts.length; n++) open(n)
+    await compacting
+    await clock.settle()
+
     expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
   })
 
