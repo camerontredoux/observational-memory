@@ -1183,7 +1183,7 @@ export const register: Register = (on) => {
   }).catch(async ($, e, next) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
-    if (next.error.message === LOOP_ENDED) return { skip: `observational-memory: ${LOOP_ENDED}` } // nothing left to compact
+    if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
     log($, `${next.error.message}; using the built-in compaction`)
     show($, next.error.message?.startsWith(OVER_BUDGET) ? 'Memory over its budget. Using built-in compaction' : 'Observation failed. Using built-in compaction', e.agentId)
     return delegateToBuiltin($, e, next, true)

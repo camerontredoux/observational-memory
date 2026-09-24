@@ -1625,6 +1625,30 @@ describe('register', () => {
     expect(seen.logs.filter((l) => l.startsWith('Observed'))).toEqual([])
   })
 
+  test("a subagent's compaction whose session ends before its Observer calls makes none and is skipped", async ($, on) => {
+    const clock = mock.clock(on)
+    const { gate, open } = gates()
+    const { agents, stored } = world(on, { holdGet: (key) => (key === 'ledger:session-1/agent-1' ? gate(1) : undefined) })
+    const seen = pi(on, { reply: readsIn })
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+    const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }])
+    for (let n = 0; n < 10; n++) rows.push(...agentCall('one', n, 16_000))
+
+    const compacting = $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...rows] })
+    await clock.settle() // its ledger read is held
+    const ending = $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await clock.settle()
+    open(1)
+    const result = await compacting
+    await ending
+    await clock.settle()
+
+    expect(result.skip).toBe('observational-memory: its loop ended')
+    expect(seen.prompts).toEqual([])
+    expect(seen.logs).toContain('a compaction outlived its loop; skipped')
+    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
+  })
+
   test("a subagent's compaction that outlives its session's end writes nothing back", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on)
