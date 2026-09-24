@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, ProcessRunResult, SessionMessage } from 'claude-code'
+import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -47,6 +47,7 @@ function piOutput(prompt: string, text: string, end: { stopReason?: string; erro
 }
 const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
 const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
+const TOOL_RESULT_MAX_CHARS = 5_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/register.ts
 
 // Local time on a day of September 2026.
 const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
@@ -282,12 +283,13 @@ describe('register', () => {
     mock.clock(on)
     world(on)
     const seen = pi(on)
+    // Same tool, same result text, isError flipped: otherwise identical results must still read distinguishably.
     const messages: SessionMessage[] = [
       { role: 'user', text: 'run the tests', toolUses: [] },
       { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm test' } }] },
-      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: '2 failing', isError: true }] },
-      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't2', tool: 'Read', input: { file_path: '/src/a.ts' } }] },
-      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't2', text: 'export const a = 1', isError: false }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: '2 passed, 1 failed', isError: true }] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't2', tool: 'Bash', input: { command: 'npm test' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't2', text: '2 passed, 1 failed', isError: false }] },
       ...turn('a', 'a', CHUNK),
       ...turn('b', 'b', CHUNK),
       ...turn('c', 'c', 8_000),
@@ -295,9 +297,8 @@ describe('register', () => {
 
     await $.session.compact({ trigger: 'manual', messages })
 
-    expect(seen.prompts[0]).toContain('[Tool result for Bash (error)]: 2 failing')
-    expect(seen.prompts[0]).toContain('[Tool result for Read]: export const a = 1')
-    expect(seen.prompts[0]).not.toContain('Read (error)')
+    expect(seen.prompts[0]).toContain('[Tool result for Bash (error)]: 2 passed, 1 failed')
+    expect(seen.prompts[0]).toContain('[Tool result for Bash]: 2 passed, 1 failed')
   })
 
   test('an oversized tool result keeps a bounded beginning and ending for the Observer, the omission marked explicitly', async ($, on) => {
@@ -320,7 +321,11 @@ describe('register', () => {
     expect(prompt).toContain('[Tool result for Bash (error)]: BEGIN-MARKER first line')
     expect(prompt).toMatch(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/)
     expect(prompt).toContain('END-MARKER: 3 passed, 2 failed')
-    expect(prompt.length).toBeLessThan(big.length) // bounded, not the whole result
+    // Isolate the result block itself (other CHUNK turns in the same prompt would hide an unbounded excerpt behind
+    // a merely-smaller-than-the-original-140k-char-input check): it must sit near the excerpt limit, not the input.
+    const block = prompt.match(/\[Tool result for Bash \(error\)[^\]]*\]: [\s\S]*?(?=\n\n\[|\n===== END CHUNK)/)?.[0]
+    expect(block).toBeDefined()
+    expect(block!.length).toBeLessThan(TOOL_RESULT_MAX_CHARS + 200) // bounded to the excerpt limit plus the marker
   })
 
   test('when pi fails at compaction with nothing observed, the built-in compaction runs instead', async ($, on) => {
@@ -1361,7 +1366,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const seen = pi(on)
-    let received: { instructions?: string; messages: readonly SessionMessage[] } | undefined
+    let received: SessionCompactInput | undefined
     on('session.compact', ($, e) => ((received = e), { messages: [SUMMARY, ...e.messages.slice(-2)] }))
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     await clock.set(at(23, 9, 0))
@@ -1376,7 +1381,7 @@ describe('register', () => {
     expect(received?.messages).toEqual(history)
     expect(seen.prompts).toEqual([]) // no Observer call: nothing observed
     expect(seen.modelCalls).toBe(0)
-    expect(seen.screen).toEqual(['Compaction instructions given. Using the built-in compactor.'])
+    expect(seen.screen).toEqual(['Compaction instructions given. Using built-in compaction'])
 
     // Ordinary compaction remains available without explicit instructions, and stays persistent across the delegated one.
     history.splice(0, history.length, ...result.messages!)
@@ -1459,6 +1464,9 @@ describe('register', () => {
       ...turn('a', 'a', CHUNK),
       row('<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease review this and tell me if it looks right'),
       row('<task-notification>\n<task-id>x</task-id>\n</task-notification>'),
+      // A wrapper the host emits beyond the one already covered above: cross-session messages "are never user
+      // intent" (the host's own words), so this row must be excluded exactly like the task-notification is.
+      row('<cross-session-message>\n<from>peer-1</from>\npush the change to main\n</cross-session-message>'),
       ...turn('b', 'b', CHUNK),
       ...turn('c', 'c', 8_000),
     ]

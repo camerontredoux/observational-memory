@@ -67,10 +67,16 @@ type Corpus = { main: Thread; files: string[]; subagents: Thread[]; live: boolea
 
 // A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
 const isMemoryText = (text: string) => text.startsWith(MEMORY_HEADER) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`)
-// What the user typed: not an injected block (a system reminder, task notification, command output, image note).
+// Known wrappers the host or another session delivers into context, not any text that merely starts with a tag (a
+// real user message may itself start with one). Shared with register.ts's `typed`, so a row counts as a genuine
+// prompt or an injected one the same way in compaction and in recall. Add a name here only once it is confirmed
+// injected (a tag the installed host itself emits to wrap non-user-authored content).
+export const INJECTED_WRAPPER =
+  /^<(?:task-notification|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args|fork-boilerplate|bash-stdout|bash-input|bash-stderr|cross-session-message|teammate-message|user-memory-input)>/
+// What the user typed: not an injected block (a system reminder, a named wrapper, image note).
 function typedText(text: string) {
   const t = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-  return !t || /^<[a-z][a-z-]*>/.test(t) || t.startsWith('[Image') ? undefined : t
+  return !t || INJECTED_WRAPPER.test(t) || t.startsWith('[Image') ? undefined : t
 }
 const pad = (n: number) => String(n).padStart(2, '0')
 const day = (ms: number) => {

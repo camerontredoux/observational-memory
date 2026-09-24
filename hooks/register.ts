@@ -15,7 +15,7 @@ import {
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
-import { liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
+import { INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
 
 declare module 'claude-code' {
@@ -196,13 +196,10 @@ const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.len
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
 
 // What the user typed, if a row is a real prompt: no tool results, compaction summary, injected block (a system
-// reminder, task notification, local command's caveat or output, image note) or skill text. A system reminder a
-// hook appended to a prompt is cut from it.
+// reminder, a named wrapper, image note) or skill text. A system reminder a hook appended to a prompt is cut from it.
 // `SessionMessage` carries no origin field (no host metadata for a user prompt's source reaches this hook, unlike
 // `prompt.submit`'s or `session.receive`'s own `origin`), so a genuine structured prompt is told from an injected
-// one by name: known wrappers the host or another session delivers into context, not any text that merely starts
-// with a tag (a real user message may itself start with one). Add a name here only once it is confirmed injected.
-const INJECTED_WRAPPER = /^<(?:task-notification|local-command-caveat|local-command-stdout|command-name|command-message|fork-boilerplate|bash-stdout|bash-input)>/
+// one by name, using recall.ts's `INJECTED_WRAPPER` so the two modules agree on what counts as typed.
 function typed(m: SessionMessage, skills: readonly Skill[]) {
   if (!isPrompt(m) || isMemory(m) || isSummary(m)) return undefined
   const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
@@ -942,16 +939,17 @@ function notPersistent($: EngineInterface, sessionId: string, messages: readonly
 }
 
 // Delegates this compaction to the built-in compactor unchanged (`e` passed on as received), and records the live
-// key so a compaction after it can still find the context it kept (see `arrange`). `fellBack` marks a genuine
-// fallback (something failed here) for stats; an intentional delegation (explicit `/compact` instructions) is not
-// a fallback and is not counted as one.
+// key so a compaction after it can still find the context it kept (see `arrange`). Every delegation is recorded as
+// a compaction; `fellBack` only marks whether it was a genuine fallback (something failed here) for stats, not
+// whether to record at all: an intentional delegation (explicit `/compact` instructions) still counts toward the
+// total, just not as a fallback.
 async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, next: (e: SessionCompactInput) => Promise<SessionCompactResult>, fellBack: boolean) {
   const installs = e.trigger !== 'precompute'
   const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
   const r = await next(e)
-  if (fellBack && sessionId !== undefined && started !== undefined)
+  if (sessionId !== undefined && started !== undefined)
     record(statsIo($), sessionId, (s, at) =>
-      addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack: true, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
+      addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
     )
   const [summary, ...kept] = r.messages ?? []
   if (installs && summary && sessionId !== undefined) {
@@ -967,7 +965,7 @@ export const register: Register = (on) => {
     // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
     // compactor honors them, background observation cannot. Ordinary compaction stays available without them.
     if (e.instructions?.trim()) {
-      show($, 'Compaction instructions given. Using the built-in compactor.', e.agentId)
+      show($, 'Compaction instructions given. Using built-in compaction', e.agentId)
       return delegateToBuiltin($, e, next, false)
     }
     const order = callOrder(e.messages)
@@ -1141,8 +1139,6 @@ export const register: Register = (on) => {
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     log($, `${next.error.message}; using the built-in compaction`)
     show($, next.error.message?.startsWith(OVER_BUDGET) ? 'Memory over its budget. Using built-in compaction' : 'Observation failed. Using built-in compaction', e.agentId)
-    // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
-    // Its summary is no memory message: what it kept is recorded, to find the live context in the history by.
     return delegateToBuiltin($, e, next, true)
   })
 
