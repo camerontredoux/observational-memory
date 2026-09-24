@@ -118,6 +118,19 @@ const truncate = (text: string, maxTokens: number) =>
 const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
 // What truncate leaves of a text given no room: its note alone.
 const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
+// An oversized command result, bounded at both ends: a final error or test summary usually sits at the start or
+// the end, never only in the middle. The omission is marked explicitly, never silently dropped; om_recall can
+// still find the full result in the transcript. The tail starts at a line boundary so its first line is whole.
+function excerpt(text: string, maxTokens: number) {
+  if (text.length <= maxTokens * 4) return text
+  const room = maxTokens * 4
+  const headChars = Math.floor(room / 2)
+  const rawTailStart = text.length - (room - headChars)
+  const nl = text.indexOf('\n', rawTailStart)
+  const tailStart = nl === -1 || nl >= text.length - 1 ? rawTailStart : nl + 1
+  const omitted = estimateTokens(text.slice(headChars, tailStart))
+  return `${text.slice(0, headChars)}\n... [~${omitted} tokens omitted; om_recall can retrieve the full result] ...\n${text.slice(tailStart)}`
+}
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
@@ -259,7 +272,9 @@ function serialize(v: View, from: number, to: number) {
     }
     if (m.text) blocks.push(`[User${at}]: ${m.text}`)
     for (const r of m.toolResults ?? [])
-      blocks.push(`[Tool result for ${names.get(r.tool_use_id) ?? 'tool'}${at}]: ${truncate(r.text, TOOL_RESULT_MAX_TOKENS) || '[empty result]'}`)
+      // `isError` is the host's own report, never inferred: an absent or successful result never claims failure, and
+      // one truncated for length never claims success it did not report either.
+      blocks.push(`[Tool result for ${names.get(r.tool_use_id) ?? 'tool'}${r.isError ? ' (error)' : ''}${at}]: ${excerpt(r.text, TOOL_RESULT_MAX_TOKENS) || '[empty result]'}`)
   }
   return blocks.join('\n\n')
 }

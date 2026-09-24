@@ -278,6 +278,51 @@ describe('register', () => {
     expect(seen.systems[0]).toContain('not the step it is on, such as reading or searching')
   })
 
+  test('the Observer input marks a failed tool result and names the tool, and never marks a successful one as failed', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'run the tests', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm test' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: '2 failing', isError: true }] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't2', tool: 'Read', input: { file_path: '/src/a.ts' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't2', text: 'export const a = 1', isError: false }] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts[0]).toContain('[Tool result for Bash (error)]: 2 failing')
+    expect(seen.prompts[0]).toContain('[Tool result for Read]: export const a = 1')
+    expect(seen.prompts[0]).not.toContain('Read (error)')
+  })
+
+  test('an oversized tool result keeps a bounded beginning and ending for the Observer, the omission marked explicitly', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    const big = `BEGIN-MARKER first line\n${'middle '.repeat(20_000)}\nEND-MARKER: 3 passed, 2 failed`
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'run the tests', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm test' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: big, isError: true }] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    const prompt = seen.prompts[0]!
+    expect(prompt).toContain('[Tool result for Bash (error)]: BEGIN-MARKER first line')
+    expect(prompt).toMatch(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/)
+    expect(prompt).toContain('END-MARKER: 3 passed, 2 failed')
+    expect(prompt.length).toBeLessThan(big.length) // bounded, not the whole result
+  })
+
   test('when pi fails at compaction with nothing observed, the built-in compaction runs instead', async ($, on) => {
     mock.clock(on)
     world(on)
