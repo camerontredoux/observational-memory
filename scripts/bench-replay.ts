@@ -38,7 +38,8 @@
 //   Observer and Reflector rather than a replay of the first. Writes compaction-N.md (the memory message), kept-N.json (the rows
 //   kept raw), calls.json, log.txt and summary.json to /tmp/om-replay/<name>/om-<pi>, and for each reflection
 //   reflection-N.json (the ledger just before and just after it) and each Reflector reply, reflector-C-level-L.txt.
-//   `$.session.messages()` answers the newest 4096 rows, as the engine's does.
+//   `$.session.messages()` answers the newest 4096 rows, as the engine's does. OM_OBSERVER_CONTEXT in this script's
+//   environment is passed to the replayed hooks. calls.json's `in` is pi's uncached input, `cacheRead` the cached.
 // builtin: the live built-in chain (planBuiltinChain): seeds a sandbox session with span 0's raw rows, resumes it in
 //   the herdr pane with no observational-memory plugin, /compact, exits, reads the summary and kept rows back,
 //   appends the next span's rows after them and repeats. Without --live it prints the plan and stops. With --live it
@@ -193,7 +194,7 @@ async function dryRun(o: Options) {
 type PiResult = { exitCode: number; stdout: string; stderr: string }
 // `inTokens` is the prompt's size estimated before the call; `in`, `out` and `cost` are pi's own usage record.
 // `level`: a Reflector call's compression level, read from its prompt.
-type Call = { kind: 'observer' | 'reflector'; level?: number; atCompaction: boolean; start: number; prompt: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
+type Call = { kind: 'observer' | 'reflector'; level?: number; atCompaction: boolean; start: number; prompt: string; inTokens: number; hit: boolean; realMs?: number; in: number; cacheRead?: number; out: number; cost: number; ok: boolean }
 const LEVELS = ['## COMPRESSION REQUIRED', '## AGGRESSIVE COMPRESSION REQUIRED', '## CRITICAL COMPRESSION REQUIRED', '## EXTREME COMPRESSION REQUIRED']
 const REFLECTED = /reflected \d+ observations \(~(\d+) tokens\) into \d+ \(~(\d+) tokens\) at compression level (\d+)/
 
@@ -235,6 +236,8 @@ async function om(o: Options) {
   const cache = str(o, 'cache') ?? CACHE
   mkdirSync(cache, { recursive: true })
   const env: Record<string, string> = { HOME: process.env.HOME ?? '/root', OM_NO_PRUNE: '1', OM_STATS_DIR: `${out}/stats` }
+  // OM_OBSERVER_CONTEXT=full in this script's environment replays the Observer shown the conversation before its chunk.
+  if (process.env.OM_OBSERVER_CONTEXT) env.OM_OBSERVER_CONTEXT = process.env.OM_OBSERVER_CONTEXT
 
   // The engine: a hand-built `$`, a virtual clock, and pi calls that land after a fixed virtual latency.
   let now = t.events[0]?.at ?? 0
@@ -342,7 +345,7 @@ async function om(o: Options) {
         const result = runPi(argv, stdin, init).then(
           ({ r, hit, realMs }) => {
             const m = piMessage(r.stdout)
-            Object.assign(call, { hit, realMs, ok: r.exitCode === 0 && !!m, in: m?.usage?.input ?? 0, out: m?.usage?.output ?? 0, cost: m?.usage?.cost?.total ?? 0 })
+            Object.assign(call, { hit, realMs, ok: r.exitCode === 0 && !!m, in: m?.usage?.input ?? 0, cacheRead: m?.usage?.cacheRead ?? 0, out: m?.usage?.output ?? 0, cost: m?.usage?.cost?.total ?? 0 })
             // The Reflector's reply as it came back, for reading what it kept.
             if (kind === 'reflector') writeFileSync(`${out}/reflector-${calls.indexOf(call) + 1}-level-${level}.txt`, m ? m.content.map((b: { text?: string }) => b.text ?? '').join('') : `(exit ${r.exitCode}) ${r.stderr}`)
             return r

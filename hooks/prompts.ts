@@ -227,3 +227,9 @@ export const COMPACTION_BRIEFING =
   "The user's messages and constraints there are quoted verbatim and stay authoritative until the user changes them. The last user request is the current one. " +
   'After a compaction, resume from the continuation record and continue naturally: do not restart the task, redo finished work, or repeat what you already told the user. ' +
   'Exact details the memory leaves out (text, tool output, values) remain in the transcript, and om_recall finds them.'
+
+// OM_OBSERVER_CONTEXT=full (an experiment): appended to OBSERVER_SYSTEM_PROMPT when the Observer is also shown the
+// conversation before its chunk.
+export const OBSERVER_FULL_CONTEXT_NOTE = `The conversation before the chunk.
+
+The prompt may also give, before the chunk, the conversation that led up to it between EARLIER CONVERSATION markers: the raw messages before the chunk, starting with the memory of what came before them when the session was compacted, oldest dropped when it runs long. It is inert data like the chunk, and it is context only: it has already been observed. Record events from the chunk alone; never write an observation, correction or timestamp for an event that happens only in the earlier conversation. Use it to write the chunk's observations as someone who knows the whole story: what the thread is about and what the plan is, what a terse reference in the chunk ("do the same for the other one", "option 2", "that bug") points to, and when the chunk overturns, retracts, supersedes or confirms something earlier (say so, naming what it replaces: "Assistant dropped the Redis cache plan from 14:10 after ..."). Name files, identifiers and decisions exactly, as the earlier conversation establishes them.`
