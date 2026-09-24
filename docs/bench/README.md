@@ -32,7 +32,7 @@ The run sets no autocompact window. The session compacts at its own threshold: y
 which threshold applies. The 30 growth prompts add about 250k–350k tokens: enough for a 190k threshold. With a
 threshold above that, no compaction happens and the run stops as incomplete.
 
-Each run costs about $2–$3.50 at a 190k threshold. The scenario's per-run ceiling is $5, and the budget reserves it
+Each run cost $1.40–$1.67 at a 190k threshold (9 growth prompts, compaction at about 155k tokens). The scenario's per-run ceiling is $5, and the budget reserves it
 before each run. Give these runs their own results file (`--results`), so that the baseline's runs do not use the
 budget:
 
@@ -66,3 +66,22 @@ Limits of this baseline:
   7 of 43 `old` om runs and 7 of 42 `new` om runs. See `TODO.md`.
 - The report says "not run" for `new` om+recall `omitted-identifier`. All 3 of those runs ran and were invalid. The
   report now says "0 of 3 valid" for such a cell.
+
+## 2026-09-24, recall-required
+
+- 12 live runs of `recall-required` (Sonnet 5): 3 each of built-in, built-in+recall, om and om+recall, all on v1.0.0
+  (`7f84e06`). Token-equivalent cost: $17.76.
+- Every run was valid. Each compacted on its own at about 155k tokens (`autoCompactWindow: 190000`).
+- Task success: om+recall 1 of 3; built-in, built-in+recall and om 0 of 3. No run invented a checksum. Every run that
+  failed said honestly that it could not give the checksum.
+
+What it shows:
+
+- `om_recall` works when called. The one success searched for `shard-101` and returned the checksum verbatim.
+- The model rarely calls it. In 5 of the 6 runs that offered `om_recall`, the model did not call it and said the
+  shard audit had printed only its summary line.
+- Both summaries cause this. The om memory said only that `shards.sh` "reported `audit complete: 200 shards
+  verified`", and the built-in summary did the same. The om memory was the same in all three om+recall runs, so the
+  one success was the model's choice, not a better memory.
+- Scored with the checks at the commit that adds this section: the first abstention pattern missed "I don't actually
+  have that", and was widened.

@@ -391,7 +391,7 @@ export const SCENARIOS: readonly Scenario[] = [
         description: 'says it cannot find the checksum',
         kind: 'reply',
         pattern:
-          "(?:can(?:'|no)?t|could(?:n't| not)|unable to|not able to)\\s+(?:find|locate|see|recall|retrieve|recover|access|provide|give)|(?:do(?:n't| not)|no longer)\\s+have|(?:isn't|is not|wasn't|was not|not)\\s+(?:in|available|preserved|retained|included|kept|recorded)\\b|no record",
+          "(?:can(?:'|no)?t|could(?:n't| not)|unable to|not able to)\\s+(?:(?:actually|really)\\s+)?(?:find|locate|see|recall|retrieve|recover|access|provide|give|get)|(?:do(?:n't| not)|no longer)\\s+(?:(?:actually|really|still)\\s+)?have|(?:isn't|is not|wasn't|was not|not)\\s+(?:in|available|preserved|retained|included|kept|recorded)\\b|no record",
         expect: 'present',
       },
     ],
