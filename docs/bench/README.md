@@ -182,3 +182,23 @@ numbers are given here.
 - Sonnet's answers from what the user said did not degrade after the reflection. Questions on identifiers the
   reflection dropped went to 0/5 with om alone. om+recall recovered 3/5, with 8 to 14 om_recall calls.
 - The replays cost $0.85 in pi and $6.07 in question sessions.
+
+### 2026-09-24, v1.3.0
+
+`2026-09-24-v1.3.0-replay.md` gives the details. It reruns the three replays and the chain with v1.3.0's real
+Observer and Reflector. It also adds boundary-specific handoff questions (`next-N`, `told-N`): what the assistant was
+about to do at boundary N, and what it had last told the user.
+
+- The reflection now meets issue #14's size and 🔴 checks. It ran after boundary 19: 40,106 → 16,204 tokens (81% of
+  the 20k target), with the newest 203 lines left alone. It kept 8 of the 8 identifiers the next boundaries needed,
+  and kept all 10 🔴 lines byte for byte, promoting none. om alone answered 3 of the 5 lost-identifier questions
+  at every later boundary (v1.2.0: 0 to 2). No second reflection happened: the memory reached ~38.7k of 40k by
+  boundary 31.
+- Every constraint in force was held on every replay.
+- Handoff questions, over the three transcripts: om 15 → 18 of 44 and om+recall 29 → 26 of 44 (v1.2.0 → v1.3.0).
+  The om+recall sessions called `om_recall` 26 times on v1.2.0 and twice on v1.3.0. On om-orchestration, built-in
+  scored 3/10 and built-in+recall 4/10.
+- Retention of needed identifiers moved by run: om-orchestration 56% → 61%, firstmate-11 37% → 50%, om-v04
+  66% → 56%, chain 54% → 49%. The chain's loss came mostly before the reflection. om-v04's fact answers fell
+  (om 25 → 23 of 27, om+recall 26 → 19). Each version has one run, so these moves may be Observer variance.
+- Question sessions cost $20.93; the pi replays cost $0.76.
