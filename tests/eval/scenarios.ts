@@ -138,8 +138,9 @@ export const SCENARIOS: readonly Scenario[] = [
     id: 'failure-in-long-output',
     title: 'A command failure at the end of long output',
     // The output is about 25,350 characters: past the 20,000 (TOOL_RESULT_MAX_TOKENS * 4) where the plugin cuts a tool
-    // result for the Observer, so the failure sits in what it cuts, and under the 30,000 past which Claude Code saves
-    // Bash output to a file and shows a preview (its `bashOutputMaxChars` default), so the transcript keeps the failure.
+    // result for the Observer, so the failure sits in what it cuts, and under the 30,000 past which Claude Code saves a
+    // successful command's output to a file and shows a preview (its documented `bashOutputMaxChars` default). This
+    // command fails; the `ran-tests` setup confirms the transcript kept the failure line, or the run is invalid.
     files: {
       'run-tests.sh': [
         '#!/usr/bin/env bash',
