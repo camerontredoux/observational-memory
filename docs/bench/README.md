@@ -85,3 +85,20 @@ What it shows:
   one success was the model's choice, not a better memory.
 - Scored with the checks at the commit that adds this section: the first abstention pattern missed "I don't actually
   have that", and was widened.
+
+## 2026-09-24, v1.1.0 recall-required
+
+- 9 live runs of `recall-required` (Sonnet 5) on v1.1.0 (`7bec0a9`), labelled `candidate`: 6 om+recall and
+  3 built-in+recall. Token-equivalent cost: $15.65. The report sets them beside the v1.0.0 runs above.
+- Every run was valid and compacted on its own at a 190k threshold.
+- Task success: om+recall 6 of 6 (v1.0.0: 1 of 3); built-in+recall 3 of 3 (v1.0.0: 0 of 3).
+
+What it shows:
+
+- Every run called `om_recall` exactly once after compaction, with no ToolSearch call before it. The pin from #11
+  works live: the tool is in the list once the session has compacted.
+- The memory did not change. In all 6 om+recall runs it still said only that `shards.sh` reported `audit complete: 200
+  shards verified`: the Observer's new rule for listed records did not fire here. The gain came from the tool being
+  visible and the recall note at the end of the memory, and it carries to the built-in summary, which has the same
+  tool and note.
+- 3 and 6 runs are small samples. They show the change, not a rate.
