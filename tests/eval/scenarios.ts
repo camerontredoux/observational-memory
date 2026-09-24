@@ -404,7 +404,7 @@ export const SCENARIOS: readonly Scenario[] = [
     // Added with issue #16 at the user's request: a design conversation whose decisions change as it goes (one decided,
     // replaced, then refined with a caveat; one changed; two options rejected with reasons), with two questions left
     // open, and bulky research reads between the decisions so a compaction falls mid-planning. The continuation asks
-    // for the current plan. The history is discussion only: the prompts forbid writing any file and run nothing, so the
+    // for the current plan. The history is discussion only: the prompts forbid writing any file (reading is allowed) and run nothing, so the
     // plan survives only in what the compaction carried (writing it to a file is the mitigation this scenario measures
     // against, and a history that writes one is invalid). About the size of the first seven: well under $1 a run.
     id: 'planning-session',
@@ -418,7 +418,7 @@ export const SCENARIOS: readonly Scenario[] = [
     steps: [
       {
         prompt:
-          'Let us plan the job queue for the ledgerd service. This is discussion only: do not write or edit any file and do not run anything, not even to keep notes; I will ask you for the plan at the end. First decisions: the queue backend is Redis Streams; each job times out after 30 seconds; a failed job is retried 3 times with exponential backoff capped at 10 minutes. Reply with just "ok".',
+          'Let us plan the job queue for the ledgerd service. This is discussion only: do not write or edit any file, not even to keep notes (reading the docs I point you to is fine); I will ask you for the plan at the end. First decisions: the queue backend is Redis Streams; each job times out after 30 seconds; a failed job is retried 3 times with exponential backoff capped at 10 minutes. Reply with just "ok".',
       },
       read(16, 'Queue backends'),
       {
@@ -434,8 +434,8 @@ export const SCENARIOS: readonly Scenario[] = [
       COMPACT,
     ],
     // The plan lives in the conversation alone: a history that wrote it to a file measures that file, not the memory.
-    // And it read the research: one built-in run took "do not run anything" to forbid reading, so its history held no
-    // research to compact (and its compaction summary refused the task): the history failed, not the memory.
+    // And it read the research: two built-in runs took an earlier wording ("do not run anything") to forbid reading, so
+    // their histories held no research to compact: the history failed, not the memory.
     setup: [
       { id: 'no-plan-file', category: 'correctness', description: 'the history wrote no file (the plan stayed in the conversation)', kind: 'tool', tool: WRITES, expect: 'absent' },
       ...[16, 17, 18].map((n) => ({ id: `read-${n}`, category: 'correctness' as const, description: `the history read docs/handbook-${n}.md`, kind: 'tool' as const, tool: '^(Read|Bash|Grep)$', path: `handbook-${n}\\.md`, expect: 'present' as const })),
