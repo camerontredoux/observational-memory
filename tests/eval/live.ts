@@ -11,6 +11,9 @@
 //   herdr's state reporting among them) still apply, the same in every configuration.
 // - om without recall: `--disallowed-tools mcp__observational-memory__om_recall`, a command-line flag, not a plugin
 //   setting. builtin+recall: an evaluation-only plugin (tests/eval/recall-plugin) that registers om_recall alone.
+// - fork and fork+recall (issue #16): the evaluation-only fork plugin (tests/eval/fork-plugin), assembled in the run
+//   directory with the recall-only plugin's hooks and the plugin version's recall.ts and prompts.ts; fork disallows
+//   om_recall as om does.
 // - `--permission-mode dontAsk` with an allow list in the settings: the session never stops at a permission prompt;
 //   what the list leaves out is denied (the attempt stays in the transcript for the checks).
 // - Auto-compaction: the run sets no window (no `autoCompactWindow` in its settings, no `--autocompact`, no
@@ -20,8 +23,8 @@
 
 import { RECALL_TOOL } from './bench'
 import type { RunRecord } from './bench'
-import type { Configuration } from './runner'
-import { recallAvailable, usesObservationalCompaction } from './runner'
+import type { LiveConfiguration } from './runner'
+import { recallAvailable, usesForkCompaction, usesObservationalCompaction, usesPluginCompaction } from './runner'
 import type { Scenario } from './scenarios'
 
 export const MODEL = 'sonnet'
@@ -29,7 +32,7 @@ export const MODEL = 'sonnet'
 export const FIRST_RUN_CEILING_USD = 1
 
 export type PlanInput = {
-  config: Configuration
+  config: LiveConfiguration
   /** `old`, `new`, or another label: lower-case letters, digits and hyphens. */
   version: string
   scenario: Scenario
@@ -38,6 +41,8 @@ export type PlanInput = {
   pluginRoot: string
   /** tests/eval/recall-plugin in the checkout running the benchmark. */
   recallPluginSource: string
+  /** tests/eval/fork-plugin in the checkout running the benchmark. */
+  forkPluginSource?: string
   benchRoot: string
   /** An existing herdr pane at a shell prompt. */
   pane: string
@@ -85,7 +90,7 @@ export type Plan = {
 
 const SAFE = /^[a-z0-9][a-z0-9-]*$/
 
-export function runIdOf(config: Configuration, version: string, scenario: string, run: number): string {
+export function runIdOf(config: LiveConfiguration, version: string, scenario: string, run: number): string {
   if (!SAFE.test(version)) throw new Error(`version "${version}": use lower-case letters, digits and hyphens`)
   if (!SAFE.test(scenario)) throw new Error(`scenario "${scenario}": use lower-case letters, digits and hyphens`)
   if (!Number.isInteger(run) || run < 0) throw new Error(`run ${run}: use a whole number`)
@@ -103,14 +108,17 @@ export function planRun(input: PlanInput): Plan {
   const settingsPath = `${runDir}/settings.json`
   const statsDir = `${runDir}/stats`
   const recallDir = `${runDir}/recall-plugin`
-  const expectedPlugin = config === 'builtin' ? undefined : config === 'builtin+recall' ? recallDir : pluginRoot.replace(/\/$/, '')
+  const forkDir = `${runDir}/fork-plugin`
+  const fork = usesForkCompaction(config)
+  if (fork && !input.forkPluginSource) throw new Error(`${config}: forkPluginSource is needed`)
+  const expectedPlugin = config === 'builtin' ? undefined : config === 'builtin+recall' ? recallDir : fork ? forkDir : pluginRoot.replace(/\/$/, '')
   const settings: Settings = {
     env: { CLAUDE_CODE_PLUGIN_DIRS: expectedPlugin ?? '', OM_STATS_DIR: statsDir, ...(input.brief ? { OM_BRIEF: input.brief } : {}) },
     permissions: { allow: ['Read', 'Glob', 'Grep', 'Write', 'Edit', ...s.commands.map((c) => `Bash(${c})`), ...(recallAvailable(config) ? [RECALL_TOOL] : [])] },
   }
   const claudeArgs = [
     ...['--model', MODEL, '--session-id', input.sessionId, '--settings', settingsPath, '--permission-mode', 'dontAsk'],
-    ...(usesObservationalCompaction(config) && !recallAvailable(config) ? ['--disallowed-tools', RECALL_TOOL] : []),
+    ...(usesPluginCompaction(config) && !recallAvailable(config) ? ['--disallowed-tools', RECALL_TOOL] : []),
   ]
   const copies =
     config === 'builtin+recall'
@@ -119,7 +127,14 @@ export function planRun(input: PlanInput): Plan {
           { from: `${pluginRoot}/hooks/recall.ts`, to: `${recallDir}/hooks/recall.ts` },
           { from: `${pluginRoot}/hooks/prompts.ts`, to: `${recallDir}/hooks/prompts.ts` },
         ]
-      : []
+      : fork
+        ? [
+            { from: input.forkPluginSource!, to: forkDir },
+            { from: `${input.recallPluginSource}/hooks/register.ts`, to: `${forkDir}/hooks/recall-hooks.ts` },
+            { from: `${pluginRoot}/hooks/recall.ts`, to: `${forkDir}/hooks/recall.ts` },
+            { from: `${pluginRoot}/hooks/prompts.ts`, to: `${forkDir}/hooks/prompts.ts` },
+          ]
+        : []
   const files: Record<string, string> = Object.fromEntries(Object.entries(s.files).map(([p, text]) => [`${projectDir}/${p}`, text]))
   files[settingsPath] = JSON.stringify(settings, null, 2) + '\n'
 
@@ -176,14 +191,16 @@ export function describePlan(plan: Plan): string {
       ? 'no observational-memory plugin (built-in compaction)'
       : input.config === 'builtin+recall'
         ? `observational-memory from ${plan.expectedPlugin}: the recall-only eval plugin (om_recall alone, built-in compaction), with the recall of ${input.pluginRoot}`
-        : `observational-memory from ${plan.expectedPlugin} (observational compaction${input.brief ? `, with OM_BRIEF=${input.brief}: every memory message carries the session brief` : ''})`
+        : usesForkCompaction(input.config)
+          ? `observational-memory from ${plan.expectedPlugin}: the fork-handoff eval plugin ($.model.fork handoff compaction, om_recall's hooks), with the recall and prompts of ${input.pluginRoot}`
+          : `observational-memory from ${plan.expectedPlugin} (observational compaction${input.brief ? `, with OM_BRIEF=${input.brief}: every memory message carries the session brief` : ''})`
   const out = [
     `Run ${plan.runId}: configuration ${input.config}, plugin version ${input.version}, scenario ${input.scenario.id}, session ${input.sessionId}`,
     `Sandbox: ${plan.runDir}`,
     '',
     'The session should have loaded:',
     `- ${loaded}`,
-    `- om_recall: ${recall ? `offered and allowed, as ${RECALL_TOOL}` : input.config === 'om' ? `not offered (--disallowed-tools ${RECALL_TOOL})` : 'not offered (no plugin registers it)'}`,
+    `- om_recall: ${recall ? `offered and allowed, as ${RECALL_TOOL}` : input.config === 'om' || input.config === 'fork' ? `not offered (--disallowed-tools ${RECALL_TOOL})` : 'not offered (no plugin registers it)'}`,
     `- model ${MODEL}; permission mode dontAsk; allowed: ${plan.settings.permissions.allow.join(', ')}`,
     `- no other observational-memory plugin: not the user's inline one`,
     `Checked before starting (zero tokens), from ${plan.projectDir}: claude --settings ${plan.settingsPath} plugin list --json`,
@@ -271,10 +288,23 @@ const RECALL_ONLY_HOOKS = ['session.start', `tool.call{tool=${RECALL_TOOL}}`, `t
 
 /** Problems with `claude plugin validate` of an assembled recall-only plugin: it must pass and handle om_recall alone. */
 export function checkRecallOnly(validateOutput: string): string[] {
+  return checkHooks(validateOutput, RECALL_ONLY_HOOKS, 'om_recall')
+}
+
+const FORK_HOOKS = [...RECALL_ONLY_HOOKS, 'session.compact', 'turn.step', 'prompt.section{name=context_management}', 'session.end']
+
+/** Problems with `claude plugin validate` of an assembled fork plugin: it must pass and handle compaction and om_recall, nothing of OM's. */
+export function checkForkPlugin(validateOutput: string): string[] {
+  const problems = checkHooks(validateOutput, FORK_HOOKS, 'the fork plugin and om_recall')
+  if (!/^\s*❯ .* hooks: .*\bsession\.compact\b/m.test(validateOutput)) problems.push('it handles no session.compact')
+  return problems
+}
+
+function checkHooks(validateOutput: string, allowed: readonly string[], what: string): string[] {
   const problems = /Validation passed/.test(validateOutput) ? [] : ['claude plugin validate did not pass']
   const hooks = [...validateOutput.matchAll(/^\s*❯ .* hooks: (.*)$/gm)].flatMap((m) => m[1]!.split(', ').map((h) => h.trim()))
-  const extra = hooks.filter((h) => !RECALL_ONLY_HOOKS.includes(h))
+  const extra = hooks.filter((h) => !allowed.includes(h))
   if (!hooks.includes(`tool.call{tool=${RECALL_TOOL}}`)) problems.push('it handles no om_recall call')
-  if (extra.length) problems.push(`it handles more than om_recall: ${extra.join(', ')}`)
+  if (extra.length) problems.push(`it handles more than ${what}: ${extra.join(', ')}`)
   return problems
 }

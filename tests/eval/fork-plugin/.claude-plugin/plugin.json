@@ -1,0 +1,8 @@
+{
+  "name": "observational-memory",
+  "version": "0.0.0-fork",
+  "description": "Evaluation only (issue #16's fork and fork+recall configurations): Codex-style fork-handoff compaction, not observational memory. The session's own model writes a handoff to its successor with $.model.fork over its own cached transcript, early at 85% of the auto-compact threshold or at compaction; the compacted context is the user's messages verbatim, then the handoff, then the messages after the fork. Falls back to the built-in compaction when no handoff can be had. Also registers om_recall (the recall-only plugin's hooks); the fork configuration disallows it. Named observational-memory so the tool is mcp__observational-memory__om_recall, as in the other configurations. scripts/bench-live.ts assembles it with a version's hooks/recall.ts and hooks/prompts.ts.",
+  "author": {
+    "name": "Cameron Tredoux"
+  }
+}

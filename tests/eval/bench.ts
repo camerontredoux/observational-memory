@@ -23,8 +23,8 @@
 // how many runs that is. The plugin's Observer and Reflector calls are its own model (pi); their cost is the sum of
 // the `*.cost` metrics the plugin's stats file records, or unavailable without that file.
 
-import type { Configuration, Measurement } from './runner'
-import { CONFIGURATIONS, estimated, measured, recallAvailable, unavailable, usesObservationalCompaction } from './runner'
+import type { LiveConfiguration, Measurement } from './runner'
+import { CONFIGURATIONS, estimated, LIVE_CONFIGURATIONS, measured, recallAvailable, unavailable, usesForkCompaction, usesObservationalCompaction, usesPluginCompaction } from './runner'
 import { growStep, SCENARIOS, scenarioById } from './scenarios'
 import type { Check, CheckCategory, Scenario } from './scenarios'
 
@@ -43,6 +43,9 @@ export const MEMORY_MARK = 'The following observations block is your memory of t
 // The first words of the session brief's note when the floor made the memory message (hooks/prompts.ts FLOOR_NOTE).
 export const FLOOR_MARK = 'At the latest compaction the Observer had not observed'
 export const RECALL_TOOL = 'mcp__observational-memory__om_recall'
+// The first words of the fork plugin's compaction message after the wrapper (tests/eval/fork-plugin/hooks/handoff.ts
+// FORK_HEADER), copied for the same reason.
+export const FORK_MARK = 'This conversation was compacted by fork handoff'
 
 // ---- Transcript ----
 
@@ -148,11 +151,36 @@ export function parseTranscript(jsonl: string): Transcript {
 
 // ---- Cost ----
 
-export type OmStats = { memoryUsd: number; memoryCalls: number; reflections: number; fellBack: number; floor: number; failures: number }
+export type OmStats = { memoryUsd: number; memoryCalls: number; reflections: number; fellBack: number; floor: number; failures: number; fork?: ForkStats }
+
+/**
+ * The fork plugin's own record (tests/eval/fork-plugin/hooks/register.ts Stats): each $.model.fork call's usage and
+ * time, and each compaction's path. Its forks are not transcript messages: their cost is priced here, from their usage.
+ */
+export type ForkStats = {
+  /** Every fork: early (in the background at 85% of the threshold) or at compaction; answered or not. */
+  forks: { phase: 'early' | 'compaction'; outcome: string; ms: number; usd?: number; input: number; output: number; cacheRead: number; cacheWrite: number }[]
+  /** Every compaction: the early handoff, one forked at compaction, or the built-in fallback. */
+  compactions: { trigger: string; path: 'early' | 'compaction' | 'fellBack'; ms: number; gapMs?: number; handoffTokens?: number; tailTokens?: number }[]
+  usd: number
+}
+
+// A fork's usage priced at the session model's rates; cache writes at the five-minute rate (a fork's prefix is the
+// main thread's, cached at its rate: the host writes five-minute entries for a subscription session's main thread).
+function forkUsd(model: string, u: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }) {
+  const p = PRICES_USD_PER_MTOK.find((x) => x.model.test(model))
+  return p ? (num(u.input_tokens) * p.input + num(u.output_tokens) * p.output + num(u.cache_read_input_tokens) * p.cacheRead + num(u.cache_creation_input_tokens) * p.cacheWrite5m) / 1e6 : undefined
+}
 
 /** The plugin's stats file (hooks/stats.ts SessionStats, the same metric names in c6c86a3 and main). */
 export function parseStats(json: string): OmStats | undefined {
-  let s: { counts?: Record<string, number>; metrics?: Record<string, { count?: number; sum?: number }> }
+  let s: {
+    counts?: Record<string, number>
+    metrics?: Record<string, { count?: number; sum?: number }>
+    model?: string
+    forks?: { phase: 'early' | 'compaction'; outcome: string; ms: number; usage?: Record<string, number> }[]
+    compactions?: ForkStats['compactions']
+  }
   try {
     s = JSON.parse(json)
   } catch {
@@ -161,13 +189,34 @@ export function parseStats(json: string): OmStats | undefined {
   const metrics = Object.entries(s.metrics ?? {})
   const counts = Object.entries(s.counts ?? {})
   const costs = metrics.filter(([k]) => /^(?:observer|reflector)\.[\w-]+\.cost$/.test(k))
+  const model = s.model ?? 'sonnet'
+  const fork: ForkStats | undefined = Array.isArray(s.forks)
+    ? (() => {
+        const forks = s.forks.map((f) => {
+          const u = f.usage ?? {}
+          const usd = f.usage ? forkUsd(model, u) : undefined
+          return {
+            phase: f.phase,
+            outcome: f.outcome,
+            ms: num(f.ms),
+            ...(usd === undefined ? {} : { usd: round(usd) }),
+            input: num(u.input_tokens),
+            output: num(u.output_tokens),
+            cacheRead: num(u.cache_read_input_tokens),
+            cacheWrite: num(u.cache_creation_input_tokens),
+          }
+        })
+        return { forks, compactions: s.compactions ?? [], usd: round(forks.reduce((t, f) => t + (f.usd ?? 0), 0)) }
+      })()
+    : undefined
   return {
-    memoryUsd: round(costs.reduce((t, [, m]) => t + num(m.sum), 0)),
-    memoryCalls: costs.reduce((t, [, m]) => t + num(m.count), 0),
+    memoryUsd: fork ? fork.usd : round(costs.reduce((t, [, m]) => t + num(m.sum), 0)),
+    memoryCalls: fork ? fork.forks.length : costs.reduce((t, [, m]) => t + num(m.count), 0),
     reflections: num(s.metrics?.['reflection.ms']?.count),
     fellBack: counts.filter(([k]) => /^compaction\.[\w-]+\.fellBack$/.test(k)).reduce((t, [, n]) => t + num(n), 0),
     floor: counts.filter(([k]) => /^compaction\.[\w-]+\.floor$/.test(k)).reduce((t, [, n]) => t + num(n), 0),
     failures: counts.filter(([k]) => /\.failed\./.test(k)).reduce((t, [, n]) => t + num(n), 0),
+    ...(fork ? { fork } : {}),
   }
 }
 
@@ -176,7 +225,7 @@ export type RunCost = {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number }
   /** Those tokens at `PRICES_USD_PER_MTOK`: an estimate, since a subscription pays no per-token price. */
   mainLoop: Measurement<number>
-  /** The plugin's Observer and Reflector calls, from its stats file. */
+  /** The plugin's own model calls, from its stats file: OM's Observer and Reflector, or the fork plugin's forks. */
   memoryModel: Measurement<number>
   memoryCalls?: number
   /** The host's own `cost-state` total, when it wrote one: it includes requests the transcript does not (compaction, titles). */
@@ -187,7 +236,7 @@ export type RunCost = {
 
 const round = (n: number) => Math.round(n * 1e6) / 1e6
 
-export function runCost(config: Configuration, t: Transcript, statsJson?: string): RunCost {
+export function runCost(config: LiveConfiguration, t: Transcript, statsJson?: string): RunCost {
   const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
   let usd = 0
   const unpriced = new Set<string>()
@@ -206,7 +255,7 @@ export function runCost(config: Configuration, t: Transcript, statsJson?: string
   }
   const mainLoop = unpriced.size ? unavailable(`no price for model ${[...unpriced].join(', ')} in PRICES_USD_PER_MTOK`) : estimated(round(usd))
   const stats = statsJson === undefined ? undefined : parseStats(statsJson)
-  const memoryModel = !usesObservationalCompaction(config)
+  const memoryModel = !usesPluginCompaction(config)
     ? measured(0)
     : stats
       ? measured(stats.memoryUsd)
@@ -215,20 +264,20 @@ export function runCost(config: Configuration, t: Transcript, statsJson?: string
   const main = Math.max(mainLoop.status === 'unavailable' ? -1 : mainLoop.value, hostReported.status === 'unavailable' ? -1 : hostReported.value)
   const total =
     main < 0 ? unavailable('neither the transcript usage nor the host priced this run') : estimated(round(main + (memoryModel.status === 'unavailable' ? 0 : memoryModel.value)))
-  return { tokens, mainLoop, memoryModel, ...(stats && usesObservationalCompaction(config) ? { memoryCalls: stats.memoryCalls } : {}), hostReported, total }
+  return { tokens, mainLoop, memoryModel, ...(stats && usesPluginCompaction(config) ? { memoryCalls: stats.memoryCalls } : {}), hostReported, total }
 }
 
 // ---- Scoring ----
 
 export type CheckResult = { id: string; category: CheckCategory; description: string; outcome: 'pass' | 'fail' | 'n/a'; evidence: string }
-/** `floor`: the memory message, its brief compiled by code for rows the Observer had not observed. */
-export type CompactionPath = 'observational' | 'floor' | 'built-in'
+/** `floor`: the memory message, its brief compiled by code for rows the Observer had not observed. `fork`: the fork plugin's handoff. */
+export type CompactionPath = 'observational' | 'floor' | 'fork' | 'built-in'
 export type CompactionScore = {
   path: CompactionPath
   durationMs: Measurement<number>
   preTokens?: number
   postTokens?: number
-  /** For each scenario fact, the parts of this compaction's first message that hold it: `observations`, `corrections`, `all-user-messages`, a `skill`, ..., or `summary` for the built-in one. */
+  /** For each scenario fact, the parts of this compaction's first message that hold it: `observations`, `corrections`, `all-user-messages`, a `skill`, ..., or `summary` for the built-in one; for a fork, also `handoff`, its assistant message. */
   carriers: Record<string, string[]>
 }
 export type RunScore = {
@@ -300,7 +349,7 @@ function checkOne(c: Check, reply: string, calls: Extract<Entry, { kind: 'tool' 
   return { ...head, outcome: pass ? 'pass' : 'fail', evidence }
 }
 
-export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stats?: OmStats): RunScore {
+export function scoreRun(s: Scenario, config: LiveConfiguration, t: Transcript, stats?: OmStats): RunScore {
   const invalid: string[] = []
   const boundaries = t.entries.flatMap((e, i) => (e.kind === 'boundary' ? [{ e, i }] : []))
   if (growStep(s)) {
@@ -319,8 +368,11 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
     const next = t.entries.slice(i + 1).find((x) => x.kind === 'summary' || x.kind === 'boundary')
     const text = next?.kind === 'summary' ? next.text : ''
     const brief = text.match(/<session-brief>\n([\s\S]*?)<\/session-brief>/)?.[1] ?? ''
-    const path: CompactionPath = !text.includes(MEMORY_MARK) ? 'built-in' : brief.includes(FLOOR_MARK) ? 'floor' : 'observational'
-    const parts = sections(text, path)
+    const path: CompactionPath = text.includes(FORK_MARK) ? 'fork' : !text.includes(MEMORY_MARK) ? 'built-in' : brief.includes(FLOOR_MARK) ? 'floor' : 'observational'
+    // A fork's handoff is the assistant message right after the compaction's user message.
+    const at = next ? t.entries.indexOf(next) : -1
+    const handoff = path === 'fork' && at >= 0 && t.entries[at + 1]?.kind === 'text' ? (t.entries[at + 1] as { text: string }).text : undefined
+    const parts = [...sections(text, path), ...(handoff === undefined ? [] : [{ name: 'handoff', text: handoff }])]
     const b = e as Extract<Entry, { kind: 'boundary' }>
     return {
       path,
@@ -331,10 +383,11 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
     }
   })
   compactions.forEach((c, i) => {
-    if (usesObservationalCompaction(config) && c.path === 'built-in') invalid.push(`compaction ${i + 1} fell back to the built-in summary`)
-    if (!usesObservationalCompaction(config) && c.path !== 'built-in') invalid.push(`compaction ${i + 1} returned the observational-memory message: the plugin was loaded`)
+    if (usesPluginCompaction(config) && c.path === 'built-in') invalid.push(`compaction ${i + 1} fell back to the built-in summary`)
+    if (!usesObservationalCompaction(config) && (c.path === 'observational' || c.path === 'floor')) invalid.push(`compaction ${i + 1} returned the observational-memory message: the plugin was loaded`)
+    if (!usesForkCompaction(config) && c.path === 'fork') invalid.push(`compaction ${i + 1} returned the fork handoff: the fork plugin was loaded`)
   })
-  if (usesObservationalCompaction(config) && stats?.fellBack) invalid.push(`the plugin's stats record ${stats.fellBack} compaction(s) that fell back to the built-in one`)
+  if (usesPluginCompaction(config) && stats?.fellBack) invalid.push(`the plugin's stats record ${stats.fellBack} compaction(s) that fell back to the built-in one`)
   if (!recallAvailable(config) && t.entries.some((e) => e.kind === 'tool' && e.name === RECALL_TOOL)) invalid.push(`om_recall was called although ${config} does not offer it`)
 
   // The history the first compaction had to carry: without its setup the run measures a failed history, not memory.
@@ -409,7 +462,7 @@ export type RunMeta = {
   runId: string
   /** `live`: a real session driven by scripts/bench-live.ts. `offline`: a synthetic or supplied transcript. */
   mode: 'live' | 'offline'
-  configuration: Configuration
+  configuration: LiveConfiguration
   /** The plugin version label: `old`, `new`, or an ablation's own label. */
   version: string
   scenario: string
@@ -481,7 +534,7 @@ export function renderReport(records: readonly RunRecord[], options: ReportOptio
   out.push(
     '',
     'Scoring: deterministic checks (regular expressions over the replies and tool calls after the continuation prompt, and over what om_recall returned); no model grading was used. A transport or prompt-format success is not a task success: a run that did not complete, or is invalid, never counts as one.',
-    `Cost: token-equivalent, an estimate: each assistant message's exact usage times PRICES_USD_PER_MTOK in tests/eval/bench.ts (${PRICES_USD_PER_MTOK.map((p) => `${p.model.source} $${p.input}/$${p.output} in/out, $${p.cacheRead} cache read, $${p.cacheWrite5m}–$${p.cacheWrite1h} cache write`).join('; ')} per million tokens). The memory model is the plugin's own Observer and Reflector, as its stats file measured it. The built-in compactor's own request is not a transcript message: a built-in run's cost includes it only through the host's cost-state record, so without one it leaves compaction out while an observational run's includes the Observer. Latencies are measured: the host's compaction duration and the transcript's timestamps.`,
+    `Cost: token-equivalent, an estimate: each assistant message's exact usage times PRICES_USD_PER_MTOK in tests/eval/bench.ts (${PRICES_USD_PER_MTOK.map((p) => `${p.model.source} $${p.input}/$${p.output} in/out, $${p.cacheRead} cache read, $${p.cacheWrite5m}–$${p.cacheWrite1h} cache write`).join('; ')} per million tokens). The memory model is the plugin's own model calls as its stats file measured them: OM's Observer and Reflector, or the fork plugin's \$.model.fork calls, priced from their usage. The built-in compactor's own request is not a transcript message: a built-in run's cost includes it only through the host's cost-state record, so without one it leaves compaction out while an observational run's includes the Observer. Latencies are measured: the host's compaction duration and the transcript's timestamps.`,
   )
   const models = [...new Set(records.flatMap((r) => r.models ?? []))]
   out.push(`Models that answered: ${models.join(', ') || 'none recorded'} (sessions started with ${[...new Set(records.map((r) => r.model))].join(', ')}).`)
@@ -495,8 +548,10 @@ export function renderReport(records: readonly RunRecord[], options: ReportOptio
   ] as const)
     if (rs.length) out.push('', `## ${title}`, '', ...section(rs, rs === live ? 'live' : 'offline'))
   if (options.versions) {
+    // The four always; fork and fork+recall where any run of them is recorded.
+    const configs = LIVE_CONFIGURATIONS.filter((c) => CONFIGURATIONS.includes(c) || records.some((r) => r.configuration === c))
     const missing = options.versions.flatMap((v) =>
-      CONFIGURATIONS.flatMap((c) =>
+      configs.flatMap((c) =>
         SCENARIOS.flatMap((s) => {
           const ran = live.filter((r) => r.version === v && r.configuration === c && r.scenario === s.id)
           if (ran.some((r) => r.score?.valid)) return []
@@ -511,13 +566,42 @@ export function renderReport(records: readonly RunRecord[], options: ReportOptio
   return out.join('\n') + '\n'
 }
 
+// The fork plugin's forks and compactions, from its stats files, over every run with one (valid or not): what each
+// compaction cost in forks, how long it took, how many used the early handoff, and the gap between that and it.
+function forkSection(gs: ReturnType<typeof groups>): string[] {
+  const rows = gs.filter((g) => usesForkCompaction(g.configuration)).flatMap((g) => {
+    const stats = g.runs.flatMap((r) => (r.memory?.fork ? [r.memory.fork] : []))
+    if (!stats.length) return []
+    const forks = stats.flatMap((s) => s.forks)
+    const cs = stats.flatMap((s) => s.compactions)
+    const answered = forks.filter((f) => f.outcome === 'answered')
+    const failed = forks.filter((f) => f.outcome !== 'answered').map((f) => f.outcome)
+    const n = (p: string) => cs.filter((c) => c.path === p).length
+    const perCompaction = stats.flatMap((s) => (s.compactions.length ? [s.usd / s.compactions.length] : []))
+    return [
+      `| ${g.version} | ${g.configuration} | ${stats.length} | ${cs.length} | ${n('early')} | ${n('compaction')} | ${n('fellBack')} | ${forks.length} (${forks.filter((f) => f.phase === 'early').length} early) | ${failed.length ? [...new Set(failed)].map((o) => `${o} ${failed.filter((x) => x === o).length}`).join(', ') : '0'} | ${cell(perCompaction, fixed(4))} | ${cell(answered.flatMap((f) => (f.usd === undefined ? [] : [f.usd])), fixed(4))} | ${cell(answered.map((f) => f.cacheRead), fixed(0))} | ${cell(answered.map((f) => f.input + f.cacheWrite), fixed(0))} | ${cell(answered.map((f) => f.output), fixed(0))} | ${cell(answered.map((f) => f.ms), fixed(0))} | ${cell(cs.filter((c) => c.path !== 'fellBack').map((c) => c.ms), fixed(0))} | ${cell(cs.flatMap((c) => (c.gapMs === undefined ? [] : [c.gapMs])), fixed(0))} | ${cell(cs.flatMap((c) => (c.handoffTokens === undefined ? [] : [c.handoffTokens])), fixed(0))} |`,
+    ]
+  })
+  if (!rows.length) return []
+  return [
+    '',
+    '### Fork handoff',
+    '',
+    "From the fork plugin's stats files, over every run with one, valid or not. Fork cost: each $.model.fork call's usage at the session model's prices (cache writes at the five-minute rate); forks are not transcript messages, so this is the run's memory model cost. Fork ms: from the call to its answer. Compaction ms: the plugin's own session.compact time (waiting for an early fork still in flight, or forking at compaction). Gap: from the early handoff's answer to the compaction that used it.",
+    '',
+    '| version | configuration | runs | compactions | early handoff | forked at compaction | fell back | forks | failed forks | fork USD per compaction | USD per answered fork | cache read tokens per fork | uncached input tokens per fork | output tokens per fork | fork ms | compaction ms (plugin) | gap ms (early) | handoff tokens (estimated) |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
+    ...rows,
+  ]
+}
+
 // A cell that ran but has no valid run says so: its runs are listed under "Invalid and incomplete runs".
 const validOf = (rs: readonly RunRecord[]) => `${rs.filter((r) => r.score?.valid).length} of ${rs.length} valid`
 
 const groupKey = (r: RunRecord) => `${r.version}\u0000${r.configuration}`
 function groups(rs: readonly RunRecord[]) {
   const versions = [...new Set(rs.map((r) => r.version))]
-  return versions.flatMap((v) => CONFIGURATIONS.flatMap((c) => {
+  return versions.flatMap((v) => LIVE_CONFIGURATIONS.flatMap((c) => {
     const g = rs.filter((r) => groupKey(r) === `${v}\u0000${c}`)
     return g.length ? [{ version: v, configuration: c, runs: g, valid: g.filter((r) => r.score?.valid) }] : []
   }))
@@ -543,26 +627,27 @@ function section(rs: readonly RunRecord[], mode: 'live' | 'offline'): string[] {
     )
   }
   // Every scored run's compactions, valid or not: a fallback makes its run invalid, and is counted here too.
-  const paths = gs.filter((g) => usesObservationalCompaction(g.configuration)).flatMap((g) => {
+  const paths = gs.filter((g) => usesPluginCompaction(g.configuration)).flatMap((g) => {
     const cs = g.runs.flatMap((r) => r.score?.compactions ?? [])
     const n = (p: CompactionPath) => cs.filter((c) => c.path === p).length
-    return cs.length ? [`| ${g.version} | ${g.configuration} | ${cs.length} | ${n('observational')} | ${n('floor')} | ${n('built-in')} |`] : []
+    return cs.length ? [`| ${g.version} | ${g.configuration} | ${cs.length} | ${n('observational')} | ${n('floor')} | ${n('fork')} | ${n('built-in')} |`] : []
   })
   if (paths.length)
     out.push(
       '',
       '### Compaction paths',
       '',
-      "Which path each observational configuration's compactions ran, over every scored run: the Observer's memory, the floor (a memory whose brief, compiled by code, stands in for what the Observer had not observed; valid), or the built-in summary it fell back to (its run invalid).",
+      "Which path each plugin configuration's compactions ran, over every scored run: the Observer's memory, the floor (a memory whose brief, compiled by code, stands in for what the Observer had not observed; valid), the fork plugin's handoff, or the built-in summary it fell back to (its run invalid).",
       '',
-      '| version | configuration | compactions | observational memory | floor (brief compiled by code) | built-in (fell back: run invalid) |',
-      '|---|---|---|---|---|---|',
+      '| version | configuration | compactions | observational memory | floor (brief compiled by code) | fork handoff | built-in (fell back: run invalid) |',
+      '|---|---|---|---|---|---|---|',
       ...paths,
     )
-  const noMemory = rs.filter((r) => usesObservationalCompaction(r.configuration) && r.cost?.memoryModel.status === 'unavailable').length
+  out.push(...forkSection(gs))
+  const noMemory = rs.filter((r) => usesPluginCompaction(r.configuration) && r.cost?.memoryModel.status === 'unavailable').length
   const noTotal = rs.filter((r) => r.cost?.total.status === 'unavailable').length
-  if (noMemory) out.push('', `Observational runs without a stats file: memory model cost and reflections unavailable in ${noMemory} run(s); their cost column leaves the memory model out.`)
-  const noCompactor = rs.filter((r) => !usesObservationalCompaction(r.configuration) && r.cost && r.cost.hostReported.status === 'unavailable').length
+  if (noMemory) out.push('', `Plugin compaction runs without a stats file: memory model cost and reflections unavailable in ${noMemory} run(s); their cost column leaves the memory model out.`)
+  const noCompactor = rs.filter((r) => !usesPluginCompaction(r.configuration) && r.cost && r.cost.hostReported.status === 'unavailable').length
   if (noCompactor) out.push('', `Built-in compaction runs without a host cost record: ${noCompactor}; their cost leaves the compactor's request out.`)
   if (noTotal) out.push('', `Cost unavailable in ${noTotal} run(s) (a model the price table does not price).`)
   for (const v of [...new Set(gs.map((g) => g.version))]) {
@@ -604,7 +689,7 @@ function section(rs: readonly RunRecord[], mode: 'live' | 'offline'): string[] {
   }
 
   // Overlapping protections, measured rather than assumed: which parts of the memory message held each fact.
-  const carried = gs.filter((g) => usesObservationalCompaction(g.configuration)).flatMap((g) =>
+  const carried = gs.filter((g) => usesPluginCompaction(g.configuration)).flatMap((g) =>
     scenarios.flatMap((s) => s.facts.map((fact) => {
       const cs = g.valid.filter((r) => r.scenario === s.id).flatMap((r) => r.score!.compactions)
       const parts = new Map<string, number>()
@@ -619,9 +704,9 @@ function section(rs: readonly RunRecord[], mode: 'live' | 'offline'): string[] {
   if (carried.length)
     out.push(
       '',
-      '### What carried each fact through observational compaction',
+      '### What carried each fact through plugin compaction',
       '',
-      "How many of the valid runs' compactions held each scenario fact in their memory message, by part (observations, corrections, all-user-messages, skills, ...), and how often a single part alone held it. This measures the overlap between the memory's protections; none is removed to measure it.",
+      "How many of the valid runs' compactions held each scenario fact in their memory message, by part (observations, corrections, all-user-messages, skills, ...; for a fork, its handoff and the parts of its user message), and how often a single part alone held it. This measures the overlap between the memory's protections; none is removed to measure it.",
       '',
       '| version | configuration | scenario | fact | compactions holding it | by part | by one part alone |',
       '|---|---|---|---|---|---|---|',

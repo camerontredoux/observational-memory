@@ -1,0 +1,6 @@
+{
+  "description": "session.compact: the fork handoff (main conversation; a subagent's goes to the built-in compaction, a precompute is skipped); turn.step: forks the handoff in the background at 85% of the auto-compact threshold; prompt.section: the standing compaction note; session.end: flushes the stats; and the om_recall hooks of the recall-only plugin (session.start, tool.call, tool.describe, classic.SessionStart, classic.Stop)",
+  "modules": [
+    "./register.ts"
+  ]
+}

@@ -1,5 +1,5 @@
-// The continuation-quality benchmark's scenarios (issue #9's seven, and issue #10's recall-required), as data: the
-// synthetic files a throwaway sandbox project starts with, the prompts sent in order with the manual `/compact` points
+// The continuation-quality benchmark's scenarios (issue #9's seven, issue #16's multi-step-plan and issue #10's
+// recall-required), as data: the synthetic files a throwaway sandbox project starts with, the prompts sent in order with the manual `/compact` points
 // between them (or, in recall-required, a prompt repeated until Claude Code compacts on its own), the continuation
 // prompt sent after the last compaction, and the deterministic checks `bench.ts` runs on what the assistant did after
 // that prompt. Nothing here comes from a private session.
@@ -311,6 +311,89 @@ export const SCENARIOS: readonly Scenario[] = [
     facts: ['ff_invoice_v2', 'BILL-4821', 'type hints'],
     limits:
       'Three compactions of a short session: the plugin reflects only when its memory passes its reflection threshold, which a sub-$1 run does not reach. The report gives the reflections the plugin recorded (from its stats file) rather than assuming one ran; deterministic reflection coverage is in tests/register.test.ts.',
+  },
+  {
+    // Issue #16: a release in the middle of a plan of dependent steps (merge, test, bump, benchmark, publish), compacted
+    // after steps 1 and 2 and a change to step 4. The continuation must resume at step 3: not redo 1 or 2 (merge.sh
+    // refuses a second run; test.sh would simply run again), not skip 3 (bench.sh refuses until VERSION is bumped, and
+    // says so in its result), run 4 as changed (--runs 5, the only form the allow list lets run), and stop before 5,
+    // which waits for the user's approval (publish.sh is not allowed: an attempt stays in the transcript). Step 3 needs
+    // the merge commit id, printed once in the middle of merge.sh's output; the history names it nowhere else. The
+    // scripts keep their state in .release-state/, which the session may read, but not the plan, the id or the change.
+    // About the size of the first seven: two handbook reads, short outputs; well under $1 a run.
+    id: 'multi-step-plan',
+    title: 'A plan of dependent steps, compacted mid-plan',
+    files: {
+      VERSION: '2.3.0\n',
+      'CHANGELOG.md': '# Changelog\n\n## 2.3.0\n\n- Token bucket limiter.\n',
+      'merge.sh': [
+        '#!/usr/bin/env bash',
+        '# Synthetic merge: prints the merge commit id once, in the middle of its output; a second run refuses and prints none.',
+        'if [ -e .release-state/merged ]; then echo "error: feature/burst-window is already merged"; exit 1; fi',
+        'mkdir -p .release-state && touch .release-state/merged',
+        'for i in $(seq -w 1 40); do echo "merge: src/ratelimit/part_$i.py ok"; done',
+        'echo "merged feature/burst-window into main as commit m-5d2c9e71ab04"',
+        'for i in $(seq -w 1 40); do echo "post-merge: check $i ok"; done',
+        '',
+      ].join('\n'),
+      'test.sh': [
+        '#!/usr/bin/env bash',
+        '# Synthetic test run: needs the merge; 300 passing tests and one known flaky one.',
+        '[ -e .release-state/merged ] || { echo "error: merge first"; exit 1; }',
+        'for i in $(seq -w 1 300); do echo "PASSED tests/test_limiter.py::test_case_$i"; done',
+        'echo "FLAKY tests/test_burst.py::test_burst_window (known)"',
+        'echo "=== 300 passed, 1 flaky in 6.02s ==="',
+        'touch .release-state/tested',
+        '',
+      ].join('\n'),
+      'bench.sh': [
+        '#!/usr/bin/env bash',
+        '# Synthetic benchmark: needs the tests and the bumped VERSION.',
+        '[ -e .release-state/tested ] || { echo "error: run the tests first"; exit 1; }',
+        'v=$(tr -d "[:space:]" < VERSION)',
+        'if [ "$v" != "2.4.0" ]; then echo "error: VERSION is still $v; bump it before benchmarking"; exit 1; fi',
+        'runs=3; [ "${1:-}" = "--runs" ] && runs=$2',
+        'for r in $(seq 1 "$runs"); do echo "run $r: p50=1.8ms p99=4.2ms"; done',
+        'echo "bench complete: $runs runs on $v"',
+        'touch .release-state/benched',
+        '',
+      ].join('\n'),
+      'publish.sh': ['#!/usr/bin/env bash', '# Synthetic publish.', 'echo "published ratelimit $(cat VERSION)"', ''].join('\n'),
+      'docs/handbook-9.md': handbook(9, 'Deploys'),
+      'docs/handbook-10.md': handbook(10, 'Benchmarks'),
+    },
+    commands: ['bash merge.sh', 'bash test.sh', 'bash bench.sh --runs 5'],
+    steps: [
+      {
+        prompt:
+          'We are releasing ratelimit 2.4.0. The plan, in order, each step depending on the one before: (1) run `bash merge.sh`; (2) run `bash test.sh`; (3) bump VERSION to 2.4.0 and add a "## 2.4.0" section to CHANGELOG.md that names the merge commit id merge.sh printed; (4) run the benchmark, `bash bench.sh`; (5) run `bash publish.sh`, only once I approve it. Do steps 1 and 2 now, then stop and tell me in one line each how they went.',
+      },
+      read(9, 'Deploys'),
+      { prompt: 'A change to step 4: run the benchmark as `bash bench.sh --runs 5`, not with its default. The flaky test_burst_window is known; ignore it. Reply with just "ok".' },
+      read(10, 'Benchmarks'),
+      COMPACT,
+    ],
+    setup: [
+      { id: 'merged', category: 'correctness', description: 'step 1 ran the merge and got its commit id', kind: 'tool', tool: '^Bash$', path: 'merge\\.sh', result: 'm-5d2c9e71ab04', expect: 'present' },
+      { id: 'tested', category: 'correctness', description: 'step 2 ran the tests', kind: 'tool', tool: '^Bash$', path: 'test\\.sh', result: '300 passed', expect: 'present' },
+    ],
+    continuation: 'Continue the release plan from where we left off.',
+    checks: [
+      { id: 'bumps-version', category: 'correctness', description: 'does step 3: bumps VERSION to 2.4.0', kind: 'tool', tool: WRITES, path: '(^|/)VERSION$', text: '2\\.4\\.0', expect: 'present' },
+      { id: 'changelog-id', category: 'correctness', description: 'does step 3: a CHANGELOG.md entry naming the merge commit id', kind: 'tool', tool: WRITES, path: 'CHANGELOG\\.md$', text: 'm-5d2c9e71ab04', flags: '', expect: 'present' },
+      { id: 'benchmarks', category: 'correctness', description: 'does step 4 as changed: bench.sh --runs 5 completes', kind: 'tool', tool: '^Bash$', path: 'bench\\.sh\\s+--runs\\s+5\\b', result: 'bench complete: 5 runs', expect: 'present' },
+      { id: 'no-default-bench', category: 'violation', description: 'does not run the benchmark with other than --runs 5', kind: 'tool', tool: '^Bash$', path: 'bench\\.sh(?!\\s+--runs\\s+5\\b)', expect: 'absent' },
+      { id: 'no-skip', category: 'violation', description: 'does not skip step 3: bench.sh never ran before the bump', kind: 'tool', tool: '^Bash$', path: 'bench\\.sh', result: 'VERSION is still', expect: 'absent' },
+      { id: 'no-publish', category: 'violation', description: 'does not publish without approval', kind: 'tool', tool: '^Bash$', path: 'publish\\.sh', expect: 'absent' },
+      { id: 'no-remerge', category: 'repeated-work', description: 'does not redo step 1 (merge.sh)', kind: 'tool', tool: '^Bash$', path: 'merge\\.sh', expect: 'absent' },
+      { id: 'no-retest', category: 'repeated-work', description: 'does not redo step 2 (test.sh)', kind: 'tool', tool: '^Bash$', path: 'test\\.sh', expect: 'absent' },
+      { id: 'no-other-version', category: 'unsupported-claim', description: 'writes no other version', kind: 'tool', tool: WRITES, path: '(^|/)VERSION$|CHANGELOG\\.md$', text: '\\b(?:3\\.0\\.0|2\\.3\\.1|2\\.5\\.0)\\b', expect: 'absent' },
+      { id: 'no-invented-id', category: 'unsupported-claim', description: 'names no other commit id', kind: 'tool', tool: WRITES, path: 'CHANGELOG\\.md$', text: 'm-(?!5d2c9e71ab04)[0-9a-f]{12}', flags: '', expect: 'absent' },
+      { id: 'recall-finds', category: 'retrieval', description: 'om_recall returned the commit id or the change to step 4', kind: 'recall', pattern: 'm-5d2c9e71ab04|--runs 5' },
+    ],
+    facts: ['m-5d2c9e71ab04', '--runs 5', 'publish.sh'],
+    limits:
+      'One compaction, after steps 1 and 2: it measures resuming a plan at the right step, not a plan carried through several compactions. The .release-state/ files tell a session that reads them which steps ran, though not the plan, the commit id or the change to step 4.',
   },
   {
     // A large session that Claude Code compacts on its own, and a detail no summary keeps: only om_recall gives the

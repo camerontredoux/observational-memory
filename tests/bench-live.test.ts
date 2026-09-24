@@ -1,20 +1,21 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { RECALL_TOOL } from './eval/bench'
 import type { RunRecord } from './eval/bench'
-import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, describePlan, planRun, runIdOf, shellLine } from './eval/live'
+import { admitRun, autoCompactThreshold, checkForkPlugin, checkPluginList, checkRecallOnly, describePlan, planRun, runIdOf, shellLine } from './eval/live'
 import type { PlanInput } from './eval/live'
 import { CONFIGURATIONS } from './eval/runner'
-import type { Configuration } from './eval/runner'
+import type { LiveConfiguration } from './eval/runner'
 import { growStep, scenarioById } from './eval/scenarios'
 
 const SESSION = '0f1e2d3c-4b5a-4968-8776-655443322110'
-const input = (config: Configuration, extra: Partial<PlanInput> = {}): PlanInput => ({
+const input = (config: LiveConfiguration, extra: Partial<PlanInput> = {}): PlanInput => ({
   config,
   version: 'new',
   scenario: scenarioById('repeated-compaction')!,
   run: 2,
   pluginRoot: '/repo',
   recallPluginSource: '/repo-under-test/tests/eval/recall-plugin',
+  forkPluginSource: '/repo-under-test/tests/eval/fork-plugin',
   benchRoot: '/tmp/om-bench',
   pane: 'w1:p2',
   sessionId: SESSION,
@@ -23,7 +24,7 @@ const input = (config: Configuration, extra: Partial<PlanInput> = {}): PlanInput
   startTimeoutMs: 60_000,
   ...extra,
 })
-const env = (config: Configuration) => planRun(input(config)).settings.env
+const env = (config: LiveConfiguration) => planRun(input(config)).settings.env
 
 describe('the live run plan', () => {
   test('names each run from its scenario, configuration, version and run number, in characters safe for a path', () => {
@@ -176,6 +177,43 @@ describe('checking the assembled recall-only plugin', () => {
   test('fails one that would also compact, or does not pass validation', () => {
     expect(checkRecallOnly(validated(`session.start, session.compact, tool.call{tool=${RECALL_TOOL}}`)).join()).toMatch(/more than om_recall: session\.compact/)
     expect(checkRecallOnly('✘ register.ts: cannot resolve ./recall').join()).toMatch(/did not pass/)
+  })
+})
+
+describe('the fork configurations (issue #16)', () => {
+  test("load the fork plugin assembled in the run directory from this checkout's plugin, the recall-only hooks and the version's modules", () => {
+    const dir = '/tmp/om-bench/repeated-compaction.fork-recall.fork1.r2/fork-plugin'
+    const plan = planRun(input('fork+recall', { version: 'fork1', pluginRoot: '/v130' }))
+    expect(plan.settings.env.CLAUDE_CODE_PLUGIN_DIRS).toBe(dir)
+    expect(plan.settings.env.OM_STATS_DIR).toBe('/tmp/om-bench/repeated-compaction.fork-recall.fork1.r2/stats')
+    expect(plan.copies).toEqual([
+      { from: '/repo-under-test/tests/eval/fork-plugin', to: dir },
+      { from: '/repo-under-test/tests/eval/recall-plugin/hooks/register.ts', to: `${dir}/hooks/recall-hooks.ts` },
+      { from: '/v130/hooks/recall.ts', to: `${dir}/hooks/recall.ts` },
+      { from: '/v130/hooks/prompts.ts', to: `${dir}/hooks/prompts.ts` },
+    ])
+    expect(describePlan(plan)).toContain('the fork-handoff eval plugin')
+    expect(() => planRun(input('fork', { forkPluginSource: undefined }))).toThrow(/forkPluginSource/)
+  })
+
+  test('fork denies om_recall on the command line, as om does; fork+recall allows it', () => {
+    expect(planRun(input('fork')).claudeArgs.join(' ')).toContain(`--disallowed-tools ${RECALL_TOOL}`)
+    expect(planRun(input('fork')).settings.permissions.allow.includes(RECALL_TOOL)).toBe(false)
+    expect(planRun(input('fork+recall')).claudeArgs.includes('--disallowed-tools')).toBe(false)
+    expect(planRun(input('fork+recall')).settings.permissions.allow.includes(RECALL_TOOL)).toBe(true)
+    expect(describePlan(planRun(input('fork')))).toContain('om_recall: not offered (--disallowed-tools')
+  })
+
+  const validated = (hooks: string) => `Validating hooks: /tmp/p/hooks/hooks.json\n\n  ❯ ./register.ts hooks: ${hooks}\n\n✔ Validation passed\n`
+  const FORK = `session.start, tool.call{tool=${RECALL_TOOL}}, tool.describe{tool=${RECALL_TOOL}}, classic.SessionStart, classic.Stop, session.compact, turn.step, prompt.section{name=context_management}, session.end`
+
+  test("the assembled fork plugin must compact and offer om_recall, and handle nothing of OM's", () => {
+    expect(checkForkPlugin(validated(FORK))).toEqual([])
+    expect(checkForkPlugin(validated(`${FORK}, turn.complete`)).join()).toMatch(/more than the fork plugin and om_recall: turn\.complete/)
+    expect(checkForkPlugin(validated(`session.start, tool.call{tool=${RECALL_TOOL}}`)).join()).toMatch(/no session\.compact/)
+    expect(checkForkPlugin('✘ cannot import').join()).toMatch(/did not pass/)
+    // The recall-only check still refuses a plugin that compacts.
+    expect(checkRecallOnly(validated(FORK)).join()).toMatch(/more than om_recall/)
   })
 })
 

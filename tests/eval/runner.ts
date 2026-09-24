@@ -35,11 +35,24 @@ import type { SessionMessage } from 'claude-code'
 export type Configuration = 'builtin' | 'builtin+recall' | 'om' | 'om+recall'
 export const CONFIGURATIONS: readonly Configuration[] = ['builtin', 'builtin+recall', 'om', 'om+recall']
 
+/**
+ * The live benchmark's configurations: the four, then issue #16's fork-handoff compaction (tests/eval/fork-plugin),
+ * with and without om_recall. Live only: the replay cannot fork without a live session at each boundary.
+ */
+export type LiveConfiguration = Configuration | 'fork' | 'fork+recall'
+export const LIVE_CONFIGURATIONS: readonly LiveConfiguration[] = [...CONFIGURATIONS, 'fork', 'fork+recall']
+
 /** Whether `om_recall` is offered to the assistant in this configuration. */
-export const recallAvailable = (config: Configuration): boolean => config.endsWith('+recall')
+export const recallAvailable = (config: LiveConfiguration): boolean => config.endsWith('+recall')
 
 /** Whether this configuration compacts through the observational-memory plugin rather than the host's own summarizer. */
-export const usesObservationalCompaction = (config: Configuration): boolean => config.startsWith('om')
+export const usesObservationalCompaction = (config: LiveConfiguration): boolean => config.startsWith('om')
+
+/** Whether this configuration compacts by the fork plugin's handoff. */
+export const usesForkCompaction = (config: LiveConfiguration): boolean => config.startsWith('fork')
+
+/** Whether this configuration's compaction is a plugin's (om or fork), which writes a stats file, rather than the host's summarizer. */
+export const usesPluginCompaction = (config: LiveConfiguration): boolean => usesObservationalCompaction(config) || usesForkCompaction(config)
 
 /** One compaction opportunity: `append` joins the previous opportunity's kept messages, chaining repeated compaction as a real, growing session would (and reflection too, once a real session's own threshold is crossed). */
 export type CompactionPoint = { trigger: 'auto' | 'manual'; append: readonly SessionMessage[] }

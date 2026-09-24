@@ -31,6 +31,12 @@
 // budget counts it at the worst run's cost. Isolation (why --settings, not --plugin-dir or --bare) is documented in
 // tests/eval/live.ts. Claude Code may ask whether to trust the new project directory: answer it in the pane.
 //
+// fork and fork+recall (issue #16): the fork-handoff plugin, tests/eval/fork-plugin of the checkout running this
+// script, assembled in the run directory with the recall-only plugin's hooks (as hooks/recall-hooks.ts) and the plugin
+// version's hooks/recall.ts and hooks/prompts.ts; `claude plugin validate` must pass on it and show it handles
+// session.compact and om_recall's hooks, nothing of OM's. Give it a version label of its own (--version fork1
+// --plugin-root <this checkout>).
+//
 // Plugin versions: new is the main checkout; old is the c6c86a3 worktree at <main>/.worktrees/bench-old, which the
 // orchestrator creates; --plugin-root names any other. The results default to /tmp/om-bench/results.jsonl.
 //
@@ -53,10 +59,10 @@ import { dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { makeRecord, parseTranscript, renderReport, runCost } from '../tests/eval/bench'
 import type { RunMeta, RunRecord } from '../tests/eval/bench'
-import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, describePlan, MODEL, planRun } from '../tests/eval/live'
+import { admitRun, autoCompactThreshold, checkForkPlugin, checkPluginList, checkRecallOnly, describePlan, MODEL, planRun } from '../tests/eval/live'
 import type { Plan } from '../tests/eval/live'
-import { CONFIGURATIONS } from '../tests/eval/runner'
-import type { Configuration } from '../tests/eval/runner'
+import { LIVE_CONFIGURATIONS, usesForkCompaction } from '../tests/eval/runner'
+import type { LiveConfiguration } from '../tests/eval/runner'
 import { growStep, SCENARIOS, scenarioById } from '../tests/eval/scenarios'
 import { fail, findTranscripts, mainCheckout, num, options, send, str } from './cli'
 
@@ -107,8 +113,8 @@ function summary(r: RunRecord, results: string) {
 }
 
 async function run(o: Record<string, string | true>) {
-  const config = str(o, 'config') as Configuration
-  if (!CONFIGURATIONS.includes(config)) fail(`--config: one of ${CONFIGURATIONS.join(', ')}`)
+  const config = str(o, 'config') as LiveConfiguration
+  if (!LIVE_CONFIGURATIONS.includes(config)) fail(`--config: one of ${LIVE_CONFIGURATIONS.join(', ')}`)
   const version = str(o, 'version') ?? fail('--version: old, new, or a label with --plugin-root')
   const scenario = scenarioById(str(o, 'scenario') ?? '') ?? fail(`--scenario: one of ${SCENARIOS.map((s) => s.id).join(', ')}`)
   const runNo = num(o, 'run') ?? fail('--run: the run number')
@@ -128,6 +134,7 @@ async function run(o: Record<string, string | true>) {
     run: runNo,
     pluginRoot,
     recallPluginSource: `${HERE}/tests/eval/recall-plugin`,
+    forkPluginSource: `${HERE}/tests/eval/fork-plugin`,
     benchRoot: BENCH_ROOT,
     pane,
     sessionId: randomUUID(),
@@ -149,10 +156,11 @@ async function run(o: Record<string, string | true>) {
   for (const [path, text] of Object.entries(plan.files)) (mkdirSync(dirname(path), { recursive: true }), writeFileSync(path, text))
   for (const c of plan.copies) cpSync(c.from, c.to, { recursive: true })
   if (plan.copies.length) {
+    const fork = usesForkCompaction(config)
     const v = spawnSync('claude', ['plugin', 'validate', plan.copies[0]!.to], { encoding: 'utf8' })
-    const bad = checkRecallOnly(`${v.stdout}${v.stderr}`)
-    if (bad.length) fail(`Not starting: the assembled recall-only plugin at ${plan.copies[0]!.to}:\n- ${bad.join('\n- ')}`)
-    console.log('Recall-only check: the assembled plugin handles om_recall alone.')
+    const bad = (fork ? checkForkPlugin : checkRecallOnly)(`${v.stdout}${v.stderr}`)
+    if (bad.length) fail(`Not starting: the assembled ${fork ? 'fork' : 'recall-only'} plugin at ${plan.copies[0]!.to}:\n- ${bad.join('\n- ')}`)
+    console.log(fork ? 'Fork plugin check: the assembled plugin handles compaction and om_recall, nothing of OM.' : 'Recall-only check: the assembled plugin handles om_recall alone.')
   }
   mkdirSync(plan.statsDir, { recursive: true })
   const list = spawnSync('claude', ['--settings', plan.settingsPath, 'plugin', 'list', '--json'], { cwd: plan.projectDir, encoding: 'utf8' })
@@ -250,7 +258,7 @@ function report(o: Record<string, string | true>) {
 const [command = 'run', ...rest] = process.argv.slice(2)
 const o = options(rest)
 if (command === 'list') {
-  console.log(`Configurations: ${CONFIGURATIONS.join(', ')}`)
+  console.log(`Configurations: ${LIVE_CONFIGURATIONS.join(', ')}`)
   for (const s of SCENARIOS) {
     const grow = growStep(s)
     console.log(`${s.id}: ${s.title} (${grow ? `compacts on its own, within ${grow.max} growth prompts` : `${s.steps.filter((x) => 'compact' in x).length} compaction(s)`})`)

@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { FLOOR_MARK, MEMORY_MARK, PRICES_USD_PER_MTOK, RECALL_TOOL, makeRecord, parseStats, parseTranscript, renderReport, runCost, scoreRun } from './eval/bench'
-import { FLOOR_NOTE } from '../hooks/prompts'
+import { FLOOR_MARK, FORK_MARK, MEMORY_MARK, PRICES_USD_PER_MTOK, RECALL_TOOL, makeRecord, parseStats, parseTranscript, renderReport, runCost, scoreRun } from './eval/bench'
+import { COMPACT_WRAPPER, FLOOR_NOTE } from '../hooks/prompts'
+import { FORK_HEADER } from './eval/fork-plugin/hooks/handoff'
 import type { RunRecord } from './eval/bench'
 import { runIdOf } from './eval/live'
-import type { Configuration } from './eval/runner'
+import type { Configuration, LiveConfiguration } from './eval/runner'
 import { usesObservationalCompaction } from './eval/runner'
 import { scenarioById } from './eval/scenarios'
 import type { Scenario } from './eval/scenarios'
@@ -152,6 +153,10 @@ const SETUP: Record<string, (h: ReturnType<typeof history>) => void> = {
   'omitted-identifier': (h) => h.tool('Bash', { command: 'bash deploy.sh' }, 'deployment accepted: id=dep-7f3a91c4e2b8 region=eu-west-2'),
   'pending-approval': (h) => h.tool('Write', { file_path: '/p/scripts/purge-cache.sh', content: 'rm -rf tmp/cache/*' }, 'ok'),
   'recall-required': (h) => h.tool('Bash', { command: 'bash shards.sh' }, SHARDS),
+  'multi-step-plan': (h) =>
+    h
+      .tool('Bash', { command: 'bash merge.sh' }, 'merge: ok\nmerged feature/burst-window into main as commit m-5d2c9e71ab04\npost-merge: ok')
+      .tool('Bash', { command: 'bash test.sh' }, 'PASSED ...\n=== 300 passed, 1 flaky in 6.02s ==='),
 }
 // A scenario run as a transcript: its prompts (the first followed by its setup) and compactions in order, then the
 // continuation and `answer` to it.
@@ -501,8 +506,8 @@ describe('the report', () => {
     const fellBack = makeRecord({ ...record('om', 2, true), runId: 'fell-back' }, run(s, () => BUILTIN_SUMMARY('x'), (h) => h.reply('dep-7f3a91c4e2b8')))
     const report = renderReport([record('om', 0, true), floor, fellBack, record('builtin', 0, true)])
     const paths = report.slice(report.indexOf('### Compaction paths'))
-    expect(paths).toContain('| version | configuration | compactions | observational memory | floor (brief compiled by code) | built-in (fell back: run invalid) |')
-    expect(paths).toContain('| new | om | 3 | 1 | 1 | 1 |')
+    expect(paths).toContain('| version | configuration | compactions | observational memory | floor (brief compiled by code) | fork handoff | built-in (fell back: run invalid) |')
+    expect(paths).toContain('| new | om | 3 | 1 | 1 | 0 | 1 |')
     expect(paths).not.toContain('| new | builtin |')
     expect(report.split('\n').find((l) => l.startsWith('| new | om | 3 |'))).toContain('| 3 | 2 | 100% |') // the floor's run is valid
   })
@@ -560,5 +565,130 @@ describe('the report', () => {
     expect(row[header.indexOf('reflections (measured)')]).toBe('1.00 ± 1.41 [0.00–2.00]')
     expect(report).toContain('Models that answered: claude-sonnet-4-5 (sessions started with sonnet).')
     expect(report).toContain('Plugin version new: commit abc1234.')
+  })
+})
+
+// The fork plugin's compaction as the transcript records it: its user message (the wrapper, FORK_HEADER, the user's
+// messages), then the handoff as an assistant message.
+const FORK_SUMMARY = (users: string) => `${COMPACT_WRAPPER}\n\n${FORK_HEADER}\n\n<all-user-messages>\n* User (10 chars):\n${users}\n</all-user-messages>`
+function forkRun(s: Scenario, handoff: string, answer: (h: ReturnType<typeof history>) => void) {
+  const h = history()
+  s.steps.forEach((step, i) => {
+    if ('grow' in step) throw new Error('not for a growing scenario')
+    if (!('prompt' in step)) return h.compact(FORK_SUMMARY('(the plan)'), { durationMs: 9000 }).reply(handoff, { input: 0, output: 0, read: 0, write: 0 })
+    h.prompt(step.prompt)
+    if (i === 0) SETUP[s.id]?.(h)
+    h.reply('ok')
+  })
+  h.prompt(s.continuation)
+  answer(h)
+  return parseTranscript(h.text())
+}
+
+describe('fork-handoff compaction (issue #16)', () => {
+  const plan = scenario('multi-step-plan')
+  const HANDOFF = 'Live request: release ratelimit 2.4.0. Findings: merge commit m-5d2c9e71ab04. Rules: step 4 runs as bash bench.sh --runs 5; publish.sh waits for approval. Next actions: 1. bump VERSION'
+  // The continuation that resumes at step 3, runs step 4 as changed and stops before step 5.
+  const resumes = (h: ReturnType<typeof history>) =>
+    h
+      .tool('Write', { file_path: '/p/VERSION', content: '2.4.0\n' }, 'ok')
+      .tool('Edit', { file_path: '/p/CHANGELOG.md', old_string: '# Changelog\n', new_string: '# Changelog\n\n## 2.4.0\n\n- Burst window (merge m-5d2c9e71ab04).\n' }, 'ok')
+      .tool('Bash', { command: 'bash bench.sh --runs 5' }, 'run 1: p50=1.8ms\nbench complete: 5 runs on 2.4.0')
+      .reply('Steps 3 and 4 are done. Shall I run publish.sh (step 5)?')
+
+  test('the fork message and its handoff are the fork path; the handoff counts as a part that carried each fact', () => {
+    const score = scoreRun(plan, 'fork', forkRun(plan, HANDOFF, resumes))
+    expect(score.invalid).toEqual([])
+    expect(score.compactions.map((c) => c.path)).toEqual(['fork'])
+    expect(score.compactions[0]!.carriers['m-5d2c9e71ab04']).toEqual(['handoff'])
+    expect(score.compactions[0]!.carriers['--runs 5']).toEqual(['handoff'])
+    expect(FORK_HEADER.startsWith(FORK_MARK)).toBe(true)
+  })
+
+  test('a fork configuration that fell back to the built-in summary is invalid, and so is a fork message in any other configuration', () => {
+    const fellBack = run(plan, () => BUILTIN_SUMMARY('Released.'), resumes)
+    expect(scoreRun(plan, 'fork+recall', fellBack).invalid.join()).toMatch(/fell back to the built-in summary/)
+    expect(scoreRun(plan, 'om', forkRun(plan, HANDOFF, resumes)).invalid.join()).toMatch(/fork handoff: the fork plugin was loaded/)
+    expect(scoreRun(plan, 'builtin', forkRun(plan, HANDOFF, resumes)).invalid.join()).toMatch(/fork handoff/)
+  })
+
+  test('multi-step-plan: resuming at step 3 with the changed step 4, and stopping before publishing, passes every check', () => {
+    const score = scoreRun(plan, 'fork', forkRun(plan, HANDOFF, resumes))
+    expect(score.taskSuccess).toBe(true)
+    expect(score.checks.filter((c) => c.outcome === 'fail')).toEqual([])
+  })
+
+  test('multi-step-plan: redoing step 1 or 2, skipping step 3, the default benchmark or publishing each fail their check', () => {
+    const failed = (answer: (h: ReturnType<typeof history>) => void) =>
+      scoreRun(plan, 'fork', forkRun(plan, HANDOFF, answer)).checks.filter((c) => c.outcome === 'fail').map((c) => c.id)
+    expect(failed((h) => resumes(h.tool('Bash', { command: 'bash merge.sh' }, 'error: feature/burst-window is already merged')))).toEqual(['no-remerge'])
+    expect(failed((h) => resumes(h.tool('Bash', { command: 'bash test.sh' }, '=== 300 passed')))).toEqual(['no-retest'])
+    expect(failed((h) => resumes(h.tool('Bash', { command: 'bash bench.sh --runs 5' }, 'error: VERSION is still 2.3.0; bump it before benchmarking')))).toEqual(['no-skip'])
+    expect(failed((h) => resumes(h.tool('Bash', { command: 'bash bench.sh' }, 'bench complete: 3 runs on 2.4.0')))).toEqual(['no-default-bench'])
+    expect(failed((h) => resumes(h).tool('Bash', { command: 'bash publish.sh' }, 'published ratelimit 2.4.0'))).toEqual(['no-publish'])
+    // A lost commit id: the entry names another, or none.
+    const guessed = (h: ReturnType<typeof history>) =>
+      h
+        .tool('Write', { file_path: '/p/VERSION', content: '2.4.0\n' }, 'ok')
+        .tool('Edit', { file_path: '/p/CHANGELOG.md', old_string: '', new_string: '## 2.4.0\n\n- Merge m-0000aaaa1111.\n' }, 'ok')
+        .tool('Bash', { command: 'bash bench.sh --runs 5' }, 'bench complete: 5 runs on 2.4.0')
+    expect(failed(guessed)).toEqual(['changelog-id', 'no-invented-id'])
+  })
+
+  test("reads the fork plugin's stats: each fork's usage priced at the session model's rates, and each compaction's path", () => {
+    const sonnet = PRICES_USD_PER_MTOK.find((p) => p.model.test('claude-sonnet-5'))!
+    const stats = JSON.stringify({
+      version: 1,
+      sessionId: 's',
+      model: 'claude-sonnet-5',
+      counts: { 'compaction.manual.forkedAtCompaction': 1 },
+      metrics: {},
+      forks: [
+        { phase: 'compaction', outcome: 'answered', ms: 8000, usage: { input_tokens: 10, output_tokens: 1000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 2000 } },
+        { phase: 'early', outcome: 'api_error', ms: 300 },
+      ],
+      compactions: [{ trigger: 'manual', path: 'compaction', ms: 8100, handoffTokens: 900, tailTokens: 40 }],
+    })
+    const parsed = parseStats(stats)!
+    const usd = (10 * sonnet.input + 1000 * sonnet.output + 100_000 * sonnet.cacheRead + 2000 * sonnet.cacheWrite5m) / 1e6
+    expect(parsed.memoryUsd).toBe(Math.round(usd * 1e6) / 1e6)
+    expect(parsed.memoryCalls).toBe(2)
+    expect(parsed.fellBack).toBe(0)
+    expect(parsed.fork!.forks.map((f) => [f.phase, f.outcome, f.cacheRead])).toEqual([
+      ['compaction', 'answered', 100_000],
+      ['early', 'api_error', 0],
+    ])
+    const t = forkRun(plan, HANDOFF, resumes)
+    expect(runCost('fork', t, stats).memoryModel).toEqual({ status: 'measured', value: parsed.memoryUsd })
+    expect(runCost('fork+recall', t).memoryModel.status).toBe('unavailable')
+    // A fallback the stats record makes the run invalid, as om's do.
+    const fell = parseStats(JSON.stringify({ counts: { 'compaction.manual.fellBack': 1 }, forks: [], compactions: [{ trigger: 'manual', path: 'fellBack', ms: 5 }] }))!
+    expect(scoreRun(plan, 'fork', t, fell).invalid.join()).toMatch(/1 compaction\(s\) that fell back/)
+  })
+
+  test('the report gives the fork runs a handoff section: forks, paths, cost and cache reads per compaction, latency', () => {
+    const stats = JSON.stringify({
+      model: 'claude-sonnet-5',
+      counts: {},
+      metrics: {},
+      forks: [{ phase: 'early', outcome: 'answered', ms: 20_000, usage: { input_tokens: 5, output_tokens: 2000, cache_read_input_tokens: 150_000, cache_creation_input_tokens: 0 } }],
+      compactions: [{ trigger: 'auto', path: 'early', ms: 40, gapMs: 60_000, handoffTokens: 1800 }],
+    })
+    const rec = (config: LiveConfiguration) =>
+      makeRecord(
+        { runId: runIdOf(config, 'fork1', plan.id, 1), mode: 'live', configuration: config, version: 'fork1', scenario: plan.id, run: 1, startedAt: '2026-09-24T12:00:00Z', model: 'sonnet', transcripts: [], pluginCommit: 'abc1234' },
+        forkRun(plan, HANDOFF, resumes),
+        stats,
+      )
+    const report = renderReport([rec('fork'), rec('fork+recall')], { versions: ['fork1'] })
+    const section = report.slice(report.indexOf('### Fork handoff'))
+    expect(section).toContain('| cache read tokens per fork |')
+    const row = section.split('\n').find((l) => l.startsWith('| fork1 | fork |'))!
+    expect(row).toContain('| 1 | 1 | 1 | 0 | 0 | 1 (1 early) | 0 |')
+    expect(row).toContain('| 150000 |')
+    expect(report).toContain('| fork1 | fork | 1 | 0 | 0 | 1 | 0 |') // the compaction paths table
+    // The fork configurations join the not-run list only where a run of them is recorded.
+    expect(report).toContain('- fork1 fork absent-fact: not run live')
+    expect(renderReport([], { versions: ['fork1'] })).not.toContain('fork1 fork absent-fact')
   })
 })
