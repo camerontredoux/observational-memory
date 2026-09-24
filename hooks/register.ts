@@ -198,10 +198,15 @@ const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.lengt
 // What the user typed, if a row is a real prompt: no tool results, compaction summary, injected block (a system
 // reminder, task notification, local command's caveat or output, image note) or skill text. A system reminder a
 // hook appended to a prompt is cut from it.
+// `SessionMessage` carries no origin field (no host metadata for a user prompt's source reaches this hook, unlike
+// `prompt.submit`'s or `session.receive`'s own `origin`), so a genuine structured prompt is told from an injected
+// one by name: known wrappers the host or another session delivers into context, not any text that merely starts
+// with a tag (a real user message may itself start with one). Add a name here only once it is confirmed injected.
+const INJECTED_WRAPPER = /^<(?:task-notification|local-command-caveat|local-command-stdout|command-name|command-message|fork-boilerplate|bash-stdout|bash-input)>/
 function typed(m: SessionMessage, skills: readonly Skill[]) {
   if (!isPrompt(m) || isMemory(m) || isSummary(m)) return undefined
   const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-  if (!text || /^<[a-z][a-z-]*>/.test(text) || text.startsWith('[Image')) return undefined
+  if (!text || INJECTED_WRAPPER.test(text) || text.startsWith('[Image')) return undefined
   return skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
 }
 

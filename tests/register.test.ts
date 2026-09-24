@@ -1450,6 +1450,25 @@ describe('register', () => {
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1/mate-1', 'times:session-1/mate-1'])
   })
 
+  test('a genuine prompt that happens to start with a tag is told apart from a named injected wrapper by name, not by shape', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+    const messages = [
+      ...turn('a', 'a', CHUNK),
+      row('<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease review this and tell me if it looks right'),
+      row('<task-notification>\n<task-id>x</task-id>\n</task-notification>'),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(userMessagesIn(text)).toEqual(['a', '<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease review this and tell me if it looks right', 'b'])
+  })
+
   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
     mock.clock(on)
     world(on)
