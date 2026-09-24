@@ -19,7 +19,9 @@ import {
   planBuiltinChain,
   planCalls,
   planQuestionSession,
+  questionRun,
   questionSeedRows,
+  questionsAt,
   recallCallsIn,
   renderReflections,
   renderTranscript,
@@ -33,6 +35,7 @@ import {
   uncompacted,
 } from './eval/replay'
 import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } from './eval/replay'
+import type { Configuration } from './eval/runner'
 
 // Synthetic transcripts in Claude Code's JSONL shape. A compaction is a `compact_boundary` row, then its summary and
 // the rows it kept raw, both stamped before the boundary (as Claude Code writes them), then the session goes on.
@@ -321,7 +324,12 @@ describe('constraints', () => {
         { id: 'regex', quote: 'thanks', setIn: 3, held: ['('] },
         { ...late, id: 'budget' },
       ],
-      questions: [{ id: 'q', ask: '?', from: 4 }],
+      questions: [
+        { id: 'q', ask: '?', from: 4 },
+        { id: 'next-2', ask: '?', from: 2, to: 1 },
+        { id: 'told-3', ask: '?', from: 3, to: 4 },
+        { id: 'told-3', ask: '?', from: 3, to: 3 },
+      ],
     }
     expect(checkSpec(t, bad)).toEqual([
       'worktrees: no user message in span 1 says "Worktrees go in .worktrees."',
@@ -330,6 +338,9 @@ describe('constraints', () => {
       'regex: a pattern that is not a regular expression: (',
       'budget: a repeated id',
       'q: asked from boundary 4, which the transcript does not have',
+      "next-2: asked to boundary 1, before boundary 2 or past the transcript's 3",
+      "told-3: asked to boundary 4, before boundary 3 or past the transcript's 3",
+      'told-3: a repeated question id',
     ])
   })
 
@@ -367,6 +378,25 @@ describe('the question stage', () => {
         ['why', 'tidy'],
       ]),
     )
+  })
+
+  test('asks a question from its first boundary on, or only up to its last', () => {
+    const spec: ReplaySpec = {
+      constraints: [],
+      questions: [
+        { id: 'fact', ask: '?', from: 2 },
+        { id: 'next-3', ask: '?', from: 3, to: 3 },
+        { id: 'told', ask: '?', from: 1, to: 2 },
+      ],
+    }
+    expect([1, 2, 3, 4].map((n) => questionsAt(spec, n).map((q) => q.id))).toEqual([['told'], ['fact', 'told'], ['fact', 'next-3'], ['fact']])
+    expect(questionsAt(undefined, 1)).toEqual([])
+    expect(questionsAt(spec, 3, /^(next|told)-/).map((q) => q.id)).toEqual(['next-3'])
+  })
+
+  test("asks om's configurations about the om run named, the live one unless another is, and the built-in ones about the built-in chain", () => {
+    expect(['om', 'om+recall', 'builtin', 'builtin+recall'].map((c) => questionRun(c as Configuration))).toEqual(['om-live', 'om-live', 'builtin', 'builtin'])
+    expect(['om', 'om+recall', 'builtin+recall'].map((c) => questionRun(c as Configuration, 'om-v130'))).toEqual(['om-v130', 'om-v130', 'builtin'])
   })
 
   test('plans a plain session with the context in its prompt, and a +recall one on a seeded copy of the transcript', () => {
@@ -571,6 +601,8 @@ describe('the plan and the report', () => {
     expect(leftOut('om-live', { luna: { failed: 2 } })).toBe('2 pi call(s) failed')
     expect(leftOut('om-strict', undefined)).toBe('no pi call count (summary.json)')
     expect(leftOut('om-stub', undefined)).toBeUndefined()
+    expect(leftOut('om-v130', { luna: { failed: 1 } })).toBe('1 pi call(s) failed')
+    expect(leftOut('om-v130', { luna: { failed: 0 } })).toBeUndefined()
     expect(leftOut('builtin', undefined)).toBeUndefined()
   })
 
@@ -619,7 +651,13 @@ describe('a chain of transcripts', () => {
   test("shifts each member's spec to its boundaries, its ids prefixed with its name", () => {
     const { text, offsets } = chainTranscripts([threeBoundaries().text(), second().text()])
     const one: ReplaySpec = { constraints: [{ id: 'budget', quote: 'Spend at most $30', setIn: 0, held: ['\\$30'], reversal: { quote: 'spend up to $50', in: 1, held: ['\\$50'] } }], questions: [{ id: 'q', ask: '?', from: 1 }] }
-    const two: ReplaySpec = { constraints: [{ id: 'issue', quote: 'start on issue #7', setIn: 0, held: ['#7'] }], questions: [{ id: 'q', ask: '?', from: 1 }] }
+    const two: ReplaySpec = {
+      constraints: [{ id: 'issue', quote: 'start on issue #7', setIn: 0, held: ['#7'] }],
+      questions: [
+        { id: 'q', ask: '?', from: 1 },
+        { id: 'next-1', ask: '?', from: 1, to: 1 },
+      ],
+    }
     const spec = chainSpec([
       { name: 'a', offset: offsets[0]!, spec: one },
       { name: 'b', offset: offsets[1]!, spec: two },
@@ -629,9 +667,10 @@ describe('a chain of transcripts', () => {
       ['a-budget', 0, 1],
       ['b-issue', 3, undefined],
     ])
-    expect(spec.questions.map((q) => [q.id, q.from])).toEqual([
-      ['a-q', 1],
-      ['b-q', 4],
+    expect(spec.questions.map((q) => [q.id, q.from, q.to])).toEqual([
+      ['a-q', 1, undefined],
+      ['b-q', 4, undefined],
+      ['b-next-1', 4, 4],
     ])
     expect(checkSpec(parseTranscript(text), spec)).toEqual([])
   })

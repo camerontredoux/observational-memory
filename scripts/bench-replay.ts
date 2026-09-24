@@ -9,8 +9,9 @@
 //     [--src DIR] [--out DIR]
 //   bun scripts/bench-replay.ts builtin --transcript NAME --pane w1:p2 --budget-usd N [--live] [--out DIR]
 //   bun scripts/bench-replay.ts questions --transcript NAME --budget-usd N [--configs om,om+recall,builtin,builtin+recall]
-//     [--boundaries 1,3,5] [--live] [--out DIR]
-//   bun scripts/bench-replay.ts report [--transcripts ...] [--configs recorded,om,...] [--out FILE]
+//     [--boundaries 1,3,5] [--only REGEX] [--om-run om-live] [--live] [--out DIR]
+//   bun scripts/bench-replay.ts report [--transcripts ...] [--configs recorded,om,...] [--om-run DIR] [--questions DIR]
+//     [--out FILE]
 //   bun scripts/bench-replay.ts reflections --transcript NAME [--run DIR]
 //
 // NAME may be a chain, `a+b+c`: those transcripts joined in that order into one long session (chainTranscripts), each
@@ -46,8 +47,11 @@
 //   rather than making up a summary.
 // questions: the question stage. For each configuration (default: all four) and boundary with questions (default:
 //   every one), a headless Sonnet session (planQuestionSession) is asked the boundary's questions about that
-//   configuration's context, read from the chained replay's results: om's from om-live (left out, as in the report,
-//   when its pi calls failed), builtin's from builtin; a +recall configuration uses its base's context. A missing
+//   configuration's context, read from the chained replay's results: om's from om-live, or the run --om-run names
+//   (om-v130, say; left out, as in the report, when its pi calls failed), builtin's from builtin; a +recall
+//   configuration uses its base's context. --only asks just the questions whose id the regular expression matches
+//   (`--only '(^|-)(next|told)-'` for the handoff questions): give it its own --out, since a (configuration,
+//   boundary) already in results.jsonl is not run again. A missing
 //   result is skipped and named. Without --live it prints each session and the estimated cost. With --live it refuses
 //   unless the estimate is within --budget-usd, stops before a session that could pass it and once the reported
 //   spend (total_cost_usd) reaches it. A plain session gets the context in its prompt, no plugin and no tool; a
@@ -59,8 +63,10 @@
 // reflections: scores each reflection of an om replay (--run, default /tmp/om-replay/<name>/om-live) with no model:
 //   the memory just before against just after (scoreReflection), and lists the Reflector's calls.
 // report: scores, per transcript, the session's own compactions ("recorded") and every configuration with results
-//   under /tmp/om-replay (--configs: only these), and prints the report (or writes it to --out). A private transcript
-//   gets aggregate numbers only.
+//   under /tmp/om-replay (--configs: only these), and prints the report (or writes it to --out). --om-run scores that
+//   om run (om-v130, say) as om in place of om-live and om-strict; the question stage is read from
+//   /tmp/om-replay/<name>/questions, or the directory there --questions names. A private transcript gets aggregate
+//   numbers only.
 import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
@@ -83,6 +89,7 @@ import {
   planCalls,
   planQuestionSession,
   questionSeedRows,
+  questionRun,
   questionsAt,
   recallCallsIn,
   renderReflections,
@@ -554,7 +561,9 @@ async function report(o: Options) {
     const results: ConfigResult[] = [{ config: 'recorded', source: "the session's own compaction", contexts: t.boundaries.map((b) => ({ summary: b.summary, kept: b.kept })) }]
     const only = str(o, 'configs')?.split(',')
     if (only) results.splice(0, results.length, ...results.filter((r) => only.includes(r.config)))
-    for (const { dir, config, source } of SOURCES) {
+    const omRun = str(o, 'om-run')
+    const sources = omRun ? [{ dir: omRun, config: 'om', source: `om replay ${omRun}, Luna through pi` }, ...SOURCES.filter((x) => x.config !== 'om')] : SOURCES
+    for (const { dir, config, source } of sources) {
       if (only && !only.includes(config)) continue
       const path = `${OUT_ROOT}/${name}/${dir}`
       if (results.some((r) => r.config === config) || !existsSync(`${path}/compaction-1.md`)) continue
@@ -565,7 +574,7 @@ async function report(o: Options) {
       }
       results.push({ config, source, contexts: readContexts(path, t.boundaries.length) })
     }
-    const asked = readQuestionResults(questionsFile(`${OUT_ROOT}/${name}/questions`))
+    const asked = readQuestionResults(questionsFile(`${OUT_ROOT}/${name}/${str(o, 'questions') ?? 'questions'}`))
     parts.push(renderTranscript({ name, t, results, bytes, private: isPrivate(name), ...(spec ? { spec } : {}), ...(asked.length ? { questions: asked } : {}) }))
     parts.push(`Sources: ${results.map((r) => `${r.config}: ${r.source}`).join('; ')}.`, '')
   }
@@ -599,8 +608,6 @@ async function reflectionsReport(o: Options) {
 
 // ---- questions: the question stage ----
 
-// The result directory whose contexts a question configuration is asked about: a +recall one shares its base's.
-const QUESTION_DIRS: Record<string, string> = { om: 'om-live', builtin: 'builtin' }
 const questionsFile = (dir: string) => `${dir}/results.jsonl`
 const readQuestionResults = (file: string): QuestionResult[] =>
   existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as QuestionResult) : []
@@ -613,6 +620,8 @@ async function questions(o: Options) {
   const { text, t, offsets } = load(o, name)
   const spec = await checkedSpec(name, t, offsets)
   if (!spec?.questions.length) fail(`${name}: no questions (tests/eval/replay-specs/${name}.ts or tests/fixtures/${name}.replay.local.ts)`)
+  const only = str(o, 'only') === undefined ? undefined : new RegExp(str(o, 'only')!)
+  const omRun = str(o, 'om-run') ?? 'om-live'
   const boundaries = str(o, 'boundaries')?.split(',').map(Number) ?? t.boundaries.map((b) => b.n)
   for (const b of boundaries) if (!Number.isInteger(b) || b < 1 || b > t.boundaries.length) fail(`--boundaries: ${b} is not a boundary of ${name} (1 to ${t.boundaries.length})`)
   const out = str(o, 'out') ?? `${OUT_ROOT}/${name}/questions`
@@ -625,7 +634,7 @@ async function questions(o: Options) {
   type Planned = { config: Configuration; boundary: number; questions: Question[]; plan: QuestionSession; sessionId: string; usd: number }
   const planned: Planned[] = []
   for (const config of configs) {
-    const dir = `${OUT_ROOT}/${name}/${QUESTION_DIRS[config.replace('+recall', '')]}`
+    const dir = `${OUT_ROOT}/${name}/${questionRun(config, omRun)}`
     if (!existsSync(`${dir}/compaction-1.md`)) {
       console.log(`${config}: skipped, no results in ${dir}`)
       continue
@@ -637,7 +646,7 @@ async function questions(o: Options) {
     }
     const contexts = readContexts(dir, t.boundaries.length)
     for (const boundary of boundaries) {
-      const qs = questionsAt(spec, boundary)
+      const qs = questionsAt(spec, boundary, only)
       const context = contexts[boundary - 1]
       if (!qs.length) continue
       if (!context) {

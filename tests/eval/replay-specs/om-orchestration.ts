@@ -26,5 +26,17 @@ export const spec: ReplaySpec = {
     { id: 'reviewer-effort', ask: "How must a reviewer agent's effort level compare with the implementer's?", from: 1 },
     { id: 'larger-window', ask: 'What new benchmark scenario did the user ask for after asking how big the context windows were?', from: 4 },
     { id: 'pi-extension', ask: 'Where did the user say the Pi observational-memory extension lives?', from: 5, expect: ['.pi'] },
+    // The handoff, each at one boundary (#15's continuation record): what the assistant did right after the cut
+    // in the real session, and its last report to the user before it.
+    { id: 'next-1', ask: 'What was the assistant about to do next when this context begins?', from: 1, to: 1, expect: ['#4'] },
+    { id: 'told-1', ask: 'What had the assistant most recently reported to the user?', from: 1, to: 1, expect: ['#8', '#9'] },
+    { id: 'next-2', ask: 'What was the assistant about to do next when this context begins?', from: 2, to: 2, expect: ['absent-fact'] },
+    { id: 'told-2', ask: 'What had the assistant most recently reported to the user?', from: 2, to: 2, expect: ['#3', '#7'] },
+    { id: 'next-3', ask: 'What was the assistant about to do next when this context begins?', from: 3, to: 3, expect: ['omitted-identifier'] },
+    { id: 'told-3', ask: 'What had the assistant most recently reported to the user?', from: 3, to: 3, expect: ['omitted-identifier'] },
+    { id: 'next-4', ask: 'What was the assistant about to do next when this context begins?', from: 4, to: 4, expect: ['recall-required'] },
+    { id: 'told-4', ask: 'What had the assistant most recently reported to the user?', from: 4, to: 4, expect: ['#10'] },
+    { id: 'next-5', ask: 'What was the assistant about to do next when this context begins?', from: 5, to: 5, expect: ['region'] },
+    { id: 'told-5', ask: 'What had the assistant most recently reported to the user?', from: 5, to: 5, expect: ['BM25'] },
   ],
 }

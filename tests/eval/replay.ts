@@ -167,7 +167,9 @@ export function chainSpec(members: readonly { name: string; offset: number; spec
     constraints: members.flatMap(({ name, offset, spec }) =>
       (spec?.constraints ?? []).map((c) => ({ ...c, id: `${name}-${c.id}`, setIn: c.setIn + offset, ...(c.reversal ? { reversal: { ...c.reversal, in: c.reversal.in + offset } } : {}) })),
     ),
-    questions: members.flatMap(({ name, offset, spec }) => (spec?.questions ?? []).map((q) => ({ ...q, id: `${name}-${q.id}`, from: q.from + offset }))),
+    questions: members.flatMap(({ name, offset, spec }) =>
+      (spec?.questions ?? []).map((q) => ({ ...q, id: `${name}-${q.id}`, from: q.from + offset, ...(q.to !== undefined ? { to: q.to + offset } : {}) })),
+    ),
   }
 }
 
@@ -315,8 +317,12 @@ export type ConstraintSpec = {
   held: readonly string[]
   reversal?: { quote: string; in: number; held: readonly string[] }
 }
-/** What a question asks at each boundary from `from` on; `expect` are strings an answer must all hold, or none with a model grader. */
-export type Question = { id: string; ask: string; from: number; expect?: readonly string[] }
+/**
+ * What a question asks at each boundary from `from` on, or from `from` to `to` (`from === to` for one boundary: what
+ * the assistant was about to do when that context begins, say); `expect` are strings an answer must all hold, or none
+ * with a model grader.
+ */
+export type Question = { id: string; ask: string; from: number; to?: number; expect?: readonly string[] }
 /** A transcript's constraints and questions. */
 export type ReplaySpec = { constraints: readonly ConstraintSpec[]; questions: readonly Question[] }
 
@@ -342,7 +348,13 @@ export function checkSpec(t: Transcript, spec: ReplaySpec): string[] {
         problems.push(`${c.id}: a pattern that is not a regular expression: ${p}`)
       }
   }
-  for (const q of spec.questions) if (q.from < 1 || q.from > t.boundaries.length) problems.push(`${q.id}: asked from boundary ${q.from}, which the transcript does not have`)
+  const asked = new Set<string>()
+  for (const q of spec.questions) {
+    if (asked.has(q.id)) problems.push(`${q.id}: a repeated question id`)
+    asked.add(q.id)
+    if (q.from < 1 || q.from > t.boundaries.length) problems.push(`${q.id}: asked from boundary ${q.from}, which the transcript does not have`)
+    if (q.to !== undefined && (q.to < q.from || q.to > t.boundaries.length)) problems.push(`${q.id}: asked to boundary ${q.to}, before boundary ${q.from} or past the transcript's ${t.boundaries.length}`)
+  }
   return problems
 }
 
@@ -524,7 +536,14 @@ export function renderReflections(r: { name: string; t: Transcript; spec?: Repla
 
 // ---- The question stage ----
 
-export const questionsAt = (spec: ReplaySpec | undefined, n: number) => (spec?.questions ?? []).filter((q) => q.from <= n)
+/** The questions asked at boundary `n`; with `only`, just those whose id it matches (the handoff questions, say). */
+export const questionsAt = (spec: ReplaySpec | undefined, n: number, only?: RegExp) =>
+  (spec?.questions ?? []).filter((q) => q.from <= n && (q.to === undefined || n <= q.to) && (!only || only.test(q.id)))
+/**
+ * The result directory, under the transcript's, whose contexts a question configuration is asked about: a +recall
+ * one shares its base's. `omRun` names the om replay's (`om-live` unless another run, `om-v130` say, is asked about).
+ */
+export const questionRun = (config: Configuration, omRun = 'om-live') => (config.startsWith('om') ? omRun : 'builtin')
 export type AnswerCheck = 'pass' | 'fail' | 'needs a model grader'
 /** An exact-string check: every expected string in the answer as a whole token, case and spacing aside. */
 export function checkAnswer(q: Question, answer: string): AnswerCheck {
@@ -956,7 +975,8 @@ export function uncompacted(c: ReturnType<typeof lastCompaction>, boundary: numb
  * measurement. A stub replay answers every call itself, and the built-in chain makes no pi call.
  */
 export function leftOut(dir: string, summary: { luna?: { failed?: number } } | undefined): string | undefined {
-  if (dir !== 'om-live' && dir !== 'om-strict') return undefined
+  // Every cached or live om replay (om-live, om-strict, or a named run such as om-v130); a stub makes no pi call.
+  if (!dir.startsWith('om-') || dir.startsWith('om-stub')) return undefined
   const failed = summary?.luna?.failed
   if (failed === undefined) return 'no pi call count (summary.json)'
   return failed ? `${failed} pi call(s) failed` : undefined
