@@ -432,6 +432,10 @@ describe('run validity', () => {
     const failing = scenario('failure-in-long-output')
     const denied = (h: ReturnType<typeof history>) => h.tool('Bash', { command: 'bash run-tests.sh 2>&1' }, 'Permission to use Bash has been denied.', { isError: true })
     expect(scoreRun(failing, 'builtin', run(failing, () => BUILTIN_SUMMARY('x'), (h) => h.reply('ok'), denied)).invalid.join()).toMatch(/lacks its setup/)
+    // Reading the script shows the id in its source; only running it is the deploy.
+    const deploy = scenario('omitted-identifier')
+    const read = (h: ReturnType<typeof history>) => h.tool('Bash', { command: 'cat deploy.sh 2>&1 | head -100' }, 'echo "deployment accepted: id=dep-7f3a91c4e2b8 region=eu-west-2"')
+    expect(scoreRun(deploy, 'builtin', run(deploy, () => BUILTIN_SUMMARY('x'), (h) => h.reply('ok'), read)).invalid.join()).toMatch(/lacks its setup/)
   })
 
   test('a transcript without the continuation prompt is invalid', () => {

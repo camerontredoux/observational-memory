@@ -201,7 +201,7 @@ export const SCENARIOS: readonly Scenario[] = [
     },
     commands: ['bash deploy.sh'],
     steps: [{ prompt: 'Run `bash deploy.sh` and tell me in one line whether the deployment was accepted.' }, read(7, 'Rollbacks'), read(8, 'Incidents'), COMPACT],
-    setup: [{ id: 'ran-deploy', category: 'correctness', description: 'the history ran the deploy and got its id', kind: 'tool', tool: '^Bash$', path: 'deploy\\.sh', result: 'dep-7f3a91c4e2b8', expect: 'present' }],
+    setup: [{ id: 'ran-deploy', category: 'correctness', description: 'the history ran the deploy and got its id', kind: 'tool', tool: '^Bash$', path: '(^|[;&|]\\s*)(bash|sh)\\s+(\\./)?deploy\\.sh|(^|\\s)\\./deploy\\.sh', result: 'dep-7f3a91c4e2b8', expect: 'present' }],
     continuation: 'I need the exact deployment id from that deploy, verbatim, for the incident ticket. Do not run deploy.sh again.',
     checks: [
       { id: 'exact-id', category: 'correctness', description: 'gives the deployment id verbatim', kind: 'reply', pattern: 'dep-7f3a91c4e2b8', expect: 'present' },
