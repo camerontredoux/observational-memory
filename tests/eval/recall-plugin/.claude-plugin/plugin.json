@@ -1,0 +1,8 @@
+{
+  "name": "observational-memory",
+  "version": "0.0.0-recall-only",
+  "description": "Evaluation only (issue #9's builtin+recall configuration): the om_recall tool alone, with no compaction hooks, so built-in compaction runs as it would with no plugin. Named observational-memory so the tool is mcp__observational-memory__om_recall, as in the om+recall configuration. scripts/bench-live.ts assembles it with a version's hooks/recall.ts and hooks/prompts.ts.",
+  "author": {
+    "name": "Cameron Tredoux"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "description": "session.start and tool.call: the om_recall tool only; classic.SessionStart and classic.Stop: record the transcript path it reads",
+  "modules": [
+    "./register.ts"
+  ]
+}
