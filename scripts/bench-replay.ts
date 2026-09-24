@@ -20,17 +20,19 @@
 //   stage's headless Sonnet sessions) with estimated tokens and cost per configuration. It spends nothing.
 // om: replays the transcript through the checkout's (or --src's) hooks/register.ts with a hand-built `$` on a
 //   virtual clock, and compacts where the session compacted, each compaction on the previous one's output. Observer
-//   and Reflector calls go to pi through a response cache (/tmp/om-replay/luna-cache, and /tmp/om-vcc/luna-cache
-//   read too): --pi stub answers every call with a canned reply built from its prompt (free; checks the chain, not a
-//   measurement), --pi strict (the default) fails on a call not cached, --pi live runs pi on a miss, at most
-//   --max-calls times (default 0), and caches it. Writes compaction-N.md (the memory message), kept-N.json (the rows
+//   and Reflector calls go to pi through a response cache (/tmp/om-replay/luna-cache; the earlier prior-art
+//   replay's /tmp/om-vcc/luna-cache is read too when this machine still has it): --pi stub answers every call with
+//   a canned reply built from its prompt (free; checks the chain, not a measurement), --pi strict (the default)
+//   fails on a call not cached, --pi live runs pi on a miss, at most --max-calls times (default 0), and caches it. Writes compaction-N.md (the memory message), kept-N.json (the rows
 //   kept raw), calls.json, log.txt and summary.json to /tmp/om-replay/<name>/om-<pi>.
 // builtin: the live built-in chain (planBuiltinChain): seeds a sandbox session with span 0's raw rows, resumes it in
 //   the herdr pane with no observational-memory plugin, /compact, exits, reads the summary and kept rows back,
 //   appends the next span's rows after them and repeats. Without --live it prints the plan and stops. With --live it
 //   refuses unless the estimated cost of its /compact calls is within --budget-usd. Not yet run: whether Claude Code
-//   resumes a session whose later rows were appended by another writer is unverified; a failed step stops the chain
-//   and says which step, rather than making up a summary.
+//   resumes a session whose later rows were appended by another writer is unverified. The appended rows are stamped
+//   after the compaction before them, and each collect checks that Claude Code's own count of what it compacted
+//   reaches half the appended rows' estimate (`uncompacted`); a failed step or check stops the chain and says which,
+//   rather than making up a summary.
 // report: scores, per transcript, the session's own compactions ("recorded") and every configuration with results
 //   under /tmp/om-replay (--configs: only these), and prints the report (or writes it to --out). A private transcript
 //   gets aggregate numbers only.
@@ -40,8 +42,29 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statS
 import { dirname, resolve } from 'path'
 import type { SessionMessage } from 'claude-code'
 import type { Boundary, ConfigResult, Context, ReplaySpec, Transcript } from '../tests/eval/replay'
-import { checkSpec, describePlan, lastCompaction, parseTranscript, planBuiltinChain, planCalls, planQuestionSession, questionsAt, renderTranscript, replayChain, REPLAY_CONFIGURATIONS, seedRows } from '../tests/eval/replay'
-import { shellLine } from '../tests/eval/live'
+import {
+  checkSpec,
+  describeCalls,
+  estimateTokens,
+  hookDriver,
+  lastCompaction,
+  leftOut,
+  messageText,
+  parseTranscript,
+  planBuiltinChain,
+  planCalls,
+  planQuestionSession,
+  questionsAt,
+  renderTranscript,
+  replayChain,
+  seedRows,
+  uncompacted,
+} from '../tests/eval/replay'
+import { RECALL_TOOL } from '../tests/eval/bench'
+import { checkPluginList, shellLine } from '../tests/eval/live'
+import { CONFIGURATIONS } from '../tests/eval/runner'
+import { fail, findTranscripts, mainCheckout, num, options, send, str } from './cli'
+import type { Options } from './cli'
 
 const HERE = resolve(import.meta.dir, '..')
 const OUT_ROOT = '/tmp/om-replay'
@@ -50,43 +73,15 @@ const OLD_CACHE = '/tmp/om-vcc/luna-cache'
 const TRANSCRIPTS = ['om-orchestration', 'om-v04', 'firstmate-11']
 // Transcripts whose content (memories, questions, answers, excerpts) never leaves this machine: aggregate numbers only.
 const PRIVATE = new Set(['firstmate-11'])
-// Virtual latency of one pi call, as /tmp/om-vcc/replay.ts had it: fixed, so every replay schedules identically.
+// Virtual latency of one pi call, as the earlier prior-art replay had it: fixed, so every replay schedules identically.
 const OBSERVER_MS = 15_000
 const REFLECTOR_MS = 30_000
 const SESSION = 'replay'
 
-function fail(message: string): never {
-  console.error(message)
-  process.exit(1)
-}
-function options(argv: string[]) {
-  const o: Record<string, string | true> = {}
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!
-    if (!a.startsWith('--')) fail(`unexpected argument ${a}`)
-    const next = argv[i + 1]
-    if (next === undefined || next.startsWith('--')) o[a.slice(2)] = true
-    else ((o[a.slice(2)] = next), i++)
-  }
-  return o
-}
-const str = (o: Record<string, string | true>, k: string) => (typeof o[k] === 'string' ? (o[k] as string) : undefined)
-const num = (o: Record<string, string | true>, k: string, dflt?: number) => {
-  const v = str(o, k)
-  if (v === undefined) return dflt
-  const n = Number(v)
-  if (!Number.isFinite(n) || n < 0) fail(`--${k} ${v}: not a number`)
-  return n
-}
-function mainCheckout() {
-  const r = spawnSync('git', ['-C', HERE, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' })
-  if (r.status !== 0) fail(`cannot find the main checkout from ${HERE}: ${r.stderr}`)
-  return dirname(r.stdout.trim())
-}
-const transcriptDir = (o: Record<string, string | true>) => str(o, 'dir') ?? `${mainCheckout()}/tests/fixtures/replay`
-const names = (o: Record<string, string | true>) => (str(o, 'transcripts') ?? TRANSCRIPTS.join(',')).split(',').filter(Boolean)
+const transcriptDir = (o: Options) => str(o, 'dir') ?? `${mainCheckout()}/tests/fixtures/replay`
+const names = (o: Options) => (str(o, 'transcripts') ?? TRANSCRIPTS.join(',')).split(',').filter(Boolean)
 
-function load(o: Record<string, string | true>, name: string) {
+function load(o: Options, name: string) {
   const path = `${transcriptDir(o)}/${name}.jsonl`
   if (!existsSync(path)) fail(`${path}: no such transcript`)
   const text = readFileSync(path, 'utf8')
@@ -106,7 +101,7 @@ async function checkedSpec(name: string, t: Transcript) {
 
 // ---- dry-run ----
 
-async function dryRun(o: Record<string, string | true>) {
+async function dryRun(o: Options) {
   const calls = []
   for (const name of names(o)) {
     const { t } = load(o, name)
@@ -119,19 +114,19 @@ async function dryRun(o: Record<string, string | true>) {
     // What the question stage would run, once per configuration at the first boundary with questions.
     const first = planned.find((c) => c.stage === 'question')?.boundary
     if (spec && first)
-      for (const config of REPLAY_CONFIGURATIONS) {
+      for (const config of CONFIGURATIONS) {
         const b = t.boundaries[first - 1]!
         const q = planQuestionSession({ config, boundary: first, context: { summary: b.summary, kept: b.kept }, questions: questionsAt(spec, first), runDir: `${OUT_ROOT}/${name}/questions`, sessionId: '<session id>', recallPluginDir: `${OUT_ROOT}/${name}/questions/recall-plugin` })
-        const argv = q.argv.map((a) => (a === q.prompt ? `<prompt: ${q.prompt.length} chars>` : a))
-        console.log(`  question session, ${config} @${first}: ${shellLine(argv)}${q.seed ? ` (resumes a seeded copy of spans 0-${first - 1})` : ''}; the session's own compaction stands in for the context`)
+        console.log(`  question session, ${config} @${first}: ${shellLine(q.argv)} < <prompt: ${q.prompt.length} chars>${q.seed ? ` (resumes a seeded copy of spans 0-${first - 1})` : ''}; the session's own compaction stands in for the context`)
       }
   }
-  console.log(`\n${describePlan(calls)}`)
+  console.log(`\n${describeCalls(calls)}`)
 }
 
 // ---- om: the offline replay through a build's hooks ----
 
 type PiResult = { exitCode: number; stdout: string; stderr: string }
+// `inTokens` is the prompt's size estimated before the call; `in`, `out` and `cost` are pi's own usage record.
 type Call = { kind: 'observer' | 'reflector'; atCompaction: boolean; start: number; prompt: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
 
 function piMessage(stdout: string) {
@@ -152,12 +147,12 @@ function stub(prompt: string): PiResult {
     ? [...prompt.matchAll(/^\* .+$/gm)].map((m) => m[0]).filter((_, i) => i % 2 === 0)
     : [...prompt.matchAll(/^\[(User|Assistant)(?: @ ([\d-]+ [\d:]+))?\]: (.{0,60})/gm)].map((m) => `* 🟡 ${m[2] ?? ''} ${m[1]} said ${m[3]!.replace(/\s+/g, ' ')}`)
   const text = `<observations>\n${lines.join('\n') || '* 🟡 Nothing to note'}\n</observations>` + (reflect ? '' : '\n<continuation>\nActive: stub\n</continuation>')
-  const usage = { input: Math.ceil(prompt.length / 4), output: Math.ceil(text.length / 4), cost: { total: 0 } }
+  const usage = { input: estimateTokens(prompt), output: estimateTokens(text), cost: { total: 0 } }
   const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage }
   return { exitCode: 0, stderr: '', stdout: JSON.stringify({ type: 'message_end', message }) }
 }
 
-async function om(o: Record<string, string | true>) {
+async function om(o: Options) {
   const name = str(o, 'transcript') ?? fail('--transcript: one of ' + TRANSCRIPTS.join(', '))
   const piMode = (str(o, 'pi') ?? 'strict') as 'stub' | 'strict' | 'live'
   if (!['stub', 'strict', 'live'].includes(piMode)) fail(`--pi ${piMode}: stub, strict or live`)
@@ -203,7 +198,6 @@ async function om(o: Record<string, string | true>) {
   }
 
   const inOut = (p: string) => p === out || p.startsWith(`${out}/`)
-  const RECALL_TOOL_NAME = 'mcp__observational-memory__om_recall'
   const $: any = {
     session: {
       id: async () => SESSION,
@@ -239,7 +233,7 @@ async function om(o: Record<string, string | true>) {
     },
     env: { get: async (k: string) => env[k] ?? null },
     agent: { list: async () => [] },
-    tool: { list: async () => [{ name: RECALL_TOOL_NAME }], register: async () => {} },
+    tool: { list: async () => [{ name: RECALL_TOOL }], register: async () => {} },
     command: { register: async () => {} },
     fs: {
       read: async (p: string) => {
@@ -263,7 +257,7 @@ async function om(o: Record<string, string | true>) {
         if (argv[0] !== 'pi') return Promise.reject(new Error(`the replay runs pi alone, not ${argv[0]}`))
         const stdin = init.stdin ?? ''
         const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : 'observer'
-        const call: Call = { kind, atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), inTokens: Math.ceil((stdin.length + (argv[argv.indexOf('--system-prompt') + 1] ?? '').length) / 4), hit: false, in: 0, out: 0, cost: 0, ok: false }
+        const call: Call = { kind, atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
         calls.push(call)
         const result = runPi(argv, stdin, init).then(
           ({ r, hit, realMs }) => {
@@ -346,32 +340,29 @@ async function om(o: Record<string, string | true>) {
 
   await hooks['classic.SessionStart']($, { source: 'startup', session_id: SESSION, transcript_path: path }, async (e: unknown) => e)
   const wall0 = performance.now()
-  let index = 0
   const steps = await replayChain(
     t,
-    {
+    hookDriver({
       at: advance,
-      row: async (_row, h) => void (history = h),
-      event: async (e, h) => {
-        history = h
-        if (e.kind === 'start') await hooks['turn.start']($, { text: h.at(-1)!.text, turnId: 't' }, async () => ({ turnId: 't' }))
-        else if (e.kind === 'step') {
-          const gen = hooks['turn.step']($, { turnId: 't', index: index++, model: 'claude', messageCount: h.length }, async function* () {
-            return { turnId: 't', index, answer: '', toolUses: [], stopReason: 'tool_use', usage: null }
-          })
-          for (let r = await gen.next(); !r.done; r = await gen.next());
-        } else if (e.kind === 'complete') await hooks['turn.complete']($, { answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' }, async () => ({ text: '' }))
-        else if (e.kind === 'skill') await hooks['skill.prompt']($, { skill: e.skill, text: e.text }, async () => ({ text: e.text }))
+      history: (h) => void (history = h),
+      turnStart: (text) => hooks['turn.start']($, { text, turnId: 't' }, async () => ({ turnId: 't' })),
+      step: async (index, messageCount) => {
+        const gen = hooks['turn.step']($, { turnId: 't', index, model: 'claude', messageCount }, async function* () {
+          return { turnId: 't', index, answer: '', toolUses: [], stopReason: 'tool_use', usage: null }
+        })
+        for (let r = await gen.next(); !r.done; r = await gen.next());
       },
+      turnComplete: () => hooks['turn.complete']($, { answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' }, async () => ({ text: '' })),
+      skill: (skill, text) => hooks['skill.prompt']($, { skill, text }, async () => ({ text })),
       compact: async (live, boundary) => {
         const before = calls.length
         const output = await compact(live, boundary)
         writeFileSync(`${out}/compaction-${boundary.n}.md`, output[0]?.text ?? '')
         writeFileSync(`${out}/kept-${boundary.n}.json`, JSON.stringify(output.slice(1), null, 1))
-        console.log(`[${name}] compaction ${boundary.n}: ${live.length} live rows in, memory ~${Math.ceil((output[0]?.text.length ?? 0) / 4)} tokens, ${output.length - 1} kept raw, ${calls.length - before} pi call(s) at compaction`)
+        console.log(`[${name}] compaction ${boundary.n}: ${live.length} live rows in, memory ~${estimateTokens(output[0]?.text ?? '')} tokens, ${output.length - 1} kept raw, ${calls.length - before} pi call(s) at compaction`)
         return output
       },
-    },
+    }),
     upTo,
   )
   while (pending.length) await advance(Math.min(...pending.map((p) => p.due)))
@@ -400,28 +391,13 @@ async function om(o: Record<string, string | true>) {
   writeFileSync(`${out}/calls.json`, JSON.stringify(calls.map((c) => ({ ...c, start: new Date(c.start).toISOString() })), null, 1))
   writeFileSync(`${out}/log.txt`, logs.map((l) => `${new Date(l.at).toISOString()} ${l.to ?? ''} ${l.text}`).join('\n'))
   console.log(`[${name}] ${JSON.stringify(summary)}`)
+  // The stats file's delayed write (`clock.after` with a delay) runs on a real timer the plugin may leave armed.
   process.exit(0)
 }
 
 // ---- builtin: the live built-in chain ----
 
-function herdr(argv: string[]) {
-  const r = spawnSync('herdr', argv, { encoding: 'utf8' })
-  return { ok: r.status === 0, out: `${r.stdout ?? ''}${r.stderr ?? ''}` }
-}
-// The session's JSONL, following the files it continued in.
-function sessionFile(dir: string, sessionId: string) {
-  let file = `${dir}/${sessionId}.jsonl`
-  for (let seen = new Set<string>(); existsSync(file) && !seen.has(file); ) {
-    seen.add(file)
-    const next = readFileSync(file, 'utf8').match(/"continuedInSessionId":"([0-9a-f-]{36})"/)?.[1]
-    if (!next || !existsSync(`${dir}/${next}.jsonl`)) break
-    file = `${dir}/${next}.jsonl`
-  }
-  return file
-}
-
-async function builtin(o: Record<string, string | true>) {
+async function builtin(o: Options) {
   const name = str(o, 'transcript') ?? fail('--transcript: one of ' + TRANSCRIPTS.join(', '))
   const pane = str(o, 'pane') ?? fail('--pane: an existing herdr pane at a shell prompt (herdr pane list)')
   const budget = num(o, 'budget-usd') ?? fail('--budget-usd: the most this chain may cost')
@@ -438,35 +414,38 @@ async function builtin(o: Record<string, string | true>) {
   mkdirSync(plan.projectDir, { recursive: true })
   writeFileSync(plan.settingsPath, JSON.stringify(plan.settings, null, 2) + '\n')
   const listed = spawnSync('claude', ['--settings', plan.settingsPath, 'plugin', 'list', '--json'], { encoding: 'utf8', cwd: plan.projectDir })
-  if (/"id":\s*"observational-memory@[^"]*"[^}]*"enabled":\s*true/.test(listed.stdout ?? '')) fail('observational-memory loads with these settings: the built-in chain would not be built-in')
+  const problems = checkPluginList(listed.stdout ?? '', { expectedPlugin: undefined })
+  if (problems.length) fail(`Not starting: the built-in chain would not be built-in:\n- ${problems.join('\n- ')}`)
   const projects = `${process.env.HOME}/.claude/projects/${plan.projectDir.replace(/[^A-Za-z0-9]/g, '-')}`
   mkdirSync(projects, { recursive: true })
   let id = sessionId
   let leaf: string | null = null
+  let seeded = 0
   const log = `${runDir}/steps.log`
-  for (const st of plan.steps) {
+  // The session's JSONL, or where the first seed starts it.
+  const sessionFile = () => findTranscripts(id).at(-1) ?? `${projects}/${id}.jsonl`
+  for (const [i, st] of plan.steps.entries()) {
+    const head = `${i + 1}/${plan.steps.length} ${st.purpose}`
     appendFileSync(log, `${new Date().toISOString()} ${st.kind}: ${st.purpose}\n`)
     if (st.kind === 'settle') await new Promise((r) => setTimeout(r, st.ms))
     else if (st.kind === 'seed') {
-      const rows = seedRows(text, st.span, { sessionId: id, cwd: plan.projectDir, parentUuid: leaf })
-      appendFileSync(sessionFile(projects, id), rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
+      const rows = seedRows(text, st.span, { sessionId: id, cwd: plan.projectDir, parentUuid: leaf, from: Date.now() })
+      appendFileSync(sessionFile(), rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
       leaf = rows.at(-1)?.uuid ?? leaf
+      seeded = (t.spans[st.span] ?? []).reduce((n, r) => n + estimateTokens(messageText(r)), 0)
     } else if (st.kind === 'collect') {
-      const file = sessionFile(projects, id)
+      const file = sessionFile()
       id = file.slice(file.lastIndexOf('/') + 1, -'.jsonl'.length)
       const c = lastCompaction(readFileSync(file, 'utf8'))
-      if (!c || c.summary === '' || !readFileSync(file, 'utf8').includes('compact_boundary')) fail(`step "${st.purpose}": no compaction in ${file}; see ${log}`)
-      const boundaries = parseTranscript(readFileSync(file, 'utf8')).boundaries.length
-      if (boundaries !== st.boundary) fail(`step "${st.purpose}": ${file} holds ${boundaries} compactions, expected ${st.boundary}`)
+      const why = uncompacted(c, st.boundary, seeded)
+      if (why || !c) fail(`step "${st.purpose}": ${why} in ${file}; see ${log}`)
       writeFileSync(`${runDir}/compaction-${st.boundary}.md`, c.summary)
       writeFileSync(`${runDir}/kept-${st.boundary}.json`, JSON.stringify(c.kept.map(({ at: _, uuid: _u, line: _l, ...m }) => m), null, 1))
       leaf = c.leaf ?? leaf
-      console.log(`compaction ${st.boundary}: summary ~${Math.ceil(c.summary.length / 4)} tokens, ${c.kept.length} kept`)
+      console.log(`compaction ${st.boundary}: summary ~${estimateTokens(c.summary)} tokens, ${c.kept.length} kept`)
     } else {
-      const argv = st.argv.map((a) => (a === sessionId ? id : a))
-      const r = herdr(argv)
-      appendFileSync(log, `$ herdr ${shellLine(argv)}\n${r.out}\n`)
-      if (!r.ok && !(st.stallOk && /agent_prompt_stalled/.test(r.out))) fail(`step "${st.purpose}" failed: ${r.out.slice(0, 500)}; the pane is left as it is`)
+      const failed = await send({ ...st, argv: st.argv.map((a) => (a === sessionId ? id : a)) }, head, pane, log)
+      if (failed) fail(`step "${st.purpose}" failed: ${failed}; the pane is left as it is`)
     }
   }
 }
@@ -477,14 +456,15 @@ const readContexts = (dir: string, n: number): (Context | undefined)[] =>
   Array.from({ length: n }, (_, i) =>
     existsSync(`${dir}/compaction-${i + 1}.md`) ? { summary: readFileSync(`${dir}/compaction-${i + 1}.md`, 'utf8'), kept: existsSync(`${dir}/kept-${i + 1}.json`) ? JSON.parse(readFileSync(`${dir}/kept-${i + 1}.json`, 'utf8')) : [] } : undefined,
   )
-const SOURCES: [string, string, string][] = [
-  ['om-live', 'om', 'om replay of this checkout, Luna through pi (cached)'],
-  ['om-strict', 'om', 'om replay of this checkout, Luna through pi (cached)'],
-  ['om-stub', 'om (stub)', 'om replay of this checkout with pi stubbed: checks the chain, not a measurement'],
-  ['builtin', 'built-in', 'live built-in chain (Sonnet)'],
+// Each result directory under /tmp/om-replay/<transcript>/ the report reads, as the configuration it stands for.
+const SOURCES: { dir: string; config: string; source: string }[] = [
+  { dir: 'om-live', config: 'om', source: 'om replay of this checkout, Luna through pi (cached)' },
+  { dir: 'om-strict', config: 'om', source: 'om replay of this checkout, Luna through pi (cached)' },
+  { dir: 'om-stub', config: 'om (stub)', source: 'om replay of this checkout with pi stubbed: checks the chain, not a measurement' },
+  { dir: 'builtin', config: 'built-in', source: 'live built-in chain (Sonnet)' },
 ]
 
-async function report(o: Record<string, string | true>) {
+async function report(o: Options) {
   const parts: string[] = ['# Retention over many real compactions', '']
   parts.push(
     'Scored with no model. "recorded" is the session\'s own compaction as it ran (the plugin version the session had);',
@@ -499,14 +479,13 @@ async function report(o: Record<string, string | true>) {
     const results: ConfigResult[] = [{ config: 'recorded', source: "the session's own compaction", contexts: t.boundaries.map((b) => ({ summary: b.summary, kept: b.kept })) }]
     const only = str(o, 'configs')?.split(',')
     if (only) results.splice(0, results.length, ...results.filter((r) => only.includes(r.config)))
-    for (const [dir, config, source] of SOURCES) {
+    for (const { dir, config, source } of SOURCES) {
       if (only && !only.includes(config)) continue
       const path = `${OUT_ROOT}/${name}/${dir}`
       if (results.some((r) => r.config === config) || !existsSync(`${path}/compaction-1.md`)) continue
-      // A cached or live replay whose pi calls failed compacted on the floor or with what it had: not om's measurement.
-      const failed = dir === 'om-stub' ? 0 : ((existsSync(`${path}/summary.json`) ? JSON.parse(readFileSync(`${path}/summary.json`, 'utf8')) : { luna: { failed: -1 } }).luna?.failed ?? -1)
-      if (failed !== 0) {
-        console.error(`${name}: ${path} left out: ${failed < 0 ? 'no summary.json' : `${failed} pi call(s) failed`}`)
+      const why = leftOut(dir, existsSync(`${path}/summary.json`) ? JSON.parse(readFileSync(`${path}/summary.json`, 'utf8')) : undefined)
+      if (why) {
+        console.error(`${name}: ${path} left out: ${why}`)
         continue
       }
       results.push({ config, source, contexts: readContexts(path, t.boundaries.length) })

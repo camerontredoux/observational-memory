@@ -13,12 +13,12 @@ The +recall configurations differ only at the question stage, which is planned a
 
 | boundary | needed | recorded |
 |---:|---:|---:|
-| 1 | 0 | – |
-| 2 | 10 | 9/10 (90%) |
-| 3 | 17 | 14/17 (82%) |
+| 1 | 2 | 1/2 (50%) |
+| 2 | 11 | 10/11 (91%) |
+| 3 | 19 | 13/19 (68%) |
 | 4 | 7 | 4/7 (57%) |
-| 5 | 21 | 15/21 (71%) |
-| all | 55 | 42/55 (76%) |
+| 5 | 22 | 15/22 (68%) |
+| all | 61 | 43/61 (70%) |
 
 ### Constraints in force held
 
@@ -34,15 +34,15 @@ The +recall configurations differ only at the question stage, which is planned a
 
 | boundary | recorded ids | recorded constraints |
 |---:|---:|---:|
-| 1 | 15/22 (68%) | 9/9 (100%) |
-| 2 | 17/22 (77%) | 9/9 (100%) |
-| 3 | 16/22 (73%) | 9/9 (100%) |
-| 4 | 18/22 (82%) | 9/9 (100%) |
-| 5 | 17/22 (77%) | 9/9 (100%) |
+| 1 | 16/25 (64%) | 9/9 (100%) |
+| 2 | 18/25 (72%) | 9/9 (100%) |
+| 3 | 17/25 (68%) | 9/9 (100%) |
+| 4 | 19/25 (76%) | 9/9 (100%) |
+| 5 | 18/25 (72%) | 9/9 (100%) |
 
 ### Needed identifiers missing (first 12 per configuration)
 
-- recorded: /tmp/om-bench/results.jsonl (@2), $0.41 (@3), docs/agents/issue-tracker.md (@3), docs/agents/triage-labels.md (@3), /tmp/om-bench/batch-wJ2_p (@4), agent/observer/prompt.ts (@4), .claude/types (@4), hooks/stats.ts (@5), $1.50 (@5), /tmp/om-bench/jobs- (@5), /tmp/om-bench/batch-wJ2_p (@5), /tmp/om-bench/batch-wJ2_pE.log (@5), and 1 more
+- recorded: <a session> (@1), /tmp/om-bench/results.jsonl (@2), ~/.claude/debug (@3), $0.37 (@3), $0.41 (@3), ~/.agents/docs/documentation-style.md (@3), docs/agents/issue-tracker.md (@3), docs/agents/triage-labels.md (@3), /tmp/om-bench/batch-wJ2_p (@4), agent/observer/prompt.ts (@4), .claude/types (@4), hooks/stats.ts (@5), and 6 more
 
 ### Constraints in force missing
 
@@ -56,22 +56,22 @@ Sources: recorded: the session's own compaction.
 
 ## om-v04
 
-13 MB, 9 real compactions at about 159k tokens; 6 constraints, 7 questions.
+13 MB, 9 real compactions at about 159k tokens; 6 constraints, 6 questions.
 
 ### Needed identifiers held
 
 | boundary | needed | recorded |
 |---:|---:|---:|
-| 1 | 7 | 3/7 (43%) |
-| 2 | 3 | 3/3 (100%) |
+| 1 | 8 | 3/8 (38%) |
+| 2 | 5 | 5/5 (100%) |
 | 3 | 2 | 2/2 (100%) |
-| 4 | 8 | 6/8 (75%) |
-| 5 | 1 | 1/1 (100%) |
-| 6 | 11 | 11/11 (100%) |
-| 7 | 11 | 9/11 (82%) |
-| 8 | 4 | 4/4 (100%) |
-| 9 | 3 | 3/3 (100%) |
-| all | 50 | 42/50 (84%) |
+| 4 | 11 | 8/11 (73%) |
+| 5 | 3 | 3/3 (100%) |
+| 6 | 16 | 14/16 (88%) |
+| 7 | 12 | 10/12 (83%) |
+| 8 | 6 | 5/6 (83%) |
+| 9 | 5 | 5/5 (100%) |
+| all | 68 | 55/68 (81%) |
 
 ### Constraints in force held
 
@@ -91,19 +91,19 @@ Sources: recorded: the session's own compaction.
 
 | boundary | recorded ids | recorded constraints |
 |---:|---:|---:|
-| 1 | 16/22 (73%) | 1/1 (100%) |
-| 2 | 21/22 (95%) | 1/1 (100%) |
-| 3 | 20/22 (91%) | 1/1 (100%) |
-| 4 | 18/22 (82%) | 1/1 (100%) |
-| 5 | 20/22 (91%) | 1/1 (100%) |
-| 6 | 18/22 (82%) | 1/1 (100%) |
-| 7 | 18/22 (82%) | 1/1 (100%) |
-| 8 | 18/22 (82%) | 1/1 (100%) |
-| 9 | 18/22 (82%) | 1/1 (100%) |
+| 1 | 20/27 (74%) | 1/1 (100%) |
+| 2 | 26/27 (96%) | 1/1 (100%) |
+| 3 | 24/27 (89%) | 1/1 (100%) |
+| 4 | 22/27 (81%) | 1/1 (100%) |
+| 5 | 24/27 (89%) | 1/1 (100%) |
+| 6 | 21/27 (78%) | 1/1 (100%) |
+| 7 | 22/27 (81%) | 1/1 (100%) |
+| 8 | 22/27 (81%) | 1/1 (100%) |
+| 9 | 22/27 (81%) | 1/1 (100%) |
 
 ### Needed identifiers missing (first 12 per configuration)
 
-- recorded: $0.0029 (@1), $0.0034 (@1), $0.0016 (@1), $0.0015 (@1), b776c4b (@4), turn.start/turn.complete (@4), /tmp/pj (@7), /tmp/cmp2/probes (@7)
+- recorded: ~/.claude/plugins/store/observational-memory_inline- (@1), $0.0029 (@1), $0.0034 (@1), $0.0016 (@1), $0.0015 (@1), <a session> (@4), <a session> (@4), turn.start/turn.complete (@4), <a session> (@6), ~/.claude/settings.json (@6), /tmp/pj (@7), /tmp/cmp2/probes (@7), and 1 more
 
 ### Constraints in force missing
 
@@ -111,7 +111,7 @@ Sources: recorded: the session's own compaction.
 
 ### Question stage (planned, not run)
 
-7 questions, 5 with an exact-string check and 2 needing a model grader; 39 asks per configuration over the 9 boundaries.
+6 questions, 4 with an exact-string check and 2 needing a model grader; 30 asks per configuration over the 9 boundaries.
 
 Sources: recorded: the session's own compaction.
 
@@ -124,17 +124,17 @@ Sources: recorded: the session's own compaction.
 | boundary | needed | recorded |
 |---:|---:|---:|
 | 1 | 0 | – |
-| 2 | 7 | 5/7 (71%) |
-| 3 | 11 | 2/11 (18%) |
-| 4 | 5 | 3/5 (60%) |
-| 5 | 6 | 5/6 (83%) |
-| 6 | 2 | 0/2 (0%) |
+| 2 | 6 | 4/6 (67%) |
+| 3 | 12 | 3/12 (25%) |
+| 4 | 8 | 4/8 (50%) |
+| 5 | 6 | 4/6 (67%) |
+| 6 | 3 | 1/3 (33%) |
 | 7 | 1 | 1/1 (100%) |
 | 8 | 1 | 1/1 (100%) |
-| 9 | 2 | 2/2 (100%) |
+| 9 | 3 | 2/3 (67%) |
 | 10 | 4 | 1/4 (25%) |
 | 11 | 2 | 2/2 (100%) |
-| all | 41 | 22/41 (54%) |
+| all | 46 | 23/46 (50%) |
 
 ### Constraints in force held
 
@@ -156,17 +156,17 @@ Sources: recorded: the session's own compaction.
 
 | boundary | recorded ids | recorded constraints |
 |---:|---:|---:|
-| 1 | 10/13 (77%) | – |
-| 2 | 7/13 (54%) | – |
-| 3 | 8/13 (62%) | – |
-| 4 | 10/13 (77%) | – |
-| 5 | 11/13 (85%) | – |
-| 6 | 11/13 (85%) | – |
-| 7 | 11/13 (85%) | – |
-| 8 | 10/13 (77%) | – |
-| 9 | 9/13 (69%) | – |
-| 10 | 9/13 (69%) | – |
-| 11 | 11/13 (85%) | – |
+| 1 | 10/14 (71%) | – |
+| 2 | 6/14 (43%) | – |
+| 3 | 7/14 (50%) | – |
+| 4 | 9/14 (64%) | – |
+| 5 | 10/14 (71%) | – |
+| 6 | 10/14 (71%) | – |
+| 7 | 10/14 (71%) | – |
+| 8 | 8/14 (57%) | – |
+| 9 | 8/14 (57%) | – |
+| 10 | 9/14 (64%) | – |
+| 11 | 12/14 (86%) | – |
 
 ### Question stage (planned, not run)
 

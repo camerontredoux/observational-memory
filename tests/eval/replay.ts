@@ -11,7 +11,10 @@
 // boundary row: they are the compaction's output, not new rows. Boundary n's context is what a configuration's
 // compaction n left: its summary (or memory message) and the rows it kept raw.
 import type { SessionMessage } from 'claude-code'
-import { PRICES_USD_PER_MTOK } from './bench'
+import { PRICES_USD_PER_MTOK, RECALL_TOOL } from './bench'
+import { MODEL } from './live'
+import { CONFIGURATIONS, recallAvailable } from './runner'
+import type { Configuration } from './runner'
 
 // ---- The transcript ----
 
@@ -38,6 +41,8 @@ export type ReplayEvent =
 export type Transcript = { cwd?: string; events: ReplayEvent[]; spans: Row[][]; boundaries: Boundary[] }
 
 type Raw = Record<string, any>
+/** A transcript's JSONL rows, parsed. */
+const rawRows = (jsonl: string | readonly Raw[]): Raw[] => (typeof jsonl === 'string' ? jsonl.split('\n').flatMap((l) => (l.trim() ? [JSON.parse(l)] : [])) : [...jsonl])
 const blockText = (c: unknown): string =>
   typeof c === 'string' ? c : Array.isArray(c) ? c.map((b: { text?: unknown }) => (typeof b.text === 'string' ? b.text : '')).join('\n') : ''
 
@@ -66,7 +71,7 @@ const isSummaryRow = (r: Raw) => r.isCompactSummary === true || blockText(r.mess
  * too, but one that loads a skill is that skill's event.
  */
 export function parseTranscript(jsonl: string | readonly Raw[]): Transcript {
-  const raw: Raw[] = typeof jsonl === 'string' ? jsonl.split('\n').flatMap((l) => (l.trim() ? [JSON.parse(l)] : [])) : [...jsonl]
+  const raw = rawRows(jsonl)
   const events: ReplayEvent[] = []
   const spans: Row[][] = [[]]
   const boundaries: Boundary[] = []
@@ -125,7 +130,7 @@ export const messageText = (m: Pick<SessionMessage, 'text' | 'toolUses' | 'toolR
 // Text Claude Code or a hook writes as a user row: not the user's own words.
 const NOT_TYPED = /^\s*(?:<(?:task-notification|command-name|command-message|command-args|local-command-\w+|system-reminder|bash-\w+)>|\[Request interrupted|Caveat: )/
 /** Whether a row is a message the user typed. */
-export const isTyped = (row: SessionMessage) => row.role === 'user' && !row.toolResults && !!row.text.trim() && !NOT_TYPED.test(row.text)
+const isTyped = (row: SessionMessage) => row.role === 'user' && !row.toolResults && !!row.text.trim() && !NOT_TYPED.test(row.text)
 
 // ---- Identifiers ----
 
@@ -137,7 +142,7 @@ const PATTERNS: [IdentifierKind, RegExp][] = [
   ['pane', /\bw\d+:p\d+\b/g],
   // A path of two or more segments, from the root, a home or a relative directory: `hooks/register.ts`, `~/.agents/x`.
   // Read first, so a hash, a version or a UUID inside a path is part of it.
-  ['path', /(?<![\w.:/~$-])(?:~|\.{1,2})?\/?(?:[\w@+-][\w.@+-]*\/)+[\w@+-][\w.@+-]*/g],
+  ['path', /(?<![\w.:/~$-])(?:~|\.{1,2})?\/?(?:\.?[\w@+-][\w.@+-]*\/)+\.?[\w@+-][\w.@+-]*/g],
   ['uuid', UUID],
   // A dollar amount with cents or two or more digits: `$1` alone is more often a shell or awk variable.
   ['usd', /\$(?:\d[\d,]*\.\d+|\d{1,3}(?:,\d{3})+|\d{2,})\b/g],
@@ -152,7 +157,7 @@ const SYSTEM_PATH = /^\/(?:dev|usr|bin|sbin|proc|etc|lib)\//
 const PATH_LIKE = /\.\w+$|[-_.]/
 
 /** Text as the scorer reads it: a home directory as `~`. */
-export const normalize = (text: string) => text.replace(HOME, '~')
+const normalize = (text: string) => text.replace(HOME, '~')
 
 /**
  * The identifiers a text names, each by its key: a commit hash (7 to 40 hex digits with a letter and a digit) by
@@ -184,17 +189,24 @@ function pathLike(key: string) {
   return PATH_LIKE.test(key) && !/^\d+\/\d+$/.test(key)
 }
 
+const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+/** Whether `text` holds `token` whole: not inside a longer word, number or version (`#1` is not in `#13`). */
+const whole = (text: string, token: string, prefix = '') => new RegExp(`(?<![\\w.])${prefix}${escape(token)}(?![\\w]|\\.\\d)`).test(text)
+
 /**
- * Whether a context holds an identifier: a hash by its 7-digit prefix, a path whole or by its last two segments
- * (a summary may name `hooks/register.ts` for the absolute path), anything else whole.
+ * Whether a context holds an identifier, as a whole token: a hash by its 7-digit prefix, a path whole or by its
+ * last two segments (a summary may name `hooks/register.ts` for the absolute path), a dollar amount with or without
+ * its thousands commas, a version with or without its `v`, anything else whole.
  */
 export function holds(context: string, key: string, kind: IdentifierKind) {
   if (kind === 'path') {
     const parts = key.split('/').filter((p) => p && p !== '~' && p !== '.' && p !== '..')
-    return context.includes(key) || (parts.length >= 2 && context.includes(parts.slice(-2).join('/')))
+    return whole(context, key) || (parts.length >= 2 && whole(context, parts.slice(-2).join('/')))
   }
-  if (kind === 'uuid') return context.toLowerCase().includes(key)
-  return context.includes(key)
+  if (kind === 'commit') return new RegExp(`(?<![\\w-])${key}`).test(context)
+  if (kind === 'uuid') return whole(context.toLowerCase(), key)
+  if (kind === 'usd') return whole(context.replace(/(\d),(?=\d{3})/g, '$1'), key)
+  return whole(context, key, kind === 'version' ? 'v?' : '')
 }
 
 const assistantUse = (row: Row) => (row.role === 'assistant' ? [row.text, ...row.toolUses.map((u) => JSON.stringify(u.input))].join('\n') : '')
@@ -335,11 +347,11 @@ export function drift(t: Transcript, specs: readonly ConstraintSpec[], contexts:
 
 export const questionsAt = (spec: ReplaySpec | undefined, n: number) => (spec?.questions ?? []).filter((q) => q.from <= n)
 export type AnswerCheck = 'pass' | 'fail' | 'needs a model grader'
-/** An exact-string check: every expected string in the answer, case and spacing aside. */
+/** An exact-string check: every expected string in the answer as a whole token, case and spacing aside. */
 export function checkAnswer(q: Question, answer: string): AnswerCheck {
   if (!q.expect?.length) return 'needs a model grader'
   const a = squash(answer).toLowerCase()
-  return q.expect.every((x) => a.includes(squash(x).toLowerCase())) ? 'pass' : 'fail'
+  return q.expect.every((x) => whole(a, squash(x).toLowerCase())) ? 'pass' : 'fail'
 }
 
 /** Reads a question session's answers: one `<id>: <answer>` line per question; a question with no line has no answer. */
@@ -353,9 +365,12 @@ export function parseAnswers(text: string, questions: readonly Question[]): Map<
 }
 
 export type QuestionSession = {
-  /** The headless session's command line, run in `projectDir`. */
+  /** The headless session's command line, run in `projectDir`, with `prompt` on its standard input. */
   argv: string[]
-  /** What it is asked: every question, and for a plain configuration the compacted context before them. */
+  /**
+   * What it is asked: every question, and for a plain configuration the compacted context before them. On stdin, not
+   * argv: a compacted context can pass Linux's 128 KiB cap on one argument (MAX_ARG_STRLEN).
+   */
   prompt: string
   settingsPath: string
   settings: { env: { CLAUDE_CODE_PLUGIN_DIRS: string } }
@@ -375,16 +390,15 @@ export type QuestionSession = {
  * Planned for the dry run and tested; nothing runs it yet.
  */
 export function planQuestionSession(input: {
-  config: ReplayConfiguration
+  config: Configuration
   boundary: number
   context: Context
   questions: readonly Question[]
   runDir: string
   sessionId: string
   recallPluginDir: string
-  model?: string
 }): QuestionSession {
-  const recall = input.config.endsWith('+recall')
+  const recall = recallAvailable(input.config)
   const dir = `${input.runDir}/q-${input.config}-${input.boundary}`
   const settingsPath = `${dir}/settings.json`
   const asks = input.questions.map((q) => `${q.id}: ${q.ask}`).join('\n')
@@ -393,10 +407,11 @@ export function planQuestionSession(input: {
   const prompt = recall
     ? `${format} You may search this session's transcript with om_recall.\n\n${asks}`
     : `This is what you know of the session so far:\n\n<context>\n${context}\n</context>\n\n${format}\n\n${asks}`
-  // `--tools ''` takes away the built-in tools; a plugin's tool is not one of them, so om_recall stays (unverified
-  // until the first live question run, which checks it before asking anything).
-  const argv = ['claude', '-p', prompt, '--model', input.model ?? QUESTION_MODEL, '--settings', settingsPath, '--output-format', 'json', '--tools', '']
-  if (recall) argv.push('--resume', input.sessionId, '--allowedTools', 'mcp__observational-memory__om_recall')
+  // `--tools ''` takes away the built-in tools; a plugin's tool is not one of them, so om_recall stays. That, and
+  // `-p` reading its prompt from stdin, are unverified until the first live question run, which checks both before
+  // asking anything.
+  const argv = ['claude', '-p', '--model', MODEL, '--settings', settingsPath, '--output-format', 'json', '--tools', '']
+  if (recall) argv.push('--resume', input.sessionId, '--allowedTools', RECALL_TOOL)
   return {
     argv,
     prompt,
@@ -408,34 +423,30 @@ export function planQuestionSession(input: {
 
 // ---- Configurations and the dry run's plan ----
 
-export const REPLAY_CONFIGURATIONS = ['builtin', 'builtin+recall', 'om', 'om+recall'] as const
-export type ReplayConfiguration = (typeof REPLAY_CONFIGURATIONS)[number]
-
 /** Characters per token for estimates, as `hooks/register.ts` estimates. */
 const CHARS_PER_TOKEN = 4
 export const estimateTokens = (text: string) => Math.ceil(text.length / CHARS_PER_TOKEN)
 /** The Observer's chunk, as in `hooks/register.ts`. */
-export const OBSERVER_CHUNK_TOKENS = 10_000
+const OBSERVER_CHUNK_TOKENS = 10_000
 /**
  * One Luna call's cost per input token: a cached Observer call over a ~10k-token chunk cost $0.0032532 for 12,282
  * tokens in and 664 out (pi's own usage record), so a call is priced at its input share of that.
  */
-export const LUNA_USD_PER_INPUT_TOKEN = 0.0032532 / 12_282
+const LUNA_USD_PER_INPUT_TOKEN = 0.0032532 / 12_282
 const OBSERVER_PROMPT_TOKENS = 2_300 // the Observer's system prompt and the chunk's framing
 const REFLECTOR_IN_TOKENS = 40_000
 /** A built-in summary's size, and a headless session's own overhead (system prompt and tool definitions). */
-export const SUMMARY_TOKENS = 5_000
-export const SESSION_OVERHEAD_TOKENS = 20_000
+const SUMMARY_TOKENS = 5_000
+const SESSION_OVERHEAD_TOKENS = 20_000
 /** A +recall answer's extra: up to two om_recall rounds, each re-reading the context and adding what it found. */
 const RECALL_ROUNDS = 2
 const RECALL_RESULT_TOKENS = 3_000
 const ANSWER_TOKENS_PER_QUESTION = 150
-const QUESTION_MODEL = 'sonnet'
 
 export type PlannedCall = {
   transcript: string
   /** The configurations that share the call: a compaction serves both its plain and its +recall configuration. */
-  configs: readonly ReplayConfiguration[]
+  configs: readonly Configuration[]
   stage: 'observer' | 'reflector' | 'compaction' | 'question'
   boundary?: number
   model: string
@@ -445,7 +456,7 @@ export type PlannedCall = {
   usd: number
 }
 
-const sonnet = PRICES_USD_PER_MTOK.find((p) => p.model.test(QUESTION_MODEL))!
+const sonnet = PRICES_USD_PER_MTOK.find((p) => p.model.test(MODEL))!
 // A resumed or headless session starts cold: its input is written to the cache once.
 const sonnetUsd = (inTokens: number, outTokens: number) => (inTokens * sonnet.cacheWrite5m + outTokens * sonnet.output) / 1e6
 
@@ -467,8 +478,8 @@ export type PlanOptions = {
  */
 export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, options: PlanOptions = {}): PlannedCall[] {
   const calls: PlannedCall[] = []
-  const om: ReplayConfiguration[] = ['om', 'om+recall']
-  const builtin: ReplayConfiguration[] = ['builtin', 'builtin+recall']
+  const om: Configuration[] = ['om', 'om+recall']
+  const builtin: Configuration[] = ['builtin', 'builtin+recall']
   const luna = (stage: 'observer' | 'reflector', inTokens: number, what: string, boundary?: number, outTokens = 700) =>
     calls.push({ transcript: name, configs: om, stage, ...(boundary ? { boundary } : {}), model: 'luna (pi)', what, inTokens, outTokens, usd: inTokens * LUNA_USD_PER_INPUT_TOKEN })
   const spanTokens = t.spans.map((span) => span.reduce((n, r) => n + estimateTokens(messageText(r)), 0))
@@ -483,16 +494,16 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
   })
   for (const b of t.boundaries) {
     const inTokens = b.preTokens ?? (b.n === 1 ? spanTokens[0]! : SUMMARY_TOKENS + spanTokens[b.n - 1]!)
-    calls.push({ transcript: name, configs: builtin, stage: 'compaction', boundary: b.n, model: QUESTION_MODEL, what: `/compact ${b.n} in the resumed session`, inTokens, outTokens: SUMMARY_TOKENS, usd: sonnetUsd(inTokens, SUMMARY_TOKENS) })
+    calls.push({ transcript: name, configs: builtin, stage: 'compaction', boundary: b.n, model: MODEL, what: `/compact ${b.n} in the resumed session`, inTokens, outTokens: SUMMARY_TOKENS, usd: sonnetUsd(inTokens, SUMMARY_TOKENS) })
   }
   for (const b of t.boundaries) {
     const qs = questionsAt(spec, b.n)
     if (!qs.length) continue
     const asked = qs.reduce((n, q) => n + estimateTokens(q.ask), 0)
-    for (const config of REPLAY_CONFIGURATIONS) {
+    for (const config of CONFIGURATIONS) {
       const context = config.startsWith('om') ? (b.postTokens ?? SUMMARY_TOKENS) : SUMMARY_TOKENS
       const once = SESSION_OVERHEAD_TOKENS + context + asked
-      const recall = config.endsWith('+recall')
+      const recall = recallAvailable(config)
       const inTokens = recall ? once * (1 + RECALL_ROUNDS) + RECALL_RESULT_TOKENS * RECALL_ROUNDS : once
       const outTokens = ANSWER_TOKENS_PER_QUESTION * qs.length
       calls.push({
@@ -500,7 +511,7 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
         configs: [config],
         stage: 'question',
         boundary: b.n,
-        model: QUESTION_MODEL,
+        model: MODEL,
         what: `${qs.length} question(s) at boundary ${b.n}${recall ? ', om_recall over the transcript' : ''} (${qs.filter((q) => !q.expect?.length).length} need a model grader)`,
         inTokens,
         outTokens,
@@ -515,16 +526,16 @@ const usd = (n: number) => `$${n.toFixed(n < 1 ? 4 : 2)}`
 const grouped = (n: number) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 
 /** The dry run's listing: every planned call, then the estimated cost per configuration and in all. */
-export function describePlan(calls: readonly PlannedCall[]): string {
+export function describeCalls(calls: readonly PlannedCall[]): string {
   const lines = calls.map(
     (c, i) =>
       `${i + 1}. [${c.transcript}] ${c.stage}${c.boundary ? ` @${c.boundary}` : ''} ${c.model} for ${c.configs.join(', ')}: ${c.what}; ~${grouped(c.inTokens)} in, ~${grouped(c.outTokens)} out, ~${usd(c.usd)}`,
   )
-  const per = (config: ReplayConfiguration) => calls.filter((c) => c.configs.includes(config))
+  const per = (config: Configuration) => calls.filter((c) => c.configs.includes(config))
   const table = [
     '| configuration | calls | est. cost (a shared compaction counted in each) |',
     '|---|---:|---:|',
-    ...REPLAY_CONFIGURATIONS.map((config) => `| ${config} | ${per(config).length} | ${usd(per(config).reduce((n, c) => n + c.usd, 0))} |`),
+    ...CONFIGURATIONS.map((config) => `| ${config} | ${per(config).length} | ${usd(per(config).reduce((n, c) => n + c.usd, 0))} |`),
     `| all (each call once) | ${calls.length} | ${usd(calls.reduce((n, c) => n + c.usd, 0))} |`,
   ]
   return [`Dry run: ${calls.length} planned model call(s), none made.`, '', ...lines, '', ...table].join('\n')
@@ -572,6 +583,38 @@ export async function replayChain(t: Transcript, driver: ReplayDriver, upTo = t.
   return steps
 }
 
+/** The hooks a plugin's replay calls, as plain functions: the script's hand-built `$`, or a test's engine. */
+export type ReplayHooks = {
+  at?(time: number): Promise<void>
+  /** The history the plugin's `$.session.messages()` shows from now on. */
+  history(history: readonly SessionMessage[]): void
+  turnStart(text: string): Promise<void>
+  step(index: number, messageCount: number): Promise<void>
+  turnComplete(): Promise<void>
+  skill(skill: string, text: string): Promise<void>
+  compact(live: readonly SessionMessage[], boundary: Boundary): Promise<readonly SessionMessage[]>
+}
+
+/**
+ * The driver that replays a transcript through a plugin's hooks: each row into the history the plugin reads, a
+ * turn's start with its prompt, each model step, a turn's end, each skill load, and each compaction.
+ */
+export function hookDriver(h: ReplayHooks): ReplayDriver {
+  let index = 0
+  return {
+    ...(h.at ? { at: h.at } : {}),
+    row: async (_row, history) => h.history(history),
+    event: async (e, history) => {
+      h.history(history)
+      if (e.kind === 'start') await h.turnStart(history.at(-1)!.text)
+      else if (e.kind === 'step') await h.step(index++, history.length)
+      else if (e.kind === 'complete') await h.turnComplete()
+      else if (e.kind === 'skill') await h.skill(e.skill, e.text)
+    },
+    compact: (live, boundary) => h.compact(live, boundary),
+  }
+}
+
 /** A chain step's output as a context: the first message is the summary, the rest were kept raw. */
 export const contextOf = (output: readonly SessionMessage[]): Context => ({ summary: output[0]?.text ?? '', kept: output.slice(1) })
 
@@ -580,10 +623,12 @@ export const contextOf = (output: readonly SessionMessage[]): Context => ({ summ
 /**
  * Span k's rows as a resumable session's JSONL rows: the transcript's own user and assistant rows (not the output
  * of the session's compaction, not sidechain or meta rows), re-parented one after the other from `parentUuid`, under
- * the new session id and project directory. The first span starts the chain (no parent).
+ * the new session id and project directory. The first span starts the chain (no parent). With `from`, the rows are
+ * stamped one millisecond apart from that time, so rows appended after a compaction the sandbox session wrote are
+ * also later than it, whichever order Claude Code reads them in.
  */
-export function seedRows(jsonl: string | readonly Raw[], span: number, session: { sessionId: string; cwd: string; parentUuid?: string | null }): Raw[] {
-  const raw: Raw[] = typeof jsonl === 'string' ? jsonl.split('\n').flatMap((l) => (l.trim() ? [JSON.parse(l)] : [])) : [...jsonl]
+export function seedRows(jsonl: string | readonly Raw[], span: number, session: { sessionId: string; cwd: string; parentUuid?: string | null; from?: number }): Raw[] {
+  const raw = rawRows(jsonl)
   const out: Raw[] = []
   const seen = new Set<string>()
   let k = 0
@@ -600,7 +645,8 @@ export function seedRows(jsonl: string | readonly Raw[], span: number, session: 
     boundaryAt = undefined
     if (typeof r.uuid !== 'string' || seen.has(r.uuid)) continue
     seen.add(r.uuid)
-    out.push({ ...r, parentUuid: parent, sessionId: session.sessionId, cwd: session.cwd })
+    const timestamp = session.from === undefined ? r.timestamp : new Date(session.from + out.length).toISOString()
+    out.push({ ...r, parentUuid: parent, sessionId: session.sessionId, cwd: session.cwd, timestamp })
     parent = r.uuid
   }
   return out
@@ -613,7 +659,7 @@ export function seedRows(jsonl: string | readonly Raw[], span: number, session: 
  * rows the seed adds.
  */
 export function questionSeedRows(jsonl: string | readonly Raw[], seed: { sessionId: string; through: number; summary: string }, cwd: string, ids: { boundary: string; summary: string }): Raw[] {
-  const raw: Raw[] = typeof jsonl === 'string' ? jsonl.split('\n').flatMap((l) => (l.trim() ? [JSON.parse(l)] : [])) : [...jsonl]
+  const raw = rawRows(jsonl)
   const rows: Raw[] = []
   for (let k = 0; k < seed.through; k++) rows.push(...seedRows(raw, k, { sessionId: seed.sessionId, cwd, parentUuid: rows.at(-1)?.uuid ?? null }))
   const at = raw.filter((r) => r.type === 'system' && r.subtype === 'compact_boundary')[seed.through - 1]?.timestamp ?? rows.at(-1)?.timestamp
@@ -625,15 +671,45 @@ export function questionSeedRows(jsonl: string | readonly Raw[], seed: { session
   return rows
 }
 
-/** What a resumed session's own last compaction left in its JSONL: the summary, the rows after it, and the row the next span continues from. */
-export function lastCompaction(jsonl: string | readonly Raw[]): { summary: string; kept: Row[]; leaf: string | undefined } | undefined {
-  const t = parseTranscript(jsonl)
-  const raw: Raw[] = typeof jsonl === 'string' ? jsonl.split('\n').flatMap((l) => (l.trim() ? [JSON.parse(l)] : [])) : [...jsonl]
+/**
+ * What a resumed session's own last compaction left in its JSONL: the summary, the rows after it, the row the next
+ * span continues from, how many compactions the file holds, and the last one's size of context compacted (Claude
+ * Code's own count), by which the chain checks that the compaction saw the rows appended before it.
+ */
+export function lastCompaction(jsonl: string | readonly Raw[]): { summary: string; kept: Row[]; leaf: string | undefined; boundaries: number; preTokens?: number } | undefined {
+  const raw = rawRows(jsonl)
+  const t = parseTranscript(raw)
   const b = t.boundaries.at(-1)
   if (!b) return undefined
   const leaf = [...raw].reverse().find((r) => (r.type === 'user' || r.type === 'assistant') && !r.isSidechain && typeof r.uuid === 'string')?.uuid
   // Rows written after the boundary without an earlier stamp (the session's reply to /compact, if any) are kept too.
-  return { summary: b.summary, kept: [...b.kept, ...(t.spans.at(-1) ?? [])], leaf }
+  return { summary: b.summary, kept: [...b.kept, ...(t.spans.at(-1) ?? [])], leaf, boundaries: t.boundaries.length, ...(b.preTokens ? { preTokens: b.preTokens } : {}) }
+}
+
+/**
+ * Why a built-in compaction the chain collected did not compact what was seeded before it, or undefined when it
+ * did: Claude Code's count of the context it compacted must reach half the estimate of the rows just appended
+ * (a resumed session that ignored them would compact the last summary alone), and the file must hold one more
+ * compaction than before.
+ */
+export function uncompacted(c: ReturnType<typeof lastCompaction>, boundary: number, seededTokens: number): string | undefined {
+  if (!c || !c.summary) return 'no compaction with a summary'
+  if (c.boundaries !== boundary) return `${c.boundaries} compactions, expected ${boundary}`
+  if (c.preTokens === undefined) return 'no compacted size (compactMetadata.preTokens) to check the appended rows against'
+  if (c.preTokens < seededTokens / 2) return `it compacted ${c.preTokens} tokens, under half of the ~${seededTokens} appended before it: the resumed session did not see them`
+  return undefined
+}
+
+/**
+ * Why the report leaves a result directory out, or undefined to score it: a cached or live om replay (`om-live`,
+ * `om-strict`) whose pi calls failed compacted on the model-free floor or with what it had, which is not om's
+ * measurement. A stub replay answers every call itself, and the built-in chain makes no pi call.
+ */
+export function leftOut(dir: string, summary: { luna?: { failed?: number } } | undefined): string | undefined {
+  if (dir !== 'om-live' && dir !== 'om-strict') return undefined
+  const failed = summary?.luna?.failed
+  if (failed === undefined) return 'no pi call count (summary.json)'
+  return failed ? `${failed} pi call(s) failed` : undefined
 }
 
 export type BuiltinStep =
@@ -649,7 +725,7 @@ export type BuiltinChainPlan = { projectDir: string; settingsPath: string; setti
  * herdr pane with no observational-memory plugin, `/compact` runs with no instructions, the session exits, and the
  * summary and kept rows are read back from its JSONL. Nothing here runs it.
  */
-export function planBuiltinChain(input: { runDir: string; sessionId: string; pane: string; boundaries: number; timeoutMs: number; startTimeoutMs: number; model?: string }): BuiltinChainPlan {
+export function planBuiltinChain(input: { runDir: string; sessionId: string; pane: string; boundaries: number; timeoutMs: number; startTimeoutMs: number }): BuiltinChainPlan {
   const projectDir = `${input.runDir}/project`
   const settingsPath = `${input.runDir}/settings.json`
   const agent = `replay-${input.sessionId.slice(0, 8)}`
@@ -659,7 +735,7 @@ export function planBuiltinChain(input: { runDir: string; sessionId: string; pan
       { kind: 'seed', span: n - 1, purpose: `append span ${n - 1}'s raw rows to the session${n > 1 ? `, after what compaction ${n - 1} left` : ''}` },
       {
         kind: 'herdr',
-        argv: ['agent', 'start', agent, '--kind', 'claude', '--pane', input.pane, '--timeout', String(input.startTimeoutMs), '--', '--model', input.model ?? QUESTION_MODEL, '--resume', input.sessionId, '--settings', settingsPath, '--permission-mode', 'dontAsk'],
+        argv: ['agent', 'start', agent, '--kind', 'claude', '--pane', input.pane, '--timeout', String(input.startTimeoutMs), '--', '--model', MODEL, '--resume', input.sessionId, '--settings', settingsPath, '--permission-mode', 'dontAsk'],
         purpose: `resume the session before boundary ${n}`,
       },
       { kind: 'herdr', argv: ['agent', 'prompt', agent, '/compact', '--wait', '--timeout', String(input.timeoutMs)], purpose: `built-in compaction ${n}, no instructions`, stallOk: true },
@@ -740,8 +816,13 @@ export function renderTranscript(r: ReportInput): string {
   })
   out.push('')
   if (!r.private) {
+    // A session id names a transcript, which may be a private one (a session the user pointed at): the list shows
+    // that one was missing, not which. So does a hash that is only the start of one.
+    const sessions = needed.flat().flatMap((x) => [...x.key.matchAll(UUID)].map((m) => m[0].toLowerCase()))
+    const names = (x: Needed) => sessions.some((id) => x.key.toLowerCase().includes(id) || (x.kind === 'commit' && id.startsWith(x.key))) || x.key.startsWith('~/.claude/projects/')
+    const shown = (x: Needed) => (names(x) ? '<a session>' : x.key)
     const missed = r.results.map((c) => {
-      const lost = needed.flatMap((ids, i) => (c.contexts[i] ? scoreIdentifiers(ids, c.contexts[i]!).missing.map((x) => `${x.key} (@${i + 1})`) : []))
+      const lost = needed.flatMap((ids, i) => (c.contexts[i] ? scoreIdentifiers(ids, c.contexts[i]!).missing.map((x) => `${shown(x)} (@${i + 1})`) : []))
       return `- ${c.config}: ${lost.length ? `${lost.slice(0, 12).join(', ')}${lost.length > 12 ? `, and ${lost.length - 12} more` : ''}` : 'none'}`
     })
     out.push('### Needed identifiers missing (first 12 per configuration)', '', ...missed, '')

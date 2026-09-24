@@ -47,51 +47,21 @@
 // score: rescores a run directory from its meta.json (after a run that stopped before scoring, or a scorer change).
 // report: the markdown report of the results: per plugin version and configuration n, mean and spread; live and
 // offline apart; every live cell not yet run, for the versions given.
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { makeRecord, parseTranscript, renderReport, runCost } from '../tests/eval/bench'
 import type { RunMeta, RunRecord } from '../tests/eval/bench'
-import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, describePlan, MODEL, planRun, shellLine } from '../tests/eval/live'
-import type { Plan, PlanStep } from '../tests/eval/live'
+import { admitRun, autoCompactThreshold, checkPluginList, checkRecallOnly, describePlan, MODEL, planRun } from '../tests/eval/live'
+import type { Plan } from '../tests/eval/live'
 import { CONFIGURATIONS } from '../tests/eval/runner'
 import type { Configuration } from '../tests/eval/runner'
 import { growStep, SCENARIOS, scenarioById } from '../tests/eval/scenarios'
+import { fail, findTranscripts, mainCheckout, num, options, send, str } from './cli'
 
 const BENCH_ROOT = '/tmp/om-bench'
 const HERE = resolve(import.meta.dir, '..')
-
-function fail(message: string): never {
-  console.error(message)
-  process.exit(1)
-}
-
-function options(argv: string[]) {
-  const o: Record<string, string | true> = {}
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!
-    if (!a.startsWith('--')) fail(`unexpected argument ${a}`)
-    const next = argv[i + 1]
-    if (next === undefined || next.startsWith('--')) o[a.slice(2)] = true
-    else ((o[a.slice(2)] = next), i++)
-  }
-  return o
-}
-const str = (o: Record<string, string | true>, k: string) => (typeof o[k] === 'string' ? (o[k] as string) : undefined)
-const num = (o: Record<string, string | true>, k: string, dflt?: number) => {
-  const v = str(o, k)
-  if (v === undefined) return dflt
-  const n = Number(v)
-  if (!Number.isFinite(n) || n < 0) fail(`--${k} ${v}: not a number`)
-  return n
-}
-
-function mainCheckout() {
-  const r = spawnSync('git', ['-C', HERE, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' })
-  if (r.status !== 0) fail(`cannot find the main checkout from ${HERE}: ${r.stderr}`)
-  return dirname(r.stdout.trim())
-}
 
 // The checkout's commit, marked `-dirty` when it has uncommitted changes: what a version label stood for in this run.
 function commitOf(root: string): string {
@@ -114,20 +84,6 @@ function readRecords(path: string): RunRecord[] {
         return []
       }
     })
-}
-
-// The session's transcript and every file it continued in (a moved session), oldest first.
-function findTranscripts(sessionId: string): string[] {
-  const root = `${process.env.HOME}/.claude/projects`
-  const dir = existsSync(root) ? readdirSync(root).map((d) => `${root}/${d}`).find((d) => existsSync(`${d}/${sessionId}.jsonl`)) : undefined
-  if (!dir) return []
-  const files = [`${dir}/${sessionId}.jsonl`]
-  for (;;) {
-    const next = readFileSync(files.at(-1)!, 'utf8').match(/"continuedInSessionId":"([0-9a-f-]{36})"/)?.[1]
-    const path = next && `${dir}/${next}.jsonl`
-    if (!path || files.includes(path) || !existsSync(path)) return files
-    files.push(path)
-  }
 }
 
 function score(meta: RunMeta, error?: string): RunRecord {
@@ -264,38 +220,6 @@ async function run(o: Record<string, string | true>) {
   if (error) process.exit(1)
 }
 
-// Runs one herdr step and recovers from what a live pane does to it; returns why it failed, or undefined.
-async function send(st: Exclude<PlanStep, { kind: 'settle' }>, head: string, pane: string, log: string): Promise<string | undefined> {
-  const stallOk = st.kind === 'herdr' && st.stallOk
-  const starting = st.argv[0] === 'agent' && st.argv[1] === 'start'
-  if (starting) await Bun.sleep(1_000) // the `cd` before it leaves the pane briefly busy: `agent start` wants an idle shell
-  const r = spawnSync('herdr', st.argv, { encoding: 'utf8' })
-  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
-  appendFileSync(log, `${new Date().toISOString()} ${head}\n$ herdr ${shellLine(st.argv)}\nexit ${r.status}\n${out}\n\n`)
-  if (r.status === 0) return
-  // Each run's sandbox is a new folder, so Claude Code asks whether to trust it: accept, then wait for the prompt.
-  if (starting && /agent_not_ready/.test(out) && /trust this folder/.test(herdr(['pane', 'read', pane]))) {
-    herdr(['pane', 'send-keys', pane, 'down', 'enter'])
-    const w = spawnSync('herdr', ['agent', 'wait', st.argv[2]!, '--until', 'idle', '--timeout', '60000'], { encoding: 'utf8' })
-    appendFileSync(log, `accepted the folder trust prompt; agent wait exit ${w.status}\n\n`)
-    await Bun.sleep(3_000) // the prompt box redraws after the trust dialog closes, and drops keys sent while it does
-    if (w.status === 0) return
-  }
-  // A prompt typed while the prompt box redraws is lost: herdr then sees no work start. Send it again once.
-  if (st.prompt && !stallOk && /agent_prompt_stalled/.test(out) && !herdr(['pane', 'read', pane]).includes(st.prompt.slice(0, 40))) {
-    await Bun.sleep(2_000)
-    const again = spawnSync('herdr', st.argv, { encoding: 'utf8' })
-    const out2 = `${again.stdout ?? ''}${again.stderr ?? ''}`.trim()
-    appendFileSync(log, `the prompt did not reach the session; sent it again: exit ${again.status}\n${out2}\n\n`)
-    if (again.status === 0) return
-  }
-  if (stallOk && /agent_prompt_stalled/.test(out)) {
-    console.log('  herdr saw no working state (a fast compaction); carrying on')
-    return
-  }
-  return `exit ${r.status}: ${out.slice(0, 500)}`
-}
-
 function readTranscript(files: readonly string[]) {
   return parseTranscript(files.map((p) => readFileSync(p, 'utf8')).join('\n'))
 }
@@ -303,11 +227,6 @@ function readTranscript(files: readonly string[]) {
 // How many compactions the session's transcript (and any file it continued in) records so far.
 function compactionsIn(sessionId: string): number {
   return readTranscript(findTranscripts(sessionId)).entries.filter((e) => e.kind === 'boundary').length
-}
-
-function herdr(argv: string[]) {
-  const r = spawnSync('herdr', argv, { encoding: 'utf8' })
-  return `${r.stdout ?? ''}${r.stderr ?? ''}`
 }
 
 function rescore(o: Record<string, string | true>) {

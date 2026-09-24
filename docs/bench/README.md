@@ -120,9 +120,9 @@ then), so this is not a built-in baseline. No built-in numbers exist until the l
 
 | transcript | compactions | needed identifiers held | constraints in force held |
 |---|---:|---:|---:|
-| om-orchestration | 5 | 42/55 (76%) | all, at every boundary |
-| om-v04 | 9 | 42/50 (84%) | all, at every boundary |
-| firstmate-11 | 11 | 22/41 (54%) | all, at every boundary; the one reversed constraint never shown as in force |
+| om-orchestration | 5 | 43/61 (70%) | all, at every boundary |
+| om-v04 | 9 | 55/68 (81%) | all, at every boundary |
+| firstmate-11 | 11 | 23/46 (50%) | all, at every boundary; the one reversed constraint never shown as in force |
 
 Every memory held every constraint in force: the memory keeps the user's own words (its corrections are never
 reflected, and the current build copies every user message into it by code).
@@ -135,11 +135,11 @@ everything else are estimates.
 
 | configuration | calls | est. cost (a shared compaction counted in each) |
 |---|---:|---:|
-| builtin | 46 | $18.96 |
-| builtin+recall | 46 | $23.38 |
-| om | 130 | $4.46 |
-| om+recall | 130 | $12.41 |
-| all (each call once) | 218 | $41.87 |
+| builtin | 46 | $18.94 |
+| builtin+recall | 46 | $23.36 |
+| om | 130 | $4.44 |
+| om+recall | 130 | $12.38 |
+| all (each call once) | 218 | $41.79 |
 
 Not run yet: the om replay with real Observer and Reflector calls (`--pi live`), the live built-in chain, and the
 question stage. Whether Claude Code resumes a session whose rows another writer appended is the first thing the

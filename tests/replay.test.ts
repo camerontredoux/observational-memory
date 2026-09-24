@@ -1,14 +1,16 @@
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import {
   checkAnswer,
   checkSpec,
   contextOf,
-  describePlan,
+  describeCalls,
+  hookDriver,
   drift,
   holds,
   identifiersIn,
   lastCompaction,
+  leftOut,
   neededIdentifiers,
   parseAnswers,
   parseTranscript,
@@ -21,6 +23,7 @@ import {
   scoreConstraints,
   scoreIdentifiers,
   seedRows,
+  uncompacted,
 } from './eval/replay'
 import type { ConstraintSpec, Context, ReplaySpec } from './eval/replay'
 
@@ -129,6 +132,89 @@ describe('the chain', () => {
   })
 })
 
+describe('the om chain through hooks/register.ts', () => {
+  // The plugin under test at every boundary, driven as `bench-replay.ts om` drives it (hookDriver), with pi answering
+  // each Observer chunk by naming its user prompts. Each span is a turn with a 10k-token tool result, so compaction
+  // has older history to observe and a tail to keep raw.
+  function chained() {
+    const s = session()
+    for (const [i, word] of ['alpha', 'bravo', 'charlie', 'delta'].entries()) {
+      if (i) s.compact(`recorded summary ${i}`)
+      s.user(word).tool('Read', { file_path: `/src/${word}.ts` }, 'x'.repeat(40_000)).reply(`${word} read`).user(`${word}2`).reply('ok')
+    }
+    return parseTranscript(s.text())
+  }
+
+  test('each compaction is a memory built on the previous compaction and the rows since', async ($, on) => {
+    const clock = mock.clock(on)
+    let history: readonly SessionMessage[] = []
+    const stored: Record<string, unknown> = {}
+    mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u' })
+    on('session.id', () => ({ value: 'replay' }))
+    on('session.cwd', () => ({ value: '/w' }))
+    on('session.messages', () => ({ value: [...history] }))
+    on('agent.list', () => ({ value: [] }))
+    on('store.keys', () => ({ value: Object.keys(stored) }))
+    on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : structuredClone(stored[e.key]) }))
+    on('store.set', ($, e) => ((stored[e.key] = structuredClone(e.value)), { value: undefined }))
+    on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
+    on('fs.read', ($, e) => {
+      throw new Error(`ENOENT: ${e.path}`)
+    })
+    on('fs.write', () => ({ value: undefined }))
+    on('fs.exists', () => ({ value: false }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('ui.log', () => ({ value: undefined }))
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+    on('turn.step', async function* ($, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
+    })
+    on('skill.prompt', ($, e) => ({ text: e.text }))
+    const observed: string[][] = []
+    on('process.run', ($, e) => {
+      const prompt = e.init?.stdin ?? ''
+      const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
+      observed.push(words)
+      const text = `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
+      const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage: { input: 1, output: 1, cost: { total: 0 } } }
+      return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'message_end', message }), stderr: '' } }
+    })
+
+    const inputs: string[][] = []
+    const steps = await replayChain(
+      chained(),
+      hookDriver({
+        at: (time) => clock.set(Math.max(time, clock.now())),
+        history: (h) => void (history = h),
+        turnStart: async (text) => void (await $.turn.start({ text, turnId: 't' })),
+        step: async (index, messageCount) => {
+          const stream = $.turn.step({ turnId: 't', index, model: 'claude', messageCount })
+          for await (const _ of stream);
+        },
+        turnComplete: async () => void (await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })),
+        skill: async (skill, text) => void (await $.skill.prompt({ skill, text })),
+        compact: async (live) => {
+          inputs.push(live.map((m) => m.text))
+          await clock.settle()
+          return (await $.session.compact({ trigger: 'auto', messages: [...live] })).messages ?? []
+        },
+      }),
+    )
+
+    expect(steps.length).toBe(3)
+    const memories = steps.map((st) => contextOf(st.output).summary)
+    // Each compaction's input starts with the previous one's output, not the session's own summary.
+    for (const n of [1, 2]) expect(inputs[n]![0]).toBe(memories[n - 1]!)
+    for (const memory of memories) expect(memory).not.toContain('recorded summary')
+    // Span 0 was observed once, at compaction 1; the last compaction never saw its rows, and its memory still holds it.
+    expect(observed).toEqual([['alpha'], ['alpha2', 'bravo'], ['bravo2', 'charlie']])
+    expect(inputs[2]!.slice(1).some((text) => text.startsWith('alpha'))).toBe(false)
+    expect(memories[2]).toContain('Saw alpha (source')
+    expect(memories[2]).toContain('Saw charlie (source')
+  })
+})
+
 describe('identifiers', () => {
   test('finds each kind, by its key', () => {
     const found = identifiersIn(
@@ -154,6 +240,26 @@ describe('identifiers', () => {
     expect(holds('edited hooks/register.ts', '~/work/x/hooks/register.ts', 'path')).toBe(true)
     expect(holds('edited register.ts', '~/work/x/hooks/register.ts', 'path')).toBe(false)
     expect(holds('at 1a2b3c4', '1a2b3c4', 'commit')).toBe(true)
+    expect(holds('at 1a2b3c4d9', '1a2b3c4', 'commit')).toBe(true)
+  })
+
+  test('a path through a dot-directory is one, under home or not', () => {
+    expect(Object.fromEntries(identifiersIn('read ~/.agents/docs/github.md, /home/someone/.claude/projects/p/s.jsonl and .worktrees/issue-13/a.ts'))).toEqual({
+      '~/.agents/docs/github.md': 'path',
+      '~/.claude/projects/p/s.jsonl': 'path',
+      '.worktrees/issue-13/a.ts': 'path',
+    })
+  })
+
+  test('a context holds an identifier only as a whole token, not inside a longer one', () => {
+    expect(holds('see issue #13', '#1', 'issue')).toBe(false)
+    expect(holds('see #1.', '#1', 'issue')).toBe(true)
+    expect(holds('cost $0.415', '$0.41', 'usd')).toBe(false)
+    expect(holds('cost $1,200 in all', '$1200', 'usd')).toBe(true)
+    expect(holds('on v1.1.0.', '1.1.0', 'version')).toBe(true)
+    expect(holds('on 1.1.0.2 and 11.1.0', '1.1.0', 'version')).toBe(false)
+    expect(holds('edited hooks/register.tsx', 'hooks/register.ts', 'path')).toBe(false)
+    expect(holds('in x1a2b3c4', '1a2b3c4', 'commit')).toBe(false)
   })
 
   test("a boundary needs what the assistant used after it, knew before it, and neither kept raw nor re-read", () => {
@@ -243,6 +349,10 @@ describe('the question stage', () => {
     expect(checkAnswer(questions[0]!, 'In  .WORKTREES of the repo')).toBe('pass')
     expect(checkAnswer(questions[0]!, 'unknown')).toBe('fail')
     expect(checkAnswer(questions[1]!, 'because')).toBe('needs a model grader')
+    // Whole tokens: #13 is not #1, and "slow" does not say "low".
+    expect(checkAnswer({ id: 'spec', ask: '?', from: 1, expect: ['#1'] }, 'It is #13')).toBe('fail')
+    expect(checkAnswer({ id: 'spec', ask: '?', from: 1, expect: ['#1'] }, 'It is #1.')).toBe('pass')
+    expect(checkAnswer({ id: 'model', ask: '?', from: 1, expect: ['opus', 'low'] }, 'opus is too slow')).toBe('fail')
     expect(parseAnswers('Sure.\n- dir: .worktrees\n`why`: tidy\nother: x\ndir: again', questions)).toEqual(
       new Map([
         ['dir', '.worktrees'],
@@ -256,7 +366,8 @@ describe('the question stage', () => {
     const plain = planQuestionSession({ ...base, config: 'om' })
     expect(plain.prompt).toContain('<context>\nSUMMARY\n\nKEPT\n</context>')
     expect(plain.prompt).toContain('dir: Where do worktrees go?\nwhy: Why?')
-    expect(plain.argv).toEqual(['claude', '-p', plain.prompt, '--model', 'sonnet', '--settings', '/r/q-om-2/settings.json', '--output-format', 'json', '--tools', ''])
+    // The prompt goes on stdin: a compacted context can pass Linux's cap on one argument.
+    expect(plain.argv).toEqual(['claude', '-p', '--model', 'sonnet', '--settings', '/r/q-om-2/settings.json', '--output-format', 'json', '--tools', ''])
     expect(plain.settings.env.CLAUDE_CODE_PLUGIN_DIRS).toBe('')
     expect(plain.seed).toBeUndefined()
     const recall = planQuestionSession({ ...base, config: 'builtin+recall' })
@@ -284,6 +395,14 @@ describe('the built-in chain', () => {
     expect(rows.map((r) => r.message.content[0]?.text ?? r.message.content)).toEqual(['Actually spend up to $50 now.', 'Back in hooks/register.ts; 1a2b3c4d and tests/kept-file.ts are unchanged.'])
     expect(rows[0]).toMatchObject({ parentUuid: 'leaf', sessionId: 'new', cwd: '/sandbox' })
     expect(rows[1]!.parentUuid).toBe(rows[0]!.uuid)
+    // Without `from`, each row keeps its own stamp.
+    expect(rows.map((r) => r.timestamp)).toEqual(rows.map((r) => s.rows.find((o) => o.uuid === r.uuid)!.timestamp))
+  })
+
+  test('seeded rows appended after a compaction can be stamped later than it, one millisecond apart', () => {
+    const from = Date.UTC(2027, 0, 1)
+    const rows = seedRows(threeBoundaries().text(), 1, { sessionId: 'new', cwd: '/sandbox', parentUuid: 'leaf', from })
+    expect(rows.map((r) => r.timestamp)).toEqual([new Date(from).toISOString(), new Date(from + 1).toISOString()])
   })
 
   test("reads a resumed session's last compaction back, and the row the next span continues from", () => {
@@ -291,7 +410,20 @@ describe('the built-in chain', () => {
     expect(c.summary).toBe('Summary three.')
     expect(c.kept.map((r) => r.text)).toEqual(['thanks', 'Done with #13.'])
     expect(c.leaf).toBe(threeBoundaries().rows.at(-1)!.uuid)
+    expect(c.boundaries).toBe(3)
+    expect(c.preTokens).toBe(150_000)
     expect(lastCompaction(session().user('no compaction').text())).toBeUndefined()
+  })
+
+  test('a collected compaction must be the next one, and must have compacted at least half of what was appended', () => {
+    const c = lastCompaction(threeBoundaries().text())
+    expect(uncompacted(c, 3, 200_000)).toBeUndefined()
+    expect(uncompacted(c, 3, 400_000)).toBe('it compacted 150000 tokens, under half of the ~400000 appended before it: the resumed session did not see them')
+    expect(uncompacted(c, 4, 1_000)).toBe('3 compactions, expected 4')
+    expect(uncompacted(undefined, 1, 1_000)).toBe('no compaction with a summary')
+    expect(uncompacted({ ...c!, summary: '' }, 3, 1_000)).toBe('no compaction with a summary')
+    const { preTokens: _, ...unsized } = c!
+    expect(uncompacted(unsized, 3, 1_000)).toBe('no compacted size (compactMetadata.preTokens) to check the appended rows against')
   })
 
   test('plans each boundary as seed, resume, /compact, exit, settle and collect, with no plugin loaded', () => {
@@ -331,7 +463,7 @@ describe('the plan and the report', () => {
     const stubbed = planCalls('t', t, spec, { omCalls: [{ kind: 'observer', inTokens: 1000 }, { kind: 'observer', inTokens: 2000 }] })
     expect(stubbed.filter((c) => c.stage === 'observer').map((c) => c.inTokens)).toEqual([1000, 2000])
     expect(stubbed.filter((c) => c.stage === 'reflector').length).toBe(2)
-    const text = describePlan(calls)
+    const text = describeCalls(calls)
     expect(text).toStartWith(`Dry run: ${calls.length} planned model call(s), none made.`)
     expect(text).toContain('| om+recall |')
     expect(text).toContain('| all (each call once) |')
@@ -351,6 +483,23 @@ describe('the plan and the report', () => {
     expect(text).toContain('### Drift: what was known before boundary 1')
     expect(text).toContain('- recorded: hooks/register.ts (@1), 1a2b3c4 (@1)')
     expect(text).toContain('1 questions, 1 with an exact-string check and 0 needing a model grader; 2 asks per configuration over the 3 boundaries.')
+  })
+
+  test('leaves out a cached or live om replay whose pi calls failed or went uncounted, and nothing else', () => {
+    expect(leftOut('om-strict', { luna: { failed: 0 } })).toBeUndefined()
+    expect(leftOut('om-live', { luna: { failed: 2 } })).toBe('2 pi call(s) failed')
+    expect(leftOut('om-strict', undefined)).toBe('no pi call count (summary.json)')
+    expect(leftOut('om-stub', undefined)).toBeUndefined()
+    expect(leftOut('builtin', undefined)).toBeUndefined()
+  })
+
+  test("a public transcript's list of missing identifiers does not say which session one named", () => {
+    const t = parseTranscript(
+      session().user('session 0f1e2d3c: read /home/u/.claude/projects/p/0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b.jsonl, not ~/.claude/projects/q').compact('s').reply('0f1e2d3c at /home/u/.claude/projects/p/0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b.jsonl and ~/.claude/projects/q, then hooks/a.ts').text(),
+    )
+    const text = renderTranscript({ name: 'demo', t, results: [{ config: 'recorded', source: 'own', contexts: [{ summary: 'nothing', kept: [] }] }] })
+    expect(text).toContain('- recorded: <a session> (@1), <a session> (@1), <a session> (@1)')
+    expect(text).not.toContain('0f1e2d3c')
   })
 
   test('a private transcript gets aggregate numbers only', () => {
