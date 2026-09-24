@@ -95,7 +95,8 @@ type Memory = {
   skills: Skill[]
   userMessages: UserMessage[]
   nextStep?: string // the user's latest request, verbatim
-  transcript?: string // known: the history the memory leaves out can be recovered from it
+  transcript?: string
+  recoverable: boolean // the session's transcript is known: om_recall can find what the memory leaves out
   recentKept: boolean
   resumeDirectly: boolean
 }
@@ -662,7 +663,7 @@ function memoryMessage(memory: Memory): SessionMessage {
   const text =
     `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
-    renderUserMessages(memory.userMessages, !!memory.transcript) +
+    renderUserMessages(memory.userMessages, memory.recoverable) +
     renderContinuation(memory) +
     '\n' +
     (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
@@ -1198,7 +1199,9 @@ export const register: Register = (on) => {
     // An omitted-count line stands for dropped prompts, never for the latest one.
     // A prompt cut to its note alone quotes nothing.
     const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
-    const transcript = main ? ((await $.store.get(transcriptKey(sessionId))) as string | undefined) : undefined
+    // A subagent's memory names no file, but om_recall reaches its thread through the session's.
+    const transcriptPath = (await $.store.get(transcriptKey(sessionId))) as string | undefined
+    const transcript = main ? transcriptPath : undefined
     // The compacted context fits half the room the overhead leaves below the point auto-compaction runs at, so the
     // session can work before compacting again. The session's figures are its main model's: a subagent's model may
     // have a smaller window. The overhead grows by what the breakdown lists beside the system prompt and built-in tools.
@@ -1233,6 +1236,7 @@ export const register: Register = (on) => {
         // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
         nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
         transcript,
+        recoverable: transcriptPath !== undefined,
         recentKept: tail.length > 0,
         resumeDirectly: e.trigger === 'auto',
       }
