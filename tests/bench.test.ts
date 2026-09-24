@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { MEMORY_MARK, PRICES_USD_PER_MTOK, RECALL_TOOL, parseTranscript, runCost, scoreRun } from './eval/bench'
+import { MEMORY_MARK, PRICES_USD_PER_MTOK, RECALL_TOOL, makeRecord, parseTranscript, renderReport, runCost, scoreRun } from './eval/bench'
+import type { RunRecord } from './eval/bench'
+import type { Configuration } from './eval/runner'
 import { scenarioById } from './eval/scenarios'
 import type { Scenario } from './eval/scenarios'
 
@@ -254,5 +256,74 @@ describe('run validity', () => {
   test('a transcript without the continuation prompt is invalid', () => {
     const h = history().prompt('something else').reply('ok')
     expect(scoreRun(s, 'builtin', parseTranscript(h.text())).invalid.join()).toMatch(/continuation prompt/)
+  })
+})
+
+describe('the report', () => {
+  const s = scenarioById('omitted-identifier')!
+  // One offline run: the continuation recalls the id (or not) after an om or a built-in compaction.
+  function record(config: Configuration, i: number, correct: boolean, mode: 'live' | 'offline' = 'offline', version = 'new'): RunRecord {
+    const summary = config.startsWith('om') ? () => OM_SUMMARY('* deploy accepted') : () => BUILTIN_SUMMARY('deploy accepted')
+    const t = run(s, summary, (h) => h.reply(correct ? 'dep-7f3a91c4e2b8' : 'dep-91d4be20c6aa'))
+    return makeRecord(
+      { runId: `${s.id}.${config.replace('+', '-')}.${version}.r${i}`, mode, configuration: config, version, scenario: s.id, run: i, startedAt: '2026-09-24T12:00:00Z', model: 'sonnet', transcripts: [`/fixtures/${config}-${i}.jsonl`] },
+      t,
+      config.startsWith('om') ? JSON.stringify({ counts: {}, metrics: { 'observer.background.cost': { count: 1, sum: 0.01 } } }) : undefined,
+    )
+  }
+
+  test('keeps an outcome where built-in compaction plus recall beats the full system', () => {
+    const records = [0, 1, 2].flatMap((i) => [record('builtin+recall', i, true), record('om+recall', i, i === 0)])
+    const report = renderReport(records)
+    const row = (config: string) => report.split('\n').find((l) => l.startsWith(`| new | ${config} |`))!
+    expect(row('builtin+recall')).toContain('| 3 | 3 | 100% |')
+    expect(row('om+recall')).toContain('| 3 | 3 | 33% |')
+    expect(report).toContain('Highest task success (offline, new): builtin+recall at 100% (3 valid runs); om+recall 33%')
+  })
+
+  test('labels offline results as offline and never claims a live comparison that did not run', () => {
+    const report = renderReport([record('builtin', 0, true)], { versions: ['old', 'new'], scenarios: ['omitted-identifier'] })
+    expect(report).toContain('Live runs: 0. Offline runs: 1.')
+    expect(report).toContain('No live run is recorded: nothing here is evidence of live model quality.')
+    expect(report).toMatch(/## Offline runs/)
+    expect(report).not.toMatch(/## Live runs/)
+    // Every expected live cell without a run is listed as not run.
+    expect(report).toContain('- old builtin omitted-identifier: not run live')
+    expect(report).toContain('- new om+recall omitted-identifier: not run live')
+    expect(report).toContain('no model grading')
+  })
+
+  test('reports live and offline runs apart, with n, mean and spread', () => {
+    const records = [record('builtin', 0, true, 'live'), record('builtin', 1, false, 'live'), record('builtin', 0, true, 'offline')]
+    const report = renderReport(records)
+    const live = report.slice(report.indexOf('## Live runs'), report.indexOf('## Offline runs'))
+    expect(live).toContain('| new | builtin | 2 | 2 | 50% | 50% ± 71% [0%–100%] |')
+    expect(report.slice(report.indexOf('## Offline runs'))).toContain('| new | builtin | 1 | 1 | 100% |')
+  })
+
+  test('keeps the evidence of every failed check and the reasons of every invalid run', () => {
+    const bad = record('builtin', 0, false)
+    const fellBack = makeRecord({ ...bad, runId: 'fell-back', configuration: 'om' }, run(s, () => BUILTIN_SUMMARY('x'), (h) => h.reply('dep-7f3a91c4e2b8')))
+    const report = renderReport([bad, fellBack])
+    expect(report).toContain(`${bad.runId} (builtin, new, omitted-identifier): exact-id [correctness]`)
+    expect(report).toContain('dep-91d4be20c6aa')
+    expect(report).toContain('/fixtures/builtin-0.jsonl')
+    expect(report).toContain('fell-back (om, new, omitted-identifier): compaction 1 fell back to the built-in summary')
+  })
+
+  test('a run that did not complete counts as a failure to run, never as a success', () => {
+    const failed: RunRecord = { ...record('om', 0, true), runId: 'stalled', score: undefined, error: 'herdr agent prompt: agent_prompt_stalled' }
+    const report = renderReport([failed])
+    expect(report).toContain('| new | om | 1 | 0 | – |')
+    expect(report).toContain('stalled (om, new, omitted-identifier): did not complete: herdr agent prompt: agent_prompt_stalled')
+  })
+
+  test('says which part of the memory carried each fact, and separates measured, estimated and unavailable cost', () => {
+    const noStats = record('om', 1, true)
+    const report = renderReport([record('om', 0, true), { ...noStats, cost: { ...noStats.cost!, memoryModel: { status: 'unavailable', reason: 'no stats file' } } }])
+    expect(report).toContain('| new | om | omitted-identifier | dep-7f3a91c4e2b8 | 0 of 2 |')
+    expect(report).toMatch(/memory model \(USD, measured\)/)
+    expect(report).toContain('memory model cost unavailable in 1 run(s)')
+    expect(report).toMatch(/cost \(USD, estimated\)/)
   })
 })

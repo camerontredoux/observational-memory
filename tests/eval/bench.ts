@@ -19,7 +19,8 @@
 // the `*.cost` metrics the plugin's stats file records, or unavailable without that file.
 
 import type { Configuration, Measurement } from './runner'
-import { estimated, measured, recallAvailable, unavailable, usesObservationalCompaction } from './runner'
+import { CONFIGURATIONS, estimated, measured, recallAvailable, unavailable, usesObservationalCompaction } from './runner'
+import { SCENARIOS } from './scenarios'
 import type { Check, CheckCategory, Scenario } from './scenarios'
 
 // ---- VERIFY BEFORE A LIVE RUN: list prices in USD per million tokens, matched against each message's model id. ----
@@ -346,4 +347,187 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
       startAt !== undefined && endAt !== undefined ? measured(endAt - startAt) : unavailable('the transcript has no timestamps around the continuation'),
     reply: cut(reply, 2000),
   }
+}
+
+// ---- Records and the report ----
+
+export type RunMeta = {
+  runId: string
+  /** `live`: a real session driven by scripts/bench-live.ts. `offline`: a synthetic or supplied transcript. */
+  mode: 'live' | 'offline'
+  configuration: Configuration
+  /** The plugin version label: `old`, `new`, or an ablation's own label. */
+  version: string
+  scenario: string
+  run: number
+  startedAt: string
+  model: string
+  sessionId?: string
+  transcripts: string[]
+  stats?: string
+}
+/** One line of the results JSONL. A run that did not complete has `error` and no score. */
+export type RunRecord = RunMeta & { score?: RunScore; cost?: RunCost; memory?: OmStats; error?: string }
+
+export function makeRecord(meta: RunMeta, t: Transcript, statsJson?: string): RunRecord {
+  const s = SCENARIOS.find((x) => x.id === meta.scenario)
+  if (!s) throw new Error(`unknown scenario ${meta.scenario}`)
+  const memory = statsJson === undefined ? undefined : parseStats(statsJson)
+  const { runId, mode, configuration, version, scenario, run, startedAt, model, sessionId, transcripts, stats } = meta
+  return {
+    ...{ runId, mode, configuration, version, scenario, run, startedAt, model, transcripts },
+    ...(sessionId ? { sessionId } : {}),
+    ...(stats ? { stats } : {}),
+    score: scoreRun(s, configuration, t, memory),
+    cost: runCost(configuration, t, statsJson),
+    ...(memory ? { memory } : {}),
+  }
+}
+
+type Spread = { n: number; mean: number; sd: number; min: number; max: number }
+function spread(xs: readonly number[]): Spread | undefined {
+  if (!xs.length) return undefined
+  const mean = xs.reduce((a, b) => a + b, 0) / xs.length
+  const sd = xs.length > 1 ? Math.sqrt(xs.reduce((a, x) => a + (x - mean) ** 2, 0) / (xs.length - 1)) : 0
+  return { n: xs.length, mean, sd, min: Math.min(...xs), max: Math.max(...xs) }
+}
+const pct = (x: number) => `${Math.round(x * 100)}%`
+const fixed = (digits: number) => (x: number) => x.toFixed(digits)
+function cell(xs: readonly number[], f: (x: number) => string): string {
+  const s = spread(xs)
+  if (!s) return '–'
+  return s.n === 1 ? f(s.mean) : `${f(s.mean)} ± ${f(s.sd)} [${f(s.min)}–${f(s.max)}]`
+}
+const values = (ms: readonly Measurement<number>[]) => ms.flatMap((m) => (m.status === 'unavailable' ? [] : [m.value]))
+
+export type ReportOptions = { versions?: readonly string[]; scenarios?: readonly string[] }
+
+/**
+ * A markdown report of the results: live and offline runs apart; per plugin version and configuration the run count,
+ * valid runs, and each measure's mean ± sample standard deviation [min–max]; task success per scenario; what carried
+ * each fact through observational compaction; every invalid or incomplete run and every failed check with its
+ * evidence; and, given the expected versions and scenarios, every live cell that has not run.
+ */
+export function renderReport(records: readonly RunRecord[], options: ReportOptions = {}): string {
+  const live = records.filter((r) => r.mode === 'live')
+  const offline = records.filter((r) => r.mode === 'offline')
+  const out: string[] = ['# Continuation-quality benchmark', '']
+  out.push(`Live runs: ${live.length}. Offline runs: ${offline.length}. Live and offline runs are reported apart and never pooled.`)
+  if (!live.length) out.push('', 'No live run is recorded: nothing here is evidence of live model quality.')
+  out.push(
+    '',
+    'Scoring: deterministic checks (regular expressions over the replies and tool calls after the continuation prompt, and over what om_recall returned); no model grading was used. A transport or prompt-format success is not a task success: a run that did not complete, or is invalid, never counts as one.',
+    `Cost: token-equivalent, an estimate: each assistant message's exact usage times PRICES_USD_PER_MTOK in tests/eval/bench.ts (${PRICES_USD_PER_MTOK.map((p) => `${p.model.source} $${p.input}/$${p.output} in/out, $${p.cacheRead} cache read, $${p.cacheWrite5m}–$${p.cacheWrite1h} cache write`).join('; ')} per million tokens). The memory model is the plugin's own Observer and Reflector, as its stats file measured it. Latencies are measured: the host's compaction duration and the transcript's timestamps.`,
+  )
+  for (const [title, rs] of [
+    ['Live runs', live],
+    ['Offline runs (synthetic or supplied transcripts, not live results)', offline],
+  ] as const)
+    if (rs.length) out.push('', `## ${title}`, '', ...section(rs, rs === live ? 'live' : 'offline'))
+  if (options.versions) {
+    const scenarios = options.scenarios ?? SCENARIOS.map((s) => s.id)
+    const missing = options.versions.flatMap((v) =>
+      CONFIGURATIONS.flatMap((c) => scenarios.filter((s) => !live.some((r) => r.version === v && r.configuration === c && r.scenario === s && r.score?.valid)).map((s) => `- ${v} ${c} ${s}: not run live`)),
+    )
+    out.push('', '## Not run', '', ...(missing.length ? missing : ['Every expected live cell has at least one valid run.']))
+  }
+  const limits = SCENARIOS.filter((s) => s.limits && records.some((r) => r.scenario === s.id))
+  if (limits.length) out.push('', '## Scenario limits', '', ...limits.map((s) => `- ${s.id}: ${s.limits}`))
+  return out.join('\n') + '\n'
+}
+
+const groupKey = (r: RunRecord) => `${r.version}\u0000${r.configuration}`
+function groups(rs: readonly RunRecord[]) {
+  const versions = [...new Set(rs.map((r) => r.version))]
+  return versions.flatMap((v) => CONFIGURATIONS.flatMap((c) => {
+    const g = rs.filter((r) => groupKey(r) === `${v}\u0000${c}`)
+    return g.length ? [{ version: v, configuration: c, runs: g, valid: g.filter((r) => r.score?.valid) }] : []
+  }))
+}
+
+function section(rs: readonly RunRecord[], mode: 'live' | 'offline'): string[] {
+  const out: string[] = []
+  const gs = groups(rs)
+  out.push(
+    '### Per plugin version and configuration',
+    '',
+    'Each measure over the valid runs: mean ± sample standard deviation [min–max], or the value alone for one run.',
+    '',
+    '| version | configuration | runs | valid | task success | correctness | violations | repeated work | unsupported claims | recall calls | recall hits | recall result tokens (estimated) | cost (USD, estimated) | memory model (USD, measured) | compaction ms (measured) | continuation ms (measured) |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
+  )
+  for (const g of gs) {
+    const sc = g.valid.map((r) => r.score!)
+    const hits = sc.reduce((t, s) => t + s.retrieval.hits, 0)
+    const checked = sc.reduce((t, s) => t + s.retrieval.checked, 0)
+    out.push(
+      `| ${g.version} | ${g.configuration} | ${g.runs.length} | ${g.valid.length} | ${sc.length ? pct(sc.filter((s) => s.taskSuccess).length / sc.length) : '–'} | ${cell(sc.map((s) => s.correctness), pct)} | ${cell(sc.map((s) => s.violations), fixed(2))} | ${cell(sc.map((s) => s.repeatedWork), fixed(2))} | ${cell(sc.map((s) => s.unsupportedClaims), fixed(2))} | ${cell(sc.map((s) => s.retrieval.calls), fixed(2))} | ${checked ? `${hits}/${checked}` : '–'} | ${cell(values(sc.map((s) => s.retrieval.resultTokens)), fixed(0))} | ${cell(values(g.valid.map((r) => r.cost?.total ?? unavailable('no cost'))), fixed(4))} | ${cell(values(g.valid.map((r) => r.cost?.memoryModel ?? unavailable('no cost'))), fixed(4))} | ${cell(values(sc.flatMap((s) => s.compactions.map((c) => c.durationMs))), fixed(0))} | ${cell(values(sc.map((s) => s.continuationMs)), fixed(0))} |`,
+    )
+  }
+  const noMemory = rs.filter((r) => usesObservationalCompaction(r.configuration) && r.cost?.memoryModel.status === 'unavailable').length
+  const noTotal = rs.filter((r) => r.cost?.total.status === 'unavailable').length
+  if (noMemory) out.push('', `Observational runs without a stats file: memory model cost unavailable in ${noMemory} run(s); their cost column leaves it out.`)
+  if (noTotal) out.push('', `Cost unavailable in ${noTotal} run(s) (a model the price table does not price).`)
+  for (const v of [...new Set(gs.map((g) => g.version))]) {
+    const ranked = gs
+      .filter((g) => g.version === v && g.valid.length)
+      .map((g) => ({ g, rate: g.valid.filter((r) => r.score!.taskSuccess).length / g.valid.length }))
+      .sort((a, b) => b.rate - a.rate)
+    if (ranked.length)
+      out.push(
+        '',
+        `Highest task success (${mode}, ${v}): ${ranked[0]!.g.configuration} at ${pct(ranked[0]!.rate)} (${ranked[0]!.g.valid.length} valid runs)${ranked
+          .slice(1)
+          .map((x) => `; ${x.g.configuration} ${pct(x.rate)}`)
+          .join('')}.`,
+      )
+  }
+
+  const scenarios = SCENARIOS.filter((s) => rs.some((r) => r.scenario === s.id))
+  out.push('', '### Task success per scenario', '', 'Successful runs out of valid runs.', '', `| scenario | ${gs.map((g) => `${g.version} ${g.configuration}`).join(' | ')} |`, `|---|${gs.map(() => '---').join('|')}|`)
+  for (const s of scenarios)
+    out.push(`| ${s.id} | ${gs.map((g) => {
+      const v = g.valid.filter((r) => r.scenario === s.id)
+      return v.length ? `${v.filter((r) => r.score!.taskSuccess).length}/${v.length}` : 'not run'
+    }).join(' | ')} |`)
+
+  // Overlapping protections, measured rather than assumed: which parts of the memory message held each fact.
+  const carried = gs.filter((g) => usesObservationalCompaction(g.configuration)).flatMap((g) =>
+    scenarios.flatMap((s) => s.facts.map((fact) => {
+      const cs = g.valid.filter((r) => r.scenario === s.id).flatMap((r) => r.score!.compactions)
+      const parts = new Map<string, number>()
+      cs.forEach((c) => c.carriers[fact]?.forEach((p) => parts.set(p, (parts.get(p) ?? 0) + 1)))
+      const any = cs.filter((c) => c.carriers[fact]?.length).length
+      const only = cs.filter((c) => c.carriers[fact]?.length === 1).map((c) => c.carriers[fact]![0]!)
+      return cs.length
+        ? [`| ${g.version} | ${g.configuration} | ${s.id} | ${fact} | ${any} of ${cs.length} | ${[...parts].map(([p, n]) => `${p} ${n}`).join(', ') || '–'} | ${[...new Set(only)].map((p) => `${p} ${only.filter((x) => x === p).length}`).join(', ') || '–'} |`]
+        : []
+    }).flat()),
+  )
+  if (carried.length)
+    out.push(
+      '',
+      '### What carried each fact through observational compaction',
+      '',
+      "How many of the valid runs' compactions held each scenario fact in their memory message, by part (observations, corrections, all-user-messages, skills, ...), and how often a single part alone held it. This measures the overlap between the memory's protections; none is removed to measure it.",
+      '',
+      '| version | configuration | scenario | fact | compactions holding it | by part | by one part alone |',
+      '|---|---|---|---|---|---|---|',
+      ...carried,
+    )
+
+  const problems = rs.flatMap((r) => {
+    const who = `${r.runId} (${r.configuration}, ${r.version}, ${r.scenario})`
+    if (!r.score) return [`- ${who}: did not complete: ${r.error ?? 'no score recorded'}. Transcripts: ${r.transcripts.join(', ') || 'none'}`]
+    return r.score.invalid.map((reason) => `- ${who}: ${reason}. Transcripts: ${r.transcripts.join(', ') || 'none'}`)
+  })
+  if (problems.length) out.push('', '### Invalid and incomplete runs', '', 'Counted in the runs column, not scored.', '', ...problems)
+
+  const failures = rs.flatMap((r) =>
+    (r.score?.checks ?? [])
+      .filter((c) => c.outcome === 'fail')
+      .map((c) => `- ${r.runId} (${r.configuration}, ${r.version}, ${r.scenario}): ${c.id} [${c.category}]: ${c.description}. Transcripts: ${r.transcripts.join(', ')}\n  Evidence: ${c.evidence.replace(/\n/g, '\n  ')}`),
+  )
+  if (failures.length) out.push('', '### Failed checks, with evidence', '', ...failures)
+  return out
 }
