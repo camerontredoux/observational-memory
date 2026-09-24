@@ -41,6 +41,9 @@ export function mainCheckout() {
   return dirname(r.stdout.trim())
 }
 
+/** Where Claude Code keeps the transcripts of sessions run in `cwd`. */
+export const projectsDir = (cwd: string) => `${process.env.HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, '-')}`
+
 /** The session's transcript and every file it continued in (a moved session), oldest first. */
 export function findTranscripts(sessionId: string): string[] {
   const root = `${process.env.HOME}/.claude/projects`

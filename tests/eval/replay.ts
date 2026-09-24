@@ -1,7 +1,8 @@
 // Retention over many real compactions (issue #13): a long real transcript is cut at its own compaction points, each
 // configuration compacts it in a chain (each compaction built on the previous one's output, as in the session), and
 // what each compacted context still holds is scored with no model: the identifiers the assistant went on to use, the
-// user's constraints in force, and how both drift over the boundaries. A question stage is planned, not run.
+// user's constraints in force, and how both drift over the boundaries. A question stage asks each context questions
+// in headless Sonnet sessions.
 //
 // Pure: no file system, process, herdr or model call here, so the tests check it on small synthetic transcripts;
 // `scripts/bench-replay.ts` reads the real transcripts, runs the chain and writes the report (its header gives the usage).
@@ -343,7 +344,7 @@ export function drift(t: Transcript, specs: readonly ConstraintSpec[], contexts:
   })
 }
 
-// ---- The question stage (planned, not run) ----
+// ---- The question stage ----
 
 export const questionsAt = (spec: ReplaySpec | undefined, n: number) => (spec?.questions ?? []).filter((q) => q.from <= n)
 export type AnswerCheck = 'pass' | 'fail' | 'needs a model grader'
@@ -386,8 +387,7 @@ export type QuestionSession = {
  * The headless Sonnet session that asks boundary n's questions of one configuration's compacted context. A plain
  * configuration gets the context in its prompt and no plugin and no tools; a +recall one resumes a seeded copy of
  * the transcript (see `seed`) with the recall-only plugin (as `scripts/bench-live.ts` assembles it from
- * tests/eval/recall-plugin) and om_recall its only tool.
- * Planned for the dry run and tested; nothing runs it yet.
+ * tests/eval/recall-plugin) and om_recall its only tool. `scripts/bench-replay.ts questions` runs it.
  */
 export function planQuestionSession(input: {
   config: Configuration
@@ -407,11 +407,12 @@ export function planQuestionSession(input: {
   const prompt = recall
     ? `${format} You may search this session's transcript with om_recall.\n\n${asks}`
     : `This is what you know of the session so far:\n\n<context>\n${context}\n</context>\n\n${format}\n\n${asks}`
-  // `--tools ''` takes away the built-in tools; a plugin's tool is not one of them, so om_recall stays. That, and
-  // `-p` reading its prompt from stdin, are unverified until the first live question run, which checks both before
-  // asking anything.
-  const argv = ['claude', '-p', '--model', MODEL, '--settings', settingsPath, '--output-format', 'json', '--tools', '']
-  if (recall) argv.push('--resume', input.sessionId, '--allowedTools', RECALL_TOOL)
+  // Checked live (stream-json's init lists the tools): `--tools ''` also takes away the plugin's om_recall, so a
+  // +recall session keeps ToolSearch alone of the built-in tools, and om_recall then loads and reads the seeded
+  // transcript; `dontAsk` denies whatever the allow list leaves out. `--strict-mcp-config` drops the user's own MCP
+  // servers and keeps the plugin's. `-p` reads its prompt from stdin.
+  const argv = ['claude', '-p', '--model', MODEL, '--settings', settingsPath, '--output-format', 'json', '--strict-mcp-config', '--tools', recall ? 'ToolSearch' : '']
+  if (recall) argv.push('--permission-mode', 'dontAsk', '--resume', input.sessionId, '--allowedTools', RECALL_TOOL)
   return {
     argv,
     prompt,
@@ -419,6 +420,76 @@ export function planQuestionSession(input: {
     settings: { env: { CLAUDE_CODE_PLUGIN_DIRS: recall ? input.recallPluginDir : '' } },
     ...(recall ? { seed: { sessionId: input.sessionId, through: input.boundary, summary: context } } : {}),
   }
+}
+
+/** One question session's outcome: a line of `questions/results.jsonl`. */
+export type QuestionResult = {
+  config: Configuration
+  boundary: number
+  sessionId: string
+  costUsd: number
+  /** Every question asked, with the session's answer (empty when it gave none) and its check. */
+  answers: { id: string; answer: string; check: AnswerCheck }[]
+  /** A +recall session's om_recall calls, read from its transcript. */
+  recallCalls?: number
+  /** Why the session gave no answers: then `answers` is empty. */
+  error?: string
+}
+
+/** A session's answers to `questions`, each checked; a question it did not answer fails its exact check. */
+export function scoreAnswers(questions: readonly Question[], text: string): QuestionResult['answers'] {
+  const answers = parseAnswers(text, questions)
+  return questions.map((q) => {
+    const answer = answers.get(q.id) ?? ''
+    return { id: q.id, answer, check: checkAnswer(q, answer) }
+  })
+}
+
+/**
+ * The om_recall calls a resumed question session made: those after its seeded compaction, the file's last. The
+ * seeded rows before it are the real session's, which may have called om_recall itself.
+ */
+export function recallCallsIn(jsonl: string | readonly Raw[]): number {
+  const t = parseTranscript(jsonl)
+  if (!t.boundaries.length) return 0
+  return (t.spans.at(-1) ?? []).reduce((n, row) => n + row.toolUses.filter((u) => u.tool === RECALL_TOOL).length, 0)
+}
+
+export type QuestionTally = {
+  config: Configuration
+  boundaries: number[]
+  sessions: number
+  /** Sessions that gave no answers (an error). */
+  failed: number
+  exact: { correct: number; asked: number }
+  /** Asks that need a model grader, which none scores yet. */
+  unscored: number
+  /** +recall configurations only: sessions that called om_recall, and the calls. */
+  recall?: { calling: number; calls: number }
+  costUsd: number
+}
+
+/** Each configuration's question results in all, the last session per boundary counted, in CONFIGURATIONS' order. */
+export function tallyQuestions(results: readonly QuestionResult[]): QuestionTally[] {
+  const last = new Map<string, QuestionResult>()
+  for (const r of results) last.set(`${r.config}@${r.boundary}`, r)
+  return CONFIGURATIONS.flatMap((config) => {
+    const rs = [...last.values()].filter((r) => r.config === config).sort((a, b) => a.boundary - b.boundary)
+    if (!rs.length) return []
+    const checks = rs.flatMap((r) => r.answers.map((a) => a.check))
+    return [
+      {
+        config,
+        boundaries: rs.map((r) => r.boundary),
+        sessions: rs.length,
+        failed: rs.filter((r) => r.error).length,
+        exact: { correct: checks.filter((c) => c === 'pass').length, asked: checks.filter((c) => c !== 'needs a model grader').length },
+        unscored: checks.filter((c) => c === 'needs a model grader').length,
+        ...(recallAvailable(config) ? { recall: { calling: rs.filter((r) => (r.recallCalls ?? 0) > 0).length, calls: rs.reduce((n, r) => n + (r.recallCalls ?? 0), 0) } } : {}),
+        costUsd: rs.reduce((n, r) => n + r.costUsd, 0),
+      },
+    ]
+  })
 }
 
 // ---- Configurations and the dry run's plan ----
@@ -499,13 +570,8 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
   for (const b of t.boundaries) {
     const qs = questionsAt(spec, b.n)
     if (!qs.length) continue
-    const asked = qs.reduce((n, q) => n + estimateTokens(q.ask), 0)
     for (const config of CONFIGURATIONS) {
-      const context = config.startsWith('om') ? (b.postTokens ?? SUMMARY_TOKENS) : SUMMARY_TOKENS
-      const once = SESSION_OVERHEAD_TOKENS + context + asked
       const recall = recallAvailable(config)
-      const inTokens = recall ? once * (1 + RECALL_ROUNDS) + RECALL_RESULT_TOKENS * RECALL_ROUNDS : once
-      const outTokens = ANSWER_TOKENS_PER_QUESTION * qs.length
       calls.push({
         transcript: name,
         configs: [config],
@@ -513,13 +579,19 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
         boundary: b.n,
         model: MODEL,
         what: `${qs.length} question(s) at boundary ${b.n}${recall ? ', om_recall over the transcript' : ''} (${qs.filter((q) => !q.expect?.length).length} need a model grader)`,
-        inTokens,
-        outTokens,
-        usd: sonnetUsd(inTokens, outTokens),
+        ...estimateQuestionSession(config.startsWith('om') ? (b.postTokens ?? SUMMARY_TOKENS) : SUMMARY_TOKENS, qs, recall),
       })
     }
   }
   return calls
+}
+
+/** One question session's estimate, given its context's size: a +recall one re-reads it on each om_recall round. */
+export function estimateQuestionSession(contextTokens: number, questions: readonly Question[], recall: boolean) {
+  const once = SESSION_OVERHEAD_TOKENS + contextTokens + questions.reduce((n, q) => n + estimateTokens(q.ask), 0)
+  const inTokens = recall ? once * (1 + RECALL_ROUNDS) + RECALL_RESULT_TOKENS * RECALL_ROUNDS : once
+  const outTokens = ANSWER_TOKENS_PER_QUESTION * questions.length
+  return { inTokens, outTokens, usd: sonnetUsd(inTokens, outTokens) }
 }
 
 const usd = (n: number) => `$${n.toFixed(n < 1 ? 4 : 2)}`
@@ -764,6 +836,8 @@ export type ReportInput = {
   /** Only aggregate numbers: no identifier, constraint or question text. */
   private?: boolean
   bytes?: number
+  /** The question sessions run (`questions/results.jsonl`); without them the stage is reported as planned. */
+  questions?: readonly QuestionResult[]
 }
 
 const pct = (held: number, total: number) => (total ? `${held}/${total} (${Math.round((held / total) * 100)}%)` : '–')
@@ -835,6 +909,32 @@ export function renderTranscript(r: ReportInput): string {
     }
   }
   const qs = spec?.questions ?? []
+  const tallies = tallyQuestions(r.questions ?? [])
+  if (tallies.length) {
+    out.push(
+      '### Question stage',
+      '',
+      'Headless Sonnet sessions given each configuration\'s compacted context, the +recall ones om_recall over the transcript before it. Exact-string answers are checked; the rest need a model grader and are not scored.',
+      '',
+      '| configuration | boundaries | sessions | exact-string correct / asked | unscored (need a grader) | om_recall calls | cost |',
+      '|---|---|---:|---:|---:|---:|---:|',
+      ...tallies.map(
+        (x) =>
+          `| ${x.config} | ${x.boundaries.join(', ')} | ${x.sessions}${x.failed ? ` (${x.failed} failed)` : ''} | ${pct(x.exact.correct, x.exact.asked)} | ${x.unscored} | ` +
+          `${x.recall ? `${x.recall.calls} in ${x.recall.calling}/${x.sessions} sessions` : '–'} | ${usd(x.costUsd)} |`,
+      ),
+      '',
+    )
+    if (!r.private) {
+      const last = new Map((r.questions ?? []).map((q) => [`${q.config}@${q.boundary}`, q]))
+      const misses = tallies.map((x) => {
+        const ids = [...last.values()].filter((q) => q.config === x.config).flatMap((q) => q.answers.filter((a) => a.check === 'fail').map((a) => `${a.id} (@${q.boundary})`))
+        return `- ${x.config}: ${ids.length ? ids.join(', ') : 'none'}`
+      })
+      out.push('### Exact-string answers missed', '', ...misses, '')
+    }
+    return out.join('\n')
+  }
   out.push(
     '### Question stage (planned, not run)',
     '',

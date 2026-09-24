@@ -18,14 +18,17 @@ import {
   planCalls,
   planQuestionSession,
   questionSeedRows,
+  recallCallsIn,
   renderTranscript,
   replayChain,
+  scoreAnswers,
   scoreConstraints,
   scoreIdentifiers,
   seedRows,
+  tallyQuestions,
   uncompacted,
 } from './eval/replay'
-import type { ConstraintSpec, Context, ReplaySpec } from './eval/replay'
+import type { ConstraintSpec, Context, QuestionResult, ReplaySpec } from './eval/replay'
 
 // Synthetic transcripts in Claude Code's JSONL shape. A compaction is a `compact_boundary` row, then its summary and
 // the rows it kept raw, both stamped before the boundary (as Claude Code writes them), then the session goes on.
@@ -367,12 +370,13 @@ describe('the question stage', () => {
     expect(plain.prompt).toContain('<context>\nSUMMARY\n\nKEPT\n</context>')
     expect(plain.prompt).toContain('dir: Where do worktrees go?\nwhy: Why?')
     // The prompt goes on stdin: a compacted context can pass Linux's cap on one argument.
-    expect(plain.argv).toEqual(['claude', '-p', '--model', 'sonnet', '--settings', '/r/q-om-2/settings.json', '--output-format', 'json', '--tools', ''])
+    expect(plain.argv).toEqual(['claude', '-p', '--model', 'sonnet', '--settings', '/r/q-om-2/settings.json', '--output-format', 'json', '--strict-mcp-config', '--tools', ''])
     expect(plain.settings.env.CLAUDE_CODE_PLUGIN_DIRS).toBe('')
     expect(plain.seed).toBeUndefined()
     const recall = planQuestionSession({ ...base, config: 'builtin+recall' })
     expect(recall.prompt).not.toContain('SUMMARY')
-    expect(recall.argv.slice(-4)).toEqual(['--resume', 'sid', '--allowedTools', 'mcp__observational-memory__om_recall'])
+    // `--tools ''` would take om_recall away too: ToolSearch alone stays, and dontAsk denies what is not allowed.
+    expect(recall.argv.slice(-8)).toEqual(['--tools', 'ToolSearch', '--permission-mode', 'dontAsk', '--resume', 'sid', '--allowedTools', 'mcp__observational-memory__om_recall'])
     expect(recall.settings.env.CLAUDE_CODE_PLUGIN_DIRS).toBe('/r/recall-plugin')
     expect(recall.seed).toEqual({ sessionId: 'sid', through: 2, summary: 'SUMMARY\n\nKEPT' })
   })
@@ -385,6 +389,60 @@ describe('the question stage', () => {
     expect(rows.every((r) => r.sessionId === 'new' && r.cwd === '/sandbox')).toBe(true)
     expect(rows.at(-2)!.logicalParentUuid).toBe(rows.at(-3)!.uuid)
     expect(rows.at(-1)).toMatchObject({ parentUuid: 'B', isCompactSummary: true, uuid: 'S' })
+  })
+})
+
+describe('question results', () => {
+  const qs = [
+    { id: 'dir', ask: 'Where do worktrees go?', from: 1, expect: ['.worktrees'] },
+    { id: 'issue', ask: 'Which issue?', from: 1, expect: ['#13'] },
+    { id: 'why', ask: 'Why?', from: 1 },
+  ]
+  const result = (config: QuestionResult['config'], boundary: number, text: string, extra: Partial<QuestionResult> = {}): QuestionResult => ({
+    config,
+    boundary,
+    sessionId: 's',
+    costUsd: 0.25,
+    answers: scoreAnswers(qs, text),
+    ...extra,
+  })
+
+  test('scores every question asked: an unanswered one fails its exact check, one with no expected string is unscored', () => {
+    expect(scoreAnswers(qs, 'dir: .worktrees\nwhy: tidy')).toEqual([
+      { id: 'dir', answer: '.worktrees', check: 'pass' },
+      { id: 'issue', answer: '', check: 'fail' },
+      { id: 'why', answer: 'tidy', check: 'needs a model grader' },
+    ])
+  })
+
+  test('tallies each configuration: the last session per boundary, exact answers, unscored ones, failed sessions and om_recall calls', () => {
+    const tallies = tallyQuestions([
+      result('om+recall', 1, 'dir: unknown', { recallCalls: 0 }),
+      result('om', 1, 'dir: .worktrees\nissue: #13'),
+      result('om+recall', 1, 'dir: .worktrees\nissue: #13', { recallCalls: 2 }), // run again: this one counts
+      result('om+recall', 2, 'dir: .worktrees', { recallCalls: 0 }),
+      { ...result('om+recall', 3, ''), answers: [], error: 'error_max_turns: stopped', recallCalls: 1 },
+    ])
+    expect(tallies).toEqual([
+      { config: 'om', boundaries: [1], sessions: 1, failed: 0, exact: { correct: 2, asked: 2 }, unscored: 1, costUsd: 0.25 },
+      { config: 'om+recall', boundaries: [1, 2, 3], sessions: 3, failed: 1, exact: { correct: 3, asked: 4 }, unscored: 2, recall: { calling: 2, calls: 3 }, costUsd: 0.75 },
+    ])
+  })
+
+  test("counts a +recall session's om_recall calls after its seeded compaction, not the real session's before it", () => {
+    const recall = (id: string) => ({ type: 'tool_use', id, name: 'mcp__observational-memory__om_recall', input: { query: 'x' } })
+    // The real session called om_recall before its boundary; the seed keeps that call.
+    const real = session().user('find it')
+    real.raw({ ...real.rows[0], uuid: 'orig', type: 'assistant', message: { role: 'assistant', content: [recall('c0')] } }).compact('real summary')
+    const rows = questionSeedRows(real.text(), { sessionId: 'q', through: 1, summary: 'CONTEXT' }, '/sandbox', { boundary: 'B', summary: 'S' })
+    expect(rows.some((r) => r.message?.content?.[0]?.name === 'mcp__observational-memory__om_recall')).toBe(true)
+    const later = new Date(Date.UTC(2027, 0, 1)).toISOString()
+    rows.push(
+      { type: 'user', uuid: 'p', parentUuid: 'S', timestamp: later, message: { role: 'user', content: 'questions' } },
+      { type: 'assistant', uuid: 'a', parentUuid: 'p', timestamp: later, message: { id: 'm', role: 'assistant', content: [recall('c1')] } },
+    )
+    expect(recallCallsIn(rows)).toBe(1)
+    expect(recallCallsIn(session().reply('no compaction').rows)).toBe(0)
   })
 })
 
@@ -483,6 +541,24 @@ describe('the plan and the report', () => {
     expect(text).toContain('### Drift: what was known before boundary 1')
     expect(text).toContain('- recorded: hooks/register.ts (@1), 1a2b3c4 (@1)')
     expect(text).toContain('1 questions, 1 with an exact-string check and 0 needing a model grader; 2 asks per configuration over the 3 boundaries.')
+  })
+
+  test('reports the question stage per configuration once it has run, and a private transcript without its questions or answers', () => {
+    const t = parseTranscript(threeBoundaries().text())
+    const recorded = [{ config: 'recorded', source: 'own', contexts: t.boundaries.map((b) => ({ summary: b.summary, kept: b.kept })) }]
+    const questions: QuestionResult[] = [
+      { config: 'om', boundary: 2, sessionId: 's1', costUsd: 0.1, answers: [{ id: 'dir', answer: 'in .worktrees', check: 'pass' }] },
+      { config: 'om+recall', boundary: 2, sessionId: 's2', costUsd: 0.3, answers: [{ id: 'dir', answer: 'somewhere-secret', check: 'fail' }], recallCalls: 2 },
+      { config: 'om+recall', boundary: 3, sessionId: 's3', costUsd: 0.2, answers: [{ id: 'dir', answer: 'in .worktrees', check: 'pass' }], recallCalls: 0 },
+    ]
+    const text = renderTranscript({ name: 'demo', t, spec, results: recorded, questions })
+    expect(text).not.toContain('(planned, not run)')
+    expect(text).toContain('| om | 2 | 1 | 1/1 (100%) | 0 | – | $0.1000 |')
+    expect(text).toContain('| om+recall | 2, 3 | 2 | 1/2 (50%) | 0 | 2 in 1/2 sessions | $0.5000 |')
+    expect(text).toContain('- om+recall: dir (@2)')
+    const hidden = renderTranscript({ name: 'private', t, spec, results: recorded, questions, private: true })
+    expect(hidden).toContain('| om+recall | 2, 3 | 2 | 1/2 (50%) | 0 | 2 in 1/2 sessions | $0.5000 |')
+    for (const secret of ['dir', 'worktrees', 'somewhere-secret', 's2']) expect(hidden).not.toContain(secret)
   })
 
   test('leaves out a cached or live om replay whose pi calls failed or went uncounted, and nothing else', () => {
