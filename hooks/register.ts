@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, SessionMessage } from 'claude-code'
+import type { EngineInterface, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 import {
   COMPACT_RECENT,
   COMPACT_RESUME_DIRECTLY,
@@ -15,7 +15,7 @@ import {
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
-import { liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
+import { INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
 
 declare module 'claude-code' {
@@ -118,6 +118,19 @@ const truncate = (text: string, maxTokens: number) =>
 const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
 // What truncate leaves of a text given no room: its note alone.
 const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
+// An oversized command result, bounded at both ends: a final error or test summary usually sits at the start or
+// the end, never only in the middle. The omission is marked explicitly, never silently dropped; om_recall can
+// still find the full result in the transcript. The tail starts at a line boundary so its first line is whole.
+function excerpt(text: string, maxTokens: number) {
+  if (text.length <= maxTokens * 4) return text
+  const room = maxTokens * 4
+  const headChars = Math.floor(room / 2)
+  const rawTailStart = text.length - (room - headChars)
+  const nl = text.indexOf('\n', rawTailStart)
+  const tailStart = nl === -1 || nl >= text.length - 1 ? rawTailStart : nl + 1
+  const omitted = estimateTokens(text.slice(headChars, tailStart))
+  return `${text.slice(0, headChars)}\n... [~${omitted} tokens omitted; om_recall can retrieve the full result] ...\n${text.slice(tailStart)}`
+}
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
@@ -183,12 +196,14 @@ const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.len
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
 
 // What the user typed, if a row is a real prompt: no tool results, compaction summary, injected block (a system
-// reminder, task notification, local command's caveat or output, image note) or skill text. A system reminder a
-// hook appended to a prompt is cut from it.
+// reminder, a named wrapper, image note) or skill text. A system reminder a hook appended to a prompt is cut from it.
+// `SessionMessage` carries no origin field (no host metadata for a user prompt's source reaches this hook, unlike
+// `prompt.submit`'s or `session.receive`'s own `origin`), so a genuine structured prompt is told from an injected
+// one by name, using recall.ts's `INJECTED_WRAPPER` so the two modules agree on what counts as typed.
 function typed(m: SessionMessage, skills: readonly Skill[]) {
   if (!isPrompt(m) || isMemory(m) || isSummary(m)) return undefined
   const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-  if (!text || /^<[a-z][a-z-]*>/.test(text) || text.startsWith('[Image')) return undefined
+  if (!text || INJECTED_WRAPPER.test(text) || text.startsWith('[Image')) return undefined
   return skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
 }
 
@@ -259,7 +274,9 @@ function serialize(v: View, from: number, to: number) {
     }
     if (m.text) blocks.push(`[User${at}]: ${m.text}`)
     for (const r of m.toolResults ?? [])
-      blocks.push(`[Tool result for ${names.get(r.tool_use_id) ?? 'tool'}${at}]: ${truncate(r.text, TOOL_RESULT_MAX_TOKENS) || '[empty result]'}`)
+      // `isError` is the host's own report, never inferred: an absent or successful result never claims failure, and
+      // one truncated for length never claims success it did not report either.
+      blocks.push(`[Tool result for ${names.get(r.tool_use_id) ?? 'tool'}${r.isError ? ' (error)' : ''}${at}]: ${excerpt(r.text, TOOL_RESULT_MAX_TOKENS) || '[empty result]'}`)
   }
   return blocks.join('\n\n')
 }
@@ -921,9 +938,36 @@ function notPersistent($: EngineInterface, sessionId: string, messages: readonly
   record(statsIo($), sessionId, (s) => count(s, 'compaction.notPersistent'))
 }
 
+// Delegates this compaction to the built-in compactor unchanged (`e` passed on as received), and records the live
+// key so a compaction after it can still find the context it kept (see `arrange`). Every delegation is recorded as
+// a compaction; `fellBack` only marks whether it was a genuine fallback (something failed here) for stats, not
+// whether to record at all: an intentional delegation (explicit `/compact` instructions) still counts toward the
+// total, just not as a fallback.
+async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, next: (e: SessionCompactInput) => Promise<SessionCompactResult>, fellBack: boolean) {
+  const installs = e.trigger !== 'precompute'
+  const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
+  const r = await next(e)
+  if (sessionId !== undefined && started !== undefined)
+    record(statsIo($), sessionId, (s, at) =>
+      addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
+    )
+  const [summary, ...kept] = r.messages ?? []
+  if (installs && summary && sessionId !== undefined) {
+    const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
+    await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
+  }
+  return r
+}
+
 export const register: Register = (on) => {
   registerPrune(on)
   on('session.compact', async ($, e, next) => {
+    // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
+    // compactor honors them, background observation cannot. Ordinary compaction stays available without them.
+    if (e.instructions?.trim()) {
+      show($, 'Compaction instructions given. Using built-in compaction', e.agentId)
+      return delegateToBuiltin($, e, next, false)
+    }
     const order = callOrder(e.messages)
     const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
@@ -1095,25 +1139,7 @@ export const register: Register = (on) => {
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     log($, `${next.error.message}; using the built-in compaction`)
     show($, next.error.message?.startsWith(OVER_BUDGET) ? 'Memory over its budget. Using built-in compaction' : 'Observation failed. Using built-in compaction', e.agentId)
-    // The built-in compaction never waits on a call that could fail: without them, it is only not recorded.
-    const installs = e.trigger !== 'precompute'
-    const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
-    const fellBack = (r: Awaited<ReturnType<typeof next>>) => (
-      sessionId !== undefined &&
-        started !== undefined &&
-        record(statsIo($), sessionId, (s, at) =>
-          addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack: true, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
-        ),
-      r
-    )
-    // Its summary is no memory message: what it kept is recorded, to find the live context in the history by.
-    const r = fellBack(await next(e))
-    const [summary, ...kept] = r.messages ?? []
-    if (installs && summary && sessionId !== undefined) {
-      const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
-      await $.store.set(liveKey(loopOf(sessionId, e.agentId).key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
-    }
-    return r
+    return delegateToBuiltin($, e, next, true)
   })
 
   on('session.start', async ($, e, next) => {

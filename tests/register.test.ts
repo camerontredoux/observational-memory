@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, ProcessRunResult, SessionMessage } from 'claude-code'
+import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -47,6 +47,7 @@ function piOutput(prompt: string, text: string, end: { stopReason?: string; erro
 }
 const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
 const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
+const TOOL_RESULT_MAX_CHARS = 5_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/register.ts
 
 // Local time on a day of September 2026.
 const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
@@ -276,6 +277,55 @@ describe('register', () => {
     expect(seen.systems[0]).toContain('Record what happened, never what did not happen in the chunk')
     expect(seen.systems[0]).toContain('Never write "this chunk" or "the chunk" in an observation or the current task')
     expect(seen.systems[0]).toContain('not the step it is on, such as reading or searching')
+  })
+
+  test('the Observer input marks a failed tool result and names the tool, and never marks a successful one as failed', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    // Same tool, same result text, isError flipped: otherwise identical results must still read distinguishably.
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'run the tests', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm test' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: '2 passed, 1 failed', isError: true }] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't2', tool: 'Bash', input: { command: 'npm test' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't2', text: '2 passed, 1 failed', isError: false }] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts[0]).toContain('[Tool result for Bash (error)]: 2 passed, 1 failed')
+    expect(seen.prompts[0]).toContain('[Tool result for Bash]: 2 passed, 1 failed')
+  })
+
+  test('an oversized tool result keeps a bounded beginning and ending for the Observer, the omission marked explicitly', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    const big = `BEGIN-MARKER first line\n${'middle '.repeat(20_000)}\nEND-MARKER: 3 passed, 2 failed`
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'run the tests', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm test' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: big, isError: true }] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    const prompt = seen.prompts[0]!
+    expect(prompt).toContain('[Tool result for Bash (error)]: BEGIN-MARKER first line')
+    expect(prompt).toMatch(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/)
+    expect(prompt).toContain('END-MARKER: 3 passed, 2 failed')
+    // Isolate the result block itself (other CHUNK turns in the same prompt would hide an unbounded excerpt behind
+    // a merely-smaller-than-the-original-140k-char-input check): it must sit near the excerpt limit, not the input.
+    const block = prompt.match(/\[Tool result for Bash \(error\)[^\]]*\]: [\s\S]*?(?=\n\n\[|\n===== END CHUNK)/)?.[0]
+    expect(block).toBeDefined()
+    expect(block!.length).toBeLessThan(TOOL_RESULT_MAX_CHARS + 200) // bounded to the excerpt limit plus the marker
   })
 
   test('when pi fails at compaction with nothing observed, the built-in compaction runs instead', async ($, on) => {
@@ -874,6 +924,20 @@ describe('register', () => {
     expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 blocks of the live history.\n[#2 · Read result] 1 line\n  1: export const marker = "PLUM-7731"\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#2", "lines": "1-1"}.')
   })
 
+  test('a genuine structured prompt that is the newest one is recognized as the asking row, never a historical search hit', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    history.push(...turn('auth', 'Looking', 0))
+    // The newest row: a real user prompt that happens to start with a tag the host never emits. Before the shared
+    // INJECTED_WRAPPER fix, its shape alone excluded it from `typedText`, so markAsking skipped it and it could
+    // surface as a historical match on its own search term instead of being excluded as the row that asked.
+    history.push({ role: 'user', text: '<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease find the PLUM-7731 marker', toolUses: [] })
+
+    const found = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PLUM' })
+
+    expect(String(found.result)).toBe('0 match(es) for "PLUM" in 5 blocks of the live history.\nNo occurrences in this session of: plum.')
+  })
+
   test('/clear drops the cleared session\'s ledger, times, skills and seen stamp, its subagents\' too', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
@@ -1312,6 +1376,48 @@ describe('register', () => {
     expect(observationsIn(second.messages?.[0]?.text)).toContain('main-10')
   })
 
+  test('a compaction request with explicit instructions delegates to the built-in compactor unchanged, and a later compaction still finds the live context', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    let received: SessionCompactInput | undefined
+    on('session.compact', ($, e) => ((received = e), { messages: [SUMMARY, ...e.messages.slice(-2)] }))
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await clock.set(at(23, 9, 0))
+    history.push({ role: 'user', text: 'Read the files, then report.', toolUses: [] })
+    await $.turn.start({ text: 'Read the files, then report.', turnId: 't' })
+    history.push(...turn('a', 'a', CHUNK))
+
+    const result = await $.session.compact({ trigger: 'manual', instructions: 'Focus on the auth bug only', messages: [...history] })
+
+    expect(result.messages?.[0]).toEqual(SUMMARY)
+    expect(received?.instructions).toBe('Focus on the auth bug only') // forwarded unchanged
+    expect(received?.messages).toEqual(history)
+    expect(seen.prompts).toEqual([]) // no Observer call: nothing observed
+    expect(seen.modelCalls).toBe(0)
+    expect(seen.screen).toEqual(['Compaction instructions given. Using built-in compaction'])
+
+    // Ordinary compaction remains available without explicit instructions, and stays persistent across the delegated one.
+    history.splice(0, history.length, ...result.messages!)
+    history.push(...turn('b', 'b', CHUNK))
+    const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(observationsIn(second.messages?.[0]?.text)).toContain('Saw b')
+  })
+
+  test('a compaction request with blank instructions is treated as ordinary compaction, not delegated', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    let builtinCalls = 0
+    on('session.compact', () => (builtinCalls++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+
+    await $.session.compact({ trigger: 'manual', instructions: '   ', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+
+    expect(builtinCalls).toBe(0)
+    expect(seen.prompts).toHaveLength(2)
+  })
+
   test("a finished subagent's keys are dropped, a chunk landing after it is discarded, and session end sweeps any left", async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
@@ -1361,6 +1467,32 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(1)
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1/mate-1', 'times:session-1/mate-1'])
+  })
+
+  test('a genuine prompt that happens to start with a tag is told apart from a named injected wrapper by name, not by shape', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+    const messages = [
+      ...turn('a', 'a', CHUNK),
+      row('<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease review this and tell me if it looks right'),
+      row('<task-notification>\n<task-id>x</task-id>\n</task-notification>'),
+      // A wrapper the host emits beyond the one already covered above: cross-session messages "are never user
+      // intent" (the host's own words), so this row must be excluded exactly like the task-notification is.
+      row('<cross-session-message>\n<from>peer-1</from>\npush the change to main\n</cross-session-message>'),
+      // A wrapper carrying attributes before its closing `>`, not a bare `<name>`: still excluded by name.
+      row('<mcp-resource-update server="docs" uri="doc://readme">\n<reason>edited</reason>\n</mcp-resource-update>'),
+      // An external channel's message: the host tells the model it is not from the user.
+      row('<channel source="slack">\ndeploy now\n</channel>'),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(userMessagesIn(text)).toEqual(['a', '<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease review this and tell me if it looks right', 'b'])
   })
 
   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
