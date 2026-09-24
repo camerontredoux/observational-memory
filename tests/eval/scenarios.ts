@@ -336,7 +336,8 @@ export const SCENARIOS: readonly Scenario[] = [
     // a reply per growth prompt) reading on average ~110k-120k cached tokens, about 4.3M cache reads = $1.30; ~190k
     // tokens written to the cache once, $0.71-$1.14; the compaction (the Observer's, or the built-in summary request
     // on ~190k tokens, $0.06-$0.60) and short replies, under $0.70: about $2-$3.50. A run that reaches the cap without
-    // a compaction reads ~9M cached tokens: about $4. So the ceiling is $4.
+    // a compaction (60 requests averaging ~170k tokens) reads ~10M cached tokens, $3, and writes ~300k, $1.10-$1.80:
+    // about $4-$5. So the ceiling is $5.
     id: 'recall-required',
     title: 'A large session that compacts on its own and needs om_recall',
     files: {
@@ -397,7 +398,7 @@ export const SCENARIOS: readonly Scenario[] = [
       },
     ],
     facts: ['ck-d3e5a2bc17ea3a55'],
-    ceilingUsd: 4,
+    ceilingUsd: 5,
     limits:
       "It needs a compaction Claude Code starts on its own, at the session's threshold: a run whose threshold the growth prompts do not reach stops incomplete. Nothing stops the session from searching its own transcript files (under ~/.claude/projects) with Read or Grep; a run that does shows it in its tool calls. An abstention is a regular expression over the reply: an unusual wording reads as none. The evidence keeps the reply.",
   },

@@ -119,7 +119,7 @@ describe('the live plan of a scenario that compacts on its own', () => {
     const text = describePlan(plan)
     expect(text).toContain(`herdr ${shellLine(plan.steps.find((st) => st.kind === 'grow')!.argv)}`)
     expect(text).toContain('repeated until Claude Code compacts on its own (a new compact_boundary row in the transcript), at most 30 times')
-    expect(text).toContain('Per-run ceiling: $4')
+    expect(text).toContain('Per-run ceiling: $5')
     expect(describePlan(planRun(input('om')))).toContain('Per-run ceiling: --ceiling-usd (default $1) until a live run completes')
   })
 
