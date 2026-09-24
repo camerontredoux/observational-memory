@@ -70,7 +70,8 @@ const isMemoryText = (text: string) => text.startsWith(MEMORY_HEADER) || text.st
 // Known wrappers the host or another session delivers into context, not any text that merely starts with a tag (a
 // real user message may itself start with one). Shared with register.ts's `typed`, so a row counts as a genuine
 // prompt or an injected one the same way in compaction and in recall. Add a name here only once it is confirmed
-// injected (a tag the installed host itself emits to wrap non-user-authored content).
+// injected (a tag the installed host itself emits to wrap content that is not a prompt addressed to the assistant,
+// whoever authored it: `<user-memory-input>` wraps the user's own `#` memory note, not a request to act on).
 export const INJECTED_WRAPPER =
   /^<(?:task-notification|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args|fork-boilerplate|bash-stdout|bash-input|bash-stderr|cross-session-message|teammate-message|user-memory-input)>/
 // What the user typed: not an injected block (a system reminder, a named wrapper, image note).

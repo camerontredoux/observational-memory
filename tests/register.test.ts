@@ -924,6 +924,20 @@ describe('register', () => {
     expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 blocks of the live history.\n[#2 · Read result] 1 line\n  1: export const marker = "PLUM-7731"\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#2", "lines": "1-1"}.')
   })
 
+  test('a genuine structured prompt that is the newest one is recognized as the asking row, never a historical search hit', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    history.push(...turn('auth', 'Looking', 0))
+    // The newest row: a real user prompt that happens to start with a tag the host never emits. Before the shared
+    // INJECTED_WRAPPER fix, its shape alone excluded it from `typedText`, so markAsking skipped it and it could
+    // surface as a historical match on its own search term instead of being excluded as the row that asked.
+    history.push({ role: 'user', text: '<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease find the PLUM-7731 marker', toolUses: [] })
+
+    const found = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PLUM' })
+
+    expect(String(found.result)).toBe('0 match(es) for "PLUM" in 5 blocks of the live history.\nNo occurrences in this session of: plum.')
+  })
+
   test('/clear drops the cleared session\'s ledger, times, skills and seen stamp, its subagents\' too', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
