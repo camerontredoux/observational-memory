@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
-import { COMPACT_WRAPPER, MEMORY_HEADER } from '../hooks/prompts'
+import { COMPACT_WRAPPER, MEMORY_HEADER, MEMORY_RECALL } from '../hooks/prompts'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -2955,5 +2955,24 @@ describe('active constraints and the continuation record', () => {
     const known = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
     expect(known).toContain('\n* (2 earlier user messages omitted; om_recall can search them)\n')
     expect(userMessagesIn(known)).toEqual(userMessagesIn(unknown))
+  })
+
+  test("the memory message ends by sending the model to om_recall before it says a detail is gone, only while the model can call om_recall", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    let tools = [{ name: 'Read', description: 'Reads a file', mcp: false }]
+    on('tool.list', () => ({ value: tools }))
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+
+    // As with --disallowed-tools mcp__observational-memory__om_recall: the tool is not the model's to call.
+    const without = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
+    tools = [...tools, { name: 'mcp__observational-memory__om_recall', description: 'Searches', mcp: true }]
+    const offered = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
+
+    expect(offered.endsWith(`</system-reminder>\n\n${MEMORY_RECALL}`)).toBe(true)
+    expect(without).not.toContain(MEMORY_RECALL)
+    expect(without.endsWith('</system-reminder>')).toBe(true)
+    expect(observationsIn(offered)).toBe(observationsIn(without))
   })
 })
