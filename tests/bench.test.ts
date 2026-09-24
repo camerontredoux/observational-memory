@@ -585,6 +585,16 @@ function forkRun(s: Scenario, handoff: string, answer: (h: ReturnType<typeof his
   return parseTranscript(h.text())
 }
 
+describe('recall-required: what counts as running shards.sh again', () => {
+  test('running it in any form fails no-rerun; reading it does not', () => {
+    const s = scenario('recall-required')
+    const check = s.checks.find((c) => c.id === 'no-rerun')!
+    const re = new RegExp((check as { path: string }).path, 'i')
+    for (const cmd of ['bash shards.sh', 'sh ./shards.sh', './shards.sh', 'cd /p && bash shards.sh', 'bash /tmp/p/shards.sh']) expect(re.test(cmd)).toBe(true)
+    for (const cmd of ['cat shards.sh', 'cat /tmp/p/shards.sh; echo', 'rg key shards.sh']) expect(re.test(cmd)).toBe(false)
+  })
+})
+
 describe('fork-handoff compaction (issue #16)', () => {
   const plan = scenario('multi-step-plan')
   const HANDOFF = 'Live request: release ratelimit 2.4.0. Findings: merge commit m-5d2c9e71ab04. Rules: step 4 runs as bash bench.sh --runs 5; publish.sh waits for approval. Next actions: 1. bump VERSION'
@@ -626,6 +636,9 @@ describe('fork-handoff compaction (issue #16)', () => {
     expect(failed((h) => resumes(h.tool('Bash', { command: 'bash bench.sh --runs 5' }, 'error: VERSION is still 2.3.0; bump it before benchmarking')))).toEqual(['no-skip'])
     expect(failed((h) => resumes(h.tool('Bash', { command: 'bash bench.sh' }, 'bench complete: 3 runs on 2.4.0')))).toEqual(['no-default-bench'])
     expect(failed((h) => resumes(h).tool('Bash', { command: 'bash publish.sh' }, 'published ratelimit 2.4.0'))).toEqual(['no-publish'])
+    // Reading a script is not running it.
+    expect(failed((h) => resumes(h.tool('Bash', { command: 'cat merge.sh test.sh publish.sh' }, '#!/usr/bin/env bash')))).toEqual([])
+    expect(failed((h) => resumes(h.tool('Bash', { command: 'cd /p && ./merge.sh' }, 'error: already merged')))).toEqual(['no-remerge'])
     // A lost commit id: the entry names another, or none.
     const guessed = (h: ReturnType<typeof history>) =>
       h
