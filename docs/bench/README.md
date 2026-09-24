@@ -208,3 +208,53 @@ about to do at boundary N, and what it had last told the user.
   control, were incomplete: Sonnet redirected `logs.sh` to a file and read its last line, so the context never
   reached the auto-compact threshold. `logs.sh` now refuses a redirect or pipe (`92e3cba`); the run after the fix
   succeeded. Live runs cost $12.02.
+
+### 2026-09-24, why v1.3.0's om+recall sessions stopped calling om_recall
+
+The v1.3.0 question sessions called `om_recall` twice where v1.2.0's called it 26 times. The cause was the harness,
+not the plugin.
+
+- Question grouping. v1.3.0 asked each boundary's fact and handoff questions in one session. v1.2.0 asked the
+  handoff questions alone. With the facts in the same session, Sonnet answered everything from the memory in one
+  reply. At om-v04 boundaries 3 and 6 it wrote `next-3: unknown` and `told-3: unknown` and stopped without calling
+  the tool. v1.2.0's fact-only sessions called `om_recall` in none of 14 sessions either.
+- The standing compaction note is not the cause. Question sessions load the recall-only plugin
+  (`tests/eval/recall-plugin`), which sends no system-prompt note. The recall note at the end of the memory has the
+  same wording and position in both versions, and the assembled recall plugins are byte-identical.
+- A second harness bug: a +recall session's JSON `result` holds only its last reply. At om-v04 boundary 2 the model
+  answered the facts, then searched, then answered only the handoff questions, so two correct fact answers scored as
+  empty. Answers are now read from every reply in the transcript.
+
+Both are fixed in `bfddc94`. The question stage now puts a boundary's handoff questions in a session of their own.
+`om --cache DIR` gives a replay a fresh pi cache, so it samples the Observer again instead of reading back the
+first run's cached replies.
+
+Matched rerun: v1.3.0's memory (`om-v130`), handoff questions asked alone, as v1.2.0's were:
+
+| transcript | om_recall calls v1.2.0 → v1.3.0 | om+recall handoff v1.2.0 → v1.3.0 |
+|---|---:|---:|
+| om-orchestration | 9 → 6 | 5/10 → 5/10 |
+| om-v04 | 8 → 3 | 12/17 → 12/17 |
+| firstmate-11 | 9 → 8 | 12/17 → 11/17 |
+| all three | 26 → 17 | 29/44 → 28/44 (mixed sessions: 26/44, 2 calls) |
+
+om alone, handoff questions asked alone, on om-orchestration and om-v04: 11/27 (v1.2.0: 12/27). The same v1.3.0 memory
+asked in mixed sessions scored 12/27, so single sessions move by about ±2 on the same input. v1.3.0 searched a little
+less for the same score. Its continuation record already states the next steps and what was told to the user. One
+run cannot separate that from noise.
+
+om-v04's fact drop is Observer variance. Two more v1.3.0 replays, each with its own pi cache, with fact questions
+asked alone:
+
+| om-v04 run | needed identifiers held | om facts | om+recall facts |
+|---|---:|---:|---:|
+| v1.2.0 | 45/68 (66%) | 25/27 | 26/27 |
+| v1.3.0, run 1 (mixed sessions) | 38/68 (56%) | 23/27 | 21/27 (19 before the reply fix) |
+| v1.3.0, run 2 | 44/68 (65%) | 25/27 | 25/27 |
+| v1.3.0, run 3 | 46/68 (68%) | 26/27 | 24/27 |
+
+In run 1 the Observer never recorded the proposed log format that contains "+11 notes", so `log-notes` failed at
+most boundaries. Runs 2 and 3 recorded it from boundary 4 on, as v1.2.0 did.
+
+Cost: $13.44 in question sessions, $0.28 in pi. The question stage's estimates ran about twice the actual cost.
+
