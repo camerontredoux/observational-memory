@@ -434,7 +434,12 @@ export const SCENARIOS: readonly Scenario[] = [
       COMPACT,
     ],
     // The plan lives in the conversation alone: a history that wrote it to a file measures that file, not the memory.
-    setup: [{ id: 'no-plan-file', category: 'correctness', description: 'the history wrote no file (the plan stayed in the conversation)', kind: 'tool', tool: WRITES, expect: 'absent' }],
+    // And it read the research: one built-in run took "do not run anything" to forbid reading, so its history held no
+    // research to compact (and its compaction summary refused the task): the history failed, not the memory.
+    setup: [
+      { id: 'no-plan-file', category: 'correctness', description: 'the history wrote no file (the plan stayed in the conversation)', kind: 'tool', tool: WRITES, expect: 'absent' },
+      ...[16, 17, 18].map((n) => ({ id: `read-${n}`, category: 'correctness' as const, description: `the history read docs/handbook-${n}.md`, kind: 'tool' as const, tool: '^(Read|Bash|Grep)$', path: `handbook-${n}\\.md`, expect: 'present' as const })),
+    ],
     continuation:
       'Where does the queue plan stand? Give me the current plan in a reply, not a file: what is decided (the latest version of each decision, not the ones we replaced), what we rejected and why, and what is still open.',
     checks: [

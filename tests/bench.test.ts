@@ -597,6 +597,10 @@ describe('recall-required: what counts as running shards.sh again', () => {
 
 describe('planning-session: the current plan after a compaction mid-planning', () => {
   const s = scenario('planning-session')
+  // The research reads the history needs (any read tool: a live session also greps a section).
+  const READS = (h: ReturnType<typeof history>) => {
+    h.tool('Read', { file_path: '/p/docs/handbook-16.md' }, '# Engineering handbook').tool('Bash', { command: 'rg -A3 Timeouts docs/handbook-17.md' }, 'rule').tool('Read', { file_path: '/p/docs/handbook-18.md' }, '# Engineering handbook')
+  }
   const PLAN = [
     'Decided:',
     '- Backend: Postgres with SELECT ... FOR UPDATE SKIP LOCKED (replaced Redis Streams). Caveat: partition the jobs table by day once it passes 50 million rows.',
@@ -610,10 +614,10 @@ describe('planning-session: the current plan after a compaction mid-planning', (
     '- Who owns the queue on-call: the platform team or the payments team?',
   ].join('\n')
   const failed = (reply: string, extra?: (h: ReturnType<typeof history>) => void) =>
-    scoreRun(s, 'om', run(s, () => OM_SUMMARY('* planned the queue'), (h) => { extra?.(h); h.reply(reply) })).checks.filter((c) => c.outcome === 'fail').map((c) => c.id)
+    scoreRun(s, 'om', run(s, () => OM_SUMMARY('* planned the queue'), (h) => { extra?.(h); h.reply(reply) }, READS)).checks.filter((c) => c.outcome === 'fail').map((c) => c.id)
 
   test('the latest decisions, the rejections with their reasons and both open questions pass every check', () => {
-    const score = scoreRun(s, 'om', run(s, () => OM_SUMMARY('* planned the queue'), (h) => h.reply(PLAN)))
+    const score = scoreRun(s, 'om', run(s, () => OM_SUMMARY('* planned the queue'), (h) => h.reply(PLAN), READS))
     expect(score.invalid).toEqual([])
     expect(score.taskSuccess).toBe(true)
   })
@@ -629,9 +633,11 @@ describe('planning-session: the current plan after a compaction mid-planning', (
     expect(failed(PLAN, (h) => h.tool('Write', { file_path: '/p/PLAN.md', content: PLAN }, 'ok'))).toEqual(['no-plan-write'])
   })
 
-  test('a history that wrote the plan to a file is invalid, not scored', () => {
-    const t = run(s, () => OM_SUMMARY('* planned the queue'), (h) => h.reply(PLAN), (h) => h.tool('Write', { file_path: '/p/notes/plan.md', content: 'backend: Postgres' }, 'ok'))
+  test('a history that wrote the plan to a file, or did not read the research, is invalid, not scored', () => {
+    const t = run(s, () => OM_SUMMARY('* planned the queue'), (h) => h.reply(PLAN), (h) => { READS(h); h.tool('Write', { file_path: '/p/notes/plan.md', content: 'backend: Postgres' }, 'ok') })
     expect(scoreRun(s, 'om', t).invalid.join()).toMatch(/wrote no file/)
+    const unread = run(s, () => OM_SUMMARY('* planned the queue'), (h) => h.reply(PLAN), (h) => h.tool('Read', { file_path: '/p/docs/handbook-16.md' }, '# Engineering handbook'))
+    expect(scoreRun(s, 'om', unread).invalid.join()).toMatch(/read docs\/handbook-17\.md.*read docs\/handbook-18\.md/)
   })
 })
 
