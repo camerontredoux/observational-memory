@@ -2,7 +2,8 @@
 // no compaction, observation, stats or pruning hook, so the host's built-in compaction runs as with no plugin.
 // scripts/bench-live.ts copies this directory into a run's sandbox with the plugin version's own recall.ts and
 // prompts.ts beside it. Kept in step with hooks/register.ts's `session.start` registration (tests/register.test.ts checks
-// they register the same om_recall) and `tool.call` handler.
+// they register the same om_recall), its `tool.call` handler, and its om_recall `tool.describe` and
+// `classic.SessionStart` handlers (tests/register.test.ts checks both pin om_recall after a compaction).
 import type { EngineInterface, Register } from 'claude-code'
 import { COMPACT_WRAPPER } from './prompts'
 import { liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'

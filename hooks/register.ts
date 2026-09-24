@@ -1439,7 +1439,7 @@ export const register: Register = (on) => {
   // om_recall waits behind ToolSearch, its description unread, until a compaction removes what it finds; from then on
   // it is in the tool list. The answer holds for the session, so a compaction's SessionStart has it asked again, when
   // the prompt is rebuilt anyway. A resumed session that was compacted has a summary in its history too.
-  on('tool.describe', { tool: RECALL_TOOL_NAME }, async ($, e, next) => {
+  on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => {
     const described = await next(e)
     const compacted = await $.session.messages().then((rows) => rows.some(isSummary), () => false)
     return compacted ? { ...described, isDeferred: false } : described

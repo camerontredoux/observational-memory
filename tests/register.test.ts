@@ -186,6 +186,11 @@ function recallOnlyHooks() {
   return hooks
 }
 
+// The engine's own answer to om_recall's `tool.describe`: an MCP tool is deferred.
+const deferredByEngine = (e: { description: string; isDeferred?: true }) => ({ description: e.description, ...(e.isDeferred ? { isDeferred: e.isDeferred } : {}) })
+const RECALL_DESCRIBE = { tool: 'mcp__observational-memory__om_recall', description: 'Searches', isDeferred: true as const, provider: { plugin: 'observational-memory', tier: 'user' as const } }
+const COMPACT_START = { source: 'compact' as const, session_id: 'session-1', transcript_path: '' }
+
 // A turn's work after its prompt: no new prompt.
 const work = (name: string, size = 0) => turn(name, 'r', size).slice(1)
 // The user's latest request the continuation record quotes: `(n chars):` then exactly n characters.
@@ -1152,38 +1157,44 @@ describe('register', () => {
     expect(evaluated).toEqual([registered.find((r) => r.name === 'om_recall')])
   })
 
-  test('om_recall waits behind ToolSearch until the first compaction, then is described again into the tool list, in the eval plugin too', async ($, on) => {
+  test('om_recall waits behind ToolSearch until the first compaction, then is described again into the tool list', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
     pi(on)
     const invalidated: string[] = []
     on('ui.invalidate', ($, e) => (invalidated.push(e.event), { value: undefined }))
     on('classic.SessionStart', () => ({}))
-    // The engine's own answer: an MCP tool is deferred.
-    const engine = (e: { description: string; isDeferred?: true }) => ({ description: e.description, ...(e.isDeferred ? { isDeferred: e.isDeferred } : {}) })
-    on('tool.describe', ($, e) => engine(e))
-    const input = { tool: 'mcp__observational-memory__om_recall', description: 'Searches', isDeferred: true as const, provider: { plugin: 'observational-memory', tier: 'user' as const } }
-    // The recall-only eval plugin's hooks, with the same history and invalidation.
-    const evalHooks = recallOnlyHooks()
-    const evalInvalidated: string[] = []
-    const evalWorld = { session: { messages: async () => history }, ui: { invalidate: (event: string) => void evalInvalidated.push(event) } }
-    const evalDescribe = () => evalHooks.get('tool.describe')!(evalWorld, input, engine)
-    const compactStart = { source: 'compact' as const, session_id: 'session-1', transcript_path: '' }
+    on('tool.describe', ($, e) => deferredByEngine(e))
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
 
-    const before = await $.tool.describe(input)
-    const evalBefore = await evalDescribe()
+    const before = await $.tool.describe(RECALL_DESCRIBE)
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
     history.push(...result.messages!) // written after the boundary, as the engine does
-    await $.classic.SessionStart(compactStart)
-    await evalHooks.get('classic.SessionStart')!(evalWorld, compactStart, (e: unknown) => e)
+    await $.classic.SessionStart(COMPACT_START)
 
     expect(before).toEqual({ description: 'Searches', isDeferred: true })
-    expect(evalBefore).toEqual(before)
     expect(invalidated).toEqual(['tool.describe'])
-    expect(evalInvalidated).toEqual(['tool.describe'])
-    expect(await $.tool.describe(input)).toEqual({ description: 'Searches', isDeferred: false })
-    expect(await evalDescribe()).toEqual({ description: 'Searches', isDeferred: false })
+    expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: false })
+  })
+
+  test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    const evalHooks = recallOnlyHooks()
+    const invalidated: string[] = []
+    const evalWorld = { session: { messages: async () => history }, ui: { invalidate: (event: string) => void invalidated.push(event) } }
+    const describe = () => evalHooks.get('tool.describe')!(evalWorld, RECALL_DESCRIBE, deferredByEngine)
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
+
+    const before = await describe()
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    history.push(...result.messages!) // written after the boundary, as the engine does
+    await evalHooks.get('classic.SessionStart')!(evalWorld, COMPACT_START, (e: unknown) => e)
+
+    expect(before).toEqual({ description: 'Searches', isDeferred: true })
+    expect(invalidated).toEqual(['tool.describe'])
+    expect(await describe()).toEqual({ description: 'Searches', isDeferred: false })
   })
 
   test('om_recall labels tool results with the tool that produced them', async ($, on) => {
