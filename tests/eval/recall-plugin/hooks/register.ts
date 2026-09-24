@@ -1,8 +1,11 @@
 // Evaluation only: issue #9's builtin+recall configuration. The om_recall tool of hooks/register.ts and nothing else:
 // no compaction, observation, stats or pruning hook, so the host's built-in compaction runs as with no plugin.
 // scripts/bench-live.ts copies this directory into a run's sandbox with the plugin version's own recall.ts and
-// prompts.ts beside it. Kept in step with hooks/register.ts's `session.start` registration and `tool.call` handler.
+// prompts.ts beside it. Kept in step with hooks/register.ts's `session.start` registration (tests/register.test.ts checks
+// they register the same om_recall), its `tool.call` handler, and its om_recall `tool.describe` and
+// `classic.SessionStart` handlers (tests/register.test.ts checks both pin om_recall after a compaction).
 import type { EngineInterface, Register } from 'claude-code'
+import { COMPACT_WRAPPER } from './prompts'
 import { liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
 
@@ -47,9 +50,12 @@ export const register: Register = (on) => {
       .register({
         name: 'om_recall',
         description:
-          "Searches, reads and outlines this session's full transcript: what compaction removed from context, the earlier " +
-          'files a moved session continued from, optionally its subagents. Use it when the summary lacks a detail you ' +
-          "need: exact text, a tool's output, a quote, what happened when. Search first: its excerpts, the best lines of each " +
+          "Use it before telling the user you no longer have a detail from earlier in this session, or that it was never " +
+          "shown: a summary that does not show a tool's full output is not evidence that the output is lost. Use it too " +
+          "whenever the summary lacks a detail you need: exact text, a tool's output, a quote, what happened when. It " +
+          "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
+          'what compaction removed from context, the earlier files a moved session continued from, optionally its ' +
+          'subagents. Search first: its excerpts, the best lines of each ' +
           'matching block, usually answer, and it names query terms that occur nowhere, so do not search again to confirm an ' +
           'absence. Read a block only when its excerpt is not enough, and only the lines you need. Outline only to orient, ' +
           'one page. Stop as soon as you have the answer. search (a query alone): words, all of which must appear (failing ' +
@@ -85,6 +91,17 @@ export const register: Register = (on) => {
     return { result: found.text }
   })
 
-  on('classic.SessionStart', async ($, e, next) => (await noteTranscript($, e), next(e)))
+  // As hooks/register.ts's: om_recall joins the tool list once a compaction has run.
+  on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => {
+    const described = await next(e)
+    const compacted = await $.session.messages().then((rows) => rows.some((m) => m.role === 'user' && m.text.startsWith(COMPACT_WRAPPER)), () => false)
+    return compacted ? { ...described, isDeferred: false } : described
+  })
+
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'compact') $.ui.invalidate('tool.describe')
+    await noteTranscript($, e)
+    return next(e)
+  })
   on('classic.Stop', async ($, e, next) => (await noteTranscript($, e), next(e)))
 }

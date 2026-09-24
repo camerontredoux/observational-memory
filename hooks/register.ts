@@ -7,6 +7,7 @@ import {
   MEMORY_CONTINUATION,
   MEMORY_HEADER,
   MEMORY_INSTRUCTIONS,
+  MEMORY_RECALL,
   OBSERVER_SYSTEM_PROMPT,
   REFLECTOR_SYSTEM_PROMPT,
   reflectionPrompt,
@@ -44,6 +45,7 @@ const REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens of output, in the 
 const MAX_MARKS = 4_000
 const STAMP_SLACK_MS = 60_000
 const RECALL_TOOL = 'om_recall'
+const RECALL_TOOL_NAME = `mcp__observational-memory__${RECALL_TOOL}` // as the model sees it
 const STATS_TOOL = 'om_stats'
 const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
 const NEXT_STEP_MAX_TOKENS = 2_000 // the latest request the continuation record quotes
@@ -97,6 +99,7 @@ type Memory = {
   nextStep?: string // the user's latest request, verbatim
   transcript?: string
   recoverable: boolean // the session's transcript is known: om_recall can find what the memory leaves out
+  recall: boolean // the model can call om_recall: the message ends by sending it there
   recentKept: boolean
   resumeDirectly: boolean
 }
@@ -675,7 +678,8 @@ function unstamp(text: string) {
   return m ? realTime(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])) : undefined
 }
 
-// Built as the built-in summary is framed: its wrapper first, the memory, then its notes after the summary.
+// Built as the built-in summary is framed: its wrapper first, the memory, then its notes after the summary; last,
+// where the model can call om_recall, the note that sends it there, so it is the last thing read before the messages.
 function memoryMessage(memory: Memory): SessionMessage {
   const text =
     `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
@@ -686,7 +690,8 @@ function memoryMessage(memory: Memory): SessionMessage {
     (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
     (memory.recentKept ? `\n${COMPACT_RECENT}` : '') +
     (memory.resumeDirectly ? `\n${COMPACT_RESUME}` : '') +
-    `\n\n<system-reminder>${MEMORY_CONTINUATION}</system-reminder>`
+    `\n\n<system-reminder>${MEMORY_CONTINUATION}</system-reminder>` +
+    (memory.recall ? `\n\n${MEMORY_RECALL}` : '')
   return { role: 'user', text, toolUses: [] }
 }
 
@@ -1152,7 +1157,13 @@ export const register: Register = (on) => {
     const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
-    const [sessionId, started, usage] = await Promise.all([$.session.id(), $.clock.now(), $.session.usage({ breakdown: 'summary' }).catch(() => undefined)])
+    const [sessionId, started, usage, recall] = await Promise.all([
+      $.session.id(),
+      $.clock.now(),
+      $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
+      // Not the model's with --disallowed-tools, or when its registration failed; assumed so when the host cannot tell.
+      $.tool.list().then((tools) => tools.some((t) => t.name === RECALL_TOOL_NAME), () => true),
+    ])
     const loop = loopOf(sessionId, e.agentId)
     const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
@@ -1256,6 +1267,7 @@ export const register: Register = (on) => {
         nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
         transcript,
         recoverable: transcriptPath !== undefined,
+        recall,
         recentKept: tail.length > 0,
         resumeDirectly: e.trigger === 'auto',
       }
@@ -1347,9 +1359,12 @@ export const register: Register = (on) => {
       .register({
         name: RECALL_TOOL,
         description:
-          "Searches, reads and outlines this session's full transcript: what compaction removed from context, the earlier " +
-          'files a moved session continued from, optionally its subagents. Use it when the observations lack a detail you ' +
-          "need: exact text, a tool's output, a quote, what happened when. Search first: its excerpts, the best lines of each " +
+          "Use it before telling the user you no longer have a detail from earlier in this session, or that it was never " +
+          "shown: a summary that does not show a tool's full output is not evidence that the output is lost. Use it too " +
+          "whenever the summary lacks a detail you need: exact text, a tool's output, a quote, what happened when. It " +
+          "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
+          'what compaction removed from context, the earlier files a moved session continued from, optionally its ' +
+          'subagents. Search first: its excerpts, the best lines of each ' +
           'matching block, usually answer, and it names query terms that occur nowhere, so do not search again to confirm an ' +
           'absence. Read a block only when its excerpt is not enough, and only the lines you need. Outline only to orient, ' +
           'one page. Stop as soon as you have the answer. search (a query alone): words, all of which must appear (failing ' +
@@ -1421,8 +1436,21 @@ export const register: Register = (on) => {
   on('tool.call', { tool: 'mcp__observational-memory__om_stats' }, async ($, e) => ({ result: await report(statsIo($), e) }))
   on('command.run', { command: 'om-stats' }, async ($, e) => ({ text: await report(statsIo($), parseArgs(e.args)) }))
 
+  // om_recall waits behind ToolSearch, its description unread, until a compaction removes what it finds; from then on
+  // it is in the tool list. The answer holds for the session, so a compaction's SessionStart has it asked again, when
+  // the prompt is rebuilt anyway. A resumed session that was compacted has a summary in its history too.
+  on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => {
+    const described = await next(e)
+    const compacted = await $.session.messages().then((rows) => rows.some(isSummary), () => false)
+    return compacted ? { ...described, isDeferred: false } : described
+  })
+
   // Where the transcript file is, for om_recall and the memory message: known at start and after every turn.
-  on('classic.SessionStart', async ($, e, next) => (await noteTranscript($, e), next(e)))
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'compact') $.ui.invalidate('tool.describe')
+    await noteTranscript($, e)
+    return next(e)
+  })
   on('classic.Stop', async ($, e, next) => (await noteTranscript($, e), next(e)))
 
   // Subagents raise no turn.start, so each is the main conversation's prompt.

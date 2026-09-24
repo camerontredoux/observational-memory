@@ -1,7 +1,8 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
-import { COMPACT_WRAPPER, MEMORY_HEADER } from '../hooks/prompts'
+import { COMPACT_WRAPPER, MEMORY_HEADER, MEMORY_RECALL } from '../hooks/prompts'
+import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -175,6 +176,20 @@ function gates() {
   }
   return { gate, open: (n: number) => (gate(n), release.get(n)!()) }
 }
+
+// The recall-only eval plugin's hooks by event, the last registered for each, to run with a `$` the test builds: the
+// test kit loads an inline plugin from its register function alone, which this one's top-level helpers are not in,
+// and the test's own `$` makes no call a plugin alone makes, such as `$.tool.register`.
+function recallOnlyHooks() {
+  const hooks = new Map<string, (...args: any[]) => Promise<unknown>>()
+  recallOnly(((event: string, ...rest: unknown[]) => void hooks.set(event, rest.at(-1) as never)) as unknown as On, {} as never)
+  return hooks
+}
+
+// The engine's own answer to om_recall's `tool.describe`: an MCP tool is deferred.
+const deferredByEngine = (e: { description: string; isDeferred?: true }) => ({ description: e.description, ...(e.isDeferred ? { isDeferred: e.isDeferred } : {}) })
+const RECALL_DESCRIBE = { tool: 'mcp__observational-memory__om_recall', description: 'Searches', isDeferred: true as const, provider: { plugin: 'observational-memory', tier: 'user' as const } }
+const COMPACT_START = { source: 'compact' as const, session_id: 'session-1', transcript_path: '' }
 
 // A turn's work after its prompt: no new prompt.
 const work = (name: string, size = 0) => turn(name, 'r', size).slice(1)
@@ -1125,6 +1140,61 @@ describe('register', () => {
     )
     const whole = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', ref: '#33', lines: '1' })).result)
     expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines \(1,031 characters\); only if you still need them: \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
+  })
+
+  test('the recall-only eval plugin registers om_recall exactly as the plugin does, so built-in+recall is offered the same tool', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const registered: { name: string }[] = []
+    on('tool.register', ($, e) => (registered.push(e), { value: { tool: `mcp__observational-memory__${e.name}` } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+    const evaluated: unknown[] = []
+    const tool = { register: async (spec: unknown) => (evaluated.push(spec), { tool: 'mcp__observational-memory__om_recall' }) }
+    await recallOnlyHooks().get('session.start')!({ tool }, { cwd: '/tmp' }, (e: unknown) => e)
+
+    expect(evaluated).toEqual([registered.find((r) => r.name === 'om_recall')])
+  })
+
+  test('om_recall waits behind ToolSearch until the first compaction, then is described again into the tool list', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    const invalidated: string[] = []
+    on('ui.invalidate', ($, e) => (invalidated.push(e.event), { value: undefined }))
+    on('classic.SessionStart', () => ({}))
+    on('tool.describe', ($, e) => deferredByEngine(e))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
+
+    const before = await $.tool.describe(RECALL_DESCRIBE)
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    history.push(...result.messages!) // written after the boundary, as the engine does
+    await $.classic.SessionStart(COMPACT_START)
+
+    expect(before).toEqual({ description: 'Searches', isDeferred: true })
+    expect(invalidated).toEqual(['tool.describe'])
+    expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: false })
+  })
+
+  test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    const evalHooks = recallOnlyHooks()
+    const invalidated: string[] = []
+    const evalWorld = { session: { messages: async () => history }, ui: { invalidate: (event: string) => void invalidated.push(event) } }
+    const describe = () => evalHooks.get('tool.describe')!(evalWorld, RECALL_DESCRIBE, deferredByEngine)
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
+
+    const before = await describe()
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    history.push(...result.messages!) // written after the boundary, as the engine does
+    await evalHooks.get('classic.SessionStart')!(evalWorld, COMPACT_START, (e: unknown) => e)
+
+    expect(before).toEqual({ description: 'Searches', isDeferred: true })
+    expect(invalidated).toEqual(['tool.describe'])
+    expect(await describe()).toEqual({ description: 'Searches', isDeferred: false })
   })
 
   test('om_recall labels tool results with the tool that produced them', async ($, on) => {
@@ -2955,5 +3025,24 @@ describe('active constraints and the continuation record', () => {
     const known = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
     expect(known).toContain('\n* (2 earlier user messages omitted; om_recall can search them)\n')
     expect(userMessagesIn(known)).toEqual(userMessagesIn(unknown))
+  })
+
+  test("the memory message ends by sending the model to om_recall before it says a detail is gone, only while the model can call om_recall", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    let tools = [{ name: 'Read', description: 'Reads a file', mcp: false }]
+    on('tool.list', () => ({ value: tools }))
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+
+    // As with --disallowed-tools mcp__observational-memory__om_recall: the tool is not the model's to call.
+    const without = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
+    tools = [...tools, { name: 'mcp__observational-memory__om_recall', description: 'Searches', mcp: true }]
+    const offered = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
+
+    expect(offered.endsWith(`</system-reminder>\n\n${MEMORY_RECALL}`)).toBe(true)
+    expect(without).not.toContain(MEMORY_RECALL)
+    expect(without.endsWith('</system-reminder>')).toBe(true)
+    expect(observationsIn(offered)).toBe(observationsIn(without))
   })
 })
