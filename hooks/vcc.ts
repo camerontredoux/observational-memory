@@ -36,10 +36,20 @@ export const emptyBrief = (): Brief => ({ modified: [], created: [], earlierModi
 // ── normalization ──
 
 type Result = { text: string; isError: boolean }
+// `ref`: the om_recall block the event came from, when the caller can name it.
 type Block =
-  | { kind: 'user'; i: number; at?: number }
-  | { kind: 'assistant'; i: number; at?: number; text: string }
-  | { kind: 'tool'; i: number; at?: number; name: string; input: Record<string, unknown>; result?: Result }
+  | { kind: 'user'; i: number; at?: number; ref?: string }
+  | { kind: 'assistant'; i: number; at?: number; ref?: string; text: string }
+  | { kind: 'tool'; i: number; at?: number; ref?: string; name: string; input: Record<string, unknown>; result?: Result }
+// The om_recall reference of row `row` of the span, or of its tool call `callId`: `<file>:<line>` as search and
+// outline give it. None when the row is in no transcript file.
+export type RefOf = (row: number, callId?: string) => string | undefined
+
+// A line's reference comes last, in parentheses; lines compare, merge and collapse without it.
+const REF_TAIL = / \((?:#|[\w.-]+:)\d+(?:\.\d+)?\)$/
+const withRef = (line: string, b: { ref?: string }) => (b.ref ? `${line} (${b.ref})` : line)
+const unref = (line: string) => line.replace(REF_TAIL, '')
+const refTail = (line: string) => line.match(REF_TAIL)?.[0] ?? ''
 
 // pi-vcc's filter-noise list, with Claude Code's own bookkeeping tools and this plugin's.
 const NOISE_TOOLS = new Set(['TodoWrite', 'TodoRead', 'ToolSearch', 'Skill', 'ExitPlanMode', 'EnterPlanMode', 'AskUserQuestion', 'Monitor', 'TaskStop'])
@@ -56,7 +66,7 @@ const oneLine = (text: string) => sanitize(text).replace(/\s+/g, ' ').trim()
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`)
 
 // Rows in call order, each tool call joined to its result; typed prompts kept as markers for where a turn closes.
-function normalize(rows: readonly SessionMessage[], at: readonly (number | undefined)[]): Block[] {
+function normalize(rows: readonly SessionMessage[], at: readonly (number | undefined)[], refOf?: RefOf): Block[] {
   const blocks: Block[] = []
   const calls = new Map<string, Extract<Block, { kind: 'tool' }>>()
   rows.forEach((m, i) => {
@@ -66,14 +76,14 @@ function normalize(rows: readonly SessionMessage[], at: readonly (number | undef
         const call = calls.get(r.tool_use_id)
         if (call) call.result = { text: sanitize(r.text), isError: r.isError === true }
       }
-      if (!m.toolResults?.length && m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()) blocks.push({ kind: 'user', i, at: t })
+      if (!m.toolResults?.length && m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()) blocks.push({ kind: 'user', i, at: t, ref: refOf?.(i) })
       return
     }
     const text = sanitize(m.text).trim()
-    if (text && text !== '(no content)') blocks.push({ kind: 'assistant', i, at: t, text })
+    if (text && text !== '(no content)') blocks.push({ kind: 'assistant', i, at: t, ref: refOf?.(i), text })
     for (const u of m.toolUses) {
       if (!u.tool || isNoiseTool(u.tool)) continue
-      const call: Extract<Block, { kind: 'tool' }> = { kind: 'tool', i, at: t, name: u.tool, input: u.input ?? {} }
+      const call: Extract<Block, { kind: 'tool' }> = { kind: 'tool', i, at: t, ref: refOf?.(i, u.tool_use_id), name: u.tool, input: u.input ?? {} }
       if (u.text !== undefined) call.result = { text: sanitize(u.text), isError: u.isError === true }
       calls.set(u.tool_use_id, call)
       blocks.push(call)
@@ -352,25 +362,26 @@ export function displayPath(path: string, cwd: string, home?: string) {
 
 // Files written, by the edit tools (a Write that answered "File created" created it) or by a Bash command that
 // succeeded; oldest first, each at its latest touch. A file created in the span is listed as created only.
+// Each path is followed by the reference of the block that touched it last.
 function extractFiles(blocks: readonly Block[], cwd: string, home?: string) {
-  const touched = new Map<string, 'modified' | 'created'>()
-  const touch = (path: string, kind: 'modified' | 'created') => {
+  const touched = new Map<string, { kind: 'modified' | 'created'; b: Block }>()
+  const touch = (path: string, kind: 'modified' | 'created', b: Block) => {
     const was = touched.get(path)
     touched.delete(path)
-    touched.set(path, was === 'created' ? 'created' : kind)
+    touched.set(path, { kind: was?.kind === 'created' ? 'created' : kind, b })
   }
   for (const b of blocks) {
     if (b.kind !== 'tool' || b.result?.isError) continue
     if (EDIT_TOOLS.has(b.name)) {
       const p = pathOf(b.input)
-      if (p) touch(displayPath(resolvePath(p, cwd, home), cwd, home), b.name === 'Write' && /^File created/.test(b.result?.text ?? '') ? 'created' : 'modified')
+      if (p) touch(displayPath(resolvePath(p, cwd, home), cwd, home), b.name === 'Write' && /^File created/.test(b.result?.text ?? '') ? 'created' : 'modified', b)
     }
     const command = commandOf(b)
-    if (command && b.result) for (const p of bashWrites(command, cwd, home)) touch(displayPath(p, cwd, home), 'modified')
+    if (command && b.result) for (const p of bashWrites(command, cwd, home)) touch(displayPath(p, cwd, home), 'modified', b)
   }
   const modified: string[] = []
   const created: string[] = []
-  for (const [p, kind] of touched) (kind === 'created' ? created : modified).push(p)
+  for (const [p, { kind, b }] of touched) (kind === 'created' ? created : modified).push(withRef(p, b))
   return { modified, created }
 }
 
@@ -388,7 +399,7 @@ export function extractCommits(blocks: readonly Block[]) {
     const subject = message || text.match(/\[[^\]]+\] (.+)/)?.[1]
     if (!subject) continue
     const line = oneLine(`${hash ? `${hash} ` : ''}${subject}`)
-    if (!commits.includes(line)) commits.push(line)
+    if (!commits.some((c) => unref(c) === line)) commits.push(withRef(line, b))
   }
   return commits
 }
@@ -454,7 +465,7 @@ function eventText(b: Block, cwd: string, home?: string) {
   }
   return head
 }
-const eventLine = (b: Block, cwd: string, home?: string) => `- ${b.at === undefined ? '' : `${hhmm(b.at)} `}${clip(eventText(b, cwd, home), LINE_CHARS)}`
+const eventLine = (b: Block, cwd: string, home?: string) => withRef(`- ${b.at === undefined ? '' : `${hhmm(b.at)} `}${clip(eventText(b, cwd, home), LINE_CHARS)}`, b)
 
 // ── Outstanding Context ──
 
@@ -503,7 +514,7 @@ function extractOutstanding(blocks: readonly Block[], cwd: string, home?: string
   for (const b of tail) {
     if (b.kind !== 'assistant') continue
     const line = b.text.split('\n').map((l) => l.trim()).find((l) => BLOCKER.test(l) && l.length >= 15 && !/^[-*+>(]/.test(l) && /^["'`*_]?[A-Z`]/.test(l))
-    if (line) items.push(`- ${b.at === undefined ? '' : `${hhmm(b.at)} `}${clip(oneLine(line), LINE_CHARS - 10)}`)
+    if (line) items.push(withRef(`- ${b.at === undefined ? '' : `${hhmm(b.at)} `}${clip(oneLine(line), LINE_CHARS - 10)}`, b))
   }
   return [...new Set(items)].slice(-OUTSTANDING_MAX)
 }
@@ -587,15 +598,15 @@ function selectTranscript(blocks: readonly Block[], modified: ReadonlySet<string
     .forEach(({ e }) => take(e))
   const out: string[] = []
   let lastDay: string | undefined
-  const bare = (l: string) => l.replace(/^- (?:\d\d:\d\d )?/, '').replace(/ \(x\d+\)$/, '')
+  const bare = (l: string) => unref(l).replace(/^- (?:\d\d:\d\d )?/, '').replace(/ \(x\d+\)$/, '')
   for (const e of [...selected].sort((a, b) => a - b)) {
     const at = events[e]!.b.at
     if (at !== undefined && day(at) !== lastDay) out.push(`@ ${(lastDay = day(at))}`)
     // pi-vcc collapses a run of the same tool line: `(xN)`.
     const prev = out.at(-1)
     if (prev?.startsWith('- ') && bare(prev) === bare(lines[e]!)) {
-      const n = Number(prev.match(/ \(x(\d+)\)$/)?.[1] ?? 1) + 1
-      out[out.length - 1] = `${lines[e]!} (x${n})`
+      const n = Number(unref(prev).match(/ \(x(\d+)\)$/)?.[1] ?? 1) + 1
+      out[out.length - 1] = `${unref(lines[e]!)} (x${n})${refTail(lines[e]!)}`
     } else out.push(lines[e]!)
   }
   return out
@@ -604,8 +615,8 @@ function selectTranscript(blocks: readonly Block[], modified: ReadonlySet<string
 // ── compile, merge, cap ──
 
 // The brief of rows [0, n) of a compaction's span: `rows` in call order, `at` each row's time.
-export function compileBrief(rows: readonly SessionMessage[], at: readonly (number | undefined)[], cwd: string, home?: string): Brief {
-  const blocks = normalize(rows, at)
+export function compileBrief(rows: readonly SessionMessage[], at: readonly (number | undefined)[], cwd: string, home?: string, refOf?: RefOf): Brief {
+  const blocks = normalize(rows, at, refOf)
   const { modified, created } = extractFiles(blocks, cwd, home)
   return {
     ...emptyBrief(),
@@ -613,7 +624,7 @@ export function compileBrief(rows: readonly SessionMessage[], at: readonly (numb
     created,
     commits: extractCommits(blocks).slice(-COMMITS_KEPT),
     outstanding: extractOutstanding(blocks, cwd, home),
-    transcript: selectTranscript(blocks, new Set(modified), TRANSCRIPT_FRESH_TOKENS * 4, cwd, home),
+    transcript: selectTranscript(blocks, new Set(modified.map(unref)), TRANSCRIPT_FRESH_TOKENS * 4, cwd, home),
   }
 }
 
@@ -636,12 +647,14 @@ function transcriptTail(lines: readonly string[], maxChars: number) {
 // The result is capped at BRIEF_MAX_TOKENS.
 export function mergeBriefs(prev: Brief | undefined, fresh: Brief): Brief {
   const p = prev ?? emptyBrief()
-  const createdAll = [...p.created.filter((x) => !fresh.created.includes(x)), ...fresh.created]
-  const modifiedAll = [...p.modified.filter((x) => !fresh.modified.includes(x)), ...fresh.modified].filter((x) => !createdAll.includes(x))
+  // A path or commit is the same without its reference; the fresh one's is newer.
+  const newer = (old: string[], fresh: string[]) => [...old.filter((x) => !fresh.some((y) => unref(y) === unref(x))), ...fresh]
+  const createdAll = newer(p.created, fresh.created)
+  const modifiedAll = newer(p.modified, fresh.modified).filter((x) => !createdAll.some((y) => unref(y) === unref(x)))
   const shown = (all: string[]) => ({ list: all.slice(-FILES_SHOWN), over: Math.max(0, all.length - FILES_SHOWN) })
   const m = shown(modifiedAll)
   const c = shown(createdAll)
-  const commits = [...p.commits.filter((x) => !fresh.commits.includes(x)), ...fresh.commits].slice(-COMMITS_KEPT)
+  const commits = newer(p.commits, fresh.commits).slice(-COMMITS_KEPT)
   let transcript = fresh.transcript
   let omitted = p.omitted + fresh.omitted
   const freshChars = fresh.transcript.join('\n').length + 1
@@ -689,6 +702,7 @@ export function capBrief(brief: Brief): Brief {
 
 export const BRIEF_NOTE =
   '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first. om_recall finds the full text.'
+const REF_NOTE = '> The reference in parentheses at the end of a line or path, like (a79f045b:12), is the block it came from: om_recall reads it whole.'
 const FILES = '[Files And Changes]'
 const COMMITS = '[Commits]'
 const OUTSTANDING = '[Outstanding Context]'
@@ -706,7 +720,8 @@ export function renderBrief(b: Brief) {
   if (b.commits.length) parts.push(COMMITS, ...b.commits.map((c) => `- ${c}`))
   if (b.outstanding.length) parts.push(OUTSTANDING, ...b.outstanding)
   if (b.transcript.length) parts.push(TRANSCRIPT, ...(b.omitted ? [`> ${b.omitted} earlier lines omitted`] : []), ...b.transcript)
-  return parts.length ? [BRIEF_NOTE, ...parts].join('\n') : ''
+  const refs = parts.some((l) => REF_TAIL.test(l) || / \((?:#|[\w.-]+:)\d+(?:\.\d+)?\),/.test(l))
+  return parts.length ? [BRIEF_NOTE, ...(refs ? [REF_NOTE] : []), ...parts].join('\n') : ''
 }
 
 export function parseBrief(body: string): Brief {

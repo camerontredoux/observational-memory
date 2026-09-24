@@ -209,6 +209,54 @@ describe('vcc', () => {
     expect(capped.omitted).toBeGreaterThan(0)
   })
 
+  test('every line names the om_recall block it came from, and merging and collapsing compare lines without it', () => {
+    const rows = [
+      prompt('go'), // row 0
+      ...call('Edit', { file_path: `${CWD}/a.ts`, old_string: 'x', new_string: 'y' }, 'updated'), // 1-2
+      ...call('Write', { file_path: `${CWD}/n.ts`, content: 'x' }, 'File created successfully at: /work/project/n.ts'), // 3-4
+      ...bash('git commit -m "Add it"', '[main 1a2b3c4] Add it'), // 5-6
+      ...call('Edit', { file_path: `${CWD}/a.ts`, old_string: 'y', new_string: 'z' }, 'updated'), // 7-8
+      ...bash('make', 'Exit code 2\nmake: *** No rule', true), // 9-10
+      ...bash('make', 'Exit code 2\nmake: *** No rule', true), // 11-12
+      say('The build still fails on a missing rule for all.'), // 13
+    ]
+    // A file's line of its row: the block om_recall addresses. None for the prompt, as if its row were not in the file.
+    const refOf = (row: number, callId?: string) => (row === 0 ? undefined : `ffffffff:${row + 1}${callId ? '' : '.1'}`)
+    const b = compileBrief(rows, times(rows), CWD, HOME, refOf)
+    expect(b.modified).toEqual(['a.ts (ffffffff:8)'])
+    expect(b.created).toEqual(['n.ts (ffffffff:4)'])
+    expect(b.commits).toEqual(['1a2b3c4 Add it (ffffffff:6)'])
+    expect(b.outstanding).toEqual([
+      '- 14:09 Bash "make" ✗ exit 2: make: *** No rule (ffffffff:10)',
+      '- 14:11 Bash "make" ✗ exit 2: make: *** No rule (ffffffff:12)',
+      '- 14:13 The build still fails on a missing rule for all. (ffffffff:14.1)',
+    ])
+    expect(b.transcript).toEqual([
+      '@ 2026-09-22',
+      '- 14:01 Edit a.ts (ffffffff:2)',
+      '- 14:03 Write n.ts (created) (ffffffff:4)',
+      '- 14:05 Bash "git commit -m "Add it"" (ffffffff:6)',
+      '- 14:07 Edit a.ts (ffffffff:8)',
+      '- 14:11 Bash "make" ✗ exit 2: make: *** No rule (ffffffff:12)',
+      '- 14:13 said: The build still fails on a missing rule for all. (ffffffff:14.1)',
+    ])
+    const twice = [prompt('go'), ...call('Edit', { file_path: `${CWD}/b.ts`, old_string: 'x', new_string: 'y' }, 'updated'), ...call('Edit', { file_path: `${CWD}/b.ts`, old_string: 'y', new_string: 'z' }, 'updated')]
+    expect(compileBrief(twice, times(twice), CWD, HOME, refOf).transcript).toEqual(['@ 2026-09-22', '- 14:03 Edit b.ts (x2) (ffffffff:4)'])
+    const text = renderBrief(b)
+    expect(text).toContain('like (a79f045b:12), is the block it came from')
+    for (const line of text.split('\n').filter((l) => l.startsWith('- '))) expect(line).toMatch(/ \(ffffffff:\d+(\.1)?\)(,|$)/)
+    expect(parseBrief(text)).toEqual(b)
+    // The same path or commit again, from another block: one entry, at its newest reference.
+    const again = compileBrief([...rows.slice(0, 1), ...call('Edit', { file_path: `${CWD}/a.ts`, old_string: 'z', new_string: 'w' }, 'updated')], times(rows).slice(0, 3), CWD, HOME, (row) => (row ? `eeeeeeee:${row}` : undefined))
+    const merged = mergeBriefs(b, { ...again, commits: ['1a2b3c4 Add it (eeeeeeee:9)'] })
+    expect(merged.modified).toEqual(['a.ts (eeeeeeee:1)'])
+    expect(merged.created).toEqual(['n.ts (ffffffff:4)'])
+    expect(merged.commits).toEqual(['1a2b3c4 Add it (eeeeeeee:9)'])
+    // Without references, the brief is as before.
+    expect(compileBrief(rows, times(rows), CWD, HOME).modified).toEqual(['a.ts'])
+    expect(renderBrief(compileBrief(rows, times(rows), CWD, HOME))).not.toContain('is the block it came from')
+  })
+
   test('render and parse round-trip, and nothing in a brief can close its section', () => {
     const b = mergeBriefs(undefined, {
       ...emptyBrief(),

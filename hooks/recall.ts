@@ -402,6 +402,26 @@ export function liveTranscript(rows: readonly SessionMessage[], times: readonly 
   }
 }
 
+// The om_recall reference of each row of a compacted span, for the session brief: a tool call by its id, a message
+// by its text (the newest block that reads the same). `agentId` names a subagent's own transcript. None from the live
+// history, whose `#<row>` a compaction moves, nor for a row the transcript files do not hold.
+export async function refsOf(c: Corpus, rows: readonly SessionMessage[], agentId?: string): Promise<(row: number, callId?: string) => string | undefined> {
+  if (c.live) return () => undefined
+  const t = agentId === undefined ? c.main : c.subagents.find((s) => s.tag === tagFor(agentId))
+  if (!t) return () => undefined
+  await c.load(t)
+  const calls = new Map<string, string>()
+  const texts = new Map<string, string>()
+  for (const b of t.blocks)
+    if (b.kind === 'call' && b.callId) calls.set(b.callId, b.ref)
+    else if (b.kind === 'user' || b.kind === 'assistant') texts.set(`${b.kind}\n${b.text.trim()}`, b.ref)
+  return (row, callId) => {
+    if (callId !== undefined) return calls.get(callId)
+    const m = rows[row]
+    return m && m.text.trim() ? texts.get(`${m.role}\n${m.text.trim()}`) : undefined
+  }
+}
+
 // ---- Addressing -------------------------------------------------------------------------------------------------
 
 // A tag as given matches a file's tag: the same, the whole id it was cut from, or cut shorter still (4 characters on).

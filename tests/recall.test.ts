@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { MEMORY_HEADER } from '../hooks/prompts'
 import { legacyRecall } from './eval/legacy-recall'
-import { liveTranscript, loadTranscript, parseInput, recall } from '../hooks/recall'
+import { liveTranscript, loadTranscript, parseInput, recall, refsOf } from '../hooks/recall'
+import type { SessionMessage } from 'claude-code'
 import type { RecallInput, RecallIo } from '../hooks/recall'
 
 const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
@@ -379,6 +380,32 @@ describe('recall', () => {
     expect(big).toMatch(/\n\d+ more files; narrow with a query: \{"mode": "files", "query": "<part of a path>"\}\.$/)
     const reads = Array.from({ length: 12 }, (_, k) => tool(k, `r${k}`, 'Read', { file_path: '/p/hot.ts' }, 'x')).flat()
     expect(await run({ mode: 'files' }, session(reads))).toContain('/p/hot.ts: read (+7 earlier) bbbbbbbb:15, bbbbbbbb:17, bbbbbbbb:19, bbbbbbbb:21, bbbbbbbb:23')
+  })
+
+  test("refsOf: a compacted row's block, by its tool call's id or its text; none for the live history", async () => {
+    const sub = `${DIR}/${NEW}/subagents`
+    const rows = [
+      msg('user', 1, 'start the PEAR job'), // line 1
+      msg('assistant', 2, [{ type: 'text', text: 'Running it.' }]), // 2
+      msg('assistant', 2, [{ type: 'tool_use', id: 'p1', name: 'Bash', input: { command: 'make pear' } }]), // 3
+      msg('user', 3, [{ type: 'tool_result', tool_use_id: 'p1', content: 'ok' }]), // 4
+    ]
+    const io = memoryIo({
+      [`${DIR}/${NEW}.jsonl`]: rows.join('\n'),
+      [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: [msg('assistant', 4, [{ type: 'tool_use', id: 's1', name: 'Read', input: { file_path: '/p/x' } }], { isSidechain: true })].join('\n'),
+    })
+    const corpus = await loadTranscript(io, `${DIR}/${NEW}.jsonl`)
+    const live: SessionMessage[] = [
+      { role: 'user', text: 'start the PEAR job', toolUses: [] },
+      { role: 'assistant', text: 'Running it.', toolUses: [{ tool_use_id: 'p1', tool: 'Bash', input: { command: 'make pear' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'p1', text: 'ok', isError: false }] },
+      { role: 'assistant', text: 'Not in the file.', toolUses: [] },
+    ]
+    const refOf = await refsOf(corpus, live)
+    expect([refOf(0), refOf(1), refOf(1, 'p1'), refOf(3), refOf(1, 'nope')]).toEqual(['bbbbbbbb:1', 'bbbbbbbb:2', 'bbbbbbbb:3', undefined, undefined])
+    // A subagent's rows are found in its own transcript.
+    expect((await refsOf(corpus, [], 'a1b2c3d4e5f6a7b8c'))(0, 's1')).toBe('a1b2c3d4:1')
+    expect((await refsOf(liveTranscript(live, [], false), live))(1, 'p1')).toBeUndefined()
   })
 
   test('every mode keeps its whole response under one size cap', async () => {
