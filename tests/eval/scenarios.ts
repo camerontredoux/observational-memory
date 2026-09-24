@@ -1,4 +1,4 @@
-// The continuation-quality benchmark's scenarios (issue #9's seven, issue #16's multi-step-plan and issue #10's
+// The continuation-quality benchmark's scenarios (issue #9's seven, issue #16's multi-step-plan and planning-session, and issue #10's
 // recall-required), as data: the synthetic files a throwaway sandbox project starts with, the prompts sent in order with the manual `/compact` points
 // between them (or, in recall-required, a prompt repeated until Claude Code compacts on its own), the continuation
 // prompt sent after the last compaction, and the deterministic checks `bench.ts` runs on what the assistant did after
@@ -399,6 +399,77 @@ export const SCENARIOS: readonly Scenario[] = [
     facts: ['m-5d2c9e71ab04', '--runs 5', 'publish.sh'],
     limits:
       'One compaction, after steps 1 and 2: it measures resuming a plan at the right step, not a plan carried through several compactions. The .release-state/ files tell a session that reads them which steps ran, though not the plan, the commit id or the change to step 4.',
+  },
+  {
+    // Added with issue #16 at the user's request: a design conversation whose decisions change as it goes (one decided,
+    // replaced, then refined with a caveat; one changed; two options rejected with reasons), with two questions left
+    // open, and bulky research reads between the decisions so a compaction falls mid-planning. The continuation asks
+    // for the current plan. The history is discussion only: the prompts forbid writing any file and run nothing, so the
+    // plan survives only in what the compaction carried (writing it to a file is the mitigation this scenario measures
+    // against, and a history that writes one is invalid). About the size of the first seven: well under $1 a run.
+    id: 'planning-session',
+    title: 'A planning conversation with revised decisions, compacted mid-planning',
+    files: {
+      'docs/handbook-16.md': handbook(16, 'Queue backends'),
+      'docs/handbook-17.md': handbook(17, 'Timeouts'),
+      'docs/handbook-18.md': handbook(18, 'Retention'),
+    },
+    commands: [],
+    steps: [
+      {
+        prompt:
+          'Let us plan the job queue for the ledgerd service. This is discussion only: do not write or edit any file and do not run anything, not even to keep notes; I will ask you for the plan at the end. First decisions: the queue backend is Redis Streams; each job times out after 30 seconds; a failed job is retried 3 times with exponential backoff capped at 10 minutes. Reply with just "ok".',
+      },
+      read(16, 'Queue backends'),
+      {
+        prompt:
+          'Having read that, I am changing the backend: not Redis Streams, use Postgres with SELECT ... FOR UPDATE SKIP LOCKED. We also considered Kafka and reject it, because the ops team cannot run another stateful cluster. Reply with just "ok".',
+      },
+      read(17, 'Timeouts'),
+      {
+        prompt:
+          'Two more changes. Refine the Postgres decision with a caveat: partition the jobs table by day once it passes 50 million rows. And change the job timeout from 30 seconds to 120 seconds. We also reject SQS, because ledgerd must run on-prem. Two questions stay open, do not decide them: whether dead-lettered jobs are kept for 7 days or 30 days, and whether the platform team or the payments team owns the queue on-call. Reply with just "ok".',
+      },
+      read(18, 'Retention'),
+      COMPACT,
+    ],
+    // The plan lives in the conversation alone: a history that wrote it to a file measures that file, not the memory.
+    setup: [{ id: 'no-plan-file', category: 'correctness', description: 'the history wrote no file (the plan stayed in the conversation)', kind: 'tool', tool: WRITES, expect: 'absent' }],
+    continuation:
+      'Where does the queue plan stand? Give me the current plan in a reply, not a file: what is decided (the latest version of each decision, not the ones we replaced), what we rejected and why, and what is still open.',
+    checks: [
+      { id: 'backend', category: 'correctness', description: 'the backend is Postgres with SKIP LOCKED', kind: 'reply', pattern: 'Postgres[\\s\\S]{0,200}SKIP LOCKED|SKIP LOCKED[\\s\\S]{0,200}Postgres', expect: 'present' },
+      { id: 'partition-caveat', category: 'correctness', description: 'keeps the caveat: partition by day past 50 million rows', kind: 'reply', pattern: 'partition[\\s\\S]{0,120}(?:50\\s*(?:M\\b|million|,000,000)|50M)|(?:50\\s*(?:M\\b|million|,000,000)|50M)[\\s\\S]{0,120}partition', expect: 'present' },
+      { id: 'timeout', category: 'correctness', description: 'the job timeout is 120 seconds', kind: 'reply', pattern: '\\b120\\s*(?:s\\b|sec|seconds)|\\b2\\s*min(?:ute)?s?\\b', expect: 'present' },
+      { id: 'retries', category: 'correctness', description: 'keeps the unchanged retry policy: 3 retries, backoff capped at 10 minutes', kind: 'reply', pattern: '(?:\\b3\\b|three)[\\s\\S]{0,150}\\b10\\s*min', expect: 'present' },
+      { id: 'kafka-why', category: 'correctness', description: 'Kafka rejected, with its reason (no other stateful cluster for ops)', kind: 'reply', pattern: 'Kafka[\\s\\S]{0,250}(?:ops|operations)\\b|(?:ops|operations)\\b[\\s\\S]{0,250}Kafka', expect: 'present' },
+      { id: 'sqs-why', category: 'correctness', description: 'SQS rejected, with its reason (must run on-prem)', kind: 'reply', pattern: 'SQS[\\s\\S]{0,250}on[- ]?prem|on[- ]?prem[\\s\\S]{0,250}SQS', expect: 'present' },
+      { id: 'open-retention', category: 'correctness', description: 'lists the dead-letter retention (7 or 30 days) as open', kind: 'reply', pattern: '(?:dead[- ]?letter|DLQ)[\\s\\S]{0,200}\\b7\\b[\\s\\S]{0,60}\\b30\\b|\\b7\\b[\\s\\S]{0,60}\\b30\\b[\\s\\S]{0,120}(?:dead[- ]?letter|DLQ)', expect: 'present' },
+      { id: 'open-oncall', category: 'correctness', description: 'lists the on-call owner (platform or payments) as open', kind: 'reply', pattern: 'on[- ]?call[\\s\\S]{0,200}platform[\\s\\S]{0,80}payments|platform[\\s\\S]{0,80}payments[\\s\\S]{0,200}on[- ]?call', expect: 'present' },
+      // Superseded decisions stated as current: a line that gives Redis as the backend, or 30 s as the timeout, with no sign of the change.
+      {
+        id: 'no-superseded',
+        category: 'violation',
+        description: 'does not state a replaced decision (Redis Streams, the 30 s timeout) as current',
+        kind: 'reply',
+        pattern: '^(?![^\\n]*(?:replac|supersed|switch|chang|instead|was|previous|origin|earlier|initial|reject|dropp|no longer|not |~~|→|->))[^\\n]*(?:backend[^\\n]{0,30}Redis|timeout[^\\n]{0,30}\\b30\\s*(?:s\\b|sec))',
+        flags: 'im',
+        expect: 'absent',
+      },
+      {
+        id: 'no-invented',
+        category: 'unsupported-claim',
+        description: 'invents no option nobody raised, and no retention outside the two open ones',
+        kind: 'reply',
+        pattern: '\\b(?:RabbitMQ|NATS|Celery|Sidekiq|Temporal|Pulsar)\\b|(?:dead[- ]?letter|DLQ)[^\\n]{0,120}\\b(?!7\\b|30\\b)\\d+[- ]days?\\b',
+        expect: 'absent',
+      },
+      { id: 'no-plan-write', category: 'violation', description: 'replies with the plan rather than writing it to a file', kind: 'tool', tool: WRITES, expect: 'absent' },
+      { id: 'recall-finds', category: 'retrieval', description: 'om_recall returned a revised decision or a rejection reason', kind: 'recall', pattern: 'SKIP LOCKED|50 million|120 seconds|stateful cluster|on-prem' },
+    ],
+    facts: ['SKIP LOCKED', '50 million', '120 seconds', 'stateful cluster', 'on-prem', '7 days or 30 days'],
+    limits:
+      'Its checks are regular expressions over one reply: a plan phrased unusually (a reason far from its option, a replaced decision on a line with no word marking the change) can read as a failure or a pass. The evidence keeps the reply for inspection. One compaction: the decisions are all made before it.',
   },
   {
     // A large session that Claude Code compacts on its own, and a detail no summary keeps: only om_recall gives the

@@ -595,6 +595,45 @@ describe('recall-required: what counts as running shards.sh again', () => {
   })
 })
 
+describe('planning-session: the current plan after a compaction mid-planning', () => {
+  const s = scenario('planning-session')
+  const PLAN = [
+    'Decided:',
+    '- Backend: Postgres with SELECT ... FOR UPDATE SKIP LOCKED (replaced Redis Streams). Caveat: partition the jobs table by day once it passes 50 million rows.',
+    '- Job timeout: 120 seconds (changed from 30 seconds).',
+    '- Retries: 3, exponential backoff capped at 10 minutes.',
+    'Rejected:',
+    '- Kafka: the ops team cannot run another stateful cluster.',
+    '- SQS: ledgerd must run on-prem.',
+    'Open:',
+    '- Dead-lettered jobs kept for 7 days or 30 days?',
+    '- Who owns the queue on-call: the platform team or the payments team?',
+  ].join('\n')
+  const failed = (reply: string, extra?: (h: ReturnType<typeof history>) => void) =>
+    scoreRun(s, 'om', run(s, () => OM_SUMMARY('* planned the queue'), (h) => { extra?.(h); h.reply(reply) })).checks.filter((c) => c.outcome === 'fail').map((c) => c.id)
+
+  test('the latest decisions, the rejections with their reasons and both open questions pass every check', () => {
+    const score = scoreRun(s, 'om', run(s, () => OM_SUMMARY('* planned the queue'), (h) => h.reply(PLAN)))
+    expect(score.invalid).toEqual([])
+    expect(score.taskSuccess).toBe(true)
+  })
+
+  test('a replaced decision stated as current, a lost caveat or reason, a closed question or an invented option each fail their check', () => {
+    expect(failed(PLAN.replace('- Backend: Postgres with SELECT ... FOR UPDATE SKIP LOCKED (replaced Redis Streams).', '- Backend: Redis Streams.'))).toEqual(['backend', 'no-superseded'])
+    expect(failed(PLAN.replace('- Job timeout: 120 seconds (changed from 30 seconds).', '- Job timeout: 30 seconds.'))).toEqual(['timeout', 'no-superseded'])
+    expect(failed(PLAN.replace(' Caveat: partition the jobs table by day once it passes 50 million rows.', ''))).toEqual(['partition-caveat'])
+    expect(failed(PLAN.replace(': the ops team cannot run another stateful cluster.', '.'))).toEqual(['kafka-why'])
+    expect(failed(PLAN.replace('- Dead-lettered jobs kept for 7 days or 30 days?', '').replace('Open:', 'Open:\n- Decided: dead-lettered jobs are kept for 14 days.'))).toEqual(['open-retention', 'no-invented'])
+    expect(failed(PLAN + '\n- We could also look at RabbitMQ.')).toEqual(['no-invented'])
+    expect(failed(PLAN, (h) => h.tool('Write', { file_path: '/p/PLAN.md', content: PLAN }, 'ok'))).toEqual(['no-plan-write'])
+  })
+
+  test('a history that wrote the plan to a file is invalid, not scored', () => {
+    const t = run(s, () => OM_SUMMARY('* planned the queue'), (h) => h.reply(PLAN), (h) => h.tool('Write', { file_path: '/p/notes/plan.md', content: 'backend: Postgres' }, 'ok'))
+    expect(scoreRun(s, 'om', t).invalid.join()).toMatch(/wrote no file/)
+  })
+})
+
 describe('fork-handoff compaction (issue #16)', () => {
   const plan = scenario('multi-step-plan')
   const HANDOFF = 'Live request: release ratelimit 2.4.0. Findings: merge commit m-5d2c9e71ab04. Rules: step 4 runs as bash bench.sh --runs 5; publish.sh waits for approval. Next actions: 1. bump VERSION'
