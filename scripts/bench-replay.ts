@@ -73,7 +73,7 @@
 //   numbers only.
 import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { dirname, resolve } from 'path'
 import type { SessionMessage } from 'claude-code'
 import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
@@ -256,20 +256,54 @@ async function om(o: Options) {
   async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
     if (piMode === 'stub') return { r: stub(stdin), hit: false }
     const hash = piKey(argv, stdin)
-    for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
-      if (existsSync(`${dir}/${hash}.json`)) {
-        const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
-        return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
-      }
+    const cached = () => {
+      for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
+        if (existsSync(`${dir}/${hash}.json`)) {
+          const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
+          return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
+        }
+    }
+    const hit = cached()
+    if (hit) return hit
     if (piMode === 'strict') throw new Error(`strict: no cached pi reply for ${hash}`)
-    if (liveLeft <= 0) throw new Error(`--max-calls reached: no live pi call for ${hash}`)
-    liveLeft--
-    const started = Date.now()
-    const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
-    const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
-    const ms = Date.now() - started
-    if (exitCode === 0) writeFileSync(`${cache}/${hash}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
-    return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
+    // One pi call per key across concurrent replays (bench-compact --jobs): the first takes the lock, the others wait
+    // for its reply. A lock whose process is gone is taken over.
+    const lock = `${cache}/${hash}.lock`
+    for (;;) {
+      try {
+        writeFileSync(lock, String(process.pid), { flag: 'wx' })
+        break
+      } catch {}
+      const after = cached()
+      if (after) return after
+      let owner = 0
+      try {
+        owner = Number(readFileSync(lock, 'utf8'))
+        process.kill(owner, 0)
+      } catch {
+        if (owner) rmSync(lock, { force: true })
+        continue
+      }
+      await Bun.sleep(1000)
+    }
+    try {
+      const after = cached()
+      if (after) return after
+      if (liveLeft <= 0) throw new Error(`--max-calls reached: no live pi call for ${hash}`)
+      liveLeft--
+      const started = Date.now()
+      const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
+      const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
+      const ms = Date.now() - started
+      // Written whole, then renamed, so a concurrent replay never reads half a reply.
+      if (exitCode === 0) {
+        writeFileSync(`${lock}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
+        renameSync(`${lock}.json`, `${cache}/${hash}.json`)
+      }
+      return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
+    } finally {
+      unlinkSync(lock)
+    }
   }
 
   const inOut = (p: string) => p === out || p.startsWith(`${out}/`)

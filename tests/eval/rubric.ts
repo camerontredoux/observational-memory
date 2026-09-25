@@ -208,9 +208,20 @@ const probeOf = (key: string, kind: string) => (kind === 'path' ? key.split('/')
  */
 export function proseContext(context: Context, before: readonly Row[]): string {
   const genuine = new Set(before.map(messageText))
+  // Code-lane experiment only (RUBRIC_FAIR_MASK=1): a row the plugin masked (a head and tail of a genuine row around an
+  // om_recall omission marker) reads whole, as the verbatim transcript text it is.
+  const byHead = new Map<string, string[]>()
+  const fair = (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.RUBRIC_FAIR_MASK === '1'
+  if (fair) for (const g of genuine) byHead.set(g.slice(0, 48), [...(byHead.get(g.slice(0, 48)) ?? []), g])
+  const masked = (s: string) => {
+    const parts = s.split(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n?/)
+    if (parts.length < 2) return false
+    const pool = parts[0]!.length >= 48 ? (byHead.get(parts[0]!.slice(0, 48)) ?? []) : [...genuine]
+    return pool.some((g) => g.startsWith(parts[0]!) && g.endsWith(parts.at(-1)!))
+  }
   const kept = context.kept.map((m) => {
     const s = messageText(m)
-    return { text: genuine.has(s) ? s : proseOnly(s), toolUses: [], toolResults: undefined }
+    return { text: genuine.has(s) || (fair && masked(s)) ? s : proseOnly(s), toolUses: [], toolResults: undefined }
   })
   return contextText({ summary: proseOnly(context.summary), kept })
 }

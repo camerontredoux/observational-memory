@@ -36,6 +36,7 @@
 // changes neither replays for free and exactly. A miss fails the run unless --record, which calls pi (openai-codex
 // models only) and stores the reply; --samples N runs N independent samples (sample k>1 in its own cache CACHE-s<k>).
 // One Observer miss changes every later call of that chained replay, so a changed Observer input is one draw per transcript.
+// --jobs N (default 3): the most replays run at once, across transcripts, samples and the sides of an ab.
 // Token gates read the context's prose only (rubric.ts proseContext): a bare list of identifiers counts for nothing.
 // Hand-authored items print their ids, not their expected strings.
 // Corpus: CORPUS below, prefixes of real sessions copied into the main checkout's gitignored tests/fixtures/replay/.
@@ -185,12 +186,29 @@ function effOf(t: Transcript, contexts: (Context | undefined)[], calls: Call[]):
 type Sample = { replays: Replay[]; items: Item[]; scores: Scores; perTranscript: Record<string, Scores> }
 type Run = { label: string; dir?: string; behavior?: BItem[]; samples: Sample[]; holdout?: Sample[]; chain?: Sample[]; noise?: Run }
 
-function replay(name: string, dir: string, record: boolean, sample: number): Replay {
+// At most JOBS replays run at once (--jobs, default 3): the transcripts are independent, and each replay stays sequential
+// inside. Each call's cache key is its own, so the replies and the scores do not depend on the order.
+const JOBS = Math.max(1, num(options(process.argv.slice(3)), 'jobs', 3)!)
+let running = 0
+const waiting: (() => void)[] = []
+async function slot<T>(f: () => Promise<T>): Promise<T> {
+  while (running >= JOBS) await new Promise<void>((r) => waiting.push(r))
+  running++
+  try {
+    return await f()
+  } finally {
+    running--
+    waiting.shift()?.()
+  }
+}
+
+async function replay(name: string, dir: string, record: boolean, sample: number): Promise<Replay> {
   const cache = sample === 1 ? CACHE : `${CACHE}-s${sample}`
   const out = `${OUT}/runs/${createHash('sha256').update(`${dir}\0${sample}\0${Date.now()}`).digest('hex').slice(0, 10)}-${name}`
   const args = ['scripts/bench-replay.ts', 'om', '--transcript', name, '--src', dir, '--cache', cache, '--out', out, '--dir', corpusDir(), '--pi', record ? 'live' : 'strict', ...(record ? ['--max-calls', '2000'] : [])]
-  const r = spawnSync('bun', args, { cwd: HERE, encoding: 'utf8', maxBuffer: 1 << 28 })
-  if (r.status !== 0) fail(`${name}: the replay failed:\n${r.stderr.slice(-2000)}`)
+  const p = Bun.spawn(['bun', ...args], { cwd: HERE, stdout: 'ignore', stderr: 'pipe' })
+  const [stderr, status] = await Promise.all([new Response(p.stderr).text(), p.exited])
+  if (status !== 0) fail(`${name}: the replay failed:\n${stderr.slice(-2000)}`)
   const s = JSON.parse(readFileSync(`${out}/summary.json`, 'utf8'))
   const t = parseTranscript(textOf(name))
   const contexts = t.boundaries.map((b) =>
@@ -309,14 +327,14 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
   }
   const run: Run = { label, ...(o.dir ? { dir: o.dir } : {}), samples: [], ...(o.holdout && HOLDOUT.length ? { holdout: [] } : {}), ...(o.chain ? { chain: [] } : {}) }
   // One sample of a corpus; the holdout is graded by the mechanical gates alone, the chain without the rubric files.
-  const gradeAll = async (entries: { name: string }[], k: number, kind: 'main' | 'holdout' | 'chain'): Promise<Sample> => {
+  const gradeAll = async (entries: { name: string }[], k: number, kind: 'main' | 'holdout' | 'chain', started: Promise<Replay>[]): Promise<Sample> => {
     const specs = kind !== 'holdout'
     const replays: Replay[] = []
     const items: Item[] = []
     const perTranscript: Record<string, Scores> = {}
-    for (const { name } of entries) {
+    for (const [i, { name }] of entries.entries()) {
+      const r = await started[i]!
       console.error(`[${label}] ${kind === 'main' ? '' : `${kind} `}${name}${o.samples > 1 ? ` sample ${k}` : ''}`)
-      const r = o.contexts ? readyMade(name, o.contexts) : replay(name, o.dir!, o.record, k)
       if (r.failed && o.lenient) throw new Error(`${name}: not cached`)
       if (r.failed) fail(`${label} ${name}: ${r.failed} of ${r.calls} Observer/Reflector calls are not cached (the variant changed their prompt or input); pass --record to call pi for them`)
       const text = textOf(name)
@@ -331,10 +349,18 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
     }
     return { replays, items, scores: score(items), perTranscript }
   }
-  for (let k = o.first ?? 1; k < (o.first ?? 1) + o.samples; k++) {
-    run.samples.push(await gradeAll(CORPUS, k, 'main'))
-    if (run.holdout) run.holdout.push(await gradeAll(HOLDOUT, k, 'holdout'))
-    if (run.chain) run.chain.push(await gradeAll(CHAIN, k, 'chain'))
+  // Every replay starts at once, through slot(); grading waits for each in turn. The chain first: it runs longest.
+  const start = (entries: { name: string }[], k: number) =>
+    entries.map(({ name }) => (o.contexts ? Promise.resolve(readyMade(name, o.contexts)) : slot(() => replay(name, o.dir!, o.record, k))))
+  const ks = Array.from({ length: o.samples }, (_, i) => (o.first ?? 1) + i)
+  const started = ks.map((k) => {
+    const chain = run.chain ? start(CHAIN, k) : []
+    return { k, main: start(CORPUS, k), holdout: run.holdout ? start(HOLDOUT, k) : [], chain }
+  })
+  for (const s of started) {
+    run.samples.push(await gradeAll(CORPUS, s.k, 'main', s.main))
+    if (run.holdout) run.holdout.push(await gradeAll(HOLDOUT, s.k, 'holdout', s.holdout))
+    if (run.chain) run.chain.push(await gradeAll(CHAIN, s.k, 'chain', s.chain))
   }
   if (o.behavior) run.behavior = await behavior(label, o.dir ?? HERE, run.samples[0]!.replays)
   return run
@@ -655,9 +681,11 @@ else if (command === 'run') {
   const holdout = !o['no-holdout']
   const chain = !o['no-chain']
   const from = (x: ReturnType<typeof source>) => (x.contexts ? { contexts: x.contexts, holdout: false } : { dir: x.dir, holdout, chain })
-  const a = await evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior })
-  const bs: Run[] = []
-  for (const sb of sbs) bs.push(await evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior }))
+  // A and every B at once: their replays share the JOBS slots.
+  const [a, ...bs] = await Promise.all([
+    evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior }),
+    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior })),
+  ])
   // A Reflector change that nothing reflects on ties exactly and says nothing: refuse to call it a tie.
   for (const [sb, b] of sbs.map((x, i) => [x, bs[i]!] as const))
     if (sa.dir && sb.dir && reflectorCode(sa.dir) !== reflectorCode(sb.dir) && !reflections(a) && !reflections(b))
