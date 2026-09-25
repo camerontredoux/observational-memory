@@ -66,12 +66,14 @@ function world(
     holdGet?: (key: string) => Promise<void> | undefined
     holdList?: () => Promise<void> | undefined
     env?: Record<string, string>
+    rowsCap?: number
   } = {},
 ) {
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
-  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? history : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
+  const main = () => (options.rowsCap && history.length > options.rowsCap ? history.slice(-options.rowsCap) : history)
+  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? main() : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
   const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
   const type = (id: string) => (options.teammates?.includes(id) ? 'teammate' : 'general-purpose')
   on('agent.list', async () => {
@@ -230,18 +232,37 @@ function nextStepIn(text?: string) {
 // The continuation record's state of the work: its lines before the quoted request, if any.
 const recordIn = (text?: string) => text?.match(/\n\n<continuation>\n([\s\S]*?)(?:\n^The user's latest request [^\n]*\(\d+ chars\):\n[\s\S]*)?\n<\/continuation>/m)?.[1]
 const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+// A memory message's text without its replies section (I42), which sits between the corrections and the observations.
+const noReplies = (text = '') => text.replace(/<your-replies>\n[\s\S]*?<\/your-replies>\n\n/, '')
+const repliesIn = (text?: string) => text?.match(/\n<your-replies>\n([\s\S]*?)<\/your-replies>\n\n<observations>/)?.[1]
 const correctionsIn = (text?: string) => text?.match(/\n<corrections>\n([\s\S]*?)\n<\/corrections>/)?.[1]
-const observationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
+const renderedObservationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
+// A memory message with its observations replaced by `observations`, as rendered.
+const withObservations = (m: SessionMessage, observations: string): SessionMessage => ({ ...m, text: m.text.replace(/(<observations>\n)[\s\S]*?(\n<\/observations>)/, (_, a, b) => `${a}${observations}${b}`) })
+// The observations with each day's date, written once on its `@ YYYY-MM-DD` line, put back on its lines and source ends.
+function observationsIn(text?: string) {
+  let day = ''
+  const at = (t: string) => (/^\d{2}:\d{2}$/.test(t) ? `${day} ${t}` : t)
+  return renderedObservationsIn(text)
+    ?.split('\n')
+    .flatMap((l) => {
+      const d = l.match(/^@ (\d{4}-\d{2}-\d{2})$/)
+      if (d) return (day = d[1]!), []
+      return [day ? l.replace(/^(\* \S+ )(\d{2}:\d{2}) /, (_, m, t) => `${m}${at(t)} `).replace(/\(source (\S+(?: \S+)?) to (\S+(?: \S+)?)\)$/, (_, a, b) => `(source ${at(a)} to ${at(b)})`) : l]
+    })
+    .join('\n')
+}
 // The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters, or an
-// omission line, read as `(n omitted)`.
+// omission line, read as `(n omitted)`; a day's `@ YYYY-MM-DD` line is skipped.
 function userMessagesIn(text?: string) {
   const start = text?.indexOf('\n\n<all-user-messages>\n') ?? -1
   if (!text || start < 0) return undefined
   const out: string[] = []
-  const entry = /\* User(?: @ [\d-]+ [\d:]+)? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n/y
+  const entry = /\* User(?: @ (?:[\d-]+ )?[\d:]+)? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ [\d-]+\n/y
   entry.lastIndex = start + '\n\n<all-user-messages>\n'.length
   for (let m; (m = entry.exec(text)); )
-    if (m[2]) out.push(`(${m[2]} omitted)`)
+    if (!m[1] && !m[2]) continue
+    else if (m[2]) out.push(`(${m[2]} omitted)`)
     else out.push(text.slice(entry.lastIndex, entry.lastIndex + Number(m[1]))), (entry.lastIndex += Number(m[1]) + 1)
   return out
 }
@@ -620,9 +641,50 @@ describe('register', () => {
 
     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([expect.stringMatching(/^retrying rows 7-11 /)])
     expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer answered without an <observations> block); left unobserved')
-    const text = result.messages?.[0]?.text ?? ''
+    const text = noReplies(result.messages?.[0]?.text)
     expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n\n</observations>`)
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+  })
+
+  test('the reply ending each turn that left context is quoted before the observations, carried forward, the newest within its cap', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 14:30 Saw ${prompt.match(/^\[User\]: (\w+)$/m)?.[1]}\n</observations>` })
+    const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'c', 8_000)]
+
+    const first = await $.session.compact({ trigger: 'manual', messages })
+
+    // The last text before the next prompt: the turn's closing reply, not its first. Turn b's closing row starts the
+    // raw tail, so it is in view already and not quoted.
+    const text = first.messages?.[0]?.text ?? ''
+    expect(repliesIn(text)).toBe('* You (24 chars):\nFound the bug in a. done\n')
+    expect(text.indexOf('<your-replies>')).toBeLessThan(text.indexOf('<observations>'))
+    expect(first.messages?.slice(1)).toEqual(messages.slice(7))
+
+    // Read back from the memory message: the next compaction keeps a's and adds b's (the first row after the memory
+    // message), c's and d's, oldest first. d's passes the per-reply cap and is cut to its head and tail.
+    const big = 'y'.repeat(9_000 * 4)
+    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('d', big, CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', 8_000)] })
+    const kept = repliesIn(second.messages?.[0]?.text) ?? ''
+    expect(kept.startsWith('* You (24 chars):\nFound the bug in a. done\n* You (13 chars):\nFixed b. done\n* You (6 chars):\nc done\n* You (')).toBe(true)
+    expect(kept).toContain('om_recall can retrieve the full message')
+    expect(kept.endsWith('y done\n')).toBe(true)
+    expect(kept.length).toBeLessThan(3_000)
+  })
+
+  test('the replies take only the room the compacted context leaves below REPLIES_ROOM_TOKENS', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw it\n</observations>' })
+    // A newest reply, kept raw, that alone nearly fills the room: nothing is quoted.
+    const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'z'.repeat(39_500 * 4))]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(result.messages?.slice(1)).toEqual(messages.slice(-1))
+    expect(text).toContain('<observations>')
+    expect(text).not.toContain('<your-replies>')
   })
 
   test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
@@ -701,7 +763,7 @@ describe('register', () => {
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await clock.settle()
-    await runTurn($, turn('b', 'b', 100), at(22, 14, 40))
+    await clock.advance(5_000) // its back-off over, the loop calls pi again
     await clock.settle()
 
     expect(seen.logs.filter((l) => l.startsWith('background observation'))).toEqual([
@@ -737,9 +799,9 @@ describe('register', () => {
     expect(seen.screen).toEqual(['Observed 7 messages in 0 ms · +4 notes · memory 4 notes'])
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
     // Clamped into the chunk's times, 13:59 to 14:32 (the latest time recorded plus a minute); a line without a
-    // real time gets the chunk's latest.
+    // real time gets the chunk's latest. The chunk's source range closes its run of lines.
     expect(observationsIn(result.messages?.[0]?.text)).toBe(
-      ['🔴 2026-09-22 14:30 User asked a', '🟡 2026-09-22 13:59 Too early', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail'].map((l) => `* ${l} (source 2026-09-22 14:00 to 2026-09-22 14:31)`).join('\n'),
+      ['🔴 2026-09-22 14:30 User asked a', '🟡 2026-09-22 13:59 Too early', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail (source 2026-09-22 14:00 to 2026-09-22 14:31)'].map((l) => `* ${l}`).join('\n'),
     )
     expect(result.messages?.slice(1)).toEqual(history.slice(7))
   })
@@ -764,6 +826,38 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(6)
     expect(seen.logs.filter((l) => l.includes('in the background'))).toHaveLength(6)
     expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23) // the last ~6k tokens left raw
+  })
+
+  test('a failing pi with more chunks than slots is called again only as each back-off ends, doubling, and the chunks land once it answers', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    let failing = true
+    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
+    await clock.settle()
+    expect(seen.prompts).toHaveLength(4) // the four in flight fail as one failure, and their slots start nothing
+    await clock.advance(4_999)
+    expect(seen.prompts).toHaveLength(4)
+    await clock.advance(1)
+    expect(seen.prompts).toHaveLength(8)
+    await clock.advance(9_999)
+    expect(seen.prompts).toHaveLength(8)
+    await clock.advance(1)
+    expect(seen.prompts).toHaveLength(12)
+    failing = false
+    await clock.advance(20_000)
+
+    expect(seen.prompts).toHaveLength(18)
+    expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23)
+    // Landed, the loop is back to no back-off: a failure now waits the first 5 s again.
+    failing = true
+    await runTurn($, [...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000)], at(22, 15, 0))
+    await clock.settle()
+    const calls = seen.prompts.length
+    await clock.advance(5_000)
+    expect(seen.prompts.length - calls).toBe(1)
   })
 
   test('chunks landing out of order commit to the ledger only once the watermark reaches them', async ($, on) => {
@@ -934,21 +1028,103 @@ describe('register', () => {
     expect(lines).toContain('🟡 2026-09-22 14:30 Read the auth module')
   })
 
-  test('a reflection that stays far under its target at every attempt leaves the observations as they were', async ($, on) => {
+  test("a later reflection passes an earlier reflection's lines through as they were, and condenses only the notes", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const line = '🟡 2026-09-22 14:30 read a file with a long name'
-    const seen = pi(on, { reply: () => `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`, reflect: () => '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>' })
+    const notes = (time: string) => `<observations>\n${`* 🟡 ${time} read a file with a long name\n`.repeat(4_000)}</observations>`
+    const seen = pi(on, {
+      reply: (prompt) => notes(prompt.includes('[User @ 2026-09-22 14:30]: a') ? '2026-09-22 14:30' : '2026-09-22 15:00'),
+      reflect: (n, prompt) => nearTarget(prompt, `* 🟡 ${n === 1 ? '2026-09-22 14:30 First condensed' : '2026-09-22 15:00 Second condensed'}`),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle()
+
+    const reflections = seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
+    expect(reflections).toHaveLength(2)
+    expect(reflections[1]).not.toContain('First condensed')
+    expect(reflections[1]).not.toContain(' filler detail ')
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    expect(lines).toContain('🟡 2026-09-22 14:30 First condensed')
+    expect(lines).toContain('🟡 2026-09-22 15:00 Second condensed')
+    expect(lines.indexOf('🟡 2026-09-22 14:30 First condensed')).toBeLessThan(lines.indexOf('🟡 2026-09-22 15:00 Second condensed'))
+  })
+
+  test('a path the condensed notes name and the reflection drops comes back as the clause that named it, at its time', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const pi_ = pi(on, {
+      reply: () =>
+        `<observations>\n* 🟡 2026-09-22 14:30 Assistant read the plan. Assistant fixed the totals in \`hooks/stats.ts\`.\n* 🟡 2026-09-22 14:30 Assistant pruned \`hooks/prune.ts\`.\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
+      reflect: (_n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Assistant pruned sessions in `hooks/prune.ts`'),
+    })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await clock.settle()
 
-    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(4)
+    expect(pi_.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    expect(lines).toContain('🟡 2026-09-22 14:30 Assistant fixed the totals in `hooks/stats.ts`.')
+    expect(lines.filter((l) => l.includes('prune.ts'))).toHaveLength(1)
+    expect(lines.some((l) => l.includes('read the plan'))).toBe(false)
+  })
+
+  test('a reflection that stays far under its target leaves the observations as they were: two attempts, no prompt sent twice, and the same observations are not sent again', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const line = '🟡 2026-09-22 14:30 read a file with a long name'
+    let observed = 0
+    const seen = pi(on, {
+      reply: () => (observed++ ? '<observations>\n* 🟡 2026-09-22 15:00 Looked again\n</observations>' : `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`),
+      reflect: () => '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>',
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    const reflections = () => seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
+    expect(reflections()).toHaveLength(2) // the second under the floor too: a third would come back the same
+    expect(new Set(reflections()).size).toBe(2)
     expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual([expect.stringMatching(/^reflection failed \(/)])
     const ledger = stored['ledger:session-1'] as Ledger
     expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
     expect(ledger.entries).toHaveLength(4_000)
+
+    // The next chunk's one line lands among the newest, kept as they were: what there is to condense is the same, and is not resent.
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle()
+    expect(reflections()).toHaveLength(2)
+    expect(seen.logs).toContainEqual('reflection skipped: the observations to condense are those of the last failed reflection')
+  })
+
+  test('replies just under the floor at both attempts: the fuller is installed', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const underFloor = (prompt: string, share: number, head: string) => {
+      const floor = Number(prompt.match(/under ~(\d+) tokens, is discarded/)![1])
+      const lines = [head]
+      for (let i = 0, chars = head.length; chars < share * floor * 4; i++) lines.push(`* 🟢 2026-09-22 14:30 detail ${i}`), (chars += 32)
+      return `<observations>\n${lines.join('\n')}\n</observations>`
+    }
+    const seen = pi(on, {
+      reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
+      reflect: (n, prompt) => underFloor(prompt, n === 1 ? 0.8 : 0.9, n === 1 ? '* 🟡 2026-09-22 14:30 First try' : '* 🟡 2026-09-22 14:30 Second try'),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(2)
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^no reflection came between ~\d+ and ~\d+ tokens; installing the fullest, ~\d+ tokens$/))
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    expect(lines).toContain('🟡 2026-09-22 14:30 Second try')
+    expect(lines).not.toContain('🟡 2026-09-22 14:30 First try')
   })
 
   test('🔴 lines pass through a reflection unchanged, in time order and exact repeats once; the Reflector never sees them, and a 🔴 line it writes is kept as 🟡', async ($, on) => {
@@ -986,6 +1162,47 @@ describe('register', () => {
     expect(after.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([api, '🟡 2026-09-22 15:00 User required concise output behind `full`', table])
   })
 
+  test("🔴 lines over their share of the reflection target shorten to om_recall index lines, and still over, the oldest go to the Reflector, which then keeps its target", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const red = (i: number) => `🔴 2026-09-22 14:30 User required that module ${i} keep ${'its public interface and its tests unchanged, '.repeat(8)}always`
+    const { gate, open } = gates()
+    const seen = pi(on, {
+      hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
+      reply: () => `<observations>\n${Array.from({ length: 350 }, (_, i) => `* ${red(i)}`).join('\n')}\n</observations>`,
+      reflect: (n, prompt) => nearTarget(prompt),
+    })
+    const runTurn = live(on, clock, history)
+
+    // ~42k tokens of 🔴 lines pass REFLECT_AT_TOKENS; the newest ~12k are kept, and unbounded, the older ~30k leave no target.
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+    const prompt = seen.prompts.find((p) => p.startsWith('## OBSERVATIONS'))!
+    open(seen.prompts.indexOf(prompt) + 1)
+    await clock.settle()
+
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the 🔴 lines were over their share of the reflection target: \d+ shortened, \d+ condensed$/))
+    const target = Number(prompt.match(/Size target: at most ~(\d+) tokens/)![1])
+    expect(target).toBeGreaterThanOrEqual(2_000)
+    expect(prompt).toContain(`* ${red(0)}`) // the oldest, condensed
+    expect(prompt).not.toContain(`module 349 keep`)
+    const after = (stored['ledger:session-1'] as Ledger).entries
+    const pinned = after.filter((e) => e.line.startsWith('🔴'))
+    // Shortened: the older 🔴 lines that stay. Whole: the newest, up to REFLECT_KEEP_TOKENS, kept as they were.
+    const module = (line: string) => Number(line.match(/module (\d+) keep/)![1])
+    const short = pinned.filter((e) => e.line.includes('(older 🔴 line, shortened'))
+    const whole = pinned.filter((e) => !short.includes(e))
+    expect(short.length).toBeGreaterThan(0)
+    for (const e of short)
+      expect(e.line).toBe(`🔴 2026-09-22 14:30 User required that module ${module(e.line)} keep its public interface and… (older 🔴 line, shortened: om_recall "User required that module ${module(e.line)} keep")`)
+    for (const e of whole) expect(e.line).toBe(red(module(e.line)))
+    expect(Math.max(...short.map((e) => module(e.line)))).toBeLessThan(Math.min(...whole.map((e) => module(e.line))))
+    expect(Math.min(...short.map((e) => module(e.line)))).toBeGreaterThan(0) // the oldest went to the Reflector
+    expect(after.some((e) => e.line.includes('module 0 keep'))).toBe(false)
+    expect(tokensOf(after)).toBeLessThanOrEqual(20_000)
+    expect(seen.logs.filter((l) => l.startsWith('reflection failed'))).toEqual([])
+  })
+
   test("a reflected line keeps a source range it gives inside the reflected span, cut to it; one outside it, or none, gets none", async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
@@ -1013,13 +1230,16 @@ describe('register', () => {
     expect(reflections).toHaveLength(1)
     expect(reflections[0]).toContain('* 🟡 2026-09-22 14:30 read a file with a long name (source 2026-09-22 14:30 to 2026-09-22 14:31)\n')
     expect(reflections[0]).toContain('* 🟡 2026-09-22 15:00 read a file with a long name (source 2026-09-22 14:31 to 2026-09-22 15:01)\n')
-    const reflected = observationsIn(result.messages?.[0]?.text)!.split('\n').filter((l) => !isFiller(l) && !l.includes('long name'))
+    const observed = observationsIn(result.messages?.[0]?.text)!.split('\n')
+    const reflected = observed.filter((l) => !isFiller(l.replace(' (source none)', '')) && !l.includes('long name'))
     expect(reflected).toEqual([
       '* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)',
       '* 🟡 2026-09-22 14:50 Read the refresh handler (source 2026-09-22 14:50 to 2026-09-22 15:01)',
       '* 🟡 2026-09-22 15:00 Ran the tests',
       '* 🟡 2026-09-22 15:00 Fixed the expiry check',
     ])
+    // The lines with none, the fillers after them included, end on a marker before the kept lines' run.
+    expect(observed[observed.findIndex((l) => l.includes('long name')) - 1]).toMatch(/ filler detail \d+ \(source none\)$/)
   })
 
   test('a memory from before source ranges is read as unknown provenance: its observations get none, and a reflection over them invents none', async ($, on) => {
@@ -1048,8 +1268,8 @@ describe('register', () => {
     await clock.settle()
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
 
-    expect(observationsIn(result.messages?.[0]?.text)!.split('\n').filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
-      '* 🟡 2026-09-22 14:30 Saw a, before the ranges',
+    expect(observationsIn(result.messages?.[0]?.text)!.split('\n').filter((l) => !isFiller(l.replace(' (source none)', '')) && !l.includes('long name'))).toEqual([
+      '* 🟡 2026-09-22 14:30 Saw a, before the ranges (source none)',
       '* 🟡 2026-09-22 14:30 Read files (source 2026-09-22 14:30 to 2026-09-22 14:31)',
       '* 🟡 2026-09-22 14:30 Ran the tests',
     ])
@@ -1196,14 +1416,40 @@ describe('register', () => {
     expect(reflections[0]).not.toContain('Sorry, I meant')
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual([correction])
     const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
-    const text = first.messages?.[0]?.text ?? ''
-    expect(text).toContain(`\n\n<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)\n`)
+    const text = noReplies(first.messages?.[0]?.text)
+    expect(text).toContain(`\n\n<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
     expect(recordIn(text)).toBe(`${WHERE} (2026-09-22 14:31):\nActive: fixing the refresh endpoint`)
     // Carried forward from the memory message itself.
     for (const key of Object.keys(stored)) delete stored[key]
     const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)] })
-    expect(second.messages?.[0]?.text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)\n`)
+    expect(noReplies(second.messages?.[0]?.text)).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
     expect(seen.modelCalls).toBe(0)
+  })
+
+  test('a memory mixing lines with and without a source reads back as it was written: rendered, carried forward and rendered again, it is the same', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw a\n</observations>' })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    const mixed = [
+      '@ 2026-09-22',
+      '* 🟡 14:00 Saw a, before the ranges',
+      '* 🟡 14:01 Asked about b (source none)',
+      '* 🟡 14:30 Read files',
+      '* 🟡 14:30 Ran the tests (source 14:30 to 14:31)',
+      '* 🟢 14:40 Condensed from no one place (source none)',
+      '* 🟡 14:45 Fixed the check (source 14:40 to 14:46)',
+      '* 🟡 15:00 Noted the rest',
+    ].join('\n')
+    for (const key of Object.keys(stored)) delete stored[key]
+    const second = await $.session.compact({ trigger: 'manual', messages: [withObservations(first.messages![0]!, mixed), ...first.messages!.slice(1)] })
+
+    expect(renderedObservationsIn(second.messages?.[0]?.text)).toBe(mixed)
   })
 
   test('an observation carries the span of transcript times it came from, never a range the Observer wrote, and keeps it through the memory message', async ($, on) => {
@@ -1237,6 +1483,36 @@ describe('register', () => {
     expect(lines.slice(0, 2).join('\n')).toBe(observed)
     expect(lines.length).toBeGreaterThan(2)
     for (const line of lines.slice(2)) expect(line).toMatch(/^\* 🟡 Read \w+$/)
+  })
+
+  test('the memory writes each day once, on a line before its first observation and its first user message, and reads the dates back', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    pi(on, {
+      reply: (prompt) => {
+        const [, time, name] = prompt.match(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/m)!
+        return `<observations>\n* 🟡 ${time ?? ''} Read ${name}\n</observations>`
+      },
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 23, 59))
+    await runTurn($, turn('b', 'b', CHUNK), at(23, 0, 20))
+    await runTurn($, turn('c', 'c', 8_000), at(23, 0, 50))
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    const text = first.messages?.[0]?.text
+
+    expect(renderedObservationsIn(text)).toBe(
+      '@ 2026-09-22\n* 🟡 23:59 Read a (source 23:59 to 2026-09-23 00:00)\n@ 2026-09-23\n* 🟡 00:20 Read b (source 00:00 to 00:21)',
+    )
+    expect(text).toContain('<all-user-messages>\n@ 2026-09-22\n* User @ 23:59 (1 chars):\na\n@ 2026-09-23\n* User @ 00:20 (1 chars):\nb\n</all-user-messages>')
+    for (const key of Object.keys(stored)) delete stored[key]
+    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
+    const again = second.messages?.[0]?.text
+
+    expect(renderedObservationsIn(again)?.split('\n').slice(0, 5).join('\n')).toBe(`${renderedObservationsIn(text)}\n* 🟡 Read c`)
+    expect(userMessagesIn(again)?.slice(0, 2)).toEqual(userMessagesIn(text))
   })
 
   test('an observation that ends in a parenthetical that is not a source range keeps it', async ($, on) => {
@@ -1704,30 +1980,42 @@ describe('register', () => {
 
   test('a memory over its budget with source ranges and within it without leaves them out of that message only, before touching skills or user messages', async ($, on) => {
     const clock = mock.clock(on)
-    const { history } = world(on)
-    const seen = pi(on, { reply: (prompt) => (prompt.includes(']: a\n') ? `<observations>\n${'* 🟡 2026-09-22 14:30 read a file\n'.repeat(800)}</observations>` : undefined) })
-    // A 15k-token budget: the ~7k tokens of observations fit it, and with their ranges, ~16k, they do not.
-    let window = 50_000
+    const { history, stored } = world(on)
+    const seen = pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 ${prompt.includes(']: a\n') ? '14:30 read a file' : '15:30 read c'}\n</observations>` })
+    let window = 200_000
     on('session.usage', () => ({ value: { context: { window }, rateLimits: [] } }) as never)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
     await clock.settle()
+    const observed = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    // A run of lines gives its range once: lines from two ranges in turn, carried forward from the memory message, are
+    // each a run, and a line with none before them ends on its marker. A 15k-token budget: the ~7k tokens of
+    // observations fit it, and with their ranges, ~14k, they do not.
+    const minute = (i: number) => `14:3${i % 2}`
+    const lines = Array.from({ length: 1200 }, (_, i) => `* 🟡 ${minute(i)} read a file (source ${minute(i)} to ${minute(i)})`)
+    for (const key of Object.keys(stored)) delete stored[key]
+    history.splice(0, history.length, withObservations(observed.messages![0]!, ['@ 2026-09-22', '* 🟡 14:29 Saw a, before the ranges (source none)', ...lines].join('\n')), ...observed.messages!.slice(1))
+    window = 50_000
+    await runTurn($, turn('c', 'c', CHUNK), at(22, 15, 30))
+    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 0))
+    await clock.settle()
     const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
 
     const text = first.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe(Array(800).fill('* 🟡 2026-09-22 14:30 read a file').join('\n'))
-    expect(userMessagesIn(text)).toEqual(['a'])
+    // Left out, the ranges take the marker with them.
+    expect(observationsIn(text)).toBe(['* 🟡 2026-09-22 14:29 Saw a, before the ranges', ...Array.from({ length: 1200 }, (_, i) => `* 🟡 2026-09-22 ${minute(i)} read a file`), '* 🟡 2026-09-22 15:30 read c'].join('\n'))
+    expect(userMessagesIn(text)).toEqual(['a', 'b', 'c'])
     expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: source ranges left out$/))
     // The ledger keeps them: a compaction with room for them gives them back.
     window = 200_000
     history.splice(0, history.length, ...first.messages!)
-    await runTurn($, turn('c', 'c', CHUNK), at(22, 15, 30))
-    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 0))
+    await runTurn($, turn('e', 'e', CHUNK), at(22, 16, 30))
+    await runTurn($, turn('f', 'f', 8_000), at(22, 17, 0))
     await clock.settle()
     const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
-    expect(observationsIn(second.messages?.[0]?.text)?.split('\n')[0]).toBe('* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:31)')
+    expect(observationsIn(second.messages?.[0]?.text)?.split('\n').slice(0, 3)).toEqual(['* 🟡 2026-09-22 14:29 Saw a, before the ranges (source none)', '* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:30)', '* 🟡 2026-09-22 14:31 read a file (source 2026-09-22 14:31 to 2026-09-22 14:31)'])
   })
 
   test('over its budget at every cut the floor tries while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
@@ -1735,17 +2023,17 @@ describe('register', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
-    const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(6_000)}</observations>`
+    const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(8_000)}</observations>`
     const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
     // Dense text: the last response measured 150k tokens where the characters estimate ~15k of messages, so the raw
-    // tail's ~5k count ~43k beside ~96k of memory, and the memory alone, with no raw tail, is over the 90k budget.
+    // tail's ~5k count ~43k beside ~100k of memory, and the memory alone, with no raw tail, is over the 90k budget.
     on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', 20_000), at(22, 15, 0))
-    await clock.settle() // [0, 3) observed: its ~77k tokens of observations start a reflection, held
+    await clock.settle() // [0, 3) observed: its ~102k tokens of observations start a reflection, held
     expect(seen.prompts.at(-1)).toMatch(/^## OBSERVATIONS/)
     const before = stored['ledger:session-1'] as Ledger
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
@@ -1800,22 +2088,32 @@ describe('register', () => {
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
   })
 
-  test("a memory whose constraints are over their own cap falls back rather than drop any, though the memory fits its budget", async ($, on) => {
+  test("constraints over their own cap shorten, the oldest first, to om_recall index lines: one the work in view names, and the newest that fit, stay whole; the ledger keeps every one whole", async ($, on) => {
     mock.clock(on)
     const { history, stored } = world(on)
-    const corrections = Array.from({ length: 2_000 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
+    const long = (i: number) => `🔴 User: "Leave module ${i} as it is, ${'and do not touch its tests or its fixtures '.repeat(9)}"`
+    const named = '🔴 User: "Keep src/widget_registry.ts as it is: widget_registry is public"'
+    const corrections = [named, ...Array.from({ length: 100 }, (_, i) => long(i))]
     const seen = pi(on, {
       reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
     })
-    // The default 90k-token budget holds the ~20k the corrections take; their 8k-token cap does not.
+    // The default 90k-token budget holds the ~10k the corrections take whole; their 8k-token cap does not.
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
-    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('widget_registry', 8_000))
 
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
 
-    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
-    expect(seen.logs).toContainEqual(expect.stringMatching(/^the user's constraints are over their cap: ~\d+ tokens, ~8000 allowed; using the built-in compaction$/))
-    expect(seen.screen.at(-1)).toBe('Constraints over their cap. Using built-in compaction')
+    const shown = correctionsIn(result.messages![0]!.text)!.split('\n')
+    expect(shown).toHaveLength(corrections.length)
+    expect(Math.ceil(shown.join('\n').length / 4)).toBeLessThanOrEqual(8_000)
+    const short = shown.flatMap((l, i) => (l.includes('(older constraint, shortened: om_recall') ? [i] : []))
+    expect(short.length).toBeGreaterThan(0)
+    expect(shown[0]).toBe(`* ${named}`) // the oldest, but named by the raw tail's Read
+    // The shortened run is the oldest after it; every line after the run is whole.
+    expect(short).toEqual(Array.from({ length: short.length }, (_, i) => i + 1))
+    expect(shown.slice(short.length + 1)).toEqual(corrections.slice(short.length + 1).map((c) => `* ${c}`))
+    expect(shown[1]).toBe('* 🔴 User: "Leave module 0 as it is, and do not touch…" (older constraint, shortened: om_recall "Leave module 0 as it is,")')
+    expect(seen.screen.at(-1)).not.toContain('built-in')
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
   })
 
@@ -2391,6 +2689,26 @@ describe('register', () => {
     expect(userMessagesIn(text)).toEqual(['a', '<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease review this and tell me if it looks right', 'b'])
   })
 
+  test('a prompt typed after pasted images is kept with their markers; an image note with no text is not a prompt', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+    const messages = [
+      ...turn('a', 'a', CHUNK),
+      row('[Image #10]\n\nNeed a follow up PR for the gorman PR'),
+      row('[Image: source: /tmp/clipboard-1.png]'),
+      row('[Image #11] [Image #12] these two'),
+      row('[Image #13]\n<system-reminder>hook note</system-reminder>'),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(userMessagesIn(result.messages?.[0]?.text)).toEqual(['a', '[Image #10]\n\nNeed a follow up PR for the gorman PR', '[Image #11] [Image #12] these two', 'b'])
+  })
+
   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
     mock.clock(on)
     world(on)
@@ -2433,7 +2751,7 @@ describe('register', () => {
     expect(again).not.toContain('without asking the user any further questions')
   })
 
-  test('the user messages section keeps the first prompt, the brief, and the newest prompts within its cap', async ($, on) => {
+  test('the user messages section keeps the brief, the newest prompts within its cap and the last three whole', async ($, on) => {
     mock.clock(on)
     world(on)
     pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
@@ -2447,7 +2765,7 @@ describe('register', () => {
     expect(kept[0]).toBe(brief)
     const omitted = Number(kept[1]!.match(/^\((\d+) omitted\)$/)![1])
     const numbers = kept.slice(2).map((k) => Number(k.split(' ')[0]))
-    expect(numbers.length).toBeGreaterThan(3)
+    expect(numbers.length).toBeGreaterThanOrEqual(3) // the last three prompts, whole, past the cap
     expect(numbers).toEqual(numbers.map((_, i) => numbers[0]! + i)) // a contiguous run
     expect(numbers.at(-1)).toBeGreaterThanOrEqual(27) // up to the newest prompt that left context
     expect(omitted).toBe(numbers[0]) // every prompt between the brief and the run
@@ -2458,13 +2776,42 @@ describe('register', () => {
     const second = await $.session.compact({ trigger: 'manual', messages: [...result.messages!, ...more, ...turn('end', 'r', 8_000)] })
     const again = userMessagesIn(second.messages?.[0]?.text) ?? []
     expect(again[0]).toBe(brief)
-    const tail = again.slice(2).map((k) => Number(k.split(' ')[0]))
-    const order = [...Array.from({ length: 30 }, (_, i) => i), NaN, 100, 101, 102, 103, 104] // NaN: 'last'
-    const from = order.findIndex((n) => Object.is(n, tail[0]))
-    expect(tail).toEqual(order.slice(from, from + tail.length))
-    expect(tail.at(-1)).toBeGreaterThanOrEqual(103)
-    expect(Number(again[1]!.match(/^\((\d+) omitted\)$/)![1])).toBe(from) // accumulated, not reset
+    // In order, the short 'last' kept whole past the cap, the long ones between counted, and the counts accumulated.
+    const count = (k: string) => Number(k.match(/^\((\d+) omitted\)$/)?.[1] ?? NaN)
+    const entries = again.slice(1)
+    const prompts = entries.filter((k) => Number.isNaN(count(k)))
+    const order = [...Array.from({ length: 30 }, (_, i) => String(i)), 'last', '100', '101', '102', '103', '104']
+    const idx = prompts.map((k) => order.indexOf(k === 'last' ? k : k.split(' ')[0]!))
+    expect(idx.every((i, j) => i >= 0 && (j === 0 || i > idx[j - 1]!))).toBe(true)
+    expect(prompts).toContain('last')
+    expect(Number(prompts.at(-1)!.split(' ')[0])).toBeGreaterThanOrEqual(103)
+    const counted = entries.map(count).filter((n) => !Number.isNaN(n)).reduce((a, b) => a + b, 0)
+    expect(counted + prompts.length).toBe(idx.at(-1)! + 1) // accumulated, not reset
     expect(again.join('').length).toBeLessThanOrEqual(10_000 * 4)
+  })
+
+  test('short prompts past the cap stay whole, in order, with the long ones between counted', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const long = (n: number) => `${n} ${'w'.repeat(8_000)}`
+    const prompts = Array.from({ length: 12 }, (_, i) => (i % 3 === 0 ? `no, use option ${i} instead` : long(i)))
+    const messages = [...turn('brief', 'r', 2_000), ...prompts.flatMap((p) => turn(p, 'r', 2_000)), ...turn('last', 'r', 8_000)]
+
+    const kept = userMessagesIn((await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text) ?? []
+    expect(kept[0]).toBe('brief')
+    // Every short correction is kept whole; the old long prompts leave, counted where they stood.
+    for (const i of [0, 3, 6, 9]) expect(kept).toContain(`no, use option ${i} instead`)
+    expect(kept.filter((k) => /^\(\d+ omitted\)$/.test(k)).length).toBeGreaterThan(0)
+    const at = (t: string) => kept.indexOf(t)
+    expect(at('no, use option 0 instead')).toBeLessThan(at('no, use option 3 instead'))
+    expect(at('no, use option 6 instead')).toBeLessThan(at('no, use option 9 instead'))
+    // Kept and counted together are every prompt up to the newest that left context.
+    const counts = kept.filter((k) => /^\(\d+ omitted\)$/.test(k))
+    const omitted = counts.reduce((n, k) => n + Number(k.match(/\d+/)![0]), 0)
+    const newest = Number(kept.at(-1)!.split(' ')[0])
+    expect(newest).toBeGreaterThanOrEqual(9)
+    expect(omitted + kept.length - 1 - counts.length).toBe(newest + 1)
   })
 
   test('an oversized brief is cut short of the cap, so the newest prompt keeps a reserve and stays the next step', async ($, on) => {
@@ -2479,9 +2826,9 @@ describe('register', () => {
     expect(kept.length).toBe(3)
     expect(kept[0]!.startsWith('brief ')).toBe(true)
     expect(kept[0]!).toMatch(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/)
-    expect(kept[1]).toBe('(1 omitted)')
+    expect(kept[1]).toBe('mid') // a short prompt is kept whole past the cap
     expect(kept[2]!.startsWith('newest n')).toBe(true) // the reserve, not a bare truncation note
-    expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4 + 100)
+    expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4 + 110) // the cap, the cut markers and 'mid'
 
     // Compacted again with no new prompt: the next step is still the newest prompt, and the brief keeps its note.
     const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...work('v', CHUNK), ...work('u', 8_000)] })
@@ -2697,6 +3044,31 @@ describe('register', () => {
     ])
     // The rows' times come from the steps that brought them, not only the prompt's.
     expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 09:03 Read a file', '🟡 2026-09-23 09:06 Read a file'])
+  })
+
+  test('past the 4096 rows the history reads as, a long turn still observes in the background mid-turn', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on, { rowsCap: 4096 })
+    const seen = pi(on, { reply: readsIn })
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await clock.set(at(23, 9, 0))
+    for (let i = 0; i < 4100; i++) history.push({ role: 'assistant', text: `note ${i}`, toolUses: [] })
+    history.push({ role: 'user', text: 'brief', toolUses: [] })
+    await $.turn.start({ text: 'brief', turnId: 't' })
+    await step($, 't', 0, history.length)
+    await clock.settle()
+    const before = seen.prompts.length
+
+    // The history the plugin reads stays 4096 rows long while the turn adds to it.
+    for (let n = 0; n < 6; n++) {
+      await clock.set(at(23, 9, n + 1))
+      history.push(...call(n, 16_000))
+      await step($, 't', n + 1, history.length)
+      await clock.settle()
+    }
+    expect(seen.prompts.length).toBeGreaterThan(before)
+    expect(seen.prompts.slice(before).join()).toContain('/src/f0.ts')
   })
 
   test("a crewmate's launch brief, its only prompt, is quoted in full across compactions and never offered as the next step", async ($, on) => {
@@ -2924,10 +3296,10 @@ describe('register', () => {
     }
 
     // As the session logged: rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail
-    // until the turn that ended at 15:08:26.
+    // until the turn that ended at 15:08:26. Past the stub's one line, each chunk carries the assistant's own sentences.
     expect(seen.logs.filter((l) => l.includes('in the background'))).toEqual([
-      'observed rows 1-56 in the background, 1 observations; watermark 56, 0 chunk(s) waiting on a gap',
-      'observed rows 56-139 in the background, 1 observations; watermark 139, 0 chunk(s) waiting on a gap',
+      'observed rows 1-56 in the background, 2 observations; watermark 56, 0 chunk(s) waiting on a gap',
+      'observed rows 56-139 in the background, 6 observations; watermark 139, 0 chunk(s) waiting on a gap',
     ])
     expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(atCompaction).toBe(0)
@@ -3045,6 +3417,39 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
+  test('an older wrapper row in the raw tail keeps only the lines a newer one does not repeat, and reads whole again after the compaction', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+    const notice = (id: string) => `<task-notification>\n<task-id>${id}</task-id>\nThe watcher woke: read the inbox, act on each new file, then reply to the lead with what changed.\n</task-notification>`
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle()
+    await runTurn($, [{ role: 'user', text: notice('w1'), toolUses: [] }, { role: 'assistant', text: 'read the inbox', toolUses: [] }], at(22, 15, 10))
+    await runTurn($, [{ role: 'user', text: notice('w2'), toolUses: [] }, { role: 'assistant', text: 'read it again', toolUses: [] }], at(22, 15, 20))
+    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    const tail = first.messages!.slice(1).map((m) => m.text)
+    expect(tail).toContain(notice('w2'))
+    expect(tail.find((t) => t.includes('w1'))).toMatch(/^<task-notification>\n<task-id>w1<\/task-id>\n\(repeated lines as in the newer notice below; [0-9a-f]+\)$/)
+
+    history.push(...first.messages!)
+    const memory = first.messages![0]!
+    await runTurn($, turn('c', 'c', CHUNK), at(22, 16, 0))
+    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 30))
+    await clock.settle()
+    const observed = seen.prompts.length
+    await $.session.compact({ trigger: 'auto', messages: history.slice(history.indexOf(memory)) })
+
+    // The Observer read both notices whole, and the next compaction matched the history with no Observer call.
+    expect(seen.prompts.some((p) => p.includes('repeated lines as in the newer notice'))).toBe(false)
+    expect(seen.prompts.join('\n').split('then reply to the lead').length - 1).toBe(2)
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+  })
+
   // A compaction writes its kept tail back in the context's order, so the history then holds a parallel block
   // grouped. The background ledger and the next compaction must read it in the same order, or the watermark over
   // it looks changed and the whole backlog is observed on the spot (a firstmate session, upgraded mid-way to 0.4.5).
@@ -3078,6 +3483,27 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
+  test('a compaction finds its context when the history holds rows past it (the /compact command) and keeps the ledger', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await clock.settle()
+    const observed = seen.prompts.length
+    expect(observed).toBeGreaterThan(0)
+    const context = [...history]
+    history.push({ role: 'user', text: '<command-name>/compact</command-name>', toolUses: [] })
+    await $.session.compact({ trigger: 'manual', messages: context })
+
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+  })
+
   test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
@@ -3094,7 +3520,7 @@ describe('register', () => {
 
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([
       'compaction not persistent: the context has 9 messages, the history 8',
-      'compaction not persistent: context message 2 differs from history row 2 (context user, 34 chars, 0 tool uses, 1 tool results; history user, 40001 chars, 0 tool uses, 1 tool results)',
+      'compaction not persistent: context message 2 differs from history row 2 (context user, 34 chars, 0 tool uses, 1 tool results; history user, 40001 chars, 0 tool uses, 1 tool results); 1 of 8 differ, the first reading as history row none within 8',
     ])
     const file = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
     expect(file.counts['compaction.notPersistent']).toBe(2)
@@ -3225,6 +3651,81 @@ describe('active constraints and the continuation record', () => {
     expect(other).toMatch(/\n\[k[0-9a-f]+\] 🔴 2026-09-22 14:10 User: "Use npm after all, pnpm breaks the lockfile"\n===== END CONSTRAINTS =====/)
     expect(other).not.toMatch(/^\[k[0-9a-f]+\] .*Use pnpm, never npm/m)
     expect(correctionsIn(second.messages?.[0]?.text)).toBe(`${reversed}\n* 🔴 2026-09-22 15:00 User: "Keep every commit small"`)
+  })
+
+  test('a user message the corrections quote whole is not repeated but for the newest, and comes back whole once they no longer quote it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const push = 'never_force_push_to_main_under_any_circumstances'
+    const lint = 'always_run_the_linter_before_every_single_commit'
+    pi(on, {
+      reply: constraining({
+        [push]: { quote: push },
+        [lint]: { quote: lint },
+        allow: { quote: 'Force pushing to main is fine today', replaces: push },
+        deny: { quote: 'No force pushes again', replaces: 'Force pushing' },
+      }),
+    })
+    const runTurn = live(on, clock, history)
+
+    for (const [i, name] of ['hello', push, lint].entries()) {
+      await runTurn($, turn(name, 'r', CHUNK), at(22, 14, i * 10))
+      await clock.settle()
+    }
+    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 30))
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(first.messages?.[0]?.text).toContain(
+      `<all-user-messages>\n@ 2026-09-22\n* User @ 14:00 (5 chars):\nhello\n* User @ 14:10 (${push.length} chars): quoted in the corrections above\n` +
+        `* User @ 14:20 (${lint.length} chars):\n${lint}\n</all-user-messages>`,
+    )
+
+    // Replaced twice, the constraint's words leave the corrections: the message is quoted whole again.
+    history.splice(0, history.length, ...first.messages!)
+    for (const [i, name] of ['allow', 'deny'].entries()) {
+      await runTurn($, turn(name, 'r', CHUNK), at(22, 15, i * 10))
+      await clock.settle()
+    }
+    await runTurn($, turn('more', 'r', 8_000), at(22, 15, 20))
+    await clock.settle()
+    const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(correctionsIn(second.messages?.[0]?.text)).not.toContain(push)
+    expect(second.messages?.[0]?.text).toContain(
+      `* User @ 14:10 (${push.length} chars):\n${push}\n* User @ 14:20 (${lint.length} chars): quoted in the corrections above\n`,
+    )
+  })
+
+  test('a user message quoted in the corrections comes back as its own words, not a span of the same length across two of their lines', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const ok = 'Reply with exactly: OK'
+    // As long as the span from the first quote's words to the second line's opening quote, in the rendered corrections.
+    const span = `${ok}"\n* 🔴 2026-09-22 14:20 User: `
+    const lint = `always_run_the_linter_${'x'.repeat(span.length - 22)}`
+    expect(lint.length).toBe(span.length)
+    pi(on, { reply: constraining({ reply: { quote: ok }, [lint]: { quote: lint } }) })
+    const runTurn = live(on, clock, history)
+
+    for (const [i, name] of ['hello', 'reply', lint, 'later'].entries()) {
+      await runTurn($, turn(name, 'r', CHUNK), at(22, 14, i * 10))
+      await clock.settle()
+    }
+    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 40))
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    expect(correctionsIn(first.messages?.[0]?.text)).toContain(`User: "${ok}"\n* 🔴 2026-09-22 14:20 User: "${lint}"`)
+
+    // Read back at the next compaction, the message is its own words, whether written whole or found in the corrections.
+    history.splice(0, history.length, ...first.messages!)
+    await runTurn($, turn('more', 'r', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('end', 'r', 8_000), at(22, 15, 10))
+    await clock.settle()
+    const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    const users = second.messages?.[0]?.text?.split('<all-user-messages>')[1] ?? ''
+    expect(users).not.toContain('🔴')
+    expect(users).toContain(`* User @ 14:20 (${lint.length} chars):\n${lint}\n`)
   })
 
   test('a reversal of a constraint set earlier in its own chunk stands alone, saying what it replaced, and is listed by its own words', async ($, on) => {
@@ -3396,7 +3897,7 @@ describe('active constraints and the continuation record', () => {
     on('classic.SessionStart', () => ({}))
     const brief = `brief ${'b'.repeat(14_600)}`
     const long = (n: number) => `${n} ${'w'.repeat(16_000)}`
-    const messages = [...turn(brief, 'r', CHUNK), ...turn(long(1), 'r', 2_000), ...turn(long(2), 'r', 2_000), ...turn(long(3), 'r', CHUNK), ...work('w', 8_000)]
+    const messages = [...turn(brief, 'r', CHUNK), ...turn(long(1), 'r', 2_000), ...turn(long(2), 'r', 2_000), ...turn(long(3), 'r', 2_000), ...turn(long(4), 'r', CHUNK), ...work('w', 8_000)]
 
     const unknown = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
     expect(unknown).toContain('\n* (2 earlier user messages omitted)\n')

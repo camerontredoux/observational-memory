@@ -190,6 +190,18 @@ describe('recall', () => {
     expect(await run({ query: 'GIZMO-7' }, io)).toMatch(/^0 match/)
   })
 
+  test('a prompt typed after pasted images is the asking one; an earlier one is found, and an image note alone is not a prompt', async () => {
+    const rows = [
+      msg('user', 1, [{ type: 'text', text: '[Image #10]\n\nNeed a follow up PR for the GORMAN PR' }, { type: 'image' }]),
+      msg('assistant', 2, [{ type: 'text', text: 'On it' }]),
+      msg('user', 3, [{ type: 'text', text: '[Image #11] [Image #12]\n\nand fix the WIDGET-3 street address' }, { type: 'image' }]),
+      msg('user', 3, '[Image: source: /tmp/clipboard-1.png]'),
+    ]
+    const io = memoryIo({ [`${DIR}/${NEW}.jsonl`]: rows.join('\n') })
+    expect(await run({ query: 'GORMAN' }, io)).toMatch(/^1 match/)
+    expect(await run({ query: 'WIDGET-3' }, io)).toMatch(/^0 match/)
+  })
+
   test('regex and quoted phrases', async () => {
     expect(await run({ query: '/needle-\\d+/' })).toMatch(/^1 match\(es\) for \/needle-\\d\+\/ in .*\n\[aaaaaaaa:3 [^\n]*\n  250: row 250 has the NEEDLE-42 marker/)
     expect(await run({ query: '/NEEDLE-4[0-9]/' })).toContain('250: row 250')
