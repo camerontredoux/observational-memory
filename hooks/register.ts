@@ -6,10 +6,15 @@ import {
   COMPACT_WRAPPER,
   COMPACTION_BRIEFING,
   FLOOR_NOTE,
+  HANDOFF_HEADER,
+  HANDOFF_PROMPT_HEAD,
+  HANDOFF_SYSTEM_PROMPT,
   MEMORY_CONTINUATION,
   MEMORY_HEADER,
   MEMORY_INSTRUCTIONS,
   MEMORY_RECALL,
+  NOTE_HEADER,
+  NOTE_SYSTEM_PROMPT,
   OBSERVER_SYSTEM_PROMPT,
   REFLECTOR_SYSTEM_PROMPT,
   reflectionPrompt,
@@ -33,6 +38,15 @@ declare module 'claude-code' {
 const PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low']
 const PI_ISOLATION = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
 const PI_CWD = '/tmp'
+// Handoff test arms (not shipped): 'amp' replaces the observations with a goal-conditioned handoff written at
+// compaction from the conversation; 'hybrid' adds a short note of the assistant's own beside them. The writer stands
+// in for the working model (`$.model.fork`), which the benchmark cannot run.
+const HANDOFF_ARM = 'amp' as 'off' | 'amp' | 'hybrid'
+const HANDOFF_PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-sol', '--thinking', 'low']
+const HANDOFF_INPUT_TOKENS = 120_000 // the conversation the writer reads, newest first
+const HANDOFF_WHOLE_TOKENS = 60_000 // of those, the newest rows whole; older rows keep their text alone
+const HANDOFF_TIMEOUT_MS = 5 * 60_000
+const NOTE_MAX_TOKENS = 1_500
 const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
 const MAX_PARALLEL = 4 // background Observer calls in flight at once, across the main loop and every subagent's
 const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
@@ -112,6 +126,7 @@ type Memory = {
   skills: Skill[]
   userMessages: UserMessage[]
   nextStep?: string // the user's latest request, verbatim
+  handoff?: string // HANDOFF_ARM: the handoff (amp) or the assistant's note (hybrid) written at this compaction
   environment?: string // the working directory and git state at compaction (see environmentOf)
   brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
@@ -607,13 +622,13 @@ function piMessage(stdout: string) {
 // One completion through pi, accepted only when pi says it finished (`stop`): a reply cut at the token limit, errored,
 // aborted or ending in any other way is partial. A failure throws, saying how pi ended but never what it was sent;
 // nothing retries it on another model.
-async function complete($: EngineInterface, role: string, system: string, prompt: string, timeoutMs: number, call: Call) {
+async function complete($: EngineInterface, role: string, system: string, prompt: string, timeoutMs: number, call: Call, pi = PI) {
   const started = await $.clock.now()
   const kind = role.startsWith('reflector') ? 'reflector' : 'observer'
   const note = (c: Partial<LunaCall>) =>
     $.session.id().then((id) => record(statsIo($), id, (s, at) => addLuna(s, { kind, ok: true, ms: at - started, ...call, ...c }, at)), () => {})
   const fail = async (error: unknown) => (await note({ ok: false, failure: failureClass(errorText(error)) }), error)
-  const r = await $.process.run([...PI, '--system-prompt', system, ...PI_ISOLATION], { cwd: PI_CWD, stdin: prompt, timeoutMs }).catch(async (error) => {
+  const r = await $.process.run([...pi, '--system-prompt', system, ...PI_ISOLATION], { cwd: PI_CWD, stdin: prompt, timeoutMs }).catch(async (error) => {
     throw await fail(error)
   })
   const message = piMessage(r.stdout)
@@ -709,6 +724,38 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
 const renderLines = (entries: readonly Entry[], sources = true) =>
   entries.map((e) => `* ${e.line}${sources && e.source ? ` ${renderSource(e.source)}` : ''}`).join('\n')
 const renderCorrections = (lines: readonly string[]) => (lines.length ? `<corrections>\n${lines.map((l) => `* ${l}`).join('\n')}\n</corrections>\n\n` : '')
+// The conversation as the handoff's writer reads it: a memory message leading the context whole, then the newest rows
+// whole up to HANDOFF_WHOLE_TOKENS, older rows their text alone, all within HANDOFF_INPUT_TOKENS, newest kept.
+function handoffInput(v: View) {
+  const lead = v.base ? `[Compacted context from before]:\n${v.messages[0]!.text}` : ''
+  let left = HANDOFF_INPUT_TOKENS - estimateTokens(lead)
+  const blocks: string[] = []
+  let i = v.messages.length - 1
+  for (; i >= v.base; i--) {
+    const m = v.messages[i]!
+    const at = v.at[i] === undefined ? '' : ` @ ${stamp(v.at[i]!)}`
+    const whole = HANDOFF_INPUT_TOKENS - left < HANDOFF_WHOLE_TOKENS
+    const text = whole ? serialize(v, i, i + 1) : m.text ? `[${m.role === 'assistant' ? 'Assistant' : 'User'}${at}]: ${excerpt(m.text, 2_000, 'message')}` : ''
+    if (estimateTokens(text) > left) break
+    if (text) blocks.push(text), (left -= estimateTokens(text))
+  }
+  if (i >= v.base) blocks.push(`[${i - v.base + 1} older messages left out; om_recall finds them]`)
+  return [lead, ...blocks.reverse()].filter(Boolean).join('\n\n')
+}
+
+// The handoff (amp) or note (hybrid), written from the whole live context; none when the writer fails.
+async function writeHandoff($: EngineInterface, v: View) {
+  const [system, tag] = HANDOFF_ARM === 'amp' ? [HANDOFF_SYSTEM_PROMPT, 'handoff'] : [NOTE_SYSTEM_PROMPT, 'assistant-notes']
+  try {
+    const text = await complete($, `handoff `, system, HANDOFF_PROMPT_HEAD + handoffInput(v), HANDOFF_TIMEOUT_MS, { phase: 'compaction' }, HANDOFF_PI)
+    const body = (tag === 'handoff' ? /<handoff>\n?([\s\S]*?)\n?<\/handoff>/ : /<assistant-notes>\n?([\s\S]*?)\n?<\/assistant-notes>/).exec(text)?.[1]?.trim()
+    return body && (HANDOFF_ARM === 'hybrid' ? truncate(body, NOTE_MAX_TOKENS) : body)
+  } catch (error) {
+    log($, `the handoff failed (${errorText(error)}); compacting without it`)
+    return undefined
+  }
+}
+
 const section = (name: string, value?: string) => (value ? `\n\n<${name}>\n${value}\n</${name}>` : '')
 
 // The user's messages, verbatim, each after a header that gives its length, so no text inside can end the section.
@@ -829,7 +876,10 @@ const SESSION_BRIEF_END = '\n</session-brief>'
 // where the model can call om_recall, the note that sends it there, so it is the last thing read before the messages.
 function memoryMessage(memory: Memory): SessionMessage {
   const text =
-    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
+    (HANDOFF_ARM === 'amp' && memory.handoff
+      ? `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${HANDOFF_HEADER}\n\n${renderCorrections(memory.corrections)}<handoff>\n${memory.handoff}\n</handoff>`
+      : `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>`) +
+    (HANDOFF_ARM === 'hybrid' && memory.handoff ? section('assistant-notes', `${NOTE_HEADER}\n${memory.handoff}`) : '') +
     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
     section('session-brief', [memory.floor ? FLOOR_NOTE : '', memory.brief ? renderBrief(memory.brief, memory.recall) : ''].filter(Boolean).join('\n')) +
     renderUserMessages(memory.userMessages, memory.recoverable) +
@@ -1349,6 +1399,7 @@ export const register: Register = (on) => {
     if (history && !persistent) notPersistent($, sessionId, messages, rows, offset)
     const v = view(messages, persistent ? await loadMarks($, loop.key) : [], persistent ? offset : undefined)
     const base = v.base
+    const handoff = HANDOFF_ARM !== 'off' && installs ? writeHandoff($, v) : undefined
     const initial = persistent ? await locked(() => loadLedger($, loop.key, v)) : fresh(v)
     const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
 
@@ -1388,6 +1439,7 @@ export const register: Register = (on) => {
       })
     }
     const priorMemory = base ? parseMemory(messages[0]!) : undefined
+    const written = await handoff
     const prior = priorMemory?.skills ?? []
     // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
@@ -1461,6 +1513,7 @@ export const register: Register = (on) => {
           // The session's first prompt, a crewmate's whole brief, is quoted above; quoted again as the latest request it
           // would send the agent back to the top of its brief.
           // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
+          ...(written ? { handoff: written } : {}),
           nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
           ...(environment ? { environment } : {}),
           ...(brief ? { brief } : {}),
@@ -1515,7 +1568,7 @@ export const register: Register = (on) => {
         throw error
       }
       if (stores && !installs) await $.store.set(ledgerKey(loop.key), ledger)
-      if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
+      if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(HANDOFF_ARM === 'amp' && built.memory.handoff ? '' : built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
       return built
     }
     const { ledger, cut, memory, message, floor, briefed } = persistent ? await locked(async () => settle(await loadLedger($, loop.key, v))) : await settle(initial)
