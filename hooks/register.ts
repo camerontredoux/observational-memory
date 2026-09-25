@@ -51,6 +51,10 @@ const SKILLS_MAX_TOKENS = 15_000
 const SKILLS_WHOLE_TURNS = 3 // a skill invoked in the last this many main-thread turns, the running one counted, keeps its text
 const TOOL_ARGS_MAX_TOKENS = 2_000
 const TOOL_RESULT_MAX_TOKENS = 5_000
+// The raw tail a compaction keeps: past its newest TAIL_WHOLE_RESULTS tool results, each successful result over
+// TAIL_RESULT_MAX_TOKENS keeps its head and tail around an om_recall marker (maskTail).
+const TAIL_WHOLE_RESULTS = 3
+const TAIL_RESULT_MAX_TOKENS = 250
 const OBSERVER_TIMEOUT_MS = 120_000 // a ~10k-token chunk takes Luna about 15 s
 const REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens of output, in the background
 const MAX_MARKS = 4_000
@@ -192,6 +196,37 @@ function excerpt(text: string, maxTokens: number, what: 'result' | 'message' = '
   const tailStart = nl === -1 || nl >= text.length - 1 ? rawTailStart : nl + 1
   const omitted = estimateTokens(text.slice(headChars, tailStart))
   return `${text.slice(0, headChars)}${omissionMarker(omitted, what)}${text.slice(tailStart)}`
+}
+// The raw tail a compaction hands back: the newest TAIL_WHOLE_RESULTS tool results and every error whole, each other
+// result over TAIL_RESULT_MAX_TOKENS cut to its head and tail. om_recall finds the whole result in the transcript.
+function maskTail(rows: readonly SessionMessage[]) {
+  let seen = 0
+  return rows
+    .toReversed()
+    .map((m) => {
+      if (!m.toolResults?.length) return m
+      // A cut that would not shorten the result (the marker outweighs what it omits) leaves it whole.
+      const cut = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
+        const text = excerpt(r.text, TAIL_RESULT_MAX_TOKENS)
+        return text.length < r.text.length ? { ...r, text } : r
+      }
+      const toolResults = m.toolResults.toReversed().map((r) => (++seen <= TAIL_WHOLE_RESULTS || r.isError ? r : cut(r)))
+      return toolResults.every((r, i) => r === m.toolResults!.at(-1 - i)) ? m : { ...m, toolResults: toolResults.toReversed() }
+    })
+    .toReversed()
+}
+const MASKED = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/
+// A result maskTail cut reads whole again wherever the history still holds it (the rows before the compaction that
+// cut it, under the same tool use id): the Observer, the row hashes and the times see the result as it was.
+function unmask(rows: readonly SessionMessage[], history: readonly SessionMessage[]) {
+  const whole = new Map<string, string>()
+  for (const m of history) for (const r of m.toolResults ?? []) if (r.text.length > (whole.get(r.tool_use_id)?.length ?? -1)) whole.set(r.tool_use_id, r.text)
+  const original = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
+    const at = r.text.search(MASKED)
+    const w = at < 0 ? undefined : whole.get(r.tool_use_id)
+    return w && w.length > r.text.length && w.startsWith(r.text.slice(0, at)) ? w : undefined
+  }
+  return rows.map((m) => (m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m))
 }
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
@@ -985,7 +1020,7 @@ function arrange(rows: readonly SessionMessage[], fallback: Fallback | undefined
 // A loop's history as its live context reads it.
 async function loopHistory($: EngineInterface, loop: Loop) {
   const [rows, fallback] = await Promise.all([historyOf($, loop.agentId), $.store.get(liveKey(loop.key))])
-  return arrange(rows, fallback as Fallback | undefined)
+  return unmask(arrange(rows, fallback as Fallback | undefined), rows)
 }
 
 // `$.session.messages()` is the whole history, each compaction's result appended to it: the live context starts
@@ -1336,8 +1371,6 @@ export const register: Register = (on) => {
       show($, 'Compaction instructions given. Using built-in compaction', e.agentId)
       return delegateToBuiltin($, e, next, false)
     }
-    const order = callOrder(e.messages)
-    const messages = order.map((i) => e.messages[i]!)
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
     const [sessionId, started, usage, recall, always, environment] = await Promise.all([
@@ -1354,6 +1387,10 @@ export const register: Register = (on) => {
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
     // the session cannot read, or a context that does not match) is compacted with no stored state.
     const history = await loopHistory($, loop).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
+    // The live context with the results an earlier compaction's raw tail cut read whole again, as the history reads them.
+    const live = history ? unmask(e.messages, history) : e.messages
+    const order = callOrder(live)
+    const messages = order.map((i) => live[i]!)
     const offset = (history?.length ?? 0) - messages.length
     const rows = !history || offset < 0 ? (history ?? []) : [...history.slice(0, offset), ...inCallOrder(history.slice(offset))]
     const persistent = !!history && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
@@ -1362,6 +1399,8 @@ export const register: Register = (on) => {
     const base = v.base
     const initial = persistent ? await locked(() => loadLedger($, loop.key, v)) : fresh(v)
     const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
+    // What the raw tail from `cut` takes in the compacted context, its old results cut (maskTail).
+    const tailTokens = (cut: number) => maskTail(messages.slice(cut)).reduce((n, m) => n + estimateTokens(rowText(m)), 0)
 
     // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
     // observed is observed now, in chunks, all at once. A chunk pi fails on stays raw: the cut is wherever the rest
@@ -1483,7 +1522,7 @@ export const register: Register = (on) => {
           resumeDirectly: e.trigger === 'auto',
         }
         // The compacted context: the memory message with its margin, and the raw tail at its density.
-        const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tokensBetween(v, cut, messages.length) * density)
+        const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
         let message = memoryMessage(memory)
         // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
         // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
@@ -1542,7 +1581,7 @@ export const register: Register = (on) => {
       $,
       (observedNow ? `observed ${observedNow} rows now, ` : floor ? '' : 'cut at the background watermark with no Observer call, ') +
         (floor ? `the floor (${why}): ${briefed} rows compiled into the session brief, ` : '') +
-        `kept ${messages.length - cut} raw messages (~${tokensBetween(v, cut, messages.length)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
+        `kept ${messages.length - cut} raw messages (~${tailTokens(cut)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
         `${ledger.entries.length} observations, ${memory.skills.length} skill(s)${memory.brief ? `, brief ~${briefTokens} tokens` : ''}`,
     )
     show(
@@ -1557,7 +1596,7 @@ export const register: Register = (on) => {
       fellBack: false,
       floor,
       tokensBefore: main ? usage?.context.tokens : undefined, // the last response's input: system prompt and tools included
-      estTokensAfter: estimateTokens(message.text) + tokensBetween(v, cut, messages.length), // messages only
+      estTokensAfter: estimateTokens(message.text) + tailTokens(cut), // messages only
       syncCalls: sync.calls,
       syncMs: sync.ms,
       rowsObservedNow: observedNow,
@@ -1572,7 +1611,7 @@ export const register: Register = (on) => {
     // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
     // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
     // In the context's own order.
-    return { messages: [message, ...e.messages.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m)] }
+    return { messages: [message, ...maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m))] }
   }).catch(async ($, e, next) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
