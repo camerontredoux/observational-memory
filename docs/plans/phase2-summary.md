@@ -4,11 +4,11 @@ This is the closing record of Phase 1 (the A/B benchmark) and Phase 2 (improving
 
 ## Where we are
 
-**base8** is the final candidate. It is HEAD `af0940d` plus 22 kept changes. It is not in the main checkout yet. The live plugin loads from the main checkout, so landing it changes every running session.
+**base8** is HEAD `af0940d` plus 22 kept changes. It landed as observational-memory v1.4.0 (commit `8003175`).
 
-- Plugin copy: `.scratch/omv-code/base8`
-- Diff against MAIN: `results/diffs/base8.diff`
-- Apply: `git apply docs/plans/results/diffs/base8.diff`, then `claude plugin test` and `bunx -p typescript tsc -p .`, then bump the version (see AGENTS.md, Releases).
+- Plugin copy as tested: `.scratch/omv-code/base8`
+- The patch as applied: `results/diffs/base8.diff`
+- On landing, one fixture-only replay test (`replays a firstmate transcript`) expected 1 observation per chunk; carry5f makes it 2 and 6, and the test now says so. 373/0 tests.
 
 ### Scores
 
@@ -120,7 +120,6 @@ Known limits:
 
 ## Next steps
 
-1. Land base8 in MAIN (the apply steps above), with a version bump.
-2. Decide whether to file the I57 engine bug.
-3. Run with debug logs until an auto or subagent notPersistent line appears, then fix I56's remaining cases.
-4. If quality work resumes, the lever is what the Observer writes (lesson 2). Try deterministic carries first.
+1. Decide whether to file the I57 engine bug.
+2. Run with debug logs until an auto or subagent notPersistent line appears, then fix I56's remaining cases.
+3. If quality work resumes, the lever is what the Observer writes (lesson 2). Try deterministic carries first.
