@@ -52,6 +52,7 @@ const io: RecallIo = {
     const hit = r.stdout?.split('\n')[0]
     return hit ? hit.slice(hit.lastIndexOf('/') + 1) : undefined
   },
+  now: async () => Date.now(),
 }
 
 const args = process.argv.slice(2)

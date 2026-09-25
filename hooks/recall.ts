@@ -13,6 +13,8 @@ const SEARCH_MAX_CHARS = 10_000 // about 2.5k tokens of hits
 const SEARCH_LINES_PER_HIT = 3
 const SEARCH_LINE_CHARS = 200
 const SEARCH_LINE_GAP = 2 // lines shown from one hit are further apart than this
+const SEARCH_BUDGET_MS = 3_000 // a regex search's time, checked between blocks
+const REGEX_TEXT_MAX = 10_000 // characters one regex test runs over
 const ABSENT_MAX = 20 // absent terms named
 const READ_MAX_LINES = 200
 const READ_MAX_CHARS = 12_000 // one page of a block, about 3k tokens
@@ -34,6 +36,7 @@ export type RecallIo = {
   list: (dir: string) => Promise<string[]> // entry names; none when the directory is missing
   // The name, among `names` in `dir`, of the file that says the session `id` continued it.
   continuing: (dir: string, names: readonly string[], id: string) => Promise<string | undefined>
+  now: () => Promise<number> // milliseconds since the epoch
 }
 export type RecallInput = {
   query?: unknown
@@ -67,7 +70,7 @@ type Block = {
   agent?: string // the tag of the subagent a call started
 }
 type Thread = { tag: string; label: string; blocks: Block[]; path?: string; loaded: boolean }
-type Corpus = { main: Thread; files: string[]; subagents: Thread[]; live: boolean; note?: string; load: (t: Thread) => Promise<void> }
+type Corpus = { main: Thread; files: string[]; subagents: Thread[]; live: boolean; note?: string; load: (t: Thread) => Promise<void>; now: () => Promise<number> }
 
 // A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
 const isMemoryText = (text: string) => text.startsWith(MEMORY_HEADER) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`)
@@ -373,11 +376,12 @@ export async function loadTranscript(io: RecallIo, path: string, options: { aski
       t.blocks = parseFile(t.tag, await io.read(t.path), newSeen(), true).blocks
       t.loaded = true
     },
+    now: io.now,
   }
 }
 
 // The live history, when there is no transcript file to read: rows addressed by their index, which a compaction moves.
-export function liveTranscript(rows: readonly SessionMessage[], times: readonly (number | undefined)[], capped: boolean): Corpus {
+export function liveTranscript(rows: readonly SessionMessage[], times: readonly (number | undefined)[], capped: boolean, now: () => Promise<number>): Corpus {
   const seen = newSeen()
   const blocks: Block[] = []
   rows.forEach((m, i) => {
@@ -399,6 +403,7 @@ export function liveTranscript(rows: readonly SessionMessage[], times: readonly 
     live: true,
     ...(capped ? { note: `only the newest ${grouped(rows.length)} messages of the live history are readable` } : {}),
     load: async () => {},
+    now,
   }
 }
 
@@ -559,10 +564,42 @@ type Term = { word: string; parts: string[] }
 type Matcher = { regex?: RegExp; terms: Term[]; shown: string }
 type Held = 'whole' | 'parts' | undefined
 
+// The length of an unbounded quantifier (`+`, `*`, `{n,}`) at `i`, else 0.
+function unboundedAt(p: string, i: number) {
+  if (p[i] === '+' || p[i] === '*') return 1
+  const brace = p.slice(i).match(/^\{\d+,\}/)
+  return brace ? brace[0].length : 0
+}
+
+// Whether an unbounded quantifier repeats a group that already holds one, as `(a+)+` or `(\w*)*`: the shape that can
+// backtrack for a very long time on a line it does not match. Overlapping alternatives, as `(a|a)+`, pass; the search's
+// time budget stops those.
+function nestsQuantifiers(p: string) {
+  const groups: boolean[] = [] // per open group: whether it holds an unbounded quantifier
+  let inClass = false
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i]
+    if (c === '\\') i++
+    else if (inClass) inClass = c !== ']'
+    else if (c === '[') inClass = true
+    else if (c === '(') groups.push(false)
+    else if (c === ')') {
+      const inner = groups.pop() ?? false
+      const q = unboundedAt(p, i + 1)
+      if (inner && q) return true
+      if (groups.length) groups[groups.length - 1] ||= inner || !!q
+      i += q
+    } else if (groups.length && unboundedAt(p, i)) groups[groups.length - 1] = true
+  }
+  return false
+}
+
 // `/regex/flags` (case-insensitive unless flags are given), else words and "quoted phrases", all of which must appear.
 function matcher(query: string): Matcher | string {
   const re = query.match(/^\/([\s\S]+)\/([a-z]*)$/)
   if (re) {
+    if (nestsQuantifiers(re[1]!))
+      return `om_recall: /${re[1]}/ repeats a group that already repeats, as (a+)+ does, which can take very long to match. Drop one of the two quantifiers, bound one as {1,20}, or search for words.`
     try {
       return { regex: new RegExp(re[1]!, (re[2] || 'i').replace(/[gy]/g, '')), terms: [], shown: `/${re[1]}/${re[2] ?? ''}` }
     } catch (error) {
@@ -579,10 +616,24 @@ function matcher(query: string): Matcher | string {
   return { terms, shown: /^".*"$/.test(query.trim()) ? query.trim() : `"${query}"` }
 }
 
+// The pieces of a text one regex test runs over, each at most REGEX_TEXT_MAX characters and cut after a newline where
+// one falls in its second half, so one huge line cannot spend the whole time budget. A match across a cut is missed.
+function pieces(text: string) {
+  const out: string[] = []
+  for (let i = 0; i < text.length; ) {
+    let end = i + REGEX_TEXT_MAX
+    const nl = end < text.length ? text.lastIndexOf('\n', end - 1) : -1
+    if (nl >= i + REGEX_TEXT_MAX / 2) end = nl + 1
+    out.push(text.slice(i, end))
+    i = end
+  }
+  return out.length ? out : ['']
+}
+
 // How a text holds each term (a regex is one): whole, by a compound's parts alone, or not. A phrase matches across any
 // run of whitespace, as a command's aligned output spaces its words.
 function held(m: Matcher, text: string, lower = text.toLowerCase()): Held[] {
-  if (m.regex) return [m.regex.test(text) ? 'whole' : undefined]
+  if (m.regex) return [pieces(text).some((p) => m.regex!.test(p)) ? 'whole' : undefined]
   const flat = lower.replace(/\s+/g, ' ')
   return m.terms.map((t) => (flat.includes(t.word) ? 'whole' : t.parts.length && t.parts.every((p) => lower.includes(p)) ? 'parts' : undefined))
 }
@@ -696,13 +747,22 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
   const threads = input.subagents ? [c.main, ...c.subagents] : [home]
   type Hit = { b: Block; t: Thread; i: number; time: number; lower: string; held: Held[]; score: number; x?: Excerpt }
   const pool: Hit[] = []
-  for (const t of threads) {
+  // A regex can backtrack for a very long time on a block; no test can be interrupted, so the clock is read between them.
+  const deadline = async () => (m.regex ? (await c.now()) + SEARCH_BUDGET_MS : Infinity)
+  const past = async (by: number) => by < Infinity && (await c.now()) > by
+  const scanBy = await deadline()
+  let stopped: { b: Block; left: number } | undefined // the first block not searched, and the threads after its own
+  scan: for (const [n, t] of threads.entries()) {
     const r = range(t, input.from, input.to, home)
     if (typeof r === 'string') return { mode: 'search', text: `om_recall: ${r}.`, matches: 0 }
     const times = timesOf(t)
     for (let i = r[0]; i <= r[1]; i++) {
       const b = t.blocks[i]!
       if (b.own || b.asking || b.kind === 'memory') continue
+      if (await past(scanBy)) {
+        stopped = { b, left: threads.length - 1 - n }
+        break scan
+      }
       const text = b.tool ? `${b.tool}\n${b.text}` : b.text
       const lower = text.toLowerCase()
       pool.push({ b, t, i, time: times[i] ?? 0, lower, held: held(m, text, lower), score: 0 })
@@ -713,18 +773,22 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
   if (loose) hits = pool.filter((h) => h.held.some(Boolean))
   // A term weighs more the fewer blocks hold it, so a block with one rare term outranks many with a common one.
   const weight = pool[0]?.held.map((_, k) => Math.log(1 + pool.length / Math.max(1, pool.filter((h) => h.held[k]).length))) ?? []
-  for (const h of hits) {
+  // Excerpting tests a hit's lines again, so a regex has a budget of its own for it, spent on the newest hits first.
+  const excerptBy = await deadline()
+  for (const [n, h] of [...hits].reverse().entries()) {
+    if (n && (await past(excerptBy))) break
     h.x = excerpt(h.b, m)
     h.score = h.held.reduce((s, x, k) => s + (x ? weight[k]! : 0), 0)
   }
   const byTime = (a: Hit, b: Hit) => a.time - b.time || (a.t === b.t ? a.i - b.i : 0)
   // The rarest terms first when no block holds every term, then the most terms whole on one line, the most terms on
-  // one line, then the newest.
-  const ranked = [...hits].sort((a, b) => (loose ? b.score - a.score : 0) || b.x!.whole - a.x!.whole || b.x!.best - a.x!.best || byTime(b, a))
+  // one line, then the newest. Hits the budget left without an excerpt come last, never shown.
+  const ranked = hits.filter((h) => h.x).sort((a, b) => (loose ? b.score - a.score : 0) || b.x!.whole - a.x!.whole || b.x!.best - a.x!.best || byTime(b, a))
+  ranked.push(...hits.filter((h) => !h.x))
   const shown: Hit[] = []
   let chars = 0
   for (const h of ranked) {
-    if (shown.length >= limit) break
+    if (shown.length >= limit || !h.x) break
     if (shown.length && chars + h.x!.text.length > SEARCH_MAX_CHARS) break
     shown.push(h)
     chars += h.x!.text.length + 1
@@ -740,6 +804,14 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
     `${hits.length} match(es) for ${m.shown} in ${plural(pool.length, 'block')} of ${where}${c.note ? ` (${c.note})` : ''}` +
     (loose && hits.length ? `; no block holds every term, so these hold some, chosen by the rarest` : '') +
     (rest.length ? `; showing ${shown.length}${loose ? '' : older ? ', the newest' : ', those with the most terms on one line'}` : '') +
+    (!stopped
+      ? ''
+      : threads.length === 1
+        ? `; the search stopped after ${SEARCH_BUDGET_MS / 1000} s, before ${stopped.b.ref}: simplify the pattern, or search the rest with "from": "${stopped.b.ref}"`
+        : // With "subagents", "from" bounds the other transcripts by time, skipping blocks of theirs never searched.
+          `; the search stopped after ${SEARCH_BUDGET_MS / 1000} s, before ${stopped.b.ref}` +
+          (stopped.left ? `, with ${plural(stopped.left, 'subagent transcript')} not searched` : '') +
+          `: simplify the pattern, or search one transcript at a time, without "subagents": "from": "${stopped.b.ref}" searches the rest of this one`) +
     '.'
   const out = [head]
   // Terms no block holds, whole or (a compound) by parts found anywhere: absent, so not worth searching for again.
