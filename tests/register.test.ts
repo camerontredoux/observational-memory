@@ -3526,6 +3526,41 @@ describe('register', () => {
     expect(file.counts['compaction.notPersistent']).toBe(2)
   })
 
+  test('a context that differs from the history past the watermark keeps the ledger up to it and counts how it differs', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, files, stored } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await clock.settle()
+    const observed = seen.prompts.length
+    const kept = (stored['ledger:session-1'] as Ledger).watermark.to
+    expect(kept).toBeLessThan(history.length - 2)
+    // The history holds a row the context lacks (`extra`); then its last row reads as none nearby (`changed`).
+    await $.session.compact({ trigger: 'auto', messages: history.filter((_, i) => i !== history.length - 2) })
+    const note = { role: 'user' as const, text: '<task-notification>done</task-notification>', toolUses: [] }
+    await $.session.compact({ trigger: 'auto', messages: [...history.slice(0, -1), note] })
+    await clock.advance(5_000)
+
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.filter((l) => l.includes('restarting the ledger'))).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('cut at the background watermark with no Observer call'))).toHaveLength(2)
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number; max: number }> }
+    expect(stats.counts).toMatchObject({
+      'compaction.notPersistent': 2,
+      'compaction.notPersistent.auto': 2,
+      'compaction.notPersistent.extra': 1,
+      'compaction.notPersistent.changed': 1,
+      'compaction.notPersistent.rows.reply-result': 1,
+      'compaction.notPersistent.rows.injected-reply': 1,
+    })
+    expect(stats.metrics['compaction.notPersistent.fromEnd']!.max).toBeLessThanOrEqual(2)
+    expect(stats.metrics['compaction.notPersistent.rowsKept']!.sum).toBe(2 * kept)
+  })
+
   test('stats: background calls and a compaction land in the session file, and om_stats and /om-stats report them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
@@ -3950,7 +3985,7 @@ describe('the floor', () => {
     expect(result.messages?.slice(1)).toEqual(messages.slice(8)) // the newest turn stays raw
     expect(seen.screen).toEqual([expect.stringMatching(/^Compacted in 0 ms · memory 0 notes · 8 messages in a brief compiled by code \(nothing was observed yet\)$/)])
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
-    expect(stats.counts).toEqual({ 'compaction.manual.floor': 1, 'compaction.notPersistent': 1 })
+    expect(stats.counts).toEqual({ 'compaction.manual.floor': 1, 'compaction.notPersistent': 1, 'compaction.notPersistent.manual': 1, 'compaction.notPersistent.short': 1 })
     expect(stats.metrics['compaction.manual.rowsBriefed']!.sum).toBe(8)
     expect(stats.metrics['compaction.manual.briefTokens']!.sum).toBeGreaterThan(0)
   })

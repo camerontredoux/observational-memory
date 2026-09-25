@@ -1771,8 +1771,17 @@ async function noteTranscript($: EngineInterface, e: { session_id: string; trans
   await $.store.set(transcriptKey(e.session_id), e.transcript_path).catch((error) => log($, `could not record the transcript path (${errorText(error)})`))
 }
 
-// Why a compaction's context is not the tail of its loop's history, by shape alone (no content): logged and counted.
-function notPersistent($: EngineInterface, sessionId: string, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
+// What a row is, by shape alone, for the mismatch counts.
+const kindOf = (m: SessionMessage) =>
+  m.role === 'assistant'
+    ? m.toolUses.length ? 'call' : 'reply'
+    : m.toolResults?.length ? 'result' : isMemory(m) ? 'memory' : isSummary(m) ? 'summary' : typed(m, []) === undefined ? 'injected' : 'prompt'
+
+// Why a compaction's context is not the tail of its loop's history, by shape alone (no content): logged, and counted
+// in the stats by trigger, by how the first differing row differs (`short`: the context is longer than the history;
+// `extra`: it reads as a later history row, so the history holds rows the context lacks; `missing`: an earlier one;
+// `changed`: none nearby) and by the two rows' kinds, with how far from the end it sits and the observed rows kept.
+function notPersistent($: EngineInterface, sessionId: string, trigger: string, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number, kept: number) {
   const shape = (m: SessionMessage) => `${m.role}, ${rowText(m).length} chars, ${m.toolUses.length} tool uses, ${m.toolResults?.length ?? 0} tool results`
   const differs = (m: SessionMessage, i: number) => rowHash(m) !== rowHash(rows[offset + i]!)
   const i = offset < 0 ? -1 : messages.findIndex(differs)
@@ -1780,14 +1789,24 @@ function notPersistent($: EngineInterface, sessionId: string, messages: readonly
   const near = (k: number) =>
     Array.from({ length: 2 * ALIGN_ROWS + 1 }, (_, d) => k + d - ALIGN_ROWS).find((j) => j !== k && rows[j] && rowHash(rows[j]) === rowHash(messages[i]!))
   const seen = offset < 0 ? undefined : near(offset + i)
+  const differing = offset < 0 ? messages.length : messages.filter(differs).length
   log(
     $,
     offset < 0
       ? `compaction not persistent: the context has ${messages.length} messages, the history ${rows.length}`
       : `compaction not persistent: context message ${i} differs from history row ${offset + i} (context ${shape(messages[i]!)}; history ${shape(rows[offset + i]!)}); ` +
-          `${messages.filter(differs).length} of ${messages.length} differ, the first reading as history row ${seen ?? `none within ${ALIGN_ROWS}`}`,
+          `${differing} of ${messages.length} differ, the first reading as history row ${seen ?? `none within ${ALIGN_ROWS}`}`,
   )
-  record(statsIo($), sessionId, (s) => count(s, 'compaction.notPersistent'))
+  const how = offset < 0 ? 'short' : seen === undefined ? 'changed' : seen > offset + i ? 'extra' : 'missing'
+  record(statsIo($), sessionId, (s, at) => {
+    count(s, 'compaction.notPersistent')
+    count(s, `compaction.notPersistent.${trigger}`)
+    count(s, `compaction.notPersistent.${how}`)
+    if (offset >= 0) count(s, `compaction.notPersistent.rows.${kindOf(messages[i]!)}-${kindOf(rows[offset + i]!)}`)
+    add(s, 'compaction.notPersistent.fromEnd', offset < 0 ? messages.length : messages.length - i, at)
+    add(s, 'compaction.notPersistent.differing', differing, at)
+    add(s, 'compaction.notPersistent.rowsKept', kept, at)
+  })
 }
 
 // Delegates this compaction to the built-in compactor unchanged (`e` passed on as received), and records the live
@@ -1843,10 +1862,12 @@ export const register: Register = (on) => {
     const order = callOrder(live)
     const messages = order.map((i) => live[i]!)
     const { offset, rows, persistent } = history ? align(messages, history) : { offset: -messages.length, rows: [], persistent: false }
-    if (history && !persistent) notPersistent($, sessionId, messages, rows, offset)
-    const v = view(messages, persistent ? await loadMarks($, loop.key) : [], persistent ? offset : undefined)
+    // Unmatched, the rows are still timed and the ledger still stands up to the first row that differs, by content:
+    // `reconcile` checks the rows under the watermark by hash and finds each chunk where its rows read the same.
+    const v = view(messages, await loadMarks($, loop.key), persistent ? offset : undefined)
     const base = v.base
-    const initial = persistent ? await locked(() => loadLedger($, loop.key, v)) : fresh(v)
+    const initial = await locked(() => loadLedger($, loop.key, v))
+    if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)
     const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
     // What the raw tail from `cut` takes in the compacted context, its old results cut (maskTail).
     const tailTokens = (cut: number) => maskTail(messages.slice(cut)).reduce((n, m) => n + estimateTokens(rowText(m)), 0)
@@ -2032,7 +2053,7 @@ export const register: Register = (on) => {
       if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
       return built
     }
-    const { ledger, cut, memory, message, floor, briefed } = persistent ? await locked(async () => settle(await loadLedger($, loop.key, v))) : await settle(initial)
+    const { ledger, cut, memory, message, floor, briefed } = await locked(async () => settle(await loadLedger($, loop.key, v)))
     // Failed rows the floor compiled into the brief are not kept.
     for (const f of failures) show($, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
     const kept = new Set(order.slice(cut))
