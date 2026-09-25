@@ -7,8 +7,8 @@ import {
   COMPACTION_BRIEFING,
   FLOOR_NOTE,
   HANDOFF_HEADER,
-  HANDOFF_PROMPT_HEAD,
   HANDOFF_SYSTEM_PROMPT,
+  handoffPrompt,
   MEMORY_CONTINUATION,
   MEMORY_HEADER,
   MEMORY_INSTRUCTIONS,
@@ -747,7 +747,7 @@ function handoffInput(v: View) {
 async function writeHandoff($: EngineInterface, v: View) {
   const [system, tag] = HANDOFF_ARM === 'amp' ? [HANDOFF_SYSTEM_PROMPT, 'handoff'] : [NOTE_SYSTEM_PROMPT, 'assistant-notes']
   try {
-    const text = await complete($, `handoff `, system, HANDOFF_PROMPT_HEAD + handoffInput(v), HANDOFF_TIMEOUT_MS, { phase: 'compaction' }, HANDOFF_PI)
+    const text = await complete($, `handoff `, system, handoffPrompt(handoffInput(v), tag), HANDOFF_TIMEOUT_MS, { phase: 'compaction' }, HANDOFF_PI)
     const body = (tag === 'handoff' ? /<handoff>\n?([\s\S]*?)\n?<\/handoff>/ : /<assistant-notes>\n?([\s\S]*?)\n?<\/assistant-notes>/).exec(text)?.[1]?.trim()
     return body && (HANDOFF_ARM === 'hybrid' ? truncate(body, NOTE_MAX_TOKENS) : body)
   } catch (error) {
