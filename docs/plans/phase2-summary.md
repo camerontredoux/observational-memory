@@ -114,12 +114,12 @@ Known limits:
 ## Open issues
 
 - **I57 duplicate tail (engine bug).** After our compaction, Claude Code gives every kept message a new uuid and shows it again, so the last answer appears twice. The memory message also shows as a long user prompt. No plugin-side fix exists (`results/1515-dup-tail.md` has the evidence and a draft bug report). Not filed yet.
-- **I56 auto and subagent mismatches.** The manual case is fixed. Auto and subagent compactions still fail the persistence check sometimes. The new log line shows the first differing row, so a debug log will show the cause. The current guess is parallel tool results held in one context row but one history row per call.
+- **I56 auto and subagent mismatches.** The manual case is fixed. Auto and subagent compactions still fail the persistence check sometimes (43 of 82 in session 40c779b6, mostly subagents). Since v1.4.1 a mismatch keeps the background notes up to the first differing row, and the stats count how it differs: by trigger, by shape (`extra`, `missing`, `changed`, `short`), by the two rows' kinds, how far from the end, and the rows kept. `/om-stats full` shows the cause. The current guess is task notifications injected into the context.
 - **Arm C (I57).** A one-line change that keeps real assistant rows (thinking signatures, attachments) instead of stand-in rows. It doesn't fix the duplicate. Not in base8.
 - **Parked:** I4 thinking (#22, PR #27), I5 observer-tool (PR #26), I7 tasks (#28), I32 threads, I40 users-first, I43 file-ledger, I42 at 2k.
 
 ## Next steps
 
 1. Decide whether to file the I57 engine bug.
-2. Run with debug logs until an auto or subagent notPersistent line appears, then fix I56's remaining cases.
+2. Read the `compaction.notPersistent.*` counts in `/om-stats full` after some sessions on v1.4.1, then fix I56's remaining cases.
 3. If quality work resumes, the lever is what the Observer writes (lesson 2). Try deterministic carries first.
