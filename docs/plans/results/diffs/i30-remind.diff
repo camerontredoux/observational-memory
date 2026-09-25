@@ -1,0 +1,187 @@
+diff -ruN '--exclude=node_modules' /tmp/omv-code/fail11/hooks/register.ts i30-remind/hooks/register.ts
+--- /tmp/omv-code/fail11/hooks/register.ts	2026-09-25 07:20:25.875928945 +0000
++++ i30-remind/hooks/register.ts	2026-09-25 07:46:11.108722534 +0000
+@@ -19,8 +19,8 @@
+ import { registerPrune } from './prune'
+ import { INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
+ import type { RecallInput, RecallIo } from './recall'
+-import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
+-import type { Brief, OpenFailure } from './vcc'
++import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, reminders, renderBrief, renderFailure, renderReminder } from './vcc'
++import type { Brief, OpenFailure, Reminder } from './vcc'
+ 
+ declare module 'claude-code' {
+   interface McpToolInputs {
+@@ -118,6 +118,7 @@
+   nextStep?: string // the user's latest request, verbatim
+   environment?: string // the working directory and git state at compaction (see environmentOf)
+   failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
++  reminders?: Reminder[] // lines of the history out of context that name what the current work names (see reminders)
+   brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
+   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
+   transcript?: string
+@@ -791,20 +792,22 @@
+ const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+ const ENVIRONMENT = 'Environment at compaction, read from git by code, not by a model'
+ const FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded'
++const REMINDERS = 'Earlier in this session, out of context now: lines found by code that name what the current work names (older than the record above, which wins where they differ)'
+ const LATEST = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
+ function renderContinuation(memory: Memory) {
+   const state = memory.currentTask ? `${WHERE}${memory.stateAt ? ` (${memory.stateAt})` : ''}:\n${memory.currentTask}\n` : ''
+   const environment = memory.environment ? `${ENVIRONMENT}:\n${memory.environment}\n` : ''
+   const failures = memory.failures?.length ? `${FAILURES}:\n${memory.failures.map(renderFailure).join('\n')}\n` : ''
++  const reminded = memory.reminders?.length ? `${REMINDERS}:\n${memory.reminders.map(renderReminder).join('\n')}\n` : ''
+   const latest = memory.nextStep && truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)
+-  return state || environment || failures || latest ? `${CONTINUATION}${state}${environment}${failures}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
++  return state || environment || failures || reminded || latest ? `${CONTINUATION}${state}${environment}${failures}${reminded}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
+ }
+ // The state of the work a record gives, read from `from` on, past the user's text.
+ function parseContinuation(text: string, from: number) {
+   const start = text.indexOf(CONTINUATION, from)
+   if (start < 0) return undefined
+   const body = text.slice(start + CONTINUATION.length)
+-  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
++  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${REMINDERS}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+   const lines = body.slice(0, end.length ? Math.min(...end) : 0).split('\n')
+   return (lines[0]?.startsWith(WHERE) ? lines.slice(1) : lines).join('\n').trim() || undefined
+ }
+@@ -815,7 +818,7 @@
+   const start = record < 0 ? -1 : text.indexOf(`\n${FAILURES}:\n`, record)
+   if (start < 0) return []
+   const body = text.slice(start + FAILURES.length + 3)
+-  const end = [`\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
++  const end = [`\n${REMINDERS}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+   return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
+ }
+ 
+@@ -1409,7 +1412,8 @@
+     const rows = !history || offset < 0 ? (history ?? []) : [...history.slice(0, offset), ...inCallOrder(history.slice(offset))]
+     const persistent = !!history && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
+     if (history && !persistent) notPersistent($, sessionId, messages, rows, offset)
+-    const v = view(messages, persistent ? await loadMarks($, loop.key) : [], persistent ? offset : undefined)
++    const marks = persistent ? await loadMarks($, loop.key) : []
++    const v = view(messages, marks, persistent ? offset : undefined)
+     const base = v.base
+     const initial = persistent ? await locked(() => loadLedger($, loop.key, v)) : fresh(v)
+     const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
+@@ -1457,6 +1461,22 @@
+     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
+     const turns = main ? (((await $.store.get(turnsKey(sessionId))) as number[] | undefined) ?? []) : undefined
+     const known = mergeSkills(prior, recorded)
++    // The history out of context, line by line, for the reminders: what older memory messages observed, the prompts
++    // and the assistant's text.
++    const coldRows = persistent ? rows.slice(0, offset) : []
++    const coldAt = view(coldRows, marks, 0).at
++    const cold = coldRows.flatMap((m, i): Reminder[] => {
++      if (isMemory(m))
++        return parseMemory(m).entries.flatMap(({ line }) => {
++          const t = line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.*)$/)
++          if (!t) return []
++          const at = unstamp(t[1]!)
++          return [{ ...(at === undefined ? {} : { at }), who: 'Observed', text: t[2]! }]
++        })
++      const text = m.role === 'assistant' ? m.text : typed(m, known)
++      const at = coldAt[i]
++      return (text ?? '').split('\n').filter((l) => l.trim().length >= 20).map((l) => ({ ...(at === undefined ? {} : { at }), who: m.role === 'assistant' ? 'Assistant' : 'User', text: l }))
++    })
+     // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
+     const prompts = messages.flatMap((m, i) => {
+       const text = i < base ? undefined : typed(m, known)
+@@ -1538,6 +1558,11 @@
+           recentKept: tail.length > 0,
+           resumeDirectly: e.trigger === 'auto',
+         }
++        // What the current goal and the raw tail name brings back the lines out of context that name it too.
++        const goal = fieldsOf(ledger.currentTask ?? '').filter((f) => f.name === 'active' || f.name === 'next steps').map((f) => f.value)
++        const work = [...goal, ...tail.map((m) => [m.text, ...m.toolUses.map((u) => JSON.stringify(u.input))].join('\n'))].join('\n')
++        const reminded = reminders(cold, work, [memoryMessage(memory).text, ...maskTail(tail).map(rowText)].join('\n'))
++        if (reminded.length) memory = { ...memory, reminders: reminded }
+         // The compacted context: the memory message with its margin, and the raw tail at its density.
+         const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
+         let message = memoryMessage(memory)
+diff -ruN '--exclude=node_modules' /tmp/omv-code/fail11/hooks/vcc.ts i30-remind/hooks/vcc.ts
+--- /tmp/omv-code/fail11/hooks/vcc.ts	2026-09-25 07:29:18.129258760 +0000
++++ i30-remind/hooks/vcc.ts	2026-09-25 07:45:31.547759636 +0000
+@@ -829,3 +829,49 @@
+     return [{ ...(at === undefined || Number.isNaN(at) ? {} : { at }), tool, target: m[3] ?? m[5] ?? '', error: m[8]!, policy: m[7] === 'was blocked' }]
+   })
+ }
++
++// ---- Reminders --------------------------------------------------------------------------------------------------
++
++// A line of the history out of context: what an older memory message observed, a prompt or the assistant's text.
++export type Reminder = { at?: number; who: string; text: string }
++export const REMIND_MAX = 5
++const REMIND_LINE_CHARS = 300
++const REMIND_MIN_TERMS = 2
++// A whole term that names something: a path, a file, a flag, snake_case, camelCase, a CONSTANT, a word with a digit.
++const TERM = /(?:--)?[A-Za-z0-9_][\w./@-]*[A-Za-z0-9_]/g
++const isName = (t: string) =>
++  t.length >= 4 && (/[_/]|\.\w/.test(t) || /[a-z][A-Z]/.test(t) || /^[A-Z][A-Z0-9]{2,}$/.test(t) || (/\d/.test(t) && /[A-Za-z]/.test(t)) || t.startsWith('--'))
++function names(text: string) {
++  const out = new Set<string>()
++  for (const [t] of text.matchAll(TERM))
++    if (isName(t)) {
++      out.add(t)
++      const file = t.slice(t.lastIndexOf('/') + 1)
++      if (file !== t && isName(file)) out.add(file)
++    }
++  return out
++}
++/**
++ * At most REMIND_MAX lines of `cold` that share REMIND_MIN_TERMS or more names with `work` (the current goal and the
++ * raw tail) and are not already in `context`, rarest names first; in time order. None when no line shares enough.
++ */
++export function reminders(cold: readonly Reminder[], work: string, context: string): Reminder[] {
++  const wanted = names(work)
++  const lines = cold.map((r) => ({ ...r, text: clip(oneLine(r.text), REMIND_LINE_CHARS) })).filter((r, k, all) => r.text && all.findIndex((o) => o.text === r.text) === k)
++  const terms = lines.map((r) => names(r.text))
++  const df = new Map<string, number>()
++  for (const ts of terms) for (const t of ts) df.set(t, (df.get(t) ?? 0) + 1)
++  const flat = oneLine(context)
++  return lines
++    .map((r, k) => {
++      const shared = [...terms[k]!].filter((t) => wanted.has(t))
++      return { r, k, n: shared.length, score: shared.reduce((s, t) => s + Math.log(lines.length / df.get(t)!), 0) }
++    })
++    .filter((x) => x.n >= REMIND_MIN_TERMS && !flat.includes(x.r.text.replace(/…$/, '')))
++    .sort((a, b) => b.score - a.score || b.k - a.k)
++    .slice(0, REMIND_MAX)
++    .sort((a, b) => a.k - b.k)
++    .map((x) => x.r)
++}
++/** One reminder as a line: its time as om_recall takes it, who said it, and its text. */
++export const renderReminder = (r: Reminder) => `- ${r.at === undefined ? '' : `${day(r.at)} ${hhmm(r.at)} `}${r.who}: ${r.text}`
+diff -ruN '--exclude=node_modules' /tmp/omv-code/fail11/tests/vcc.test.ts i30-remind/tests/vcc.test.ts
+--- /tmp/omv-code/fail11/tests/vcc.test.ts	2026-09-25 06:41:59.077428250 +0000
++++ i30-remind/tests/vcc.test.ts	2026-09-25 07:51:16.036744245 +0000
+@@ -1,6 +1,6 @@
+ import { describe, expect, test } from 'claude-code/testing'
+ import type { SessionMessage } from 'claude-code'
+-import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, renderBrief } from '../hooks/vcc'
++import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, REMIND_MAX, reminders, renderBrief } from '../hooks/vcc'
+ import type { Brief } from '../hooks/vcc'
+ 
+ const CWD = '/work/project'
+@@ -275,4 +275,21 @@
+     expect(text).not.toContain('</session-brief>')
+     expect(text.split('\n').every((l) => /^[>[\-@]/.test(l))).toBe(true)
+   })
++
++  test('reminders: out-of-context lines that share names with the current work, at most REMIND_MAX, in time order', () => {
++    const line = (text: string, at: number) => ({ at, who: 'Assistant', text })
++    const cold = [
++      line('The cap lives in hooks/register.ts as CONSTRAINTS_MAX_TOKENS and throws OVER_CAP past it.', 1),
++      line('Lunch is at noon, nothing to do with the code.', 2),
++      line('hooks/register.ts alone is not enough to be recalled.', 3),
++      ...Array.from({ length: REMIND_MAX + 2 }, (_, i) => line(`Run ${i}: bench-compact.ts wrote /tmp/om-bench/results.jsonl again.`, 10 + i)),
++    ]
++    const work = 'Lower CONSTRAINTS_MAX_TOKENS in hooks/register.ts, then read /tmp/om-bench/results.jsonl from bench-compact.ts'
++    const got = reminders(cold, work, '')
++    expect(got).toHaveLength(REMIND_MAX)
++    expect(got[0]!.text).toContain('CONSTRAINTS_MAX_TOKENS')
++    expect(got.map((r) => r.at)).toEqual([...got.map((r) => r.at)].sort((a, b) => a! - b!))
++    expect(reminders(cold, work, cold[0]!.text).some((r) => r.at === 1)).toBe(false)
++    expect(reminders(cold, 'Nothing named here at all', '')).toEqual([])
++  })
+ })

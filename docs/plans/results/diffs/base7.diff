@@ -1,0 +1,64 @@
+diff -ru -x '*.orig' base6/hooks/register.ts base7/hooks/register.ts
+--- base6/hooks/register.ts	2026-09-25 12:35:08.102337395 +0000
++++ base7/hooks/register.ts	2026-09-25 13:11:16.403918912 +0000
+@@ -945,7 +945,8 @@
+     })
+     .join('\n')
+ }
+-const renderCorrections = (lines: readonly string[]) => (lines.length ? `<corrections>\n${lines.map((l) => `* ${l}`).join('\n')}\n</corrections>\n\n` : '')
++const correctionsBody = (lines: readonly string[]) => lines.map((l) => `* ${l}`).join('\n')
++const renderCorrections = (lines: readonly string[]) => (lines.length ? `<corrections>\n${correctionsBody(lines)}\n</corrections>\n\n` : '')
+ const section = (name: string, value?: string) => (value ? `\n\n<${name}>\n${value}\n</${name}>` : '')
+ 
+ // The user's messages, verbatim, each after a header that gives its length, so no text inside can end the section.
+@@ -1177,7 +1178,8 @@
+     `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
+     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
+     section('session-brief', [memory.floor ? FLOOR_NOTE : '', memory.brief ? renderBrief(memory.brief, memory.recall) : ''].filter(Boolean).join('\n')) +
+-    renderUserMessages(memory.userMessages, memory.recoverable, memory.corrections.join('\n')) +
++    // The text parseMemory reads the section back as: a message is found in the same text it was matched in.
++    renderUserMessages(memory.userMessages, memory.recoverable, correctionsBody(memory.corrections).trim()) +
+     renderContinuation(memory) +
+     '\n' +
+     (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
+diff -ru -x '*.orig' base6/tests/register.test.ts base7/tests/register.test.ts
+--- base6/tests/register.test.ts	2026-09-25 12:35:08.104074469 +0000
++++ base7/tests/register.test.ts	2026-09-25 13:11:16.404346558 +0000
+@@ -3649,6 +3649,37 @@
+     )
+   })
+ 
++  test('a user message quoted in the corrections comes back as its own words, not a span of the same length across two of their lines', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history } = world(on)
++    const ok = 'Reply with exactly: OK'
++    // As long as the span from the first quote's words to the second line's opening quote, in the rendered corrections.
++    const span = `${ok}"\n* 🔴 2026-09-22 14:20 User: `
++    const lint = `always_run_the_linter_${'x'.repeat(span.length - 22)}`
++    expect(lint.length).toBe(span.length)
++    pi(on, { reply: constraining({ reply: { quote: ok }, [lint]: { quote: lint } }) })
++    const runTurn = live(on, clock, history)
++
++    for (const [i, name] of ['hello', 'reply', lint, 'later'].entries()) {
++      await runTurn($, turn(name, 'r', CHUNK), at(22, 14, i * 10))
++      await clock.settle()
++    }
++    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 40))
++    await clock.settle()
++    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
++    expect(correctionsIn(first.messages?.[0]?.text)).toContain(`User: "${ok}"\n* 🔴 2026-09-22 14:20 User: "${lint}"`)
++
++    // Read back at the next compaction, the message is its own words, whether written whole or found in the corrections.
++    history.splice(0, history.length, ...first.messages!)
++    await runTurn($, turn('more', 'r', CHUNK), at(22, 15, 0))
++    await runTurn($, turn('end', 'r', 8_000), at(22, 15, 10))
++    await clock.settle()
++    const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
++    const users = second.messages?.[0]?.text?.split('<all-user-messages>')[1] ?? ''
++    expect(users).not.toContain('🔴')
++    expect(users).toContain(`* User @ 14:20 (${lint.length} chars):\n${lint}\n`)
++  })
++
+   test('a reversal of a constraint set earlier in its own chunk stands alone, saying what it replaced, and is listed by its own words', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history } = world(on)

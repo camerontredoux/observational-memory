@@ -1,0 +1,236 @@
+diff --git a/hooks/register.ts b/hooks/register.ts
+index 0df854d..8258cd7 100644
+--- a/hooks/register.ts
++++ b/hooks/register.ts
+@@ -19,8 +19,8 @@ import type { Io, LunaCall } from './stats'
+ import { registerPrune } from './prune'
+ import { INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
+ import type { RecallInput, RecallIo } from './recall'
+-import { compileBrief, mergeBriefs, parseBrief, renderBrief } from './vcc'
+-import type { Brief } from './vcc'
++import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
++import type { Brief, OpenFailure } from './vcc'
+ 
+ declare module 'claude-code' {
+   interface McpToolInputs {
+@@ -117,6 +117,7 @@ type Memory = {
+   userMessages: UserMessage[]
+   nextStep?: string // the user's latest request, verbatim
+   environment?: string // the working directory and git state at compaction (see environmentOf)
++  failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
+   brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
+   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
+   transcript?: string
+@@ -789,23 +790,35 @@ const CONTINUATION = '\n\n<continuation>\n'
+ // The environment, read afresh at each compaction, sits between them and is never read back as the state.
+ const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+ const ENVIRONMENT = 'Environment at compaction, read from git by code, not by a model'
++const FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded'
+ const LATEST = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
+ function renderContinuation(memory: Memory) {
+   const state = memory.currentTask ? `${WHERE}${memory.stateAt ? ` (${memory.stateAt})` : ''}:\n${memory.currentTask}\n` : ''
+   const environment = memory.environment ? `${ENVIRONMENT}:\n${memory.environment}\n` : ''
++  const failures = memory.failures?.length ? `${FAILURES}:\n${memory.failures.map(renderFailure).join('\n')}\n` : ''
+   const latest = memory.nextStep && truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)
+-  return state || environment || latest ? `${CONTINUATION}${state}${environment}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
++  return state || environment || failures || latest ? `${CONTINUATION}${state}${environment}${failures}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
+ }
+ // The state of the work a record gives, read from `from` on, past the user's text.
+ function parseContinuation(text: string, from: number) {
+   const start = text.indexOf(CONTINUATION, from)
+   if (start < 0) return undefined
+   const body = text.slice(start + CONTINUATION.length)
+-  const end = [`\n${ENVIRONMENT}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
++  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+   const lines = body.slice(0, end.length ? Math.min(...end) : 0).split('\n')
+   return (lines[0]?.startsWith(WHERE) ? lines.slice(1) : lines).join('\n').trim() || undefined
+ }
+ 
++// The open failures a record lists, read from `from` on, past the user's text.
++function failuresOf(text: string, from: number) {
++  const record = text.indexOf(CONTINUATION, from)
++  const start = record < 0 ? -1 : text.indexOf(`\n${FAILURES}:\n`, record)
++  if (start < 0) return []
++  const body = text.slice(start + FAILURES.length + 3)
++  const end = [`\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
++  return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
++}
++
+ // The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
+ // oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS,
+ // keeping its head and its tail, and the newest over what remains is cut; the newest is always kept.
+@@ -912,6 +925,7 @@ function parseMemory(first: SessionMessage) {
+       .map(splitSource)
+       .reduceRight<ReturnType<typeof splitSource>[]>((out, e) => [e.source || !out[0]?.source ? e : { ...e, source: out[0].source }, ...out], []),
+     currentTask: parseContinuation(first.text, user.end || own.length) ?? tag(head.slice(end), 'current-task'),
++    failures: failuresOf(first.text, user.end || own.length),
+     skills,
+     userMessages: user.messages,
+     brief: briefAt < 0 || briefEnd < briefAt ? undefined : parseBrief(whole.slice(briefAt + SESSION_BRIEF.length, briefEnd)),
+@@ -1501,6 +1515,8 @@ export const register: Register = (on) => {
+         // it holds rows the Observer never observed, which no observation covers.
+         const from = always ? base : floor ? observed : cut
+         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
++        dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
++        const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
+         let memory: Memory = {
+           corrections: ledger.corrections,
+           observations: renderGrouped(ledger.entries),
+@@ -1513,6 +1529,7 @@ export const register: Register = (on) => {
+           // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
+           nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
+           ...(environment ? { environment } : {}),
++          ...(failures.length ? { failures } : {}),
+           ...(brief ? { brief } : {}),
+           ...(floor ? { floor } : {}),
+           transcript,
+diff --git a/hooks/vcc.ts b/hooks/vcc.ts
+index cc2a39c..66a68da 100644
+--- a/hooks/vcc.ts
++++ b/hooks/vcc.ts
+@@ -745,3 +745,87 @@ export function parseBrief(body: string): Brief {
+   }
+   return b
+ }
++
++// ---- Open failures ----------------------------------------------------------------------------------------------
++
++// A tool failure still open when its rows leave context: no later call of the same command or file succeeded. A
++// policy block (a hook, a Blocked:, a missing tool) counts even where a later call worked around it.
++export type OpenFailure = { at?: number; tool: string; target: string; error: string; policy: boolean }
++export const OPEN_FAILURES_MAX = 8
++const OPEN_FAILURES_MAX_CHARS = 2_000 // about 500 tokens
++const POLICY_FAILURE = /^(?:<tool_use_error>)?Blocked: |PreToolUse:\w+ hook error|No such tool available/
++const tick = (s: string) => s.replace(/`/g, "'")
++// Not a failure to carry: the user declined the call, or interrupted it.
++const DECLINED = /^The user doesn't want to proceed|^\[Request interrupted|^User rejected/
++const ERROR_LINE = /\b(?:\w*error(?:s)?|\w*Exception|fatal|cannot|can't|denied|refused|invalid|not found|No such|panic|failed|failure)\b|✗|\b[1-9]\d* (?:fail(?:ed|ures?)?|errors?)\b/i
++// The line that says what went wrong: a hook's script and the reason it gave, a Python error's last line, or the
++// first line that reads as an error.
++function failureText(text: string) {
++  const hook = /^PreToolUse:\w+ hook error: .*?([\w.-]+\.sh)\b/.exec(text)
++  if (hook) {
++    const why = /"(?:systemMessage|reason|permissionDecisionReason)":"((?:[^"\\]|\\.)*)"/.exec(text)?.[1]
++    return clip(oneLine(`hook ${hook[1]}${why ? `: ${why.replace(/\\"/g, '"')}` : ''}`), 160)
++  }
++  const lines = text.replace(/<\/?tool_use_error>/g, '').split('\n').map((l) => l.trim()).filter(Boolean)
++  const body = lines.filter((l) => !/^Exit code \d+$/.test(l))
++  if (POLICY_FAILURE.test(text)) return clip(oneLine(body[0] ?? ''), 160)
++  const traceback = body.findIndex((l) => l.startsWith('Traceback'))
++  const line = traceback >= 0 ? body.slice(traceback).findLast((l) => /^[\w.]+(?:Error|Exception)\b/.test(l)) : undefined
++  return clip(oneLine(line ?? body.find((l) => ERROR_LINE.test(l)) ?? body[0] ?? ''), 160)
++}
++const failureTarget = (b: Extract<Block, { kind: 'tool' }>, cwd: string, home?: string) => {
++  const command = commandOf(b)
++  if (command !== undefined) return clip(oneLine(compressBash(command)), 120)
++  const path = pathOf(b.input)
++  return path ? displayPath(resolvePath(path, cwd, home), cwd, home) : ''
++}
++// Whether a successful call clears an open failure: the same tool and target, or a Bash command that runs the same
++// programs on the same operands.
++function clears(f: OpenFailure, b: Block, cwd: string, home?: string) {
++  if (b.kind !== 'tool' || !b.result || b.result.isError || b.name !== f.tool) return false
++  if (failureTarget(b, cwd, home) === f.target) return true
++  const command = commandOf(b)
++  const keys = f.tool === 'Bash' ? runKeys(f.target) : []
++  return command !== undefined && keys.length > 0 && keys.every((k) => runKeys(command).includes(k))
++}
++/**
++ * The failures open after a compaction: `prev` (the memory message's) less those a call in `rows` cleared, then the
++ * failures among rows [0, leaving) that no later call in `rows` cleared; newest last, at most OPEN_FAILURES_MAX
++ * within about 500 tokens.
++ */
++export function openFailures(prev: readonly OpenFailure[], rows: readonly SessionMessage[], at: readonly (number | undefined)[], leaving: number, cwd: string, home?: string) {
++  const blocks = normalize(rows, at)
++  const open = prev.filter((f) => !blocks.some((b) => clears(f, b, cwd, home)))
++  blocks.forEach((b, k) => {
++    if (b.kind !== 'tool' || b.i >= leaving || !b.result?.isError || DECLINED.test(b.result.text)) return
++    const policy = POLICY_FAILURE.test(b.result.text)
++    if (!policy && isLook(b, cwd, home)) return
++    const f: OpenFailure = { ...(b.at === undefined ? {} : { at: b.at }), tool: b.name, target: failureTarget(b, cwd, home), error: failureText(b.result.text), policy }
++    if (!f.error || blocks.slice(k + 1).some((later) => clears(f, later, cwd, home))) return
++    // A policy block is one rule, whatever call met it: its newest instance stands for all.
++    const same = open.findIndex((o) => o.tool === f.tool && o.error === f.error && (f.policy || o.target === f.target))
++    if (same >= 0) open.splice(same, 1)
++    open.push(f)
++  })
++  const out = open.slice(-OPEN_FAILURES_MAX)
++  while (out.length > 1 && out.map(renderFailure).join('\n').length > OPEN_FAILURES_MAX_CHARS) out.shift()
++  return out
++}
++/** One open failure as a sentence. */
++export function renderFailure(f: OpenFailure) {
++  const when = f.at === undefined ? 'At an unknown time' : `At ${day(f.at)} ${hhmm(f.at)}`
++  const what = f.tool === 'Bash' ? `the Bash command \`${tick(f.target)}\`` : f.target ? `the ${f.tool} call on \`${tick(f.target)}\`` : `a ${f.tool} call`
++  return `- ${when} ${what} ${f.policy ? 'was blocked' : 'failed'}: \`${tick(f.error)}\`; no later call of it succeeded.`
++}
++const FAILURE_LINE =
++  /^- At (?:an unknown time|(\d{4}-\d\d-\d\d) (\d\d:\d\d)) (?:the Bash command `([^`]*)`|the (\S+) call on `([^`]*)`|a (\S+) call) (failed|was blocked): `([^`]*)`; no later call of it succeeded\.$/
++/** The open failures renderFailure's lines give back. */
++export function parseFailures(body: string): OpenFailure[] {
++  return body.split('\n').flatMap((l) => {
++    const m = FAILURE_LINE.exec(l.trim())
++    if (!m) return []
++    const at = m[1] ? new Date(`${m[1]}T${m[2]}:00`).getTime() : undefined
++    const tool = m[3] !== undefined ? 'Bash' : (m[4] ?? m[6])!
++    return [{ ...(at === undefined || Number.isNaN(at) ? {} : { at }), tool, target: m[3] ?? m[5] ?? '', error: m[8]!, policy: m[7] === 'was blocked' }]
++  })
++}
+diff --git a/tests/vcc.test.ts b/tests/vcc.test.ts
+index 2a048c6..8475153 100644
+--- a/tests/vcc.test.ts
++++ b/tests/vcc.test.ts
+@@ -1,7 +1,7 @@
+ import { describe, expect, test } from 'claude-code/testing'
+ import type { SessionMessage } from 'claude-code'
+-import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, renderBrief } from '../hooks/vcc'
+-import type { Brief } from '../hooks/vcc'
++import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, OPEN_FAILURES_MAX, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from '../hooks/vcc'
++import type { Brief, OpenFailure } from '../hooks/vcc'
+ 
+ const CWD = '/work/project'
+ const HOME = '/home/u'
+@@ -275,4 +275,43 @@ describe('vcc', () => {
+     expect(text).not.toContain('</session-brief>')
+     expect(text.split('\n').every((l) => /^[>[\-@]/.test(l))).toBe(true)
+   })
++
++  const open = (rows: SessionMessage[], leaving = rows.length, prev: OpenFailure[] = []) => openFailures(prev, rows, times(rows), leaving, CWD, HOME)
++
++  test('open failures: a leaving failure no later call cleared, with the line that names the error', () => {
++    const rows = [
++      prompt('build it'),
++      ...bash('bun run build', 'Exit code 1\n$ tsc\nsrc/a.ts(3,1): error TS2304: Cannot find name x', true),
++      ...bash('python3 gen.py', 'Exit code 1\nTraceback (most recent call last):\n  File "gen.py", line 2\n    raise JSONDecodeError("Expecting value", s, 0)\njson.decoder.JSONDecodeError: Expecting value: line 1 column 1', true),
++      ...call('Edit', { file_path: `${CWD}/src/a.ts`, old_string: 'x', new_string: 'y' }, '<tool_use_error>String to replace not found in file.</tool_use_error>', true),
++    ]
++    expect(open(rows).map((f) => [f.tool, f.target, f.error])).toEqual([
++      ['Bash', 'bun run build', 'src/a.ts(3,1): error TS2304: Cannot find name x'],
++      ['Bash', 'python3 gen.py', 'json.decoder.JSONDecodeError: Expecting value: line 1 column 1'],
++      ['Edit', 'src/a.ts', 'String to replace not found in file.'],
++    ])
++  })
++
++  test('open failures: a later success of the same call clears it, in the kept rows or at a later compaction', () => {
++    const rows = [prompt('go'), ...bash('bun test', 'Exit code 1\n3 fail', true), ...bash('bun test', '12 pass\n0 fail')]
++    expect(open(rows, 3)).toEqual([])
++    const prev = open(rows.slice(0, 3))
++    expect(prev).toHaveLength(1)
++    expect(open(rows.slice(3), 0, prev)).toEqual([])
++  })
++
++  test('open failures: declined calls are left out, and one policy block stands for every call it met', () => {
++    const hook = (cmd: string) =>
++      bash(cmd, `PreToolUse:Bash hook error: [exec "$CLAUDE_PROJECT_DIR"/bin/cd-check.sh]: {"systemMessage":"[persistent-cd] a cd is blocked"}`, true)
++    const rows = [prompt('go'), ...hook('cd a && make x'), ...hook('cd b && make y'), ...bash('rm -rf x', "The user doesn't want to proceed with this tool use.", true)]
++    expect(open(rows).map(({ at: _, ...f }) => f)).toEqual([{ tool: 'Bash', target: 'make y', error: 'hook cd-check.sh: [persistent-cd] a cd is blocked', policy: true }])
++  })
++
++  test('open failures: renderFailure lines parse back, and the list keeps the newest within its cap', () => {
++    const rows = [prompt('go'), ...Array.from({ length: OPEN_FAILURES_MAX + 3 }, (_, i) => bash(`make t${i}`, `Exit code 2\nmake: *** No rule to make target t${i}`, true)).flat()]
++    const failures = open(rows)
++    expect(failures).toHaveLength(OPEN_FAILURES_MAX)
++    expect(failures.at(-1)!.target).toBe(`make t${OPEN_FAILURES_MAX + 2}`)
++    expect(parseFailures(failures.map(renderFailure).join('\n'))).toEqual(failures)
++  })
+ })

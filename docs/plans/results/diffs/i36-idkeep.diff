@@ -1,0 +1,37 @@
+--- imaskna60k1/hooks/register.ts	2026-09-25 08:48:30.155401612 +0000
++++ idk60k1/hooks/register.ts	2026-09-25 08:51:06.437143047 +0000
+@@ -211,12 +211,33 @@
+ }
+ // The raw tail a compaction hands back: the newest TAIL_WHOLE_RESULTS tool results and every error whole, each other
+ // result over TAIL_RESULT_MAX_TOKENS cut to its head and tail. om_recall finds the whole result in the transcript.
++// The identifiers a cut argument's omitted middle names (paths, dotted names, PR and issue numbers, commit hashes)
++// that its head and tail don't, listed after the marker, up to TAIL_NAMES_MAX_CHARS: what the call touched stays
++// findable in the context without its bulk.
++const TAIL_NAMES_MAX_CHARS = 240
++const NAME = /(?:[~.\w@-]*\/[\w@.\/-]*[\w@-])|\b(?:PR|issue) #?\d+\b|#\d{2,}\b|\b[0-9a-f]{7,40}\b|\b[a-z_]\w*(?:\.[a-z_]\w*)+\b/gi
++function keepNames(whole: string, cut: string) {
++  const m = cut.match(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full \w+\] \.\.\.\n/)
++  if (!m || m.index === undefined) return cut
++  const head = cut.slice(0, m.index)
++  const tail = cut.slice(m.index + m[0].length)
++  const middle = whole.slice(head.length, whole.length - tail.length)
++  const names: string[] = []
++  let chars = 0
++  for (const [name] of middle.matchAll(NAME)) {
++    if (name.length < 4 || /^\d+$/.test(name) || /^[0-9a-f]+$/i.test(name) && !/\d/.test(name) || names.includes(name) || head.includes(name) || tail.includes(name)) continue
++    if (chars + name.length + 2 > TAIL_NAMES_MAX_CHARS) break
++    names.push(name)
++    chars += name.length + 2
++  }
++  return names.length ? `${head}${m[0]}(it names ${names.join(', ')})\n${tail}` : cut
++}
+ function maskTail(rows: readonly SessionMessage[]) {
+   let seen = 0
+   let calls = 0
+   const cutValue = (v: unknown): unknown => {
+     if (typeof v === 'string') {
+-      const text = excerpt(v, TAIL_INPUT_MAX_TOKENS, 'input')
++      const text = keepNames(v, excerpt(v, TAIL_INPUT_MAX_TOKENS, 'input'))
+       return text.length < v.length ? text : v
+     }
+     if (Array.isArray(v)) return v.map(cutValue)

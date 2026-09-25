@@ -1,0 +1,72 @@
+--- a/hooks/register.ts	2026-09-25 13:11:16.403918912 +0000
++++ b/hooks/register.ts	2026-09-25 14:09:36.348813797 +0000
+@@ -864,6 +864,60 @@
+ const noteObservations = ($: EngineInterface, sessionId: string, phase: Call['phase'], n: number) =>
+   record(statsIo($), sessionId, (s, at) => add(s, `observer.${phase}.observations`, n, at))
+ 
++// A sentence the assistant stated in a chunk with a specific (a number, path, identifier) or a reason in it, which the
++// Observer's lines leave out, is carried verbatim as a line of its own. By code, from the chunk's own rows, so the
++// chunk's source range still holds it: at most CARRIED_CLAUSES a chunk, each at most CLAUSE_MAX_WORDS words.
++const CARRIED_CLAUSES = 3
++const CLAUSE_MAX_WORDS = 25
++const CLAUSE_MIN_WORDS = 6
++const CLAUSE_MARK =
++  /\b(?:because|since|so that|otherwise|instead of|rather than|why not|the reason|due to|caused by|root cause|means that|would (?:take|need|mean|cost|break|reload|lose|leave|require)|over (?:your|the) (?:cap|budget|limit))\b|\b(?:cause|why not[^:\n]{0,40}|what i cut)\s*:/i
++const SPECIFIC = /`[^`\n]{3,60}`|\b[\w-]+\.(?:ts|tsx|js|md|json|py|sh|sql|yml|yaml)\b|\$\d[\d,.]*|\b\d+(?:\.\d+)?\s?(?:%|k\b|ms\b|tokens\b)|\b\d+ (?:times )?(?:in|of|out of) \d+\b|#\d{2,}|\b[0-9a-f]{7,12}\b/gi
++const wordsOf = (text: string) => new Set(text.toLowerCase().match(/[a-z][a-z0-9_.-]{3,}/g) ?? [])
++function carryClauses(v: View, from: number, to: number, lines: string[]) {
++  if (!lines.length) return lines
++  const said = lines.join('\n').toLowerCase()
++  const saidWords = wordsOf(said)
++  const found: { clause: string; score: number; at: number }[] = []
++  for (let i = from; i < to; i++) {
++    const m = v.messages[i]!
++    if (m.role !== 'assistant' || !m.text) continue
++    for (const passage of m.text.split(/\n\s*\n/)) {
++      // Code, tables and headings are no sentences to carry.
++      if (/^\s*(?:```|\|)/.test(passage)) continue
++      for (const sentence of passage.split(/(?<=[.!?])\s+|\n+/)) {
++        if (/^\s*(?:#|\|)/.test(sentence) || sentence.includes('"')) continue
++        const mark = CLAUSE_MARK.test(sentence)
++        if (!mark && !sentence.match(SPECIFIC)) continue
++        // The sentence without its list marker or bold marks, or when longer than the cap, the clause around its marker.
++        let clause = sentence.replace(/^[\s>*-]*(?:\d+\.\s+)?/, '').replace(/\*\*/g, '')
++        if (clause.split(/\s+/).length > CLAUSE_MAX_WORDS) {
++          const at = Math.max(0, mark ? clause.search(CLAUSE_MARK) : clause.search(SPECIFIC))
++          const start = Math.max(0, ...[', ', '; ', ' — ', ': ', '(', ' - '].map((b) => (clause.lastIndexOf(b, at) < 0 ? 0 : clause.lastIndexOf(b, at) + b.length)))
++          clause = clause.slice(start).split(/\s+/).slice(0, CLAUSE_MAX_WORDS).join(' ')
++        }
++        clause = clause.trim()
++        // A fragment (under CLAUSE_MIN_WORDS words, or a lead-in to a list) says nothing alone.
++        if (clause.split(/\s+/).length < CLAUSE_MIN_WORDS || clause.endsWith(':')) continue
++        if (!m.text.replace(/\*\*/g, '').includes(clause)) continue
++        const specifics = (clause.match(SPECIFIC) ?? []).filter((t) => !said.includes(t.toLowerCase()))
++        const fresh = [...wordsOf(clause)].filter((w) => !saidWords.has(w))
++        if (!specifics.length && (!mark || fresh.length < 3)) continue
++        found.push({ clause, score: specifics.length * 3 + fresh.length + (mark ? 2 : 0), at: i })
++      }
++    }
++  }
++  // Each sentence is a line of its own, at the time it was said, among the Observer's lines in time order.
++  const out = [...lines]
++  for (const f of found.sort((a, b) => b.score - a.score || b.at - a.at).slice(0, CARRIED_CLAUSES)) {
++    const t = v.at[f.at] === undefined ? undefined : stamp(v.at[f.at]!)
++    const line = `🟡 ${t ? `${t} ` : ''}Assistant said: "${f.clause}"`
++    const k = t ? out.findIndex((l) => (l.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? '') > t) : -1
++    out.splice(k < 0 ? out.length : k, 0, line)
++  }
++  return out
++}
++
+ // One chunk, read alone: the Observer never sees the observations so far.
+ async function observe($: EngineInterface, v: View, from: number, to: number, phase: Call['phase'], { constraints, state }: Before): Promise<Chunk> {
+   const chunk = serialize(v, from, to)
+@@ -894,7 +948,7 @@
+   const corrections = parseLines(correctionsOf(text), bounds, !bounds, (t, how) => (note(t, how), how.own && moved.push(how.own)))
+     .filter((l) => l.startsWith('🔴'))
+     .map((l) => splitSource(l).line)
+-  const lines = [...parseLines(observed, bounds, !bounds, note), ...moved].map((l) => splitSource(l).line)
++  const lines = carryClauses(v, from, to, [...parseLines(observed, bounds, !bounds, note), ...moved].map((l) => splitSource(l).line))
+   // A marker or a time alone is no observation. With none, the reply counts only when it says so: an empty block,
+   // or corrections and no observations.
+   const saysNothingNew = !observed.trim() && (corrections.length > 0 || EMPTY_OBSERVATIONS.test(text))

@@ -1,0 +1,192 @@
+diff -ru base5/hooks/register.ts b5u3s8r6/hooks/register.ts
+--- base5/hooks/register.ts	2026-09-25 09:41:26.265484346 +0000
++++ b5u3s8r6/hooks/register.ts	2026-09-25 12:33:15.541342005 +0000
+@@ -76,14 +76,22 @@
+ const REPLIES_MAX_TOKENS = 1_000 // the assistant's replies section, newest kept
+ const REPLIES_ROOM_TOKENS = 40_000 // and only within what the compacted context leaves below this
+ const REPLIES_MIN_TOKENS = 200 // less room than this quotes none
+-const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
++// The verbatim user messages section. The brief has a cap of its own. After it, the newest prompts are kept within
++// USER_MESSAGES_MAX_TOKENS; past that, the last three prompts stay whole within USER_RECENT_TOKENS (they are the
++// requests in hand), and every prompt of USER_SHORT_CHARS or fewer (a correction, an approval, a question) within
++// USER_SHORT_TOKENS: long pastes would otherwise fill the section and drop them.
++const BRIEF_MAX_TOKENS = 8_000
++const USER_MESSAGES_MAX_TOKENS = 3_000
++const USER_RECENT_TOKENS = 6_000
++const USER_SHORT_CHARS = 400
++const USER_SHORT_TOKENS = 8_000
+ const NEXT_STEP_MAX_TOKENS = 2_000 // the latest request the continuation record quotes
+ const HANDOFF_FIELD_MAX_TOKENS = 500 // each of the continuation record's Next steps and Told the user
+ const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
+ const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the rest counted
+ const ENV_LINE_MAX_CHARS = 200 // each line of the environment
+ const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force shown whole; past it the oldest shorten (boundPins)
+-const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
++const NEWEST_RESERVE_TOKENS = 2_000 // the least the newest prompt keeps, whatever the brief takes
+ const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say, or for a subagent's model: the smallest in use
+ const OVERHEAD_TOKENS = 20_000 // the system prompt and built-in tool schemas every request carries beside the messages
+ const MEMORY_HEADROOM = 1.25 // the memory message's estimate scaled up: the Observer's prose runs near it, quoted skills and prompts may not
+@@ -1073,31 +1081,56 @@
+   return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
+ }
+ 
+-// The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
+-// oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS,
+-// keeping its head and its tail, and the newest over what remains is cut; the newest is always kept.
++// The session's first message, the standing brief, cut to BRIEF_MAX_TOKENS keeping its head and its tail; then, oldest
++// first with one line counting each run of those dropped between: the newest within what is left of
++// USER_MESSAGES_MAX_TOKENS (at least NEWEST_RESERVE_TOKENS, the newest over it cut, and always kept), the rest of the
++// last three whole within USER_RECENT_TOKENS, and the short ones whole within USER_SHORT_TOKENS.
+ function capUserMessages(messages: readonly UserMessage[]) {
+   const [first, ...rest] = messages
+   if (!first) return []
+   // A brief an earlier compaction cut is kept as it was, with the marker that counts what it lost: cut again, its
+   // count would be lost. A head-only cut is an older plugin version's.
+-  const briefMax = USER_MESSAGES_MAX_TOKENS - NEWEST_RESERVE_TOKENS
++  const briefMax = BRIEF_MAX_TOKENS
+   const wasCut = [BRIEF_CUT, TRUNCATED].some((cut) => cut.test(first.text) && first.text.replace(cut, '').length <= briefMax * 4)
+   const brief = { ...first, text: wasCut ? first.text : excerpt(first.text, briefMax, 'message') }
+-  let left = USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text)
+-  const kept: UserMessage[] = []
+-  for (const m of [...rest].reverse()) {
++  let left = Math.max(USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text), NEWEST_RESERVE_TOKENS)
++  let shortLeft = USER_SHORT_TOKENS
++  let recentLeft = USER_RECENT_TOKENS
++  const keep = new Map<number, UserMessage>()
++  let longDone = false
++  for (let i = rest.length - 1; i >= 0; i--) {
++    const m = rest[i]!
+     if (m.omitted) continue
+     const t = estimateTokens(m.text)
+-    if (!kept.length && t > left) {
+-      kept.unshift({ ...m, text: truncate(m.text, Math.max(left, 0)) })
+-      break
++    if (!keep.size) {
++      keep.set(i, t > left ? { ...m, text: truncate(m.text, Math.max(left, 0)) } : m)
++      left -= t
++      continue
+     }
+-    if (t > left) break
+-    kept.unshift(m)
+-    left -= t
++    if (!longDone && t <= left) {
++      keep.set(i, m)
++      left -= t
++      continue
++    }
++    if (keep.size < 3 && t <= recentLeft) {
++      keep.set(i, m)
++      recentLeft -= t
++      continue
++    }
++    if (m.text.length > USER_SHORT_CHARS) longDone = true
++    else if (t <= shortLeft) keep.set(i, m), (shortLeft -= t)
+   }
+-  return [...withOmitted(brief, rest.slice(0, rest.length - kept.length)), ...kept]
++  // In order: the brief, then each kept message, one line counting the messages dropped between.
++  const out: UserMessage[] = [brief]
++  let omitted = 0
++  rest.forEach((m, i) => {
++    const k = keep.get(i)
++    if (!k) return void (omitted += m.omitted ?? 1)
++    if (omitted) out.push({ text: '', omitted }), (omitted = 0)
++    out.push(k)
++  })
++  if (omitted) out.push({ text: '', omitted })
++  return out
+ }
+ 
+ // The brief, then one line counting the messages dropped after it.
+diff -ru base5/tests/register.test.ts b5u3s8r6/tests/register.test.ts
+--- base5/tests/register.test.ts	2026-09-25 09:33:15.671206941 +0000
++++ b5u3s8r6/tests/register.test.ts	2026-09-25 12:32:11.080310047 +0000
+@@ -2712,7 +2712,7 @@
+     expect(again).not.toContain('without asking the user any further questions')
+   })
+ 
+-  test('the user messages section keeps the first prompt, the brief, and the newest prompts within its cap', async ($, on) => {
++  test('the user messages section keeps the brief, the newest prompts within its cap and the last three whole', async ($, on) => {
+     mock.clock(on)
+     world(on)
+     pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+@@ -2726,7 +2726,7 @@
+     expect(kept[0]).toBe(brief)
+     const omitted = Number(kept[1]!.match(/^\((\d+) omitted\)$/)![1])
+     const numbers = kept.slice(2).map((k) => Number(k.split(' ')[0]))
+-    expect(numbers.length).toBeGreaterThan(3)
++    expect(numbers.length).toBeGreaterThanOrEqual(3) // the last three prompts, whole, past the cap
+     expect(numbers).toEqual(numbers.map((_, i) => numbers[0]! + i)) // a contiguous run
+     expect(numbers.at(-1)).toBeGreaterThanOrEqual(27) // up to the newest prompt that left context
+     expect(omitted).toBe(numbers[0]) // every prompt between the brief and the run
+@@ -2737,15 +2737,44 @@
+     const second = await $.session.compact({ trigger: 'manual', messages: [...result.messages!, ...more, ...turn('end', 'r', 8_000)] })
+     const again = userMessagesIn(second.messages?.[0]?.text) ?? []
+     expect(again[0]).toBe(brief)
+-    const tail = again.slice(2).map((k) => Number(k.split(' ')[0]))
+-    const order = [...Array.from({ length: 30 }, (_, i) => i), NaN, 100, 101, 102, 103, 104] // NaN: 'last'
+-    const from = order.findIndex((n) => Object.is(n, tail[0]))
+-    expect(tail).toEqual(order.slice(from, from + tail.length))
+-    expect(tail.at(-1)).toBeGreaterThanOrEqual(103)
+-    expect(Number(again[1]!.match(/^\((\d+) omitted\)$/)![1])).toBe(from) // accumulated, not reset
++    // In order, the short 'last' kept whole past the cap, the long ones between counted, and the counts accumulated.
++    const count = (k: string) => Number(k.match(/^\((\d+) omitted\)$/)?.[1] ?? NaN)
++    const entries = again.slice(1)
++    const prompts = entries.filter((k) => Number.isNaN(count(k)))
++    const order = [...Array.from({ length: 30 }, (_, i) => String(i)), 'last', '100', '101', '102', '103', '104']
++    const idx = prompts.map((k) => order.indexOf(k === 'last' ? k : k.split(' ')[0]!))
++    expect(idx.every((i, j) => i >= 0 && (j === 0 || i > idx[j - 1]!))).toBe(true)
++    expect(prompts).toContain('last')
++    expect(Number(prompts.at(-1)!.split(' ')[0])).toBeGreaterThanOrEqual(103)
++    const counted = entries.map(count).filter((n) => !Number.isNaN(n)).reduce((a, b) => a + b, 0)
++    expect(counted + prompts.length).toBe(idx.at(-1)! + 1) // accumulated, not reset
+     expect(again.join('').length).toBeLessThanOrEqual(10_000 * 4)
+   })
+ 
++  test('short prompts past the cap stay whole, in order, with the long ones between counted', async ($, on) => {
++    mock.clock(on)
++    world(on)
++    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
++    const long = (n: number) => `${n} ${'w'.repeat(8_000)}`
++    const prompts = Array.from({ length: 12 }, (_, i) => (i % 3 === 0 ? `no, use option ${i} instead` : long(i)))
++    const messages = [...turn('brief', 'r', 2_000), ...prompts.flatMap((p) => turn(p, 'r', 2_000)), ...turn('last', 'r', 8_000)]
++
++    const kept = userMessagesIn((await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text) ?? []
++    expect(kept[0]).toBe('brief')
++    // Every short correction is kept whole; the old long prompts leave, counted where they stood.
++    for (const i of [0, 3, 6, 9]) expect(kept).toContain(`no, use option ${i} instead`)
++    expect(kept.filter((k) => /^\(\d+ omitted\)$/.test(k)).length).toBeGreaterThan(0)
++    const at = (t: string) => kept.indexOf(t)
++    expect(at('no, use option 0 instead')).toBeLessThan(at('no, use option 3 instead'))
++    expect(at('no, use option 6 instead')).toBeLessThan(at('no, use option 9 instead'))
++    // Kept and counted together are every prompt up to the newest that left context.
++    const counts = kept.filter((k) => /^\(\d+ omitted\)$/.test(k))
++    const omitted = counts.reduce((n, k) => n + Number(k.match(/\d+/)![0]), 0)
++    const newest = Number(kept.at(-1)!.split(' ')[0])
++    expect(newest).toBeGreaterThanOrEqual(9)
++    expect(omitted + kept.length - 1 - counts.length).toBe(newest + 1)
++  })
++
+   test('an oversized brief is cut short of the cap, so the newest prompt keeps a reserve and stays the next step', async ($, on) => {
+     mock.clock(on)
+     world(on)
+@@ -2758,9 +2787,9 @@
+     expect(kept.length).toBe(3)
+     expect(kept[0]!.startsWith('brief ')).toBe(true)
+     expect(kept[0]!).toMatch(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/)
+-    expect(kept[1]).toBe('(1 omitted)')
++    expect(kept[1]).toBe('mid') // a short prompt is kept whole past the cap
+     expect(kept[2]!.startsWith('newest n')).toBe(true) // the reserve, not a bare truncation note
+-    expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4 + 100)
++    expect(kept.join('').length).toBeLessThanOrEqual(10_000 * 4 + 110) // the cap, the cut markers and 'mid'
+ 
+     // Compacted again with no new prompt: the next step is still the newest prompt, and the brief keeps its note.
+     const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...work('v', CHUNK), ...work('u', 8_000)] })
+@@ -3752,7 +3781,7 @@
+     on('classic.SessionStart', () => ({}))
+     const brief = `brief ${'b'.repeat(14_600)}`
+     const long = (n: number) => `${n} ${'w'.repeat(16_000)}`
+-    const messages = [...turn(brief, 'r', CHUNK), ...turn(long(1), 'r', 2_000), ...turn(long(2), 'r', 2_000), ...turn(long(3), 'r', CHUNK), ...work('w', 8_000)]
++    const messages = [...turn(brief, 'r', CHUNK), ...turn(long(1), 'r', 2_000), ...turn(long(2), 'r', 2_000), ...turn(long(3), 'r', 2_000), ...turn(long(4), 'r', CHUNK), ...work('w', 8_000)]
+ 
+     const unknown = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
+     expect(unknown).toContain('\n* (2 earlier user messages omitted)\n')

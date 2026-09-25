@@ -1,0 +1,123 @@
+diff -ru /tmp/omv-code/fail11/hooks/register.ts /tmp/omv-build/i15-user-dedup/hooks/register.ts
+--- /tmp/omv-code/fail11/hooks/register.ts	2026-09-25 07:20:25.875928945 +0000
++++ /tmp/omv-build/i15-user-dedup/hooks/register.ts	2026-09-25 08:03:08.757811940 +0000
+@@ -762,21 +762,38 @@
+ const USER_MESSAGES_END = '</all-user-messages>'
+ const NEXT_STEP = '\n\n<optional-next-step>\n' // an older memory message's: its user's latest request
+ const omittedLine = (n: number, recoverable: boolean) => `* (${n} earlier user messages omitted${recoverable ? '; om_recall can search them' : ''})\n`
+-const renderUserMessages = (messages: readonly UserMessage[], recoverable: boolean) =>
++// A message the corrections quote whole, as the first `User: "…"` of its length there, is not repeated but for the
++// newest, quoted for its exact wording; its header gives its length, which finds its text in them again.
++const renderUserMessages = (messages: readonly UserMessage[], recoverable: boolean, corrections: string) =>
+   messages.length
+-    ? `${USER_MESSAGES}${messages.map((m) => (m.omitted ? omittedLine(m.omitted, recoverable) : `* User${m.at ? ` @ ${m.at}` : ''} (${m.text.length} chars):\n${m.text}\n`)).join('')}${USER_MESSAGES_END}`
++    ? `${USER_MESSAGES}${messages
++        .map((m, i) =>
++          m.omitted
++            ? omittedLine(m.omitted, recoverable)
++            : `* User${m.at ? ` @ ${m.at}` : ''} (${m.text.length} chars):${i < messages.length - 1 && m.text.length > QUOTED.length && quotedIn(corrections, m.text.length) === m.text ? QUOTED : `\n${m.text}\n`}`,
++        )
++        .join('')}${USER_MESSAGES_END}`
+     : ''
++const QUOTED = ' quoted in the corrections above\n'
++const USER_QUOTE = 'User: "'
++function quotedIn(corrections: string, n: number) {
++  for (let i = corrections.indexOf(USER_QUOTE); i >= 0; i = corrections.indexOf(USER_QUOTE, i + 1)) {
++    const from = i + USER_QUOTE.length
++    if (corrections[from + n] === '"') return corrections.slice(from, from + n)
++  }
++}
+ 
+ // The user messages and where their section ends (0 without one).
+-function parseUserMessages(text: string) {
++function parseUserMessages(text: string, corrections: string) {
+   const messages: UserMessage[] = []
+   const start = text.indexOf(USER_MESSAGES)
+   if (start < 0) return { messages, end: 0 }
+-  const entry = /\* User(?: @ ([\d-]+ [\d:]+))? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n/y
++  const entry = /\* User(?: @ ([\d-]+ [\d:]+))? \((\d+) chars\):(?:\n|( quoted in the corrections above\n))|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n/y
+   entry.lastIndex = start + USER_MESSAGES.length
+   let end = entry.lastIndex
+   for (let m; (m = entry.exec(text)); end = entry.lastIndex)
+-    if (m[3]) messages.push({ text: '', omitted: Number(m[3]) })
++    if (m[4]) messages.push({ text: '', omitted: Number(m[4]) })
++    else if (m[3]) messages.push({ ...(m[1] ? { at: m[1] } : {}), text: quotedIn(corrections, Number(m[2])) ?? '' })
+     else {
+       messages.push({ ...(m[1] ? { at: m[1] } : {}), text: text.slice(entry.lastIndex, entry.lastIndex + Number(m[2])) })
+       entry.lastIndex += Number(m[2]) + 1
+@@ -889,7 +906,7 @@
+     `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
+     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
+     section('session-brief', [memory.floor ? FLOOR_NOTE : '', memory.brief ? renderBrief(memory.brief, memory.recall) : ''].filter(Boolean).join('\n')) +
+-    renderUserMessages(memory.userMessages, memory.recoverable) +
++    renderUserMessages(memory.userMessages, memory.recoverable, memory.corrections.join('\n')) +
+     renderContinuation(memory) +
+     '\n' +
+     (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
+@@ -916,9 +933,10 @@
+   const end = head.lastIndexOf('\n</observations>')
+   const observations = start < 0 || end < start ? '' : head.slice(start + '<observations>\n'.length, end)
+   const skills = skillsAt < 0 ? [] : [...own.slice(skillsAt).matchAll(SKILL_BLOCK)].map((m): Skill => ({ skill: m[1]!, text: m[3] ?? '', at: m[2] ? unstamp(m[2]) : undefined }))
+-  const user = parseUserMessages(first.text)
++  const corrections = start < 0 ? '' : (tag(head.slice(0, start), 'corrections') ?? '')
++  const user = parseUserMessages(first.text, corrections)
+   return {
+-    corrections: applyConstraints([], start < 0 ? [] : parseLines(tag(head.slice(0, start), 'corrections') ?? '', undefined).filter((l) => l.startsWith('🔴'))),
++    corrections: applyConstraints([], parseLines(corrections, undefined).filter((l) => l.startsWith('🔴'))),
+     observations,
+     anchor: hash(observations),
+     entries: parseLines(observations, undefined)
+diff -ru /tmp/omv-code/fail11/tests/register.test.ts /tmp/omv-build/i15-user-dedup/tests/register.test.ts
+--- /tmp/omv-code/fail11/tests/register.test.ts	2026-09-25 06:41:59.076128461 +0000
++++ /tmp/omv-build/i15-user-dedup/tests/register.test.ts	2026-09-25 08:04:18.777784023 +0000
+@@ -3227,6 +3227,50 @@
+     expect(correctionsIn(second.messages?.[0]?.text)).toBe(`${reversed}\n* 🔴 2026-09-22 15:00 User: "Keep every commit small"`)
+   })
+ 
++  test('a user message the corrections quote whole is not repeated but for the newest, and comes back whole once they no longer quote it', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history } = world(on)
++    const push = 'never_force_push_to_main_under_any_circumstances'
++    const lint = 'always_run_the_linter_before_every_single_commit'
++    pi(on, {
++      reply: constraining({
++        [push]: { quote: push },
++        [lint]: { quote: lint },
++        allow: { quote: 'Force pushing to main is fine today', replaces: push },
++        deny: { quote: 'No force pushes again', replaces: 'Force pushing' },
++      }),
++    })
++    const runTurn = live(on, clock, history)
++
++    for (const [i, name] of ['hello', push, lint].entries()) {
++      await runTurn($, turn(name, 'r', CHUNK), at(22, 14, i * 10))
++      await clock.settle()
++    }
++    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 30))
++    await clock.settle()
++    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
++
++    expect(first.messages?.[0]?.text).toContain(
++      `<all-user-messages>\n* User @ 2026-09-22 14:00 (5 chars):\nhello\n* User @ 2026-09-22 14:10 (${push.length} chars): quoted in the corrections above\n` +
++        `* User @ 2026-09-22 14:20 (${lint.length} chars):\n${lint}\n</all-user-messages>`,
++    )
++
++    // Replaced twice, the constraint's words leave the corrections: the message is quoted whole again.
++    history.splice(0, history.length, ...first.messages!)
++    for (const [i, name] of ['allow', 'deny'].entries()) {
++      await runTurn($, turn(name, 'r', CHUNK), at(22, 15, i * 10))
++      await clock.settle()
++    }
++    await runTurn($, turn('more', 'r', 8_000), at(22, 15, 20))
++    await clock.settle()
++    const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
++
++    expect(correctionsIn(second.messages?.[0]?.text)).not.toContain(push)
++    expect(second.messages?.[0]?.text).toContain(
++      `* User @ 2026-09-22 14:10 (${push.length} chars):\n${push}\n* User @ 2026-09-22 14:20 (${lint.length} chars): quoted in the corrections above\n`,
++    )
++  })
++
+   test('a reversal of a constraint set earlier in its own chunk stands alone, saying what it replaced, and is listed by its own words', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history } = world(on)

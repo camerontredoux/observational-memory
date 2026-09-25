@@ -1,0 +1,64 @@
+--- /tmp/omv-refl/b5/tests/register.test.ts	2026-09-25 12:08:27.761378503 +0000
++++ .scratch/rt/tests/register.test.ts	2026-09-25 12:12:50.138042050 +0000
+@@ -1071,21 +1071,58 @@
+     expect(lines.some((l) => l.includes('read the plan'))).toBe(false)
+   })
+ 
+-  test('a reflection that stays far under its target at every attempt leaves the observations as they were', async ($, on) => {
++  test('a reflection that stays far under its target leaves the observations as they were: two attempts, no prompt sent twice, and the same observations are not sent again', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, stored } = world(on)
+     const line = '🟡 2026-09-22 14:30 read a file with a long name'
+-    const seen = pi(on, { reply: () => `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`, reflect: () => '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>' })
++    let observed = 0
++    const seen = pi(on, {
++      reply: () => (observed++ ? '<observations>\n* 🟡 2026-09-22 15:00 Looked again\n</observations>' : `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`),
++      reflect: () => '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>',
++    })
+     const runTurn = live(on, clock, history)
+ 
+     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+     await clock.settle()
+ 
+-    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(4)
++    const reflections = () => seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
++    expect(reflections()).toHaveLength(2) // the second under the floor too: a third would come back the same
++    expect(new Set(reflections()).size).toBe(2)
+     expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual([expect.stringMatching(/^reflection failed \(/)])
+     const ledger = stored['ledger:session-1'] as Ledger
+     expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
+     expect(ledger.entries).toHaveLength(4_000)
++
++    // The next chunk's one line lands among the newest, kept as they were: what there is to condense is the same, and is not resent.
++    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
++    await clock.settle()
++    expect(reflections()).toHaveLength(2)
++    expect(seen.logs).toContainEqual('reflection skipped: the observations to condense are those of the last failed reflection')
++  })
++
++  test('replies just under the floor at both attempts: the fuller is installed', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    const underFloor = (prompt: string, share: number, head: string) => {
++      const floor = Number(prompt.match(/under ~(\d+) tokens, is discarded/)![1])
++      const lines = [head]
++      for (let i = 0, chars = head.length; chars < share * floor * 4; i++) lines.push(`* 🟢 2026-09-22 14:30 detail ${i}`), (chars += 32)
++      return `<observations>\n${lines.join('\n')}\n</observations>`
++    }
++    const seen = pi(on, {
++      reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
++      reflect: (n, prompt) => underFloor(prompt, n === 1 ? 0.8 : 0.9, n === 1 ? '* 🟡 2026-09-22 14:30 First try' : '* 🟡 2026-09-22 14:30 Second try'),
++    })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await clock.settle()
++
++    expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(2)
++    expect(seen.logs).toContainEqual(expect.stringMatching(/^no reflection came between ~\d+ and ~\d+ tokens; installing the fullest, ~\d+ tokens$/))
++    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
++    expect(lines).toContain('🟡 2026-09-22 14:30 Second try')
++    expect(lines).not.toContain('🟡 2026-09-22 14:30 First try')
+   })
+ 
+   test('🔴 lines pass through a reflection unchanged, in time order and exact repeats once; the Reflector never sees them, and a 🔴 line it writes is kept as 🟡', async ($, on) => {

@@ -1,0 +1,222 @@
+diff -ru /tmp/omv-code/base4/hooks/register.ts /tmp/omv-code/rep-r40c/hooks/register.ts
+--- /tmp/omv-code/base4/hooks/register.ts	2026-09-25 09:09:26.439512718 +0000
++++ /tmp/omv-code/rep-r40c/hooks/register.ts	2026-09-25 09:36:22.602323166 +0000
+@@ -72,6 +72,9 @@
+ const RECALL_TOOL = 'om_recall'
+ const RECALL_TOOL_NAME = `mcp__observational-memory__${RECALL_TOOL}` // as the model sees it
+ const STATS_TOOL = 'om_stats'
++const REPLIES_MAX_TOKENS = 2_000 // the assistant's replies section, newest kept
++const REPLIES_ROOM_TOKENS = 40_000 // and only within what the compacted context leaves below this
++const REPLIES_MIN_TOKENS = 200 // less room than this quotes none
+ const USER_MESSAGES_MAX_TOKENS = 10_000 // the verbatim user messages section, newest kept
+ const NEXT_STEP_MAX_TOKENS = 2_000 // the latest request the continuation record quotes
+ const HANDOFF_FIELD_MAX_TOKENS = 500 // each of the continuation record's Next steps and Told the user
+@@ -125,6 +128,7 @@
+   stateAt?: string // the time of the last message the memory covers
+   skills: Skill[]
+   userMessages: UserMessage[]
++  replies?: UserMessage[] // the assistant's last reply of each turn that left context, newest kept
+   nextStep?: string // the user's latest request, verbatim
+   environment?: string // the working directory and git state at compaction (see environmentOf)
+   failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
+@@ -955,6 +959,53 @@
+         .join('')}${USER_MESSAGES_END}`
+     : ''
+ }
++// The assistant's reply ending each turn that left context, verbatim, each after a header giving its length, in a
++// block between the corrections and the observations: an old reply's value reads before the observations' current one.
++const REPLIES = '<your-replies>\n'
++const REPLIES_END = '</your-replies>'
++function renderReplies(replies: readonly UserMessage[] | undefined) {
++  if (!replies?.length) return ''
++  let day = ''
++  return `${REPLIES}${replies
++    .map((m) => {
++      const [d, t] = (m.at ?? '').split(' ')
++      const head = m.at ? `${d === day ? '' : `${DAY_MARK}${(day = d!)}\n`}* You @ ${t}` : '* You'
++      return `${head} (${m.text.length} chars):\n${m.text}\n`
++    })
++    .join('')}${REPLIES_END}\n\n`
++}
++// The replies section of a memory message: only where it can be, before the first <observations> tag.
++function parseReplies(text: string) {
++  const replies: UserMessage[] = []
++  const start = text.indexOf(REPLIES)
++  if (start < 0 || start > text.indexOf('<observations>\n')) return { replies, start, end: 0 }
++  const entry = /\* You(?: @ ([\d:]+))? \((\d+) chars\):\n|@ (\d{4}-\d{2}-\d{2})\n/y
++  entry.lastIndex = start + REPLIES.length
++  let end = entry.lastIndex
++  let day = ''
++  for (let m; (m = entry.exec(text)); end = entry.lastIndex)
++    if (m[3]) day = m[3]
++    else replies.push({ ...(m[1] && day ? { at: `${day} ${m[1]}` } : {}), text: text.slice(entry.lastIndex, entry.lastIndex + Number(m[2])) }), (entry.lastIndex += Number(m[2]) + 1)
++  return { replies, start, end: text.startsWith(REPLIES_END, end) ? end + REPLIES_END.length : end }
++}
++// The newest replies within `max` tokens, oldest first; the newest is cut to fit when it alone passes it.
++const REPLY_MAX_TOKENS = 600 // one reply over this is cut to its head and tail (0: only the section's cap)
++// A reply cut to `max` tokens, unless an earlier compaction cut it so already.
++const cutReply = (text: string, max: number) => (BRIEF_CUT.test(text) && text.replace(BRIEF_CUT, '').length <= max * 4 ? text : excerpt(text, max, 'message'))
++function capReplies(replies: readonly UserMessage[], max: number) {
++  if (max < REPLIES_MIN_TOKENS) return []
++  const kept: UserMessage[] = []
++  let left = max
++  for (const r of [...replies].reverse()) {
++    const m = REPLY_MAX_TOKENS ? { ...r, text: cutReply(r.text, REPLY_MAX_TOKENS) } : r
++    const t = estimateTokens(m.text)
++    if (!kept.length && t > left) return [{ ...m, text: cutReply(m.text, left) }]
++    if (t > left) break
++    kept.unshift(m)
++    left -= t
++  }
++  return kept
++}
+ const QUOTED = ' quoted in the corrections above\n'
+ const USER_QUOTE = 'User: "'
+ function quotedIn(corrections: string, n: number) {
+@@ -1062,7 +1113,7 @@
+ // A memory with its skills as lines and its user messages the brief alone, the rest counted.
+ function briefer(memory: Memory): Memory {
+   const [brief, ...rest] = memory.userMessages
+-  return { ...memory, skills: memory.skills.map((s) => ({ ...s, text: '' })), userMessages: brief ? withOmitted(brief, rest) : [] }
++  return { ...memory, skills: memory.skills.map((s) => ({ ...s, text: '' })), userMessages: brief ? withOmitted(brief, rest) : [], replies: [] }
+ }
+ 
+ const renderSkill = (s: Skill) => {
+@@ -1084,7 +1135,7 @@
+ // where the model can call om_recall, the note that sends it there, so it is the last thing read before the messages.
+ function memoryMessage(memory: Memory): SessionMessage {
+   const text =
+-    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}<observations>\n${memory.observations}\n</observations>` +
++    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
+     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
+     section('session-brief', [memory.floor ? FLOOR_NOTE : '', memory.brief ? renderBrief(memory.brief, memory.recall) : ''].filter(Boolean).join('\n')) +
+     renderUserMessages(memory.userMessages, memory.recoverable, memory.corrections.join('\n')) +
+@@ -1101,7 +1152,10 @@
+ // The memory message a previous compaction left at the head of the live context, or an older one: its corrections
+ // may repeat, its state is a <current-task> before the skills, and its latest request an <optional-next-step>.
+ // The user's text starts no earlier than its section, so everything else is read before it.
+-function parseMemory(first: SessionMessage) {
++function parseMemory(message: SessionMessage) {
++  // The replies section, before the observations, is cut out first: its text is the assistant's, read by its lengths.
++  const said = parseReplies(message.text)
++  const first = said.end ? { ...message, text: message.text.slice(0, said.start) + message.text.slice(said.end).replace(/^\n\n/, '') } : message
+   const userAt = [USER_MESSAGES, CONTINUATION, NEXT_STEP].map((m) => first.text.indexOf(m)).filter((i) => i >= 0)
+   const whole = userAt.length ? first.text.slice(0, Math.min(...userAt)) : first.text
+   // The brief comes last before the user's messages; a skill's text is read only up to it.
+@@ -1127,6 +1181,7 @@
+     failures: failuresOf(first.text, user.end || own.length),
+     skills,
+     userMessages: user.messages,
++    replies: said.replies,
+     brief: briefAt < 0 || briefEnd < briefAt ? undefined : parseBrief(whole.slice(briefAt + SESSION_BRIEF.length, briefEnd)),
+   }
+ }
+@@ -1694,6 +1749,15 @@
+       const text = i < base ? undefined : typed(m, known)
+       return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
+     })
++    // The reply ending each turn: the last assistant text before the next prompt, from rows past the memory message.
++    const replyRows = prompts.flatMap((p, k) => {
++      const lo = k ? prompts[k - 1]!.i : base - 1
++      for (let j = p.i - 1; j > lo; j--) {
++        const m = messages[j]!
++        if (m.role === 'assistant' && m.text.trim()) return [{ i: j, message: { ...(v.at[j] === undefined ? {} : { at: stamp(v.at[j]!) }), text: m.text.trim() } }]
++      }
++      return []
++    })
+     // An omitted-count line stands for dropped prompts, never for the latest one.
+     // A prompt cut to its note alone quotes nothing.
+     const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
+@@ -1772,6 +1836,9 @@
+         }
+         // The compacted context: the memory message with its margin, and the raw tail at its density.
+         const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
++        // The replies fill what room is left below REPLIES_ROOM_TOKENS, at most REPLIES_MAX_TOKENS.
++        const room = REPLIES_ROOM_TOKENS - contextTokens(memoryMessage(memory))
++        memory.replies = capReplies([...(priorMemory?.replies ?? []), ...replyRows.filter((r) => r.i < cut).map((r) => r.message)], Math.min(REPLIES_MAX_TOKENS, Math.floor(room / MEMORY_HEADROOM)))
+         let message = memoryMessage(memory)
+         // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
+         // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
+diff -ru /tmp/omv-code/base4/tests/register.test.ts /tmp/omv-code/rep-r40c/tests/register.test.ts
+--- /tmp/omv-code/base4/tests/register.test.ts	2026-09-25 09:09:09.453399267 +0000
++++ /tmp/omv-code/rep-r40c/tests/register.test.ts	2026-09-25 09:33:15.671206941 +0000
+@@ -230,6 +230,9 @@
+ // The continuation record's state of the work: its lines before the quoted request, if any.
+ const recordIn = (text?: string) => text?.match(/\n\n<continuation>\n([\s\S]*?)(?:\n^The user's latest request [^\n]*\(\d+ chars\):\n[\s\S]*)?\n<\/continuation>/m)?.[1]
+ const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
++// A memory message's text without its replies section (I42), which sits between the corrections and the observations.
++const noReplies = (text = '') => text.replace(/<your-replies>\n[\s\S]*?<\/your-replies>\n\n/, '')
++const repliesIn = (text?: string) => text?.match(/\n<your-replies>\n([\s\S]*?)<\/your-replies>\n\n<observations>/)?.[1]
+ const correctionsIn = (text?: string) => text?.match(/\n<corrections>\n([\s\S]*?)\n<\/corrections>/)?.[1]
+ const renderedObservationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
+ // A memory message with its observations replaced by `observations`, as rendered.
+@@ -636,11 +639,52 @@
+ 
+     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([expect.stringMatching(/^retrying rows 7-11 /)])
+     expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer answered without an <observations> block); left unobserved')
+-    const text = result.messages?.[0]?.text ?? ''
++    const text = noReplies(result.messages?.[0]?.text)
+     expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n\n</observations>`)
+     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+   })
+ 
++  test('the reply ending each turn that left context is quoted before the observations, carried forward, the newest within its cap', async ($, on) => {
++    mock.clock(on)
++    world(on)
++    pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 14:30 Saw ${prompt.match(/^\[User\]: (\w+)$/m)?.[1]}\n</observations>` })
++    const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'c', 8_000)]
++
++    const first = await $.session.compact({ trigger: 'manual', messages })
++
++    // The last text before the next prompt: the turn's closing reply, not its first. Turn b's closing row starts the
++    // raw tail, so it is in view already and not quoted.
++    const text = first.messages?.[0]?.text ?? ''
++    expect(repliesIn(text)).toBe('* You (24 chars):\nFound the bug in a. done\n')
++    expect(text.indexOf('<your-replies>')).toBeLessThan(text.indexOf('<observations>'))
++    expect(first.messages?.slice(1)).toEqual(messages.slice(7))
++
++    // Read back from the memory message: the next compaction keeps a's and adds b's (the first row after the memory
++    // message), c's and d's, oldest first. d's passes the per-reply cap and is cut to its head and tail.
++    const big = 'y'.repeat(9_000 * 4)
++    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('d', big, CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', 8_000)] })
++    const kept = repliesIn(second.messages?.[0]?.text) ?? ''
++    expect(kept.startsWith('* You (24 chars):\nFound the bug in a. done\n* You (13 chars):\nFixed b. done\n* You (6 chars):\nc done\n* You (')).toBe(true)
++    expect(kept).toContain('om_recall can retrieve the full message')
++    expect(kept.endsWith('y done\n')).toBe(true)
++    expect(kept.length).toBeLessThan(3_000)
++  })
++
++  test('the replies take only the room the compacted context leaves below REPLIES_ROOM_TOKENS', async ($, on) => {
++    mock.clock(on)
++    world(on)
++    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw it\n</observations>' })
++    // A newest reply, kept raw, that alone nearly fills the room: nothing is quoted.
++    const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'z'.repeat(39_500 * 4))]
++
++    const result = await $.session.compact({ trigger: 'manual', messages })
++
++    const text = result.messages?.[0]?.text ?? ''
++    expect(result.messages?.slice(1)).toEqual(messages.slice(-1))
++    expect(text).toContain('<observations>')
++    expect(text).not.toContain('<your-replies>')
++  })
++
+   test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
+     mock.clock(on)
+     world(on)
+@@ -1333,13 +1377,13 @@
+     expect(reflections[0]).not.toContain('Sorry, I meant')
+     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual([correction])
+     const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+-    const text = first.messages?.[0]?.text ?? ''
++    const text = noReplies(first.messages?.[0]?.text)
+     expect(text).toContain(`\n\n<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
+     expect(recordIn(text)).toBe(`${WHERE} (2026-09-22 14:31):\nActive: fixing the refresh endpoint`)
+     // Carried forward from the memory message itself.
+     for (const key of Object.keys(stored)) delete stored[key]
+     const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)] })
+-    expect(second.messages?.[0]?.text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
++    expect(noReplies(second.messages?.[0]?.text)).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
+     expect(seen.modelCalls).toBe(0)
+   })
+ 

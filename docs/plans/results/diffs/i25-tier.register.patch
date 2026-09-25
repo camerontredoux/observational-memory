@@ -1,0 +1,60 @@
+--- /tmp/omv/grp/hooks/register.ts	2026-09-25 06:15:22.651749371 +0000
++++ hooks/register.ts	2026-09-25 08:14:59.826679496 +0000
+@@ -45,6 +45,7 @@
+ // The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
+ // whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
+ const REFLECT_KEEP_TOKENS = 12_000
++const REFLECT_TIER_TOKENS = 6_000 // earlier reflections' lines kept as they were, up to this: condensing a line twice loses it
+ const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
+ const REFLECT_ATTEMPTS = 4
+ const SKILLS_MAX_TOKENS = 15_000
+@@ -86,7 +87,7 @@
+ // `currentTask`: where the work stands, in the Observer's <continuation> fields (an older reply's Primary/Secondary).
+ type Observed = { lines: string[]; corrections: string[]; currentTask?: string; source?: Source }
+ type Chunk = Range & Observed
+-type Entry = { id: string; line: string; source?: Source } // line: `🔴 2026-09-23 14:30 User asked …`
++type Entry = { id: string; line: string; source?: Source; r?: true } // line: `🔴 2026-09-23 14:30 User asked …`; r: the Reflector wrote it
+ type Ledger = {
+   anchor?: string // the observations of the memory message the live context starts with, hashed
+   watermark: Range // rows [base, to), observed and committed to `entries`
+@@ -1131,7 +1132,8 @@
+ }
+ 
+ // The Reflector over a snapshot of the entries, in the background. The newest, up to REFLECT_KEEP_TOKENS, and every
+-// 🔴 line (exact repeats once) pass through unchanged; the Reflector condenses the rest into what is left of
++// 🔴 line (exact repeats once) pass through unchanged, as do the lines earlier reflections wrote while they fit
++// REFLECT_TIER_TOKENS (condensing a line twice loses it); the Reflector condenses the rest into what is left of
+ // REFLECT_TARGET_TOKENS, and a 🔴 line it writes is kept as 🟡. A result over that target is tried again with stronger
+ // compression, one under REFLECT_FLOOR of it with a request for more detail, up to REFLECT_ATTEMPTS; with none in
+ // range, nothing changes. The replaced entries are then replaced in place, so entries committed while it ran survive.
+@@ -1157,7 +1159,11 @@
+       const kept = snapshot.slice(recent)
+       const isRed = (e: Entry) => e.line.startsWith('🔴')
+       const red = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
+-      const sent = older.filter((e) => !isRed(e))
++      // Lines an earlier reflection wrote pass through while they fit REFLECT_TIER_TOKENS; past it they are condensed again.
++      const tier = estimateTokens(renderLines(older.filter((e) => e.r && !isRed(e)))) <= REFLECT_TIER_TOKENS
++      const through = older.filter((e) => red.includes(e) || (tier && e.r && !isRed(e)))
++      const sent = older.filter((e) => !isRed(e) && !(tier && e.r))
++      if (!sent.length) throw new Error('nothing to condense but earlier reflections')
+       const target = REFLECT_TARGET_TOKENS - estimateTokens(renderLines([...red, ...kept]))
+       const floor = Math.ceil(REFLECT_FLOOR * target)
+       if (target < 1_000) throw new Error(`the 🔴 lines and the newest observations leave ~${target} tokens of the ~${REFLECT_TARGET_TOKENS}-token target`)
+@@ -1180,7 +1186,7 @@
+         const parsed = parseLines(observationsOf(reply), bounds, false, noteUnmarked($, 'reflector.background', `reflector reply at level ${level}`)).map((l) => {
+           const { line, source } = splitSource(l)
+           const kept = reflectedSource(source, span, sources.length === sent.length)
+-          return { line: isRed({ id: '', line }) ? `🟡${line.slice('🔴'.length)}` : line, ...(kept ? { source: kept } : {}) }
++          return { line: isRed({ id: '', line }) ? `🟡${line.slice('🔴'.length)}` : line, ...(kept ? { source: kept } : {}), r: true as const }
+         })
+         const tokens = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
+         if (tokens !== undefined && tokens <= target && tokens >= floor) lines = parsed
+@@ -1197,7 +1203,7 @@
+           return
+         }
+         let seq = ledger.seq
+-        const reflected = interleave(lines, red).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
++        const reflected = interleave(lines, through).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
+         const rest = ledger.entries.filter((e) => !ids.has(e.id))
+         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
+         const after = estimateTokens(renderLines([...reflected, ...kept]))

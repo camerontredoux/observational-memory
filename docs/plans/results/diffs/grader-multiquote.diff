@@ -1,0 +1,65 @@
+diff --git a/tests/eval/behavior.ts b/tests/eval/behavior.ts
+index 8214819..8acea25 100644
+--- a/tests/eval/behavior.ts
++++ b/tests/eval/behavior.ts
+@@ -95,10 +95,15 @@ const squash = (s: string) => s.replace(/\s+/g, ' ').trim()
+ const str = (x: unknown) => (typeof x === 'string' ? x : x === undefined || x === null ? '' : JSON.stringify(x))
+ export const isUnknown = (a: Answer) => /^unknown\b/i.test(str(a.answer).trim())
+ 
+-/** Grades one answer. `ctx` is the squashed context text; `recalled`, what om_recall's search returned for its recall_query. */
+-export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string): { pass: boolean; why: string } {
++// An answer that joins facts (multi-hop, rationale, lessons) may quote up to three places, as "a"; "b", a; b, a … b, or
++// a JSON array of quotes. Any other probe's evidence is one quote: a path or value stitched from pieces is no quote.
++export const QUOTE_PARTS_MAX = 3
++const JOINED: readonly BGate[] = ['multi-hop', 'rationale', 'lessons']
++export const QUOTE_JOIN = /["”]\s*[;,]?\s*(?:and\s+)?["“]|\s(?:…|\.\.\.)\s|;\s+/
++/** Grades one answer. `ctx` is the squashed context text; `recalled`, what om_recall's search returned for its recall_query; `parts`, how many quotes the evidence may join (1: one quote; by default QUOTE_PARTS_MAX for a probe that joins facts). */
++export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string, parts = JOINED.includes(p.gate) ? QUOTE_PARTS_MAX : 1): { pass: boolean; why: string } {
+   const ans = squash(str(a.answer))
+-  const ev = squash(str(a.evidence))
++  const ev = squash(Array.isArray(a.evidence) ? a.evidence.map(str).join('"; "') : str(a.evidence))
+   const short = (s: string) => (s.length > 70 ? `${s.slice(0, 70)}…` : s)
+   const said = `"${short(ans)}"`
+   if (!ans) return { pass: false, why: 'no answer' }
+@@ -112,7 +117,10 @@ export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string)
+   }
+   // A quote survives the reader dropping markdown and quote marks, and a trailing ellipsis.
+   const bare = (s: string) => squash(s.replace(/[`*_"'“”‘’]/g, '').replace(/(?:…|\.\.\.)$/, '')).toLowerCase()
+-  if (ev.length < (p.quoteOf ? 2 : 8) || !bare(ctx).includes(bare(ev))) return { pass: false, why: `${said}, evidence not in the context: "${short(ev)}"` }
++  // Each part of joined quotes is verbatim in the context and at least 8 characters.
++  const pieces = ev.split(QUOTE_JOIN).map((x) => bare(x.replace(/^\s*(?:…|\.\.\.)/, '')))
++  const quoted = bare(ctx).includes(bare(ev)) || (pieces.length > 1 && pieces.length <= parts && pieces.every((x) => x.length >= 8 && bare(ctx).includes(x)))
++  if (ev.length < (p.quoteOf ? 2 : 8) || !quoted) return { pass: false, why: `${said}, evidence not in the context: "${short(ev)}"` }
+   const both = `${ans}\n${ev}`
+   const ok = (() => {
+     switch (p.gate) {
+diff --git a/tests/replay.test.ts b/tests/replay.test.ts
+index 443c8ba..18e18d1 100644
+--- a/tests/replay.test.ts
++++ b/tests/replay.test.ts
+@@ -876,4 +876,25 @@ describe('the compaction rubric', () => {
+     expect(gradeAnswer(dropped, { answer: 'unknown', recall_query: 'checksum' }, ctx, 'the checksum was ck-1').pass).toBe(true)
+     expect(gradeAnswer(dropped, { answer: 'unknown', recall_query: 'sum' }, ctx, 'nothing').pass).toBe(false)
+   })
++
++  test('takes an answer that joins facts when it quotes up to three places, each verbatim in the context', () => {
++    const ctx = 'The runs bill against the Max subscription. The pane showed 40% of the weekly limit used. Merged as 1dee8ac.'
++    const hop = { gate: 'multi-hop' as const, id: 'usage', ask: 'What do the runs bill against, and what limit?', answer: 'subscription' }
++    const two = '"bill against the Max subscription"; "40% of the weekly limit"'
++    expect(gradeAnswer(hop, { answer: 'The subscription, weekly', evidence: two }, ctx).pass).toBe(true)
++    expect(gradeAnswer(hop, { answer: 'The subscription, weekly', evidence: two }, ctx, undefined, 1).pass).toBe(false)
++    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: ['bill against the Max subscription', 'Merged as 1dee8ac'] }, ctx).pass).toBe(true)
++    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: 'the Max subscription … 40% of the weekly limit' }, ctx).pass).toBe(true)
++    // One part not in the context, one too short, or more than three parts: no evidence.
++    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: '"bill against the Max subscription"; "a monthly card limit"' }, ctx).pass).toBe(false)
++    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: '"bill against the Max subscription"; "40%"' }, ctx).pass).toBe(false)
++    const four = '"The runs bill"; "the Max subscription"; "The pane showed"; "Merged as 1dee8ac"'
++    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: four }, ctx).pass).toBe(false)
++    expect(gradeAnswer(hop, { answer: 'The subscription, weekly', evidence: 'bill against the Max subscription; 40% of the weekly limit' }, ctx).pass).toBe(true)
++    // A value is one quote: pieces stitched into a path that is nowhere in the context are no evidence.
++    const tree = 'The repo is ~/work/mods/app. Another repo has tests/register.test.ts.'
++    const stitched = { answer: '~/work/mods/app/tests/register.test.ts', evidence: '~/work/mods/app; tests/register.test.ts' }
++    expect(gradeAnswer({ gate: 'value', id: 'path', ask: 'Which test file?', answer: 'register\\.test' }, stitched, tree).pass).toBe(false)
++    expect(gradeAnswer({ ...hop, answer: 'register\\.test' }, stitched, tree).pass).toBe(true)
++  })
+ })

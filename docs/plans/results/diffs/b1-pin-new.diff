@@ -1,0 +1,11 @@
+--- a/tests/fixtures/om-orchestration.hard.local.ts
++++ b/tests/fixtures/om-orchestration.hard.local.ts
+@@ -36,7 +36,7 @@
+     // Decision rationale: the decision and its reason.
+     { id: 'why:cut-builtin-recall-new', gate: 'decisions', from: 3, to: 4, expect: [["$51", "51 dollars", "$51.00"]], ask: 'Why was built-in+recall on the new plugin cut from the v1.0.0 matrix?', answer: '51|cap|budget' },
+     { id: 'why:threshold', gate: 'decisions', from: 5, expect: ['190000', '967k'], ask: 'Which auto-compaction window do recall-required runs use, and why not the default?', answer: '190' },
+-    { id: 'why:pin-new', gate: 'decisions', from: 3, expect: ['pinned worktree', ["mid-run", "mid run", "during a run", "while a run", "in the middle of a run"]], ask: 'Why do the new-plugin runs load the plugin from their own pinned worktree instead of main?', answer: 'reload|mid-run' },
++    { id: 'why:pin-new', gate: 'decisions', from: 3, expect: [["pinned worktree", "pinned copy", "pinned at", "pin the new plugin", "own worktree", "bench-new"], ["mid-run", "mid run", "during a run", "while a run", "in the middle of a run"]], ask: 'Why do the new-plugin runs load the plugin from their own pinned worktree instead of main?', answer: 'reload|mid-run' },
+     { id: 'why:lanes', gate: 'decisions', from: 1, to: 2, expect: ['#7', ["Lane A", "one lane", "same lane", "sequential", "sequentially", "serially", "one at a time", "one after another"], 'register.ts'], ask: 'Why do #2, #3, #7, #5 and #6 run one at a time?', answer: 'register\\.ts' },
+     { id: 'why:opus-round', from: 2, expect: [["1M main", "1M window", "1M-token window", "1M-window", "main session's window", "main window"], ["200k subagent", "subagent"]], ask: 'What bug did the extra Opus review round on #2 find?', answer: '1M|subagent' },
+   ],

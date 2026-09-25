@@ -1,0 +1,140 @@
+diff -ru '--exclude=node_modules' omv-code/base2/hooks/register.ts omv-build/i34-backoff/hooks/register.ts
+--- omv-code/base2/hooks/register.ts	2026-09-25 08:10:07.795671557 +0000
++++ omv-build/i34-backoff/hooks/register.ts	2026-09-25 08:23:55.727688900 +0000
+@@ -35,6 +35,9 @@
+ const PI_CWD = '/tmp'
+ const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
+ const MAX_PARALLEL = 4 // background Observer calls in flight at once, across the main loop and every subagent's
++// After a failed background call its loop starts none for this long, doubled with each failure in a row up to the cap.
++const RETRY_MS = 5_000
++const RETRY_MAX_MS = 300_000
+ const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
+ const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
+ const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
+@@ -143,6 +146,7 @@
+ const briefAlways = ($: EngineInterface) => $.env.get('OM_BRIEF').then((v) => v === 'always', () => false)
+ const sinceScheduled = new Map<string, { rows: number; tokens: number }>() // history seen by the last step, and its growth since a pass
+ const waiting = new Map<string, { loop: Loop; stamp: string }>() // loops a pass left short of a slot, first in line when one frees
++const backoff = new Map<string, { failures: number; until: number }>() // loops whose last background call failed
+ 
+ // How many times each loop has ended, and under `<sessionId>/` how many times every subagent of the session has:
+ // counted up, never reset, so a session that goes on after /clear or a resume starts a new life rather than being
+@@ -156,7 +160,7 @@
+ function end(key: string) {
+   ends.set(key, endsOf(key) + 1)
+   const prefix = key.endsWith('/')
+-  for (const k of [...sinceScheduled.keys(), ...waiting.keys()]) if (prefix ? k.startsWith(key) : k === key) (sinceScheduled.delete(k), waiting.delete(k))
++  for (const k of [...sinceScheduled.keys(), ...waiting.keys(), ...backoff.keys()]) if (prefix ? k.startsWith(key) : k === key) (sinceScheduled.delete(k), waiting.delete(k), backoff.delete(k))
+ }
+ 
+ // Thrown to stop work whose loop ended under it.
+@@ -522,11 +526,12 @@
+     const key = keyOf(line)
+     const ids = new Set(ref?.[1]!.match(/k[0-9a-f]+/gi)?.map((id) => id.toLowerCase()))
+     const replaced: string[] = []
+-    for (const [k, l] of out)
+-      if (k !== key && ids.has(idOf(k))) {
+-        replaced.push(l)
+-        out.delete(k)
+-      }
++    if (ids.size)
++      for (const [k, l] of out)
++        if (k !== key && ids.has(idOf(k))) {
++          replaced.push(l)
++          out.delete(k)
++        }
+     const again = out.get(key) ?? ''
+     out.delete(key)
+     const note = replaced.length
+@@ -1146,10 +1151,13 @@
+ 
+ // Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight across every loop: gaps a failed
+ // call left first, then whole chunks at the frontier, which stops KEEP_RAW_TOKENS short of the end. A loop left short
+-// of a slot waits for the next one to free. A pass for a loop that ended, before it or while it read, does nothing.
++// of a slot waits for the next one to free. A pass for a loop that ended, before it or while it read, does nothing,
++// and so does one while the loop backs off after a failed call.
+ function schedule($: EngineInterface, loop: Loop, stamp: string) {
+   return locked(async () => {
+     if (!isLive(loop, stamp)) return
++    const held = backoff.get(loop.key)
++    if (held && (await $.clock.now()) < held.until) return
+     const v = await liveView($, loop)
+     const ledger = await loadLedger($, loop.key, v)
+     if (!isLive(loop, stamp)) return
+@@ -1225,11 +1233,25 @@
+       )
+     return !!at
+   }).catch((error) => (log($, errorText(error)), false))
++  if (landed) backoff.delete(loop.key)
++  else if (!chunk && isLive(loop, stamp)) await backOff($, loop, stamp)
+   // The slot it held goes to a loop waiting for one first, whether this chunk landed or not.
+   const next = [...waiting.values(), ...(landed ? [{ loop, stamp }] : [])].filter((l, i, all) => all.findIndex((o) => o.loop.key === l.loop.key) === i)
+   await Promise.all([landed && maybeReflect($, loop, stamp), ...next.map((l) => schedule($, l.loop, l.stamp))]).catch((error) => log($, errorText(error)))
+ }
+ 
++// A failed call holds its loop's passes back until its back-off ends, then runs one. Calls that fail while it lasts
++// (others in flight when pi began failing) count as the same failure.
++async function backOff($: EngineInterface, loop: Loop, stamp: string) {
++  const now = await $.clock.now()
++  const last = backoff.get(loop.key)
++  if (last && now < last.until) return
++  const failures = (last?.failures ?? 0) + 1
++  const ms = Math.min(RETRY_MS * 2 ** (failures - 1), RETRY_MAX_MS)
++  backoff.set(loop.key, { failures, until: now + ms })
++  $.clock.after(ms, () => void schedule($, loop, stamp).catch((error) => log($, errorText(error))))
++}
++
+ // The Reflector over a snapshot of the entries, in the background. The newest, up to REFLECT_KEEP_TOKENS, and every
+ // 🔴 line (exact repeats once) pass through unchanged; the Reflector condenses the rest into what is left of
+ // REFLECT_TARGET_TOKENS, and a 🔴 line it writes is kept as 🟡. A result over that target is tried again with stronger
+diff -ru '--exclude=node_modules' omv-code/base2/tests/register.test.ts omv-build/i34-backoff/tests/register.test.ts
+--- omv-code/base2/tests/register.test.ts	2026-09-25 08:10:48.170865331 +0000
++++ omv-build/i34-backoff/tests/register.test.ts	2026-09-25 08:18:44.144167310 +0000
+@@ -715,7 +715,7 @@
+ 
+     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+     await clock.settle()
+-    await runTurn($, turn('b', 'b', 100), at(22, 14, 40))
++    await clock.advance(5_000) // its back-off over, the loop calls pi again
+     await clock.settle()
+ 
+     expect(seen.logs.filter((l) => l.startsWith('background observation'))).toEqual([
+@@ -780,6 +780,38 @@
+     expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23) // the last ~6k tokens left raw
+   })
+ 
++  test('a failing pi with more chunks than slots is called again only as each back-off ends, doubling, and the chunks land once it answers', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    let failing = true
++    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
++    await clock.settle()
++    expect(seen.prompts).toHaveLength(4) // the four in flight fail as one failure, and their slots start nothing
++    await clock.advance(4_999)
++    expect(seen.prompts).toHaveLength(4)
++    await clock.advance(1)
++    expect(seen.prompts).toHaveLength(8)
++    await clock.advance(9_999)
++    expect(seen.prompts).toHaveLength(8)
++    await clock.advance(1)
++    expect(seen.prompts).toHaveLength(12)
++    failing = false
++    await clock.advance(20_000)
++
++    expect(seen.prompts).toHaveLength(18)
++    expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23)
++    // Landed, the loop is back to no back-off: a failure now waits the first 5 s again.
++    failing = true
++    await runTurn($, [...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000)], at(22, 15, 0))
++    await clock.settle()
++    const calls = seen.prompts.length
++    await clock.advance(5_000)
++    expect(seen.prompts.length - calls).toBe(1)
++  })
++
+   test('chunks landing out of order commit to the ledger only once the watermark reaches them', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, stored } = world(on)

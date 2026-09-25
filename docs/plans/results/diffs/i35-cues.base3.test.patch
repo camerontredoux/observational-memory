@@ -1,0 +1,29 @@
+--- .scratch/b3now/tests/register.test.ts	2026-09-25 08:39:48.122992344 +0000
++++ .scratch/b3now-i35/tests/register.test.ts	2026-09-25 08:39:51.056303761 +0000
+@@ -1007,6 +1007,26 @@
+     expect(lines.indexOf('🟡 2026-09-22 14:30 First condensed')).toBeLessThan(lines.indexOf('🟡 2026-09-22 15:00 Second condensed'))
+   })
+ 
++  test('a path the condensed notes name and the reflection drops comes back as the clause that named it, at its time', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    const pi_ = pi(on, {
++      reply: () =>
++        `<observations>\n* 🟡 2026-09-22 14:30 Assistant read the plan. Assistant fixed the totals in \`hooks/stats.ts\`.\n* 🟡 2026-09-22 14:30 Assistant pruned \`hooks/prune.ts\`.\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
++      reflect: (_n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Assistant pruned sessions in `hooks/prune.ts`'),
++    })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await clock.settle()
++
++    expect(pi_.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
++    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
++    expect(lines).toContain('🟡 2026-09-22 14:30 Assistant fixed the totals in `hooks/stats.ts`.')
++    expect(lines.filter((l) => l.includes('prune.ts'))).toHaveLength(1)
++    expect(lines.some((l) => l.includes('read the plan'))).toBe(false)
++  })
++
+   test('a reflection that stays far under its target at every attempt leaves the observations as they were', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, stored } = world(on)

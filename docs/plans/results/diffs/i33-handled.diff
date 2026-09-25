@@ -1,0 +1,254 @@
+diff -ru -x node_modules -x '*.local.ts' /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/hooks/register.ts handled/hooks/register.ts
+--- /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/hooks/register.ts	2026-09-25 08:10:07.795671557 +0000
++++ handled/hooks/register.ts	2026-09-25 08:21:34.016794775 +0000
+@@ -107,7 +107,9 @@
+   at: (number | undefined)[]
+   base: number // 1 when a memory message leads
+ }
+-type UserMessage = { at?: string; text: string; omitted?: number } // `omitted`: a line standing for that many dropped
++// `omitted`: a line standing for that many dropped. `replied`: the time of the first reply that ended a turn after
++// it ('' when the rows carry no time); `open`: none had by the compaction that quoted it. An older memory's has neither.
++type UserMessage = { at?: string; text: string; omitted?: number; replied?: string; open?: boolean }
+ type Memory = {
+   corrections: string[]
+   observations: string
+@@ -116,6 +118,7 @@
+   skills: Skill[]
+   userMessages: UserMessage[]
+   nextStep?: string // the user's latest request, verbatim
++  nextStatus?: UserMessage // whether a reply followed it (see statusOf)
+   environment?: string // the working directory and git state at compaction (see environmentOf)
+   failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
+   brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
+@@ -292,6 +295,13 @@
+ const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
+ const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
+ const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
++// Where a turn ended with a reply: an assistant row with text and no tool call, with no assistant row after it before
++// a user row that is no tool result, or the end. A turn cut off, or still running at the end, ends nowhere.
++const turnEnds = (messages: readonly SessionMessage[]) =>
++  messages.flatMap((m, i) => {
++    const next = messages[i + 1]
++    return m.role === 'assistant' && m.text.trim() && !m.toolUses.length && (!next || isPrompt(next)) ? [i] : []
++  })
+ 
+ // What the user typed, if a row is a real prompt: no tool results, compaction summary, injected block (a system
+ // reminder, a named wrapper, image note) or skill text. A system reminder a hook appended to a prompt is cut from it.
+@@ -786,6 +796,10 @@
+ const USER_MESSAGES_END = '</all-user-messages>'
+ const NEXT_STEP = '\n\n<optional-next-step>\n' // an older memory message's: its user's latest request
+ const omittedLine = (n: number, recoverable: boolean) => `* (${n} earlier user messages omitted${recoverable ? '; om_recall can search them' : ''})\n`
++// Whether a reply followed a message, found by code from the rows: a fact beside its length, not whether its work is
++// done, which the continuation record says. A reply on `day` gives its time alone.
++const statusOf = (m: UserMessage, day = '') =>
++  m.replied !== undefined ? `; replied${m.replied ? ` at ${m.replied.startsWith(`${day} `) ? m.replied.slice(day.length + 1) : m.replied}` : ''}` : m.open ? '; no reply yet' : ''
+ // Each day's date is written once, as in the observations. A message the corrections quote whole, as the first
+ // `User: "…"` of its length there, is not repeated but for the newest, quoted for its exact wording; its header gives
+ // its length, which finds its text in them again.
+@@ -800,7 +814,7 @@
+         .map((m, i) =>
+           m.omitted
+             ? omittedLine(m.omitted, recoverable)
+-            : `${m.at ? header(m.at) : '* User'} (${m.text.length} chars):${i < messages.length - 1 && m.text.length > QUOTED.length && quotedIn(corrections, m.text.length) === m.text ? QUOTED : `\n${m.text}\n`}`,
++            : `${m.at ? header(m.at) : '* User'} (${m.text.length} chars${statusOf(m, day)}):${i < messages.length - 1 && m.text.length > QUOTED.length && quotedIn(corrections, m.text.length) === m.text ? QUOTED : `\n${m.text}\n`}`,
+         )
+         .join('')}${USER_MESSAGES_END}`
+     : ''
+@@ -819,17 +833,20 @@
+   const messages: UserMessage[] = []
+   const start = text.indexOf(USER_MESSAGES)
+   if (start < 0) return { messages, end: 0 }
+-  const entry = /\* User(?: @ ((?:[\d-]+ )?[\d:]+))? \((\d+) chars\):(?:\n|( quoted in the corrections above\n))|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ (\d{4}-\d{2}-\d{2})\n/y
++  const entry =
++    /\* User(?: @ ((?:[\d-]+ )?[\d:]+))? \((\d+) chars(?:; (?:(replied)(?: at ((?:[\d-]+ )?[\d:]+))?|(no reply yet)))?\):(?:\n|( quoted in the corrections above\n))|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ (\d{4}-\d{2}-\d{2})\n/y
+   entry.lastIndex = start + USER_MESSAGES.length
+   let end = entry.lastIndex
+   let day = ''
+   for (let m; (m = entry.exec(text)); end = entry.lastIndex)
+-    if (m[5]) day = m[5]
+-    else if (m[4]) messages.push({ text: '', omitted: Number(m[4]) })
++    if (m[8]) day = m[8]
++    else if (m[7]) messages.push({ text: '', omitted: Number(m[7]) })
+     else {
+-      const at = m[1] && day && !m[1].includes(' ') ? `${day} ${m[1]}` : m[1]
+-      if (m[3]) messages.push({ ...(at ? { at } : {}), text: quotedIn(corrections, Number(m[2])) ?? '' })
+-      else messages.push({ ...(at ? { at } : {}), text: text.slice(entry.lastIndex, entry.lastIndex + Number(m[2])) }), (entry.lastIndex += Number(m[2]) + 1)
++      const dated = (t?: string) => (t && day && !t.includes(' ') ? `${day} ${t}` : t)
++      const at = dated(m[1])
++      const status = m[3] ? { replied: dated(m[4]) ?? '' } : m[5] ? { open: true } : {}
++      if (m[6]) messages.push({ ...(at ? { at } : {}), text: quotedIn(corrections, Number(m[2])) ?? '', ...status })
++      else messages.push({ ...(at ? { at } : {}), text: text.slice(entry.lastIndex, entry.lastIndex + Number(m[2])), ...status }), (entry.lastIndex += Number(m[2]) + 1)
+     }
+   return { messages, end: text.startsWith(USER_MESSAGES_END, end) ? end + USER_MESSAGES_END.length : end }
+ }
+@@ -847,7 +864,7 @@
+   const environment = memory.environment ? `${ENVIRONMENT}:\n${memory.environment}\n` : ''
+   const failures = memory.failures?.length ? `${FAILURES}:\n${memory.failures.map(renderFailure).join('\n')}\n` : ''
+   const latest = memory.nextStep && truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)
+-  return state || environment || failures || latest ? `${CONTINUATION}${state}${environment}${failures}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
++  return state || environment || failures || latest ? `${CONTINUATION}${state}${environment}${failures}${latest ? `${LATEST} (${latest.length} chars${memory.nextStatus ? statusOf(memory.nextStatus) : ''}):\n${latest}\n` : ''}</continuation>` : ''
+ }
+ // The state of the work a record gives, read from `from` on, past the user's text.
+ function parseContinuation(text: string, from: number) {
+@@ -1508,14 +1525,22 @@
+     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
+     const turns = main ? (((await $.store.get(turnsKey(sessionId))) as number[] | undefined) ?? []) : undefined
+     const known = mergeSkills(prior, recorded)
++    // Each prompt's status: the first reply that ended a turn after row `i`, or none yet.
++    const ends = turnEnds(messages)
++    const replyAfter = (i: number): Pick<UserMessage, 'replied' | 'open'> => {
++      const j = ends.find((e) => e > i)
++      return j === undefined ? { open: true } : { replied: v.at[j] === undefined ? '' : stamp(v.at[j]!) }
++    }
++    // A message the memory quoted with no reply yet has the first after the memory message; the others keep theirs.
++    const carried = (priorMemory?.userMessages ?? []).map(({ open, ...m }) => (open ? { ...m, ...replyAfter(base - 1) } : m))
+     // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
+     const prompts = messages.flatMap((m, i) => {
+       const text = i < base ? undefined : typed(m, known)
+-      return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
++      return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text, ...replyAfter(i) } }]
+     })
+     // An omitted-count line stands for dropped prompts, never for the latest one.
+     // A prompt cut to its note alone quotes nothing.
+-    const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
++    const typedSoFar = [...carried.filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
+     // A subagent's memory names no file, but om_recall reaches its thread through the session's.
+     const transcriptPath = (await $.store.get(transcriptKey(sessionId))) as string | undefined
+     const transcript = main ? transcriptPath : undefined
+@@ -1574,11 +1599,11 @@
+           currentTask: ledger.currentTask,
+           ...(covered ? { stateAt: stamp(covered.to) } : {}),
+           skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
+-          userMessages: capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)]),
++          userMessages: capUserMessages([...carried, ...prompts.filter((p) => p.i < cut).map((p) => p.message)]),
+           // The session's first prompt, a crewmate's whole brief, is quoted above; quoted again as the latest request it
+           // would send the agent back to the top of its brief.
+           // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
+-          nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
++          ...(typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? { nextStep: typedSoFar.at(-1)!.text, nextStatus: typedSoFar.at(-1)! } : {}),
+           ...(environment ? { environment } : {}),
+           ...(failures.length ? { failures } : {}),
+           ...(brief ? { brief } : {}),
+diff -ru -x node_modules -x '*.local.ts' /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/tests/register.test.ts handled/tests/register.test.ts
+--- /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/tests/register.test.ts	2026-09-25 08:10:48.170865331 +0000
++++ handled/tests/register.test.ts	2026-09-25 08:23:40.875466415 +0000
+@@ -222,13 +222,13 @@
+ 
+ // A turn's work after its prompt: no new prompt.
+ const work = (name: string, size = 0) => turn(name, 'r', size).slice(1)
+-// The user's latest request the continuation record quotes: `(n chars):` then exactly n characters.
++// The user's latest request the continuation record quotes: `(n chars[; status]):` then exactly n characters.
+ function nextStepIn(text?: string) {
+-  const m = text?.match(/\n\n<continuation>\n[\s\S]*?^The user's latest request [^\n]*\((\d+) chars\):\n/m)
++  const m = text?.match(/\n\n<continuation>\n[\s\S]*?^The user's latest request [^\n]*\((\d+) chars(?:; [^)\n]*)?\):\n/m)
+   return m ? text!.slice(m.index! + m[0].length, m.index! + m[0].length + Number(m[1])) : undefined
+ }
+ // The continuation record's state of the work: its lines before the quoted request, if any.
+-const recordIn = (text?: string) => text?.match(/\n\n<continuation>\n([\s\S]*?)(?:\n^The user's latest request [^\n]*\(\d+ chars\):\n[\s\S]*)?\n<\/continuation>/m)?.[1]
++const recordIn = (text?: string) => text?.match(/\n\n<continuation>\n([\s\S]*?)(?:\n^The user's latest request [^\n]*\(\d+ chars(?:; [^)\n]*)?\):\n[\s\S]*)?\n<\/continuation>/m)?.[1]
+ const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+ const correctionsIn = (text?: string) => text?.match(/\n<corrections>\n([\s\S]*?)\n<\/corrections>/)?.[1]
+ const renderedObservationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
+@@ -245,13 +245,13 @@
+     })
+     .join('\n')
+ }
+-// The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters, or an
++// The entries of the user messages section: `* User[ @ time] (n chars[; status]):` then exactly n characters, or an
+ // omission line, read as `(n omitted)`; a day's `@ YYYY-MM-DD` line is skipped.
+ function userMessagesIn(text?: string) {
+   const start = text?.indexOf('\n\n<all-user-messages>\n') ?? -1
+   if (!text || start < 0) return undefined
+   const out: string[] = []
+-  const entry = /\* User(?: @ (?:[\d-]+ )?[\d:]+)? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ [\d-]+\n/y
++  const entry = /\* User(?: @ (?:[\d-]+ )?[\d:]+)? \((\d+) chars(?:; [^)\n]*)?\):\n|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ [\d-]+\n/y
+   entry.lastIndex = start + '\n\n<all-user-messages>\n'.length
+   for (let m; (m = entry.exec(text)); )
+     if (!m[1] && !m[2]) continue
+@@ -1274,7 +1274,7 @@
+     expect(renderedObservationsIn(text)).toBe(
+       '@ 2026-09-22\n* 🟡 23:59 Read a (source 23:59 to 2026-09-23 00:00)\n@ 2026-09-23\n* 🟡 00:20 Read b (source 00:00 to 00:21)',
+     )
+-    expect(text).toContain('<all-user-messages>\n@ 2026-09-22\n* User @ 23:59 (1 chars):\na\n@ 2026-09-23\n* User @ 00:20 (1 chars):\nb\n</all-user-messages>')
++    expect(text).toContain('<all-user-messages>\n@ 2026-09-22\n* User @ 23:59 (1 chars; replied at 2026-09-23 00:00):\na\n@ 2026-09-23\n* User @ 00:20 (1 chars; replied at 00:21):\nb\n</all-user-messages>')
+     for (const key of Object.keys(stored)) delete stored[key]
+     const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
+     const again = second.messages?.[0]?.text
+@@ -3295,8 +3295,8 @@
+     const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+ 
+     expect(first.messages?.[0]?.text).toContain(
+-      `<all-user-messages>\n@ 2026-09-22\n* User @ 14:00 (5 chars):\nhello\n* User @ 14:10 (${push.length} chars): quoted in the corrections above\n` +
+-        `* User @ 14:20 (${lint.length} chars):\n${lint}\n</all-user-messages>`,
++      `<all-user-messages>\n@ 2026-09-22\n* User @ 14:00 (5 chars; replied at 14:01):\nhello\n* User @ 14:10 (${push.length} chars; replied at 14:11): quoted in the corrections above\n` +
++        `* User @ 14:20 (${lint.length} chars; replied at 14:21):\n${lint}\n</all-user-messages>`,
+     )
+ 
+     // Replaced twice, the constraint's words leave the corrections: the message is quoted whole again.
+@@ -3311,7 +3311,7 @@
+ 
+     expect(correctionsIn(second.messages?.[0]?.text)).not.toContain(push)
+     expect(second.messages?.[0]?.text).toContain(
+-      `* User @ 14:10 (${push.length} chars):\n${push}\n* User @ 14:20 (${lint.length} chars): quoted in the corrections above\n`,
++      `* User @ 14:10 (${push.length} chars; replied at 14:11):\n${push}\n* User @ 14:20 (${lint.length} chars; replied at 14:21): quoted in the corrections above\n`,
+     )
+   })
+ 
+@@ -3373,7 +3373,7 @@
+     const text = result.messages?.[0]?.text ?? ''
+     expect(recordIn(text)).toBe(`${WHERE}:\nCompleted: fixed the token refresh bug in src/auth/refresh.ts; npm test passes (212 tests)`)
+     expect(nextStepIn(text)).toBe('fix')
+-    expect(text).toContain("\nThe user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again (3 chars):\nfix\n</continuation>")
++    expect(text).toContain("\nThe user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again (3 chars; replied):\nfix\n</continuation>")
+     expect(text).not.toContain("Continue with the user's most recent request")
+     expect(text).not.toContain('Pick up the last task')
+     expect(text).toContain("do not redo what it lists as completed, even when that was the user's latest request")
+@@ -3433,6 +3433,48 @@
+     expect(recordIn(result.messages?.[0]?.text)).toBe(`${WHERE} (2026-09-22 14:11):\nActive: tidying the logs\n${gate}`)
+   })
+ 
++  test('each quoted user message says when the reply that ended its turn came', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history } = world(on)
++    pi(on, { reply: () => '<observations>\n* 🟡 Saw it\n</observations>' })
++    const runTurn = live(on, clock, history)
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 0))
++    await clock.settle()
++    await runTurn($, turn('b', 'b', CHUNK), at(22, 14, 30))
++    await clock.settle()
++    await runTurn($, turn('tail', 'r', 8_000), at(22, 15, 0))
++    await clock.settle()
++
++    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
++
++    expect(result.messages?.[0]?.text).toContain(
++      '\n@ 2026-09-22\n* User @ 14:00 (1 chars; replied at 14:01):\na\n* User @ 14:30 (1 chars; replied at 14:31):\nb\n</all-user-messages>',
++    )
++  })
++
++  test('a quoted user message whose turn was still running says no reply yet, and gets the first reply after a later compaction', async ($, on) => {
++    mock.clock(on)
++    world(on)
++    pi(on, { reply: () => '<observations>\n* 🟡 Saw it\n</observations>' })
++    // Turn c is still running at the compaction: its calls have no reply after them.
++    const running = (name: string, size: number) => turn(name, 'r', size).slice(1, 3)
++    const first = await $.session.compact({
++      trigger: 'auto',
++      messages: [...turn('a', 'a', CHUNK), { role: 'user', text: 'c', toolUses: [] }, ...running('c1', CHUNK), ...running('c2', 8_000)],
++    })
++
++    const text = first.messages?.[0]?.text ?? ''
++    expect(text).toContain('\n* User (1 chars; replied):\na\n* User (1 chars; no reply yet):\nc\n</all-user-messages>')
++    expect(text).toContain('not as an instruction to start it again (1 chars; no reply yet):\nc\n</continuation>')
++
++    // The next compaction reads the status back, and c has its reply: the turn ended before d.
++    const second = await $.session.compact({
++      trigger: 'manual',
++      messages: [...first.messages!, { role: 'assistant', text: 'c done', toolUses: [] }, ...turn('d', 'r', CHUNK), ...turn('tail', 'r', 8_000)],
++    })
++    expect(second.messages?.[0]?.text).toContain('\n* User (1 chars; replied):\na\n* User (1 chars; replied):\nc\n* User (1 chars; replied):\nd\n</all-user-messages>')
++  })
++
+   test('the record is carried across repeated compactions, replaced by a newer one, and read from an older memory message without it', async ($, on) => {
+     mock.clock(on)
+     world(on)

@@ -1,0 +1,98 @@
+--- scripts/bench-replay.ts	2026-09-25 09:47:46.837695295 +0000
++++ scripts/bench-replay.ts	2026-09-25 14:06:06.225442891 +0000
+@@ -36,7 +36,8 @@
+ //   a canned reply built from its prompt (free; checks the chain, not a measurement), --pi strict (the default)
+ //   fails on a call not cached, --pi live runs pi on a miss, at most --max-calls times (default 0), and caches it.
+ //   --cache DIR reads and writes that cache alone: a new one makes every pi call again, a second sample of the
+-//   Observer and Reflector rather than a replay of the first. Writes compaction-N.md (the memory message), kept-N.json (the rows
++//   Observer and Reflector rather than a replay of the first. --reflector-cache DIR sends the Reflector's calls to that
++//   cache alone (the Observer's still use --cache): a resample of the Reflector draws only. Writes compaction-N.md (the memory message), kept-N.json (the rows
+ //   kept raw), calls.json, log.txt and summary.json to <main checkout>/.scratch/om-replay/<name>/om-<pi>, and for each reflection
+ //   reflection-N.json (the ledger just before and just after it) and each Reflector reply, reflector-C-level-L.txt.
+ //   `$.session.messages()` answers the newest 4096 rows, as the engine's does.
+@@ -234,8 +235,10 @@
+   if (existsSync(out) && readdirSync(out).length) fail(`${out} exists: move it or pass another --out`)
+   mkdirSync(`${out}/stats`, { recursive: true })
+   // --cache: a cache of this run's own, so a rerun makes its pi calls again (a second sample of the Observer).
+-  const cache = str(o, 'cache') ?? CACHE
+-  mkdirSync(cache, { recursive: true })
++  const observerCache = str(o, 'cache') ?? CACHE
++  mkdirSync(observerCache, { recursive: true })
++  const reflectorCache = str(o, 'reflector-cache')
++  if (reflectorCache) mkdirSync(reflectorCache, { recursive: true })
+   const env: Record<string, string> = { HOME: process.env.HOME ?? '/root', OM_NO_PRUNE: '1', OM_STATS_DIR: `${out}/stats` }
+ 
+   // The engine: a hand-built `$`, a virtual clock, and pi calls that land after a fixed virtual latency.
+@@ -255,8 +258,9 @@
+ 
+   // The cache key: the whole argv (the system prompt with it) and stdin. calls.json records it per call.
+   const piKey = (argv: string[], stdin: string) => createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
+-  async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
++  async function runPi(argv: string[], stdin: string, init: { cwd?: string }, kind: 'observer' | 'reflector') {
+     if (piMode === 'stub') return { r: stub(stdin), hit: false }
++    const cache = kind === 'reflector' && reflectorCache ? reflectorCache : observerCache
+     const hash = piKey(argv, stdin)
+     const cached = () => {
+       for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
+@@ -377,7 +381,7 @@
+         const level = kind === 'reflector' ? LEVELS.findLastIndex((l) => stdin.includes(`\n${l}\n`)) + 1 : 0
+         const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
+         calls.push(call)
+-        const result = runPi(argv, stdin, init).then(
++        const result = runPi(argv, stdin, init, kind).then(
+           ({ r, hit, realMs }) => {
+             const m = piMessage(r.stdout)
+             Object.assign(call, { hit, realMs, ok: r.exitCode === 0 && !!m, in: m?.usage?.input ?? 0, out: m?.usage?.output ?? 0, cost: m?.usage?.cost?.total ?? 0 })
+--- scripts/bench-compact.ts	2026-09-25 11:58:38.731382590 +0000
++++ scripts/bench-compact.ts	2026-09-25 14:06:17.560327836 +0000
+@@ -30,6 +30,8 @@
+ //   --behavior (run, ab): also Luna (--thinking max, no tools) answers probes on each context (tests/eval/behavior.ts),
+ //     3 samples, majority vote, graded by code; reported apart from retention. Answers are cached in BCACHE by
+ //     sha256(context + probes + prompt + reader argv), so identical contexts in A and B cost nothing; misses are called.
++//     --b-reflector-sample K (ab): B's Reflector calls read and write their own cache CACHE-r<K> (its Observer calls stay
++//     in CACHE): with B = A's plugin, a resample of the Reflector draws alone, the noise floor of the chain and long tracks.
+ //     --behavior-sample K: read sample K's contexts instead of the first sample's (with --samples K or more).
+ //   bun scripts/bench-compact.ts run --contexts DIR          # grade ready-made contexts: DIR/<name>/compaction-N.md
+ //   bun scripts/bench-compact.ts controls [--plugin <ref|dir>] # write tests/fixtures/rubric-controls{,.<name>}.local.ts, the
+@@ -244,11 +246,12 @@
+   }
+ }
+ 
+-async function replay(name: string, dir: string, record: boolean, sample: number): Promise<Replay> {
++async function replay(name: string, dir: string, record: boolean, sample: number, reflectorSample?: number): Promise<Replay> {
+   const cache = sample === 1 ? CACHE : `${CACHE}-s${sample}`
++  const refl = reflectorSample ? ['--reflector-cache', `${CACHE}-r${reflectorSample}`] : []
+   const out = `${OUT}/runs/${createHash('sha256').update(`${dir}\0${sample}\0${Date.now()}`).digest('hex').slice(0, 10)}-${name}`
+   const long = name === LONG.name ? ['--gap-hours', String(LONG_GAP_HOURS), '--fallback', 'recorded'] : []
+-  const args = ['scripts/bench-replay.ts', 'om', '--transcript', members(name).join('+'), ...long, '--src', dir, '--cache', cache, '--out', out, '--dir', corpusDir(), '--pi', record ? 'live' : 'strict', ...(record ? ['--max-calls', '2000'] : [])]
++  const args = ['scripts/bench-replay.ts', 'om', '--transcript', members(name).join('+'), ...long, '--src', dir, '--cache', cache, ...refl, '--out', out, '--dir', corpusDir(), '--pi', record ? 'live' : 'strict', ...(record ? ['--max-calls', '2000'] : [])]
+   const p = Bun.spawn(['bun', ...args], { cwd: HERE, stdout: 'ignore', stderr: 'pipe' })
+   const [stderr, status] = await Promise.all([new Response(p.stderr).text(), p.exited])
+   if (status !== 0) fail(`${name}: the replay failed:\n${stderr.slice(-2000)}`)
+@@ -363,7 +366,7 @@
+ }
+ 
+ /** `first`: the first sample's number (default 1). `lenient`: a cache miss throws instead of ending the run. */
+-async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean }): Promise<Run> {
++async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; reflectorSample?: number }): Promise<Run> {
+   if (o.record && o.dir) {
+     const model = /'--model', '([^']+)'/.exec(readFileSync(`${o.dir}/hooks/register.ts`, 'utf8'))?.[1] ?? ''
+     if (!model.startsWith('openai-codex/')) fail(`--record: ${o.dir}'s pi model is "${model}"; only openai-codex models may be called`)
+@@ -397,7 +400,7 @@
+   }
+   // Every replay starts at once, through slot(); grading waits for each in turn. The long chain and the chain first: they run longest.
+   const start = (entries: { name: string }[], k: number) =>
+-    entries.map(({ name }) => (o.contexts ? Promise.resolve(readyMade(name, o.contexts)) : slot(() => replay(name, o.dir!, o.record, k))))
++    entries.map(({ name }) => (o.contexts ? Promise.resolve(readyMade(name, o.contexts)) : slot(() => replay(name, o.dir!, o.record, k, o.reflectorSample))))
+   const ks = Array.from({ length: o.samples }, (_, i) => (o.first ?? 1) + i)
+   const started = ks.map((k) => {
+     const long = run.long ? start([LONG], k) : []
+@@ -760,7 +763,7 @@
+   // A and every B at once: their replays share the JOBS slots.
+   const [a, ...bs] = await Promise.all([
+     evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior }),
+-    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior })),
++    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, reflectorSample: num(o, 'b-reflector-sample') })),
+   ])
+   // A Reflector change that nothing reflects on ties exactly and says nothing: refuse to call it a tie.
+   for (const [sb, b] of sbs.map((x, i) => [x, bs[i]!] as const))

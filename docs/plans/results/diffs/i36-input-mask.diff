@@ -1,0 +1,67 @@
+--- base3/hooks/register.ts	2026-09-25 08:46:08.845052407 +0000
++++ imaskna500/hooks/register.ts	2026-09-25 08:55:14.728673943 +0000
+@@ -61,6 +61,10 @@
+ // TAIL_RESULT_MAX_TOKENS keeps its head and tail around an om_recall marker (maskTail).
+ const TAIL_WHOLE_RESULTS = 3
+ const TAIL_RESULT_MAX_TOKENS = 250
++// Past the newest TAIL_WHOLE_INPUTS tool calls, each string argument of a call that did not fail over
++// TAIL_INPUT_MAX_TOKENS keeps its head and tail the same way (a heredoc, a subagent's prompt, an edit's text).
++const TAIL_WHOLE_INPUTS = 3
++const TAIL_INPUT_MAX_TOKENS = 500
+ const OBSERVER_TIMEOUT_MS = 120_000 // a ~10k-token chunk takes Luna about 15 s
+ const REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens of output, in the background
+ const MAX_MARKS = 4_000
+@@ -195,7 +199,7 @@
+ const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
+ // The marker excerpt leaves in a brief it cut (see capUserMessages).
+ const BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/
+-function excerpt(text: string, maxTokens: number, what: 'result' | 'message' = 'result') {
++function excerpt(text: string, maxTokens: number, what: 'result' | 'message' | 'input' = 'result') {
+   if (text.length <= maxTokens * 4) return text
+   const room = maxTokens * 4
+   const headChars = Math.floor(room / 2)
+@@ -209,9 +213,28 @@
+ // result over TAIL_RESULT_MAX_TOKENS cut to its head and tail. om_recall finds the whole result in the transcript.
+ function maskTail(rows: readonly SessionMessage[]) {
+   let seen = 0
++  let calls = 0
++  const cutValue = (v: unknown): unknown => {
++    if (typeof v === 'string') {
++      const text = excerpt(v, TAIL_INPUT_MAX_TOKENS, 'input')
++      return text.length < v.length ? text : v
++    }
++    if (Array.isArray(v)) return v.map(cutValue)
++    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cutValue(x)]))
++    return v
++  }
++  const cutInputs = (m: SessionMessage): SessionMessage => {
++    const toolUses = m.toolUses.toReversed().map((u) => {
++      if (++calls <= TAIL_WHOLE_INPUTS || u.isError || u.tool === 'Agent' || JSON.stringify(u.input).length <= TAIL_INPUT_MAX_TOKENS * 4) return u
++      const input = cutValue(u.input) as Record<string, unknown>
++      return JSON.stringify(input).length < JSON.stringify(u.input).length ? { ...u, input } : u
++    })
++    return toolUses.every((u, i) => u === m.toolUses.at(-1 - i)) ? m : { ...m, toolUses: toolUses.toReversed() }
++  }
+   return rows
+     .toReversed()
+     .map((m) => {
++      if (m.toolUses.length) m = cutInputs(m)
+       if (!m.toolResults?.length) return m
+       // A cut that would not shorten the result (the marker outweighs what it omits) leaves it whole.
+       const cut = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
+@@ -234,8 +257,14 @@
+     const w = at < 0 ? undefined : whole.get(r.tool_use_id)
+     return w && w.length > r.text.length && w.startsWith(r.text.slice(0, at)) ? w : undefined
+   }
+-  return rows.map((m) => (m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m))
++  const inputs = new Map<string, Record<string, unknown>>()
++  for (const m of history) for (const u of m.toolUses) if (!INPUT_MASKED.test(JSON.stringify(u.input))) inputs.set(u.tool_use_id, u.input)
++  const input = (u: SessionMessage['toolUses'][number]) => (INPUT_MASKED.test(JSON.stringify(u.input)) ? inputs.get(u.tool_use_id) : undefined)
++  return rows
++    .map((m) => (m.toolUses.some(input) ? { ...m, toolUses: m.toolUses.map((u) => ({ ...u, input: input(u) ?? u.input })) } : m))
++    .map((m) => (m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m))
+ }
++const INPUT_MASKED = /\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full input\] \.\.\./
+ const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+ // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
+ const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })

@@ -38,6 +38,11 @@ import {
 } from './eval/replay'
 import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } from './eval/replay'
 import type { Configuration } from './eval/runner'
+import { factHolds, grade, negativeControl, norm, score } from './eval/rubric'
+import { gradeAnswer } from './eval/behavior'
+
+// The test runner prints what a test file logs; the hooks module's own globals have no console.
+declare const console: { warn: (message: string) => void }
 
 // Synthetic transcripts in Claude Code's JSONL shape. A compaction is a `compact_boundary` row, then its summary and
 // the rows it kept raw, both stamped before the boundary (as Claude Code writes them), then the session goes on.
@@ -793,5 +798,103 @@ describe('reflections', () => {
     expect(quiet).not.toContain('9f8e7d6')
     expect(quiet).not.toContain('worktrees')
     expect(renderReflections({ name: 'demo', t: t(), reflections: [], target: 20_000 })).toContain('No reflection ran.')
+  })
+})
+
+describe('the compaction rubric', () => {
+  test('grades the correction, the reversal and a stale fact at a cut, and weights one total', () => {
+    const t = parseTranscript(threeBoundaries().text())
+    const spec: ReplaySpec = {
+      constraints: [{ id: 'budget', quote: 'Spend at most $30 on this.', setIn: 0, held: ['\\$30'], reversal: { quote: 'Actually spend up to $50 now.', in: 1, held: ['\\$50'] } }],
+      questions: [],
+    }
+    const rubric = { absent: [{ id: 'old-budget', from: 2, pattern: 'at most \\$30' }] }
+    const good = grade(t, 2, { summary: 'The user: "Actually spend up to $50 now." Work is in hooks/register.ts at 1a2b3c4d; tests/kept-file.ts.', kept: [] }, spec, rubric)
+    const stale = grade(t, 2, { summary: 'Spend at most $30 on this.', kept: [] }, spec, rubric)
+    const of = (items: typeof good, gate: string) => items.filter((i) => i.gate === gate).map((i) => i.score)
+    expect([of(good, 'corrections'), of(good, 'reversals'), of(good, 'absent')]).toEqual([[1], [1], [1, 1]])
+    expect([of(stale, 'corrections'), of(stale, 'reversals'), of(stale, 'absent')]).toEqual([[0], [0], [1, 0]])
+    expect(score(good).total).toBeGreaterThan(score(stale).total)
+  })
+
+  test('counts a token only in prose, takes paraphrases, and scales the total by the budget fit', () => {
+    const t = parseTranscript(threeBoundaries().text())
+    const rubric = { facts: [{ id: 'where', from: 2, expect: ['hooks/register.ts'] }, { id: 'turns', from: 2, expect: [['last 3', 'final 3']] }] }
+    const at = (summary: string) => grade(t, 2, { summary, kept: [] }, undefined, rubric)
+    const facts = (items: ReturnType<typeof at>) => items.filter((i) => i.id === 'where' || i.id === 'turns').map((i) => i.score)
+    expect(facts(at('## Identifiers\nhooks/register.ts 1a2b3c4d tests/kept-file.ts last 3'))).toEqual([0, 0])
+    const prose = 'The work is in hooks/register.ts and it keeps the last three turns raw.'
+    expect(facts(at(prose))).toEqual([1, 1])
+    const bloated = at(`${prose}\n${'word '.repeat(60_000)}`)
+    expect(bloated.find((i) => i.gate === 'budget')!.score).toBeLessThan(1)
+    expect(score(bloated).total).toBeLessThan(score(at(prose)).total)
+  })
+
+  test('counts an identifier only on a line that says what the transcript said about it, never in a bare list', () => {
+    const t = parseTranscript(threeBoundaries().text())
+    const path = (summary: string) => grade(t, 2, { summary, kept: [] }).find((i) => i.gate === 'identifiers' && i.id.endsWith('hooks/register.ts'))!.score
+    expect(path('Files: hooks/register.ts 1a2b3c4d tests/kept-file.ts')).toBe(0)
+    expect(path('Something about hooks/register.ts elsewhere.')).toBe(0)
+    expect(path('We were working in hooks/register.ts at that commit.')).toBe(1)
+  })
+
+  test('checks an order item in its order', () => {
+    const f = { id: 'order:a-b', expect: ['14:31', '15:08'] }
+    const at = (s: string) => factHolds(f, s.toLowerCase(), norm(s))
+    expect([at('Compacted at 14:31, then loaded 0.4.5 at 15:08.'), at('Loaded at 15:08 after the 14:31 one? No: 15:08 came, then 14:31.')]).toEqual([true, false])
+  })
+
+  test('checks a purpose item on one line of the context, never across lines', () => {
+    const f = { id: 'purpose:x', expect: ['orchestrator', ['subagent', 'subagents']] }
+    const at = (s: string) => factHolds(f, s.toLowerCase(), norm(s), s)
+    expect([at('Session: the assistant is the orchestrator, building each change in subagents.'), at('The orchestrator read a file.\nA subagent ran the tests.')]).toEqual([true, false])
+  })
+
+  // The negative control over the real rubrics: no hand-authored item may pass a context that cannot answer it (another
+  // transcript's, or its own before the item's `from`). `bun scripts/bench-compact.ts controls` writes the module.
+  test('no hand-authored item passes a foreign context or one before its from', async () => {
+    const fx = (await import('./fixtures/rubric-controls.local').catch(() => undefined)) as
+      | { items: Parameters<typeof negativeControl>[0]; names: string[] }
+      | undefined
+    if (!fx) return console.warn('SKIP the compaction rubric > negative control: no tests/fixtures/rubric-controls.local.ts; bun scripts/bench-compact.ts controls writes it')
+    if (!fx.names) throw new Error('tests/fixtures/rubric-controls.local.ts is in the old one-module form: rerun bun scripts/bench-compact.ts controls')
+    // Each transcript's lines and cuts are a module of their own (tests/fixtures/rubric-controls.<name>.local.ts).
+    const parts = await Promise.all(fx.names.map(async (name) => [name, (await import(`./fixtures/rubric-controls.${name}.local`)) as { lines: string[]; cuts: { n: number; at: number[] }[] }] as const))
+    const contexts = Object.fromEntries(parts.map(([name, p]) => [name, p.cuts.map((c) => ({ n: c.n, prose: c.at.map((i) => p.lines[i]).join('\n') }))]))
+    expect(negativeControl(fx.items, contexts)).toEqual([])
+  })
+
+  test("grades a reader's answers by code: a quote from the context, the permission word, unknown with a recall that finds it", () => {
+    const ctx = 'The user: "Actually spend up to $50 now." Never push to origin.'
+    const rule = { gate: 'rule' as const, id: 'budget', ask: 'What is the budget?', answer: '\\$50' }
+    expect(gradeAnswer(rule, { answer: '$50', evidence: 'spend up to $50 now.' }, ctx).pass).toBe(true)
+    expect(gradeAnswer(rule, { answer: '$50', evidence: 'the budget is $50' }, ctx).pass).toBe(false)
+    const push = { gate: 'permission' as const, id: 'push', ask: 'May you push?', answer: 'no' }
+    expect(gradeAnswer(push, { answer: 'No.', evidence: 'Never push to origin.' }, ctx).pass).toBe(true)
+    expect(gradeAnswer(push, { answer: 'ask', evidence: 'Never push to origin.' }, ctx).pass).toBe(false)
+    const dropped = { gate: 'dropped' as const, id: 'sum', ask: 'The checksum?', expect: ['ck-1'], query: ['ck-1'] }
+    expect(gradeAnswer(dropped, { answer: 'unknown', recall_query: 'checksum' }, ctx, 'the checksum was ck-1').pass).toBe(true)
+    expect(gradeAnswer(dropped, { answer: 'unknown', recall_query: 'sum' }, ctx, 'nothing').pass).toBe(false)
+  })
+
+  test('takes an answer that joins facts when it quotes up to three places, each verbatim in the context', () => {
+    const ctx = 'The runs bill against the Max subscription. The pane showed 40% of the weekly limit used. Merged as 1dee8ac.'
+    const hop = { gate: 'multi-hop' as const, id: 'usage', ask: 'What do the runs bill against, and what limit?', answer: 'subscription' }
+    const two = '"bill against the Max subscription"; "40% of the weekly limit"'
+    expect(gradeAnswer(hop, { answer: 'The subscription, weekly', evidence: two }, ctx).pass).toBe(true)
+    expect(gradeAnswer(hop, { answer: 'The subscription, weekly', evidence: two }, ctx, undefined, 1).pass).toBe(false)
+    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: ['bill against the Max subscription', 'Merged as 1dee8ac'] }, ctx).pass).toBe(true)
+    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: 'the Max subscription … 40% of the weekly limit' }, ctx).pass).toBe(true)
+    // One part not in the context, one too short, or more than three parts: no evidence.
+    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: '"bill against the Max subscription"; "a monthly card limit"' }, ctx).pass).toBe(false)
+    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: '"bill against the Max subscription"; "40%"' }, ctx).pass).toBe(false)
+    const four = '"The runs bill"; "the Max subscription"; "The pane showed"; "Merged as 1dee8ac"'
+    expect(gradeAnswer(hop, { answer: 'The subscription', evidence: four }, ctx).pass).toBe(false)
+    expect(gradeAnswer(hop, { answer: 'The subscription, weekly', evidence: 'bill against the Max subscription; 40% of the weekly limit' }, ctx).pass).toBe(true)
+    // A value is one quote: pieces stitched into a path that is nowhere in the context are no evidence.
+    const tree = 'The repo is ~/work/mods/app. Another repo has tests/register.test.ts.'
+    const stitched = { answer: '~/work/mods/app/tests/register.test.ts', evidence: '~/work/mods/app; tests/register.test.ts' }
+    expect(gradeAnswer({ gate: 'value', id: 'path', ask: 'Which test file?', answer: 'register\\.test' }, stitched, tree).pass).toBe(false)
+    expect(gradeAnswer({ ...hop, answer: 'register\\.test' }, stitched, tree).pass).toBe(true)
   })
 })

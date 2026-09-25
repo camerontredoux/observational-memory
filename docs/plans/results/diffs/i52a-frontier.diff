@@ -1,0 +1,85 @@
+diff -ru -x '*.orig' omv-code/base7/hooks/register.ts omv-build/i52a/hooks/register.ts
+--- omv-code/base7/hooks/register.ts	2026-09-25 13:11:16.403918912 +0000
++++ omv-build/i52a/hooks/register.ts	2026-09-25 13:23:04.827280586 +0000
+@@ -40,6 +40,7 @@
+ const RETRY_MAX_MS = 300_000
+ const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
+ const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
++const PARTIAL_MIN_TOKENS = 1_500 // at a turn's end, history short of a whole chunk this big before the raw tail is observed as it is
+ const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
+ // The observations alone, as the memory renders them. The memory message also holds the corrections, skills, user
+ // messages and continuation record, which a reflection does not condense, so it passes this size sooner.
+@@ -1389,10 +1390,13 @@
+ }
+ 
+ // Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight across every loop: gaps a failed
+-// call left first, then whole chunks at the frontier, which stops KEEP_RAW_TOKENS short of the end. A loop left short
+-// of a slot waits for the next one to free. A pass for a loop that ended, before it or while it read, does nothing,
+-// and so does one while the loop backs off after a failed call.
+-function schedule($: EngineInterface, loop: Loop, stamp: string) {
++// call left first, then whole chunks at the frontier, which stops KEEP_RAW_TOKENS short of the end. At a turn's end
++// (`ended`), with none of the loop's calls in flight, what is left at the frontier short of a whole chunk is observed
++// as it is once it reaches PARTIAL_MIN_TOKENS, so a compaction cutting at the watermark keeps about KEEP_RAW_TOKENS
++// raw rather than that plus most of a chunk; the next chunk starts after it. A loop left short of a slot waits for
++// the next one to free. A pass for a loop that ended, before it or while it read, does nothing, and so does one
++// while the loop backs off after a failed call.
++function schedule($: EngineInterface, loop: Loop, stamp: string, ended = false) {
+   return locked(async () => {
+     if (!isLive(loop, stamp)) return
+     const held = backoff.get(loop.key)
+@@ -1418,7 +1422,8 @@
+         from = Math.max(from, r.to)
+       }
+       if (from >= next) break
+-      const to = chunkEnd(v, from, next, next === limit)
++      const partial = ended && next === limit && !mine.length && covered.length === 1 + ledger.chunks.length && tokensBetween(v, from, next) >= PARTIAL_MIN_TOKENS
++      const to = chunkEnd(v, from, next, next === limit) ?? (partial ? next : undefined)
+       if (to === undefined) break
+       const job: Job = { loop, range: range(v, from, to), stamp, before: beforeRows(ledger, from) }
+       running.push(job)
+@@ -2128,7 +2133,7 @@
+       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
+       const { loop, stamp } = await current($, e.agentId)
+       if (e.agentId !== undefined && !teammate) await dropLoop($, loop.key)
+-      else await markTime($, false, loop, stamp).then(() => schedule($, loop, stamp))
++      else await markTime($, false, loop, stamp).then(() => schedule($, loop, stamp, true))
+     } catch (error) {
+       log($, errorText(error))
+     }
+diff -ru -x '*.orig' omv-code/base7/tests/register.test.ts omv-build/i52a/tests/register.test.ts
+--- omv-code/base7/tests/register.test.ts	2026-09-25 13:11:16.404346558 +0000
++++ omv-build/i52a/tests/register.test.ts	2026-09-25 13:24:11.563142337 +0000
+@@ -804,6 +804,33 @@
+     expect(result.messages?.slice(1)).toEqual(history.slice(7))
+   })
+ 
++  test("at a turn's end, history short of a whole chunk before the raw tail is observed as it is, and compaction then calls nothing", async ($, on) => {
++    const clock = mock.clock(on)
++    const { history } = world(on)
++    const seen = pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:00 noted\n</observations>' })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, turn('a', 'a', 12_000), at(22, 14, 0))
++    await clock.settle()
++    expect(seen.prompts).toHaveLength(0) // all of it within the raw tail's ~6k tokens
++    await runTurn($, turn('b', 'b', 24_000), at(22, 14, 10))
++    await clock.settle()
++    // ~9k tokens, under a whole chunk: rows 0-7 before the raw tail (b's reply) go at the turn's end.
++    expect(seen.prompts).toHaveLength(1)
++    expect(seen.logs).toContain('observed rows 0-7 in the background, 1 observations; watermark 7, 0 chunk(s) waiting on a gap')
++    // The next chunk starts after it, and waits to be whole.
++    await runTurn($, turn('c', 'c', CHUNK), at(22, 14, 20))
++    await clock.settle()
++    expect(seen.prompts).toHaveLength(2)
++    expect(seen.prompts[1]).toContain('[Assistant @ 2026-09-22 14:11]: b done\n\n[User @ 2026-09-22 14:20]: c')
++    expect(seen.prompts[1]).not.toContain(']: a done')
++    expect(seen.logs).toContain('observed rows 7-11 in the background, 1 observations; watermark 11, 0 chunk(s) waiting on a gap')
++
++    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
++    expect(seen.prompts).toHaveLength(2) // no call on the compaction's path
++    expect(result.messages?.slice(1)).toEqual(history.slice(11))
++  })
++
+   test('keeps at most four Observer calls in flight and schedules the rest as they land', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, stored } = world(on)

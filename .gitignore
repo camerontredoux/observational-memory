@@ -1,3 +1,4 @@
 tests/fixtures/*.local.ts
 .worktrees/
 tests/fixtures/replay/
+.scratch/

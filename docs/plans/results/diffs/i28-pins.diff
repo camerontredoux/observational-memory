@@ -1,0 +1,143 @@
+diff --git a/hooks/register.ts b/hooks/register.ts
+index 8258cd7..429c540 100644
+--- a/hooks/register.ts
++++ b/hooks/register.ts
+@@ -45,6 +45,7 @@ const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so th
+ // The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
+ // whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
+ const REFLECT_KEEP_TOKENS = 12_000
++const REFLECT_MIN_TARGET_TOKENS = 2_000 // the least the 🔴 lines and the kept observations leave the Reflector (boundPins)
+ const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
+ const REFLECT_ATTEMPTS = 4
+ const SKILLS_MAX_TOKENS = 15_000
+@@ -68,7 +69,7 @@ const HANDOFF_FIELD_MAX_TOKENS = 500 // each of the continuation record's Next s
+ const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
+ const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the rest counted
+ const ENV_LINE_MAX_CHARS = 200 // each line of the environment
+-const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force, shown whole or not at all
++const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force shown whole; past it the oldest shorten (boundPins)
+ const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
+ const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say, or for a subagent's model: the smallest in use
+ const OVERHEAD_TOKENS = 20_000 // the system prompt and built-in tool schemas every request carries beside the messages
+@@ -513,6 +514,46 @@ const keyOf = (line: string) =>
+     .trim()
+ const idOf = (key: string) => `k${hash(key)}`
+ const constraintId = (line: string) => idOf(keyOf(line))
++
++// A pinned line (a constraint, or a 🔴 observation) past its tier's cap, as an index line: its time, first words and
++// the om_recall query that finds its whole text. The ledger keeps the whole line; only the rendering shortens.
++const SHORTENED = /\(older (?:constraint|🔴 line), shortened: om_recall "/
++const PIN_WORDS = 10
++function shortenPin(line: string, what: 'constraint' | '🔴 line') {
++  if (SHORTENED.test(line)) return line
++  const m = /^(🔴\s*(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}\s+)?)(.*)$/s.exec(baseOf(line))!
++  const [, head, body] = m as unknown as [string, string, string]
++  const quote = /^(User:\s*)"((?:[^"\\]|\\.)*)"?/.exec(body)
++  const words = (quote ? quote[2]! : body).split(/(?:\s|\\n)+/).filter(Boolean)
++  const lead = words.slice(0, PIN_WORDS).join(' ').replace(/\\?"/g, "'")
++  const more = words.length > PIN_WORDS ? '…' : ''
++  const shown = quote ? `${quote[1]}"${lead}${more}"` : `${lead}${more}`
++  return `${head}${shown} (older ${what}, shortened: om_recall "${lead.split(' ').slice(0, 6).join(' ')}")`
++}
++// Whole terms a pinned line shares with the work in view: paths, identifiers and long words.
++const pinTerms = (line: string) => new Set((baseOf(line).toLowerCase().match(/[a-z_][\w./-]{5,}/g) ?? []).filter((t) => !/^(?:should|always|before|instead|because|without|please|there|their|which|about|would|could)$/.test(t)))
++// A row's text and its tool calls' inputs, where the work in view names things.
++const rowTerms = (m: SessionMessage) => [m.text, ...m.toolUses.map((u) => JSON.stringify(u.input ?? ''))].join('\n')
++const referenced = (line: string, inView: string) => [...pinTerms(line)].filter((t) => inView.includes(t)).length >= 2
++/**
++ * The pinned lines rendered within `maxTokens` (as `measure` counts them): whole while they fit; past that, every line
++ * starts as an index line (shortenPin), and lines go back to whole while they fit, those the work in view still names
++ * first, then the newest. Over the cap even as index lines, every line stays, shortened: nothing is dropped.
++ */
++function boundPins(lines: readonly string[], maxTokens: number, inView: string, what: 'constraint' | '🔴 line', measure: (l: readonly string[]) => number) {
++  if (measure(lines) <= maxTokens) return [...lines]
++  // A line no longer than its index line stays whole.
++  const shorter = (l: string, s = shortenPin(l, what)) => (s.length < l.length ? s : l)
++  const out = lines.map((l) => shorter(l))
++  const view = inView.toLowerCase()
++  const order = lines.map((_, i) => i).reverse()
++  const byUse = [...order.filter((i) => referenced(lines[i]!, view)), ...order.filter((i) => !referenced(lines[i]!, view))]
++  for (const i of byUse) {
++    const whole = out.with(i, lines[i]!)
++    if (measure(whole) <= maxTokens) out[i] = lines[i]!
++  }
++  return out
++}
+ function applyConstraints(active: readonly string[], lines: readonly string[]) {
+   const out = new Map<string, string>() // by key, in the order last said
+   const put = (raw: string) => {
+@@ -855,8 +896,6 @@ function withOmitted(brief: UserMessage, dropped: readonly UserMessage[]): UserM
+ // A memory message that would not fit the compacted context's budget: the built-in compaction runs instead. The
+ // fallback reads it by its message, as the engine hands a hook's error on rewrapped.
+ const OVER_BUDGET = 'the compacted context is over its budget'
+-// The user's constraints in force over CONSTRAINTS_MAX_TOKENS: shown whole or not at all, so the built-in compaction runs.
+-const OVER_CAP = "the user's constraints are over their cap"
+ // A context that is the memory message alone: nothing for the floor to compile either.
+ const MEMORY_ALONE = 'nothing to compact after the memory message'
+ const overLimit = (what: string, tokens: number, limit: number) => `${what}: ~${tokens} tokens, ~${limit} allowed`
+@@ -1205,9 +1244,19 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
+       const older = snapshot.slice(0, recent)
+       const kept = snapshot.slice(recent)
+       const isRed = (e: Entry) => e.line.startsWith('🔴')
+-      const red = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
+-      const sent = older.filter((e) => !isRed(e))
+-      const target = REFLECT_TARGET_TOKENS - estimateTokens(renderLines([...red, ...kept]))
++      const pinned = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
++      // The 🔴 lines' share is bounded so the Reflector keeps at least REFLECT_MIN_TARGET_TOKENS: past it the oldest
++      // shorten to index lines (boundPins), and still over, the oldest go to the Reflector with the rest.
++      const share = REFLECT_TARGET_TOKENS - REFLECT_MIN_TARGET_TOKENS
++      const measure = (es: readonly Entry[]) => estimateTokens(renderLines([...es, ...kept]))
++      const pins = boundPins(pinned.map((e) => e.line), share, renderLines(kept), '🔴 line', (ls) => measure(pinned.map((e, i) => ({ ...e, line: ls[i]! }))))
++      let red = pinned.map((e, i) => (pins[i] === e.line ? e : { ...e, line: pins[i]! }))
++      const moved = new Set<string>()
++      while (red.length && measure(red) > share) moved.add(red.shift()!.id)
++      if (red.length < pinned.length || pins.some((l, i) => l !== pinned[i]!.line))
++        log($, `the 🔴 lines were over their share of the reflection target: ${pins.filter((l, i) => l !== pinned[i]!.line).length} shortened, ${moved.size} condensed`)
++      const sent = older.filter((e) => !isRed(e) || moved.has(e.id))
++      const target = REFLECT_TARGET_TOKENS - measure(red)
+       const floor = Math.ceil(REFLECT_FLOOR * target)
+       if (target < 1_000) throw new Error(`the 🔴 lines and the newest observations leave ~${target} tokens of the ~${REFLECT_TARGET_TOKENS}-token target`)
+       const input = renderLines(sent)
+@@ -1501,11 +1550,9 @@ export const register: Register = (on) => {
+     // The memory message from the ledger once this compaction's chunks commit: cut at the watermark, as observed.
+     // Where that cannot stand (nothing observed, the Observer failed, or over the budget), the floor: the same memory
+     // with the raw tail cut later, the rows between the watermark and the cut compiled by code into the session brief.
+-    // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for constraints
+-    // over their cap, and for a context that is the memory message alone.
++    // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for a context that
++    // is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
+     const build = async (ledger: Ledger) => {
+-      const constraintTokens = estimateTokens(renderCorrections(ledger.corrections))
+-      if (constraintTokens > CONSTRAINTS_MAX_TOKENS) throw new Error(overLimit(OVER_CAP, constraintTokens, CONSTRAINTS_MAX_TOKENS))
+       const observed = ledger.watermark.to
+       const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
+       const attempt = async (cut: number, floor: boolean) => {
+@@ -1518,7 +1565,9 @@ export const register: Register = (on) => {
+         dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
+         const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
+         let memory: Memory = {
+-          corrections: ledger.corrections,
++          corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
++            estimateTokens(renderCorrections(l)),
++          ),
+           observations: renderGrouped(ledger.entries),
+           currentTask: ledger.currentTask,
+           ...(covered ? { stateAt: stamp(covered.to) } : {}),
+@@ -1543,7 +1592,7 @@ export const register: Register = (on) => {
+         let message = memoryMessage(memory)
+         // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
+         // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
+-        // find; the corrections, observations and continuation record stay whole.
++        // find; the corrections (within their cap), observations and continuation record stay whole.
+         const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', briefer]]
+         if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ({ ...m, observations: renderLines(ledger.entries, false) })])
+         const over = contextTokens(message)
+@@ -1635,7 +1684,7 @@ export const register: Register = (on) => {
+     if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
+     log($, `${next.error.message}; using the built-in compaction`)
+     const message = next.error.message ?? ''
+-    const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message.startsWith(OVER_CAP) ? 'Constraints over their cap' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
++    const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
+     show($, `${why}. Using built-in compaction`, e.agentId)
+     return delegateToBuiltin($, e, next, true)
+   })

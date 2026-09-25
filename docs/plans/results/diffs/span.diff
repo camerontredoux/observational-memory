@@ -1,0 +1,12 @@
+diff -ru /tmp/omv-code/fail11/hooks/register.ts span/hooks/register.ts
+--- /tmp/omv-code/fail11/hooks/register.ts	2026-09-25 07:20:25.875928945 +0000
++++ span/hooks/register.ts	2026-09-25 07:43:32.302007498 +0000
+@@ -33,7 +33,7 @@
+ const PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low']
+ const PI_ISOLATION = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
+ const PI_CWD = '/tmp'
+-const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
++const CHUNK_TOKENS = 7_000 // each Observer call reads about this much history
+ const MAX_PARALLEL = 4 // background Observer calls in flight at once, across the main loop and every subagent's
+ const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
+ const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes

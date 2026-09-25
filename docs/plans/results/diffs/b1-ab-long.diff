@@ -1,0 +1,59 @@
+--- a/scripts/bench-compact.ts
++++ b/scripts/bench-compact.ts
+@@ -662,7 +662,7 @@
+   const better = verdict.startsWith('A is') ? 'A' : verdict.startsWith('B is') ? 'B' : undefined
+   const perT = dT.map(([, x]) => signed(x)).join(' / ')
+   return {
+-    d, up: f.up.length, down: f.down.length, exact, better, text: out.join('\n'), effFlag,
++    d, up: f.up.length, down: f.down.length, uu: f.uu, ud: f.ud, p: f.p, units: f.units, exact, better, text: out.join('\n'), effFlag,
+     row: `| ${b.label} | ${f1(total(b))} | ${signed(d)} | ${perT} | ${f.uu} | ${f.ud} | ${f.p.toPrecision(2)} | ${exact ? 'exact' : nz ? `A' ${signed(nz.d)}` : 'noise unknown'} | ${better ?? (verdict.startsWith('tradeoff') ? 'tradeoff' : '–')} | ${e.verdict}${effFlag ? ' **(!)**' : ''} | ${top || '–'} |`,
+   }
+ }
+@@ -769,10 +769,19 @@
+     a.noise = await evaluate(`A' ${sa.label}`, { dir: sa.dir, record: false, samples: 1, first: 2, lenient: true, holdout })
+       .catch(() => evaluate(`A' ${sa.label}`, { dir: sa.dir, record: false, samples: 1, first: 2, lenient: true, holdout: false }))
+       .catch(() => undefined)
+-  const rs = bs.map((b) => {
++  // The long chain per B: its own A/B (flips by unique item, like the other tracks) and the recall-aware credit of each side.
++  const longs = bs.map((b) => {
++    if (!a.long || !b.long) return undefined
++    const l = ab(longOf(a), longOf(b), { informational: !sameKeys(a.long, b.long) && samples === 1 })
++    const [ca, cb] = [longStats(a).credit, longStats(b).credit]
++    const cell = `${signed(l.d)} (${l.uu}↑ ${l.ud}↓)${l.better ? ` ${l.better}` : ''}; recall-aware ${f1(cb)} (${signed(cb - ca)})`
++    const json = { b: b.label, total: { a: total(longOf(a)), b: total(longOf(b)) }, recallAware: { a: ca, b: cb }, d: l.d, up: l.up, down: l.down, uniqueUp: l.uu, uniqueDown: l.ud, p: l.p, better: l.better ?? null, units: l.units }
++    return { l, ca, cb, cell, json }
++  })
++  const rs = bs.map((b, i) => {
+     const main0 = ab(a, b)
+-    const l = a.long && b.long ? ab(longOf(a), longOf(b), { informational: !sameKeys(a.long, b.long) && samples === 1 }) : undefined
+-    if (l) main0.text += `\n${l.text.replace('# Compaction A/B', '## Long chain (not in the total)')}\nRecall-aware credit: A ${f1(longStats(a).credit)}, B ${f1(longStats(b).credit)}\n`
++    const lg = longs[i]
++    if (lg) main0.text += `\n${lg.l.text.replace('# Compaction A/B', '## Long chain (not in the total)')}\nRecall-aware credit (not in any total): A ${f1(lg.ca)}, B ${f1(lg.cb)} (${signed(lg.cb - lg.ca)})\n`
+     // The reflection chain: its own verdict, informational when its Observer draws differ (no resample of it is recorded).
+     const c = a.chain && b.chain ? ab(chainOf(a), chainOf(b), { informational: !sameKeys(a.chain, b.chain) && samples === 1 }) : undefined
+     const main = c
+@@ -789,11 +798,11 @@
+   })
+   const names = CORPUS.map((c) => c.name).join(' / ')
+   const summary = [
+-    `# Against ${a.label}: ${f1(total(a))}${a.holdout ? `; holdout ${f1(total(holdoutOf(a)))}` : ''}${a.chain ? `; reflection chain ${f1(total(chainOf(a)))}` : ''}`,
++    `# Against ${a.label}: ${f1(total(a))}${a.holdout ? `; holdout ${f1(total(holdoutOf(a)))}` : ''}${a.chain ? `; reflection chain ${f1(total(chainOf(a)))}` : ''}${a.long ? `; long chain ${f1(total(longOf(a)))}, recall-aware ${f1(longStats(a).credit)}` : ''}`,
+     '',
+-    `| B | total | Δ | Δ ${names} | unique ↑ | unique ↓ | p | noise | verdict | efficiency | gates that moved the total |${a.holdout ? ' holdout Δ (informational) |' : ''}${a.chain ? ' chain Δ |' : ''}`,
+-    `|---|---:|---:|---|---:|---:|---:|---|---|---|---|${a.holdout ? '---:|' : ''}${a.chain ? '---:|' : ''}`,
+-    ...rs.map((r) => r.row + (a.holdout ? ` ${r.hd}${r.warn ? ' **(!)**' : ''} |` : '') + (a.chain ? ` ${r.cd} |` : '')),
++    `| B | total | Δ | Δ ${names} | unique ↑ | unique ↓ | p | noise | verdict | efficiency | gates that moved the total |${a.holdout ? ' holdout Δ (informational) |' : ''}${a.chain ? ' chain Δ |' : ''}${a.long ? ' long Δ |' : ''}`,
++    `|---|---:|---:|---|---:|---:|---:|---|---|---|---|${a.holdout ? '---:|' : ''}${a.chain ? '---:|' : ''}${a.long ? '---|' : ''}`,
++    ...rs.map((r, i) => r.row + (a.holdout ? ` ${r.hd}${r.warn ? ' **(!)**' : ''} |` : '') + (a.chain ? ` ${r.cd} |` : '') + (a.long ? ` ${longs[i]?.cell ?? '–'} |` : '')),
+     '',
+     ...rs.filter((r) => r.warn).map((r) => r.warn),
+     ...rs.filter((r) => r.effFlag).map((r) => r.effFlag),
+@@ -801,7 +810,7 @@
+   ]
+   const cards = (r: Run) => [scorecard(r, false), ...(r.holdout ? [scorecard(holdoutOf(r), false)] : []), ...(r.chain ? [scorecard(chainOf(r), false)] : []), ...(r.long ? [longCard(r, false)] : [])]
+   console.log([summary.join('\n'), ...rs.flatMap((r, i) => [r.text, ...(a.behavior ? [behaviorAb(a, bs[i]!)] : [])]), ...cards(a), ...bs.flatMap(cards)].join('\n'))
+-  json({ a: strip(a), b: bs.map(strip) }, 'ab')
++  json({ a: strip(a), b: bs.map(strip), ...(a.long ? { long: longs.map((x) => x?.json ?? null) } : {}) }, 'ab')
+ } else if (command === 'controls') {
+   // The negative-control fixture (tests/replay.test.ts): each transcript's fact and latest items, and a plugin's prose
+   // contexts at every cut, cut down to the lines any item could match (the test module must stay under 1 MiB).

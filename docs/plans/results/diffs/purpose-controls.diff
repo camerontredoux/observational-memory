@@ -1,0 +1,240 @@
+--- a/scripts/bench-compact.ts
++++ b/scripts/bench-compact.ts
+@@ -30,8 +30,9 @@
+ //   --behavior (run, ab): also Luna (--thinking max, no tools) answers probes on each context (tests/eval/behavior.ts),
+ //     3 samples, majority vote, graded by code; reported apart from retention. Answers are cached in BCACHE by
+ //     sha256(context + probes + prompt + reader argv), so identical contexts in A and B cost nothing; misses are called.
++//     --behavior-sample K: read sample K's contexts instead of the first sample's (with --samples K or more).
+ //   bun scripts/bench-compact.ts run --contexts DIR          # grade ready-made contexts: DIR/<name>/compaction-N.md
+-//   bun scripts/bench-compact.ts controls [--plugin <ref|dir>] # write tests/fixtures/rubric-controls.local.ts, the
++//   bun scripts/bench-compact.ts controls [--plugin <ref|dir>] # write tests/fixtures/rubric-controls{,.<name>}.local.ts, the
+ //     negative control's fixture: rerun it after editing a rubric (the test fails any fact or latest item that another
+ //     transcript's context passes, unless the item lists that transcript in `shared`)
+ //
+@@ -409,7 +410,7 @@
+     if (run.chain) run.chain.push(await gradeAll(CHAIN, s.k, 'chain', s.chain))
+     if (run.long) run.long.push(await gradeAll([LONG], s.k, 'long', s.long))
+   }
+-  if (o.behavior) run.behavior = await behavior(label, o.dir ?? HERE, run.samples[0]!.replays)
++  if (o.behavior) run.behavior = await behavior(label, o.dir ?? HERE, (run.samples[behaviorSample - (o.first ?? 1)] ?? fail(`--behavior-sample ${behaviorSample}: no such sample`)).replays)
+   return run
+ }
+ /** The holdout as a run of its own, for the scorecard and the A/B table. */
+@@ -729,6 +730,7 @@
+ const record = !!o.record
+ const samples = num(o, 'samples', 1)!
+ const withBehavior = !!o.behavior
++const behaviorSample = num(o, 'behavior-sample', 1)!
+ mkdirSync(OUT, { recursive: true })
+ const json = (x: unknown, name: string) => {
+   const file = str(o, 'json') ?? `${OUT}/${name}.json`
+@@ -843,9 +845,16 @@
+     })
+     lines[rp.name] = [...table.keys()]
+   }
+-  const file = `${HERE}/tests/fixtures/rubric-controls.local.ts`
+-  const body = `// Written by \`bun scripts/bench-compact.ts controls\` from ${src.label}'s contexts. Private: never commit.\nexport const items = ${JSON.stringify(items)}\nexport const lines = ${JSON.stringify(lines)}\nexport const cuts = ${JSON.stringify(cuts)}\n`
+-  if (body.length > 1_000_000) fail(`${file}: ${body.length} bytes, over the 1 MiB claude plugin test imports`)
+-  writeFileSync(file, body, { mode: 0o600 })
+-  console.log(`${file}: ${body.length} bytes`)
++  // One module for the items and one per transcript for its lines and cuts: each module stays under the 1 MiB limit.
++  const dir = `${HERE}/tests/fixtures`
++  const header = `// Written by \`bun scripts/bench-compact.ts controls\` from ${src.label}'s contexts. Private: never commit.\n`
++  const modules = [
++    { file: `${dir}/rubric-controls.local.ts`, body: `${header}export const items = ${JSON.stringify(items)}\nexport const names = ${JSON.stringify(Object.keys(lines))}\n` },
++    ...Object.keys(lines).map((name) => ({ file: `${dir}/rubric-controls.${name}.local.ts`, body: `${header}export const lines = ${JSON.stringify(lines[name])}\nexport const cuts = ${JSON.stringify(cuts[name])}\n` })),
++  ]
++  for (const m of modules) if (m.body.length > 1_000_000) fail(`${m.file}: ${m.body.length} bytes, over the 1 MiB claude plugin test imports`)
++  for (const m of modules) {
++    writeFileSync(m.file, m.body, { mode: 0o600 })
++    console.log(`${m.file}: ${m.body.length} bytes`)
++  }
+ } else fail('usage: bun scripts/bench-compact.ts corpus | controls [--plugin <ref|dir>] | run --plugin <ref|dir> | ab --a <ref|dir> --b <ref|dir> (see the header)')
+--- a/tests/eval/rubric.ts
++++ b/tests/eval/rubric.ts
+@@ -7,23 +7,24 @@
+ export type Gate =
+   | 'identifiers' | 'constraints' | 'verbatim' | 'corrections' | 'reversals' | 'approvals' | 'asks' | 'in-progress' | 'handoff'
+   | 'files-edited' | 'commits' | 'failures' | 'facts' | 'decisions' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale'
+-  | 'chronology' | 'recall' | 'absent' | 'tokens' | 'budget'
++  | 'chronology' | 'recall' | 'absent' | 'purpose' | 'tokens' | 'budget'
+ 
+ /** Weight per gate: the one table. */
+ export const WEIGHTS: Record<Gate, number> = {
+   identifiers: 10, constraints: 6, verbatim: 5, corrections: 8, reversals: 6, approvals: 5, asks: 5, 'in-progress': 5, handoff: 8,
+   'files-edited': 5, commits: 4, failures: 6, facts: 5, decisions: 5, lessons: 7, 'file-state': 7, 'multi-hop': 7, rationale: 7,
+-  chronology: 6, recall: 5, absent: 5, tokens: 6, budget: 3,
++  chronology: 6, recall: 5, absent: 5, purpose: 5, tokens: 6, budget: 3,
+ }
+ /**
+  * A hard hand-authored item's gate, by its id's type prefix (docs/research/hard-compaction-items.md), when its own gate
+  * is facts, decisions or unset: neg → lessons (tried and dropped, and why), file → file-state (what a file does after its
+- * last edit), hop/multi → multi-hop (two facts from far-apart spans), why → rationale (a decision with its reason).
++ * last edit), hop/multi → multi-hop (two facts from far-apart spans), why → rationale (a decision with its reason),
++ * purpose → purpose (what the whole session is about: its overall goal and the assistant's role, on one line).
+  */
+ export function itemGate(id: string, gate: Gate | undefined, dflt: Gate): Gate {
+   if (gate && gate !== 'facts' && gate !== 'decisions') return gate
+-  const by: Record<string, Gate> = { neg: 'lessons', file: 'file-state', hop: 'multi-hop', multi: 'multi-hop', why: 'rationale' }
+-  const m = /^(neg|file|hop|multi|why)[:-]/.exec(id)
++  const by: Record<string, Gate> = { neg: 'lessons', file: 'file-state', hop: 'multi-hop', multi: 'multi-hop', why: 'rationale', purpose: 'purpose' }
++  const m = /^(neg|file|hop|multi|why|purpose)[:-]/.exec(id)
+   return m ? by[m[1]!]! : (gate ?? dflt)
+ }
+ /**
+@@ -85,9 +86,17 @@
+ }
+ type Fact = { id: string; expect: readonly Expect[] }
+ type Latest = { current: string; stale: string }
+-/** A fact item holds in a prose context (squashed, normed): every expect; for an order item (ord:/order:), in its order. */
+-export function factHolds(f: Fact, ptext: string, pnorm: string) {
++const PURPOSE_LINE_MAX = 600
++/**
++ * A fact item holds in a prose context (squashed, normed): every expect; for an order item (ord:/order:), in its order;
++ * for a purpose item (purpose:), every expect on one line of `prose` no longer than PURPOSE_LINE_MAX, so that tokens
++ * scattered over the context, or over a dump such as a tool result's JSON on one line, do not make a statement of the
++ * session's goal.
++ */
++export function factHolds(f: Fact, ptext: string, pnorm: string, prose?: string) {
+   const exact = isExact(f.id)
++  if (prose !== undefined && /^purpose[:-]/.test(f.id))
++    return prose.split('\n').some((l) => l.length <= PURPOSE_LINE_MAX && f.expect.every((e) => hasExpect(squash(l), norm(l), e, exact)))
+   if (!f.expect.every((e) => hasExpect(ptext, pnorm, e, exact))) return false
+   if (!/^ord(?:er)?[:-]/.test(f.id)) return true
+   const at = f.expect.map((e) => lastAt(ptext, pnorm, e, exact))
+@@ -108,7 +117,7 @@
+   const prepared = Object.fromEntries(Object.entries(contexts).map(([k, cs]) => [k, cs.map((c) => ({ ...c, ptext: squash(c.prose), pnorm: norm(c.prose) }))]))
+   for (const [name, spec] of Object.entries(items)) {
+     const tests = [
+-      ...(spec.facts ?? []).map((f) => ({ id: f.id, shared: f.shared ?? [], ok: (c: { ptext: string; pnorm: string }) => factHolds(f, c.ptext, c.pnorm) })),
++      ...(spec.facts ?? []).map((f) => ({ id: f.id, shared: f.shared ?? [], ok: (c: { prose: string; ptext: string; pnorm: string }) => factHolds(f, c.ptext, c.pnorm, c.prose) })),
+       ...(spec.latest ?? []).map((l) => ({ id: l.id, shared: l.shared ?? [], ok: (c: { prose: string }) => latestHolds(l, c.prose) })),
+     ]
+     for (const x of tests) {
+@@ -431,7 +440,7 @@
+   const invented = [...identifiersIn(context.summary)].filter(([key, kind]) => kind === 'commit' && !holds(source, key, 'commit')).map(([key]) => key)
+   items.push(pass('absent', n, 'invented-hashes', !invented.length, invented.length ? invented.join(', ') : 'none'))
+ 
+-  for (const f of rubric?.facts ?? []) if (inSpan(f, n)) items.push(pass(itemGate(f.id, f.gate, 'facts'), n, f.id, factHolds(f, ptext, pnorm), `${f.expect.length} tokens`))
++  for (const f of rubric?.facts ?? []) if (inSpan(f, n)) items.push(pass(itemGate(f.id, f.gate, 'facts'), n, f.id, factHolds(f, ptext, pnorm, pr), `${f.expect.length} tokens`))
+   for (const a of rubric?.absent ?? []) if (inSpan(a, n)) items.push(pass('absent', n, a.id, !statedAsCurrent(raw, a.pattern), 'stale or false claim'))
+   for (const l of rubric?.latest ?? [])
+     if (inSpan(l, n)) {
+--- a/tests/eval/behavior.ts
++++ b/tests/eval/behavior.ts
+@@ -5,10 +5,10 @@
+ import type { Expect, Gate, RubricSpec } from './rubric'
+ import { hasExpect, itemGate, norm } from './rubric'
+ 
+-export type BGate = 'rule' | 'permission' | 'done' | 'next' | 'value' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale' | 'dropped' | 'false'
+-export const BGATES: BGate[] = ['rule', 'permission', 'done', 'next', 'value', 'lessons', 'file-state', 'multi-hop', 'rationale', 'dropped', 'false']
++export type BGate = 'rule' | 'permission' | 'done' | 'next' | 'value' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale' | 'purpose' | 'dropped' | 'false'
++export const BGATES: BGate[] = ['rule', 'permission', 'done', 'next', 'value', 'lessons', 'file-state', 'multi-hop', 'rationale', 'purpose', 'dropped', 'false']
+ /** A rubric item's probe gate: the hard types keep their retention gate's name; constraints and reversals are rules. */
+-const bgate = (g: Gate): BGate => (g === 'constraints' || g === 'reversals' ? 'rule' : g === 'lessons' || g === 'file-state' || g === 'multi-hop' || g === 'rationale' ? g : 'value')
++const bgate = (g: Gate): BGate => (g === 'constraints' || g === 'reversals' ? 'rule' : g === 'lessons' || g === 'file-state' || g === 'multi-hop' || g === 'rationale' || g === 'purpose' ? g : 'value')
+ /** `answer`: a pattern (case-insensitive) for rule/value/next, the word for permission, the short SHA for done. */
+ export type Probe = { gate: BGate; id: string; ask: string; answer?: string; expect?: readonly Expect[]; quoteOf?: string; query?: readonly string[] }
+ export type Answer = { id?: string; answer?: unknown; evidence?: unknown; note?: unknown; recall_query?: unknown }
+--- a/tests/replay.test.ts
++++ b/tests/replay.test.ts
+@@ -844,14 +844,23 @@
+     expect([at('Compacted at 14:31, then loaded 0.4.5 at 15:08.'), at('Loaded at 15:08 after the 14:31 one? No: 15:08 came, then 14:31.')]).toEqual([true, false])
+   })
+ 
++  test('checks a purpose item on one line of the context, never across lines', () => {
++    const f = { id: 'purpose:x', expect: ['orchestrator', ['subagent', 'subagents']] }
++    const at = (s: string) => factHolds(f, s.toLowerCase(), norm(s), s)
++    expect([at('Session: the assistant is the orchestrator, building each change in subagents.'), at('The orchestrator read a file.\nA subagent ran the tests.')]).toEqual([true, false])
++  })
++
+   // The negative control over the real rubrics: no hand-authored item may pass a context that cannot answer it (another
+   // transcript's, or its own before the item's `from`). `bun scripts/bench-compact.ts controls` writes the module.
+   test('no hand-authored item passes a foreign context or one before its from', async () => {
+     const fx = (await import('./fixtures/rubric-controls.local').catch(() => undefined)) as
+-      | { items: Parameters<typeof negativeControl>[0]; lines: Record<string, string[]>; cuts: Record<string, { n: number; at: number[] }[]> }
++      | { items: Parameters<typeof negativeControl>[0]; names: string[] }
+       | undefined
+     if (!fx) return console.warn('SKIP the compaction rubric > negative control: no tests/fixtures/rubric-controls.local.ts; bun scripts/bench-compact.ts controls writes it')
+-    const contexts = Object.fromEntries(Object.entries(fx.cuts).map(([name, cs]) => [name, cs.map((c) => ({ n: c.n, prose: c.at.map((i) => fx.lines[name]![i]).join('\n') }))]))
++    if (!fx.names) throw new Error('tests/fixtures/rubric-controls.local.ts is in the old one-module form: rerun bun scripts/bench-compact.ts controls')
++    // Each transcript's lines and cuts are a module of their own (tests/fixtures/rubric-controls.<name>.local.ts).
++    const parts = await Promise.all(fx.names.map(async (name) => [name, (await import(`./fixtures/rubric-controls.${name}.local`)) as { lines: string[]; cuts: { n: number; at: number[] }[] }] as const))
++    const contexts = Object.fromEntries(parts.map(([name, p]) => [name, p.cuts.map((c) => ({ n: c.n, prose: c.at.map((i) => p.lines[i]).join('\n') }))]))
+     expect(negativeControl(fx.items, contexts)).toEqual([])
+   })
+ 
+--- a/tests/fixtures/om-v04.rubric.local.ts
++++ b/tests/fixtures/om-v04.rubric.local.ts
+@@ -2,6 +2,7 @@
+ import type { RubricSpec } from '../eval/rubric'
+ 
+ const MAIN = 'Which plugin version is on main right now, and at which commit?'
++const PURPOSE = 'What is this session about, and what is its overall goal?'
+ export const rubric: RubricSpec = {
+   facts: [
+     // The version on main changes at almost every span: each boundary must hold the current one.
+@@ -20,6 +21,10 @@
+     { id: 'merge-recall', gate: 'decisions', from: 9, expect: ['94%', '97%'], shared: ['om-orchestration'] },
+     { id: 'vcc-repo', from: 7, expect: ['lllyasviel/VCC'] },
+     { id: 'todo-gap', from: 8, expect: ['TODO.md', '6e23307'] },
++    // What the whole session is about, on one line (purpose: items hold only when every expect is on one line).
++    { id: 'purpose:om-plugin-orchestrator', from: 1,
++      expect: [['orchestrator', 'orchestrating', 'orchestrate', 'orchestrates', 'orchestration'], ['subagent', 'subagents', 'sub-agent', 'sub-agents'], ['observational-memory', 'observational memory', '0.4', 'v0.4', '0.4.x']],
++      ask: PURPOSE, answer: '^(?=[\\s\\S]*(observational|compaction|0\\.4))(?=[\\s\\S]*(orchestrat|subagent))' },
+   ],
+   absent: [
+     { id: 'no-remote', from: 1, pattern: "(?<!not |n't |never |nothing )pushed to (github|origin)", ask: 'Which commit did you push to GitHub most recently?' },
+--- a/tests/fixtures/om-orchestration.rubric.local.ts
++++ b/tests/fixtures/om-orchestration.rubric.local.ts
+@@ -1,6 +1,7 @@
+ // Local only (gitignored): om-orchestration's hand-authored rubric gates for scripts/bench-compact.ts.
+ import type { RubricSpec } from '../eval/rubric'
+ 
++const PURPOSE = 'What is this session about, and what is its overall goal?'
+ export const rubric: RubricSpec = {
+   facts: [
+     { id: 'agents-commit', gate: 'chronology', from: 1, expect: ['7ecb975'] },
+@@ -18,6 +19,10 @@
+     { id: 'testing-backup', from: 1, expect: ['/tmp/testing-conventions.md.bak'], ask: 'Where is the backup copy of the testing conventions guide?' },
+     { id: 'recall-required', from: 5, expect: ['recall-required'] },
+     { id: 'vcc-brief', gate: 'decisions', from: 5, expect: ['vcc-brief', 'a88cb81'] },
++    // What the whole session is about, on one line (purpose: items hold only when every expect is on one line).
++    { id: 'purpose:agent-teams-tickets', from: 1,
++      expect: [['agent team', 'agent teams', 'agent-team', 'agent-teams', 'teammates'], ['ticket', 'tickets', 'issue', 'issues'], ['benchmark', 'benchmarks', 'benchmarking', 'bench', 'performs better', 'compare', 'compared', 'comparison', 'built-in compaction', 'builtin compaction']],
++      ask: PURPOSE, answer: '^(?=[\\s\\S]*(agent.?teams?|teammates|lanes))(?=[\\s\\S]*(tickets?|issues?))' },
+   ],
+   absent: [
+     { id: 'old-cap', from: 1, pattern: '\\$30 (hard )?(cap|limit)', ask: 'Is the hard spending cap for paid benchmark runs $30?' },
+--- a/tests/fixtures/firstmate-11.rubric.local.ts
++++ b/tests/fixtures/firstmate-11.rubric.local.ts
+@@ -1,6 +1,7 @@
+ // Local only (gitignored): firstmate-11's hand-authored rubric gates for scripts/bench-compact.ts.
+ import type { RubricSpec } from '../eval/rubric'
+ 
++const PURPOSE = 'What is this session about, and what is its overall goal?'
+ export const rubric: RubricSpec = {
+   facts: [
+     { id: 'fork-push', gate: 'chronology', from: 4, expect: ['74153fae'] },
+@@ -17,6 +18,10 @@
+     { id: 'upstream-sync', gate: 'decisions', from: 2, to: 3, expect: [['273 behind', 'all 273', '273 changes', '273 commits', '273 upstream']] },
+     { id: 'tools', from: 3, expect: ['no-mistakes', '1.79.0'], ask: 'Which no-mistakes version is installed now?', answer: '1\\.79\\.0' },
+     { id: 'contract', from: 9, expect: ['CON-2026-0082'] },
++    // What the whole session is about, on one line (purpose: items hold only when every expect is on one line).
++    { id: 'purpose:firstmate-crew', from: 2,
++      expect: [['firstmate'], ['crewmate', 'crewmates'], ['oasis', 'opie'], ['gorman', 'sbom', 'uspa', 'line item', 'line items']],
++      ask: PURPOSE, answer: '^(?=[\\s\\S]*firstmate)(?=[\\s\\S]*crew)' },
+   ],
+   absent: [
+     { id: 'upstream-push', from: 4, pattern: '(?<!not |never |nothing )(pushed|sent) to (the )?upstream', ask: 'Which commit did you push to the upstream firstmate repository?' },
+--- a/tests/fixtures/om-v04.hard.local.ts
++++ b/tests/fixtures/om-v04.hard.local.ts
+@@ -55,7 +55,7 @@
+     { id: 'hop:brief-pinned', from: 3,
+       expect: [["3.7k", "3,700", "3700", "3.7 k", "3.7K"], 'pin-brief'],
+       ask: "How large is the crewmate's launch brief, and which branch made it always stay in 'All user messages'?", answer: '3\\.7k' },
+-    { id: 'hop:made-up-answers', from: 9,
++    { id: 'hop:made-up-answers', from: 9, shared: ['om-orchestration'],
+       expect: [["83%", "83 %", "83 percent"], '94%', ["made-up", "made up", "fabricated", "invented", "hallucinated", "hallucination", "confabulated"]],
+       ask: 'How did Luna notes score without recall versus with the new recall, and what happened to made-up answers?', answer: '94' },
+ 

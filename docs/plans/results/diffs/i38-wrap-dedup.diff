@@ -1,0 +1,108 @@
+diff -ruN -x node_modules -x .git /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/hooks/register.ts /tmp/omv-build/i38-wrap-dedup/hooks/register.ts
+--- /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/hooks/register.ts	2026-09-25 08:46:08.845052407 +0000
++++ /tmp/omv-build/i38-wrap-dedup/hooks/register.ts	2026-09-25 08:52:00.906197557 +0000
+@@ -224,17 +224,49 @@
+     .toReversed()
+ }
+ const MASKED = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/
++const isWrapper = (m: SessionMessage) => isPrompt(m) && INJECTED_WRAPPER.test(m.text.trim())
++// An injected wrapper row in the raw tail (a task notification, hook feedback) that a newer one repeats keeps its
++// first line and the lines no newer one has, then names the whole row by its hash for unmask.
++const REPEATED = /\n\(repeated lines as in the newer notice below; ([0-9a-f]+)\)$/
++function dedupWrappers(rows: readonly SessionMessage[]) {
++  const newer = new Set<string>()
++  return rows
++    .toReversed()
++    .map((m) => {
++      if (!isWrapper(m)) return m
++      const lines = m.text.split('\n')
++      const keep = lines.filter((l, i) => i === 0 || !l.trim() || !newer.has(l))
++      for (const l of lines) if (l.trim()) newer.add(l)
++      const text = `${keep.join('\n').replace(/\n{2,}/g, '\n')}\n(repeated lines as in the newer notice below; ${hash(m.text)})`
++      return keep.length < lines.length && text.length < m.text.length ? { ...m, text } : m
++    })
++    .toReversed()
++}
+ // A result maskTail cut reads whole again wherever the history still holds it (the rows before the compaction that
+-// cut it, under the same tool use id): the Observer, the row hashes and the times see the result as it was.
++// cut it, under the same tool use id), and so does a wrapper row dedupWrappers cut (under its hash): the Observer, the
++// row hashes and the times see the row as it was.
+ function unmask(rows: readonly SessionMessage[], history: readonly SessionMessage[]) {
+   const whole = new Map<string, string>()
+-  for (const m of history) for (const r of m.toolResults ?? []) if (r.text.length > (whole.get(r.tool_use_id)?.length ?? -1)) whole.set(r.tool_use_id, r.text)
++  const wrappers = new Map<string, string>()
++  for (const m of history) {
++    for (const r of m.toolResults ?? []) if (r.text.length > (whole.get(r.tool_use_id)?.length ?? -1)) whole.set(r.tool_use_id, r.text)
++    if (isWrapper(m)) wrappers.set(hash(m.text), m.text)
++  }
+   const original = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
+     const at = r.text.search(MASKED)
+     const w = at < 0 ? undefined : whole.get(r.tool_use_id)
+     return w && w.length > r.text.length && w.startsWith(r.text.slice(0, at)) ? w : undefined
+   }
+-  return rows.map((m) => (m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m))
++  const wrapper = (m: SessionMessage) => {
++    const id = isPrompt(m) ? m.text.match(REPEATED)?.[1] : undefined
++    const w = id && wrappers.get(id)
++    return w && w.startsWith(m.text.slice(0, m.text.indexOf('\n'))) ? w : undefined
++  }
++  return rows.map((m) => {
++    const w = wrapper(m)
++    if (w) return { ...m, text: w }
++    return m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m
++  })
+ }
+ const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+ // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
+@@ -1797,7 +1829,7 @@
+     // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
+     // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
+     // In the context's own order.
+-    return { messages: [message, ...maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m))] }
++    return { messages: [message, ...dedupWrappers(maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m)))] }
+   }).catch(async ($, e, next) => {
+     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
+     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
+diff -ruN -x node_modules -x .git /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/tests/register.test.ts /tmp/omv-build/i38-wrap-dedup/tests/register.test.ts
+--- /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/tests/register.test.ts	2026-09-25 08:46:08.846402741 +0000
++++ /tmp/omv-build/i38-wrap-dedup/tests/register.test.ts	2026-09-25 08:53:34.295121454 +0000
+@@ -3260,6 +3260,39 @@
+     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+   })
+ 
++  test('an older wrapper row in the raw tail keeps only the lines a newer one does not repeat, and reads whole again after the compaction', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history } = world(on)
++    const seen = pi(on)
++    const runTurn = live(on, clock, history)
++    const notice = (id: string) => `<task-notification>\n<task-id>${id}</task-id>\nThe watcher woke: read the inbox, act on each new file, then reply to the lead with what changed.\n</task-notification>`
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
++    await clock.settle()
++    await runTurn($, [{ role: 'user', text: notice('w1'), toolUses: [] }, { role: 'assistant', text: 'read the inbox', toolUses: [] }], at(22, 15, 10))
++    await runTurn($, [{ role: 'user', text: notice('w2'), toolUses: [] }, { role: 'assistant', text: 'read it again', toolUses: [] }], at(22, 15, 20))
++    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
++    const tail = first.messages!.slice(1).map((m) => m.text)
++    expect(tail).toContain(notice('w2'))
++    expect(tail.find((t) => t.includes('w1'))).toMatch(/^<task-notification>\n<task-id>w1<\/task-id>\n\(repeated lines as in the newer notice below; [0-9a-f]+\)$/)
++
++    history.push(...first.messages!)
++    const memory = first.messages![0]!
++    await runTurn($, turn('c', 'c', CHUNK), at(22, 16, 0))
++    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 30))
++    await clock.settle()
++    const observed = seen.prompts.length
++    await $.session.compact({ trigger: 'auto', messages: history.slice(history.indexOf(memory)) })
++
++    // The Observer read both notices whole, and the next compaction matched the history with no Observer call.
++    expect(seen.prompts.some((p) => p.includes('repeated lines as in the newer notice'))).toBe(false)
++    expect(seen.prompts.join('\n').split('then reply to the lead').length - 1).toBe(2)
++    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
++    expect(seen.prompts).toHaveLength(observed)
++    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
++  })
++
+   // A compaction writes its kept tail back in the context's order, so the history then holds a parallel block
+   // grouped. The background ledger and the next compaction must read it in the same order, or the watermark over
+   // it looks changed and the whole backlog is observed on the spot (a firstmate session, upgraded mid-way to 0.4.5).

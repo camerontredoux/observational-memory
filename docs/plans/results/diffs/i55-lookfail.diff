@@ -1,0 +1,120 @@
+diff -ru base7/hooks/vcc.ts lookfail/hooks/vcc.ts
+--- base7/hooks/vcc.ts	2026-09-25 13:11:16.403838461 +0000
++++ lookfail/hooks/vcc.ts	2026-09-25 14:29:11.467355224 +0000
+@@ -779,10 +779,24 @@
+   const path = pathOf(b.input)
+   return path ? displayPath(resolvePath(path, cwd, home), cwd, home) : ''
+ }
++// A lookup that failed because its path is missing: the path, as the call or the error names it. Unlike other
++// failed lookups it says something (the file is not there), so it is carried until a later call finds the path.
++const MISSING_PATH = /No such file or directory|cannot access|does not exist|ENOENT/
++function missingPath(f: Pick<OpenFailure, 'tool' | 'target' | 'error'>) {
++  if (!MISSING_PATH.test(f.error)) return undefined
++  if (f.tool !== 'Bash') return f.target || undefined
++  const m = /(?:cannot (?:access|open|stat)|No such file or directory:?) '([^']+)'|([^\s:'"`]+): No such file or directory/.exec(f.error)
++  return m?.[1] ?? m?.[2]
++}
+ // Whether a successful call clears an open failure: the same tool and target, or a Bash command that runs the same
+-// programs on the same operands.
++// programs on the same operands; a failed lookup of a missing path, any successful call that names its file.
+ function clears(f: OpenFailure, b: Block, cwd: string, home?: string) {
+-  if (b.kind !== 'tool' || !b.result || b.result.isError || b.name !== f.tool) return false
++  if (b.kind !== 'tool' || !b.result || b.result.isError) return false
++  // Only a failed lookup: a command that also ran something else (`ls $F; pdftotext $F`) may have failed at that too.
++  const gone = f.tool !== 'Bash' || inspects(f.target, cwd, home) ? missingPath(f) : undefined
++  const file = gone?.replace(/\/+$/, '').split('/').at(-1)
++  if (file && file.length >= 3 && JSON.stringify(b.input).includes(file)) return true
++  if (b.name !== f.tool) return false
+   if (failureTarget(b, cwd, home) === f.target) return true
+   const command = commandOf(b)
+   const keys = f.tool === 'Bash' ? runKeys(f.target) : []
+@@ -799,8 +813,8 @@
+   blocks.forEach((b, k) => {
+     if (b.kind !== 'tool' || b.i >= leaving || !b.result?.isError || DECLINED.test(b.result.text)) return
+     const policy = POLICY_FAILURE.test(b.result.text)
+-    if (!policy && isLook(b, cwd, home)) return
+     const f: OpenFailure = { ...(b.at === undefined ? {} : { at: b.at }), tool: b.name, target: failureTarget(b, cwd, home), error: failureText(b.result.text), policy }
++    if (!policy && isLook(b, cwd, home) && !missingPath(f)) return
+     if (!f.error || blocks.slice(k + 1).some((later) => clears(f, later, cwd, home))) return
+     // A policy block is one rule, whatever call met it: its newest instance stands for all.
+     const same = open.findIndex((o) => o.tool === f.tool && o.error === f.error && (f.policy || o.target === f.target))
+diff -ru base7/tests/vcc.test.ts lookfail/tests/vcc.test.ts
+--- base7/tests/vcc.test.ts	2026-09-25 13:11:16.405478234 +0000
++++ lookfail/tests/vcc.test.ts	2026-09-25 14:29:46.171453097 +0000
+@@ -1,7 +1,7 @@
+ import { describe, expect, test } from 'claude-code/testing'
+ import type { SessionMessage } from 'claude-code'
+-import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, renderBrief } from '../hooks/vcc'
+-import type { Brief } from '../hooks/vcc'
++import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, OPEN_FAILURES_MAX, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from '../hooks/vcc'
++import type { Brief, OpenFailure } from '../hooks/vcc'
+ 
+ const CWD = '/work/project'
+ const HOME = '/home/u'
+@@ -275,4 +275,66 @@
+     expect(text).not.toContain('</session-brief>')
+     expect(text.split('\n').every((l) => /^[>[\-@]/.test(l))).toBe(true)
+   })
++
++  const open = (rows: SessionMessage[], leaving = rows.length, prev: OpenFailure[] = []) => openFailures(prev, rows, times(rows), leaving, CWD, HOME)
++
++  test('open failures: a leaving failure no later call cleared, with the line that names the error', () => {
++    const rows = [
++      prompt('build it'),
++      ...bash('bun run build', 'Exit code 1\n$ tsc\nsrc/a.ts(3,1): error TS2304: Cannot find name x', true),
++      ...bash('python3 gen.py', 'Exit code 1\nTraceback (most recent call last):\n  File "gen.py", line 2\n    raise JSONDecodeError("Expecting value", s, 0)\njson.decoder.JSONDecodeError: Expecting value: line 1 column 1', true),
++      ...call('Edit', { file_path: `${CWD}/src/a.ts`, old_string: 'x', new_string: 'y' }, '<tool_use_error>String to replace not found in file.</tool_use_error>', true),
++    ]
++    expect(open(rows).map((f) => [f.tool, f.target, f.error])).toEqual([
++      ['Bash', 'bun run build', 'src/a.ts(3,1): error TS2304: Cannot find name x'],
++      ['Bash', 'python3 gen.py', 'json.decoder.JSONDecodeError: Expecting value: line 1 column 1'],
++      ['Edit', 'src/a.ts', 'String to replace not found in file.'],
++    ])
++  })
++
++  test('open failures: a later success of the same call clears it, in the kept rows or at a later compaction', () => {
++    const rows = [prompt('go'), ...bash('bun test', 'Exit code 1\n3 fail', true), ...bash('bun test', '12 pass\n0 fail')]
++    expect(open(rows, 3)).toEqual([])
++    const prev = open(rows.slice(0, 3))
++    expect(prev).toHaveLength(1)
++    expect(open(rows.slice(3), 0, prev)).toEqual([])
++  })
++
++  test('open failures: declined calls are left out, and one policy block stands for every call it met', () => {
++    const hook = (cmd: string) =>
++      bash(cmd, `PreToolUse:Bash hook error: [exec "$CLAUDE_PROJECT_DIR"/bin/cd-check.sh]: {"systemMessage":"[persistent-cd] a cd is blocked"}`, true)
++    const rows = [prompt('go'), ...hook('cd a && make x'), ...hook('cd b && make y'), ...bash('rm -rf x', "The user doesn't want to proceed with this tool use.", true)]
++    expect(open(rows).map(({ at: _, ...f }) => f)).toEqual([{ tool: 'Bash', target: 'make y', error: 'hook cd-check.sh: [persistent-cd] a cd is blocked', policy: true }])
++  })
++
++  test('open failures: renderFailure lines parse back, and the list keeps the newest within its cap', () => {
++    const rows = [prompt('go'), ...Array.from({ length: OPEN_FAILURES_MAX + 3 }, (_, i) => bash(`make t${i}`, `Exit code 2\nmake: *** No rule to make target t${i}`, true)).flat()]
++    const failures = open(rows)
++    expect(failures).toHaveLength(OPEN_FAILURES_MAX)
++    expect(failures.at(-1)!.target).toBe(`make t${OPEN_FAILURES_MAX + 2}`)
++    expect(parseFailures(failures.map(renderFailure).join('\n'))).toEqual(failures)
++  })
++
++  test('open failures: a lookup that found its path missing is carried until a later call names the file; other failed lookups are not', () => {
++    const rows = [
++      prompt('go'),
++      ...bash('ls docs/plan.md', "Exit code 2\nls: cannot access 'docs/plan.md': No such file or directory", true),
++      ...call('Read', { file_path: `${CWD}/notes.md` }, '<tool_use_error>File does not exist. Note: your current working directory is /work/project.</tool_use_error>', true),
++      ...call('Read', { file_path: `${CWD}/big.ts` }, '<tool_use_error>File content (30000 tokens) exceeds maximum allowed tokens (25000).</tool_use_error>', true),
++      ...bash('grep -r nothere src', 'Exit code 1', true),
++    ]
++    expect(open(rows).map((f) => [f.tool, f.target, f.error])).toEqual([
++      ['Bash', 'ls docs/plan.md', "ls: cannot access 'docs/plan.md': No such file or directory"],
++      ['Read', 'notes.md', 'File does not exist. Note: your current working directory is /work/project.'],
++    ])
++    const later = [...call('Write', { file_path: `${CWD}/docs/plan.md`, content: 'x' }, 'File created'), ...call('Read', { file_path: `${CWD}/notes.md` }, 'hello')]
++    expect(open([...rows, ...later], rows.length)).toEqual([])
++    expect(open(later, 0, open(rows))).toEqual([])
++  })
++
++  test('open failures: a command that also ran something else stays open when a later call names its missing file', () => {
++    const rows = [prompt('go'), ...bash('ls -la a.pdf; pdftotext a.pdf -', "Exit code 1\nls: cannot access 'a.pdf': No such file or directory\n/bin/bash: line 1: pdftotext: command not found", true)]
++    const later = call('Read', { file_path: `${CWD}/uploads/a.pdf` }, 'PDF')
++    expect(open([...rows, ...later], rows.length).map((f) => f.target)).toEqual(['ls -la a.pdf; pdftotext a.pdf -'])
++  })
+ })

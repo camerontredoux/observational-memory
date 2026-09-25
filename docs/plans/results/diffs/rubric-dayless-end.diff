@@ -1,0 +1,4 @@
+--- tests/eval/rubric.ts (pointed)
++++ tests/eval/rubric.ts (pointed)
+-    const [from, to] = [at(d1, m[2]!, m[3]!), at(m[4] ?? d1, m[5]!, m[6]!) + 60_000]
++    const [from, to] = [at(d1, m[2]!, m[3]!), at(m[4] ?? (m[1] && day && day > m[1] ? day : d1), m[5]!, m[6]!) + 60_000]

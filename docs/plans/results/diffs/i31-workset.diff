@@ -1,0 +1,301 @@
+diff -ru -x node_modules -x fixtures /tmp/omv-code/fail11/hooks/register.ts i31-workset/hooks/register.ts
+--- /tmp/omv-code/fail11/hooks/register.ts	2026-09-25 07:20:25.875928945 +0000
++++ i31-workset/hooks/register.ts	2026-09-25 07:56:50.685706621 +0000
+@@ -19,8 +19,8 @@
+ import { registerPrune } from './prune'
+ import { INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
+ import type { RecallInput, RecallIo } from './recall'
+-import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
+-import type { Brief, OpenFailure } from './vcc'
++import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, parseWorkingSet, renderBrief, renderFailure, renderWorkingSet, resolvePath, workingSet } from './vcc'
++import type { Brief, OpenFailure, WorkingSet } from './vcc'
+ 
+ declare module 'claude-code' {
+   interface McpToolInputs {
+@@ -118,6 +118,7 @@
+   nextStep?: string // the user's latest request, verbatim
+   environment?: string // the working directory and git state at compaction (see environmentOf)
+   failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
++  working?: WorkingSet // the files the session read or edited and the tests it ran, found by code (see workingSet)
+   brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
+   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
+   transcript?: string
+@@ -791,20 +792,22 @@
+ const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+ const ENVIRONMENT = 'Environment at compaction, read from git by code, not by a model'
+ const FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded'
++const WORKING = 'Files and test runs seen in this session, found by code: om_recall returns the last read of a file not changed since'
+ const LATEST = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
+ function renderContinuation(memory: Memory) {
+   const state = memory.currentTask ? `${WHERE}${memory.stateAt ? ` (${memory.stateAt})` : ''}:\n${memory.currentTask}\n` : ''
+   const environment = memory.environment ? `${ENVIRONMENT}:\n${memory.environment}\n` : ''
+   const failures = memory.failures?.length ? `${FAILURES}:\n${memory.failures.map(renderFailure).join('\n')}\n` : ''
++  const working = memory.working && (memory.working.files.length || memory.working.tests.length) ? `${WORKING}:\n${renderWorkingSet(memory.working)}\n` : ''
+   const latest = memory.nextStep && truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)
+-  return state || environment || failures || latest ? `${CONTINUATION}${state}${environment}${failures}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
++  return state || environment || failures || working || latest ? `${CONTINUATION}${state}${environment}${failures}${working}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
+ }
+ // The state of the work a record gives, read from `from` on, past the user's text.
+ function parseContinuation(text: string, from: number) {
+   const start = text.indexOf(CONTINUATION, from)
+   if (start < 0) return undefined
+   const body = text.slice(start + CONTINUATION.length)
+-  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
++  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${WORKING}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+   const lines = body.slice(0, end.length ? Math.min(...end) : 0).split('\n')
+   return (lines[0]?.startsWith(WHERE) ? lines.slice(1) : lines).join('\n').trim() || undefined
+ }
+@@ -815,10 +818,20 @@
+   const start = record < 0 ? -1 : text.indexOf(`\n${FAILURES}:\n`, record)
+   if (start < 0) return []
+   const body = text.slice(start + FAILURES.length + 3)
+-  const end = [`\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
++  const end = [`\n${WORKING}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+   return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
+ }
+ 
++// The working set a record lists, read from `from` on, past the user's text.
++function workingOf(text: string, from: number) {
++  const record = text.indexOf(CONTINUATION, from)
++  const start = record < 0 ? -1 : text.indexOf(`\n${WORKING}:\n`, record)
++  if (start < 0) return undefined
++  const body = text.slice(start + WORKING.length + 3)
++  const end = [`\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
++  return parseWorkingSet(body.slice(0, end.length ? Math.min(...end) : 0))
++}
++
+ // The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
+ // oldest first, one line counting those dropped between. The brief is cut short of the cap by NEWEST_RESERVE_TOKENS,
+ // keeping its head and its tail, and the newest over what remains is cut; the newest is always kept.
+@@ -926,6 +939,7 @@
+       .reduceRight<ReturnType<typeof splitSource>[]>((out, e) => [e.source || !out[0]?.source ? e : { ...e, source: out[0].source }, ...out], []),
+     currentTask: parseContinuation(first.text, user.end || own.length) ?? tag(head.slice(end), 'current-task'),
+     failures: failuresOf(first.text, user.end || own.length),
++    working: workingOf(first.text, user.end || own.length),
+     skills,
+     userMessages: user.messages,
+     brief: briefAt < 0 || briefEnd < briefAt ? undefined : parseBrief(whole.slice(briefAt + SESSION_BRIEF.length, briefEnd)),
+@@ -1485,6 +1499,23 @@
+     // read it: the transcript file, the session's directory and home are read once, and only when a brief is compiled.
+     let corpus: Promise<Awaited<ReturnType<typeof loadTranscript>> | undefined> | undefined
+     let dirs: Promise<[string, string | undefined]> | undefined
++    // The working set, each file checked on disk: changed when it was modified after the minute the session last
++    // touched it. A file that cannot be read is left as the rows give it.
++    let working: Promise<WorkingSet> | undefined
++    const workingNow = async () => {
++      dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
++      const [cwd, home] = await dirs
++      const ws = workingSet(priorMemory?.working ?? { files: [], tests: [] }, messages.slice(base), v.at.slice(base), cwd, home)
++      const files = await Promise.all(
++        ws.files.map((f) =>
++          $.fs.stat(resolvePath(f.path, cwd, home)).then(
++            (s) => ({ ...f, changed: minute(s.mtimeMs) > minute(Math.max(f.read ?? 0, f.edited ?? 0)) }),
++            () => f,
++          ),
++        ),
++      )
++      return { ...ws, files }
++    }
+     const compile = async (from: number, to: number) => {
+       const rows = messages.slice(from, to)
+       let refOf
+@@ -1517,6 +1548,8 @@
+         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
+         dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
+         const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
++        working ??= workingNow()
++        const seen = await working
+         let memory: Memory = {
+           corrections: ledger.corrections,
+           observations: renderGrouped(ledger.entries),
+@@ -1530,6 +1563,7 @@
+           nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
+           ...(environment ? { environment } : {}),
+           ...(failures.length ? { failures } : {}),
++          ...(seen.files.length || seen.tests.length ? { working: seen } : {}),
+           ...(brief ? { brief } : {}),
+           ...(floor ? { floor } : {}),
+           transcript,
+diff -ru -x node_modules -x fixtures /tmp/omv-code/fail11/hooks/vcc.ts i31-workset/hooks/vcc.ts
+--- /tmp/omv-code/fail11/hooks/vcc.ts	2026-09-25 07:29:18.129258760 +0000
++++ i31-workset/hooks/vcc.ts	2026-09-25 08:04:57.894224728 +0000
+@@ -167,7 +167,7 @@
+   return out.filter((s) => s.length)
+ }
+ 
+-function resolvePath(raw: string, dir: string, home?: string) {
++export function resolvePath(raw: string, dir: string, home?: string) {
+   let p = raw
+   if (home && (p === '~' || p.startsWith('~/'))) p = home + p.slice(1)
+   if (!p.startsWith('/')) p = `${dir.replace(/\/$/, '')}/${p}`
+@@ -829,3 +829,93 @@
+     return [{ ...(at === undefined || Number.isNaN(at) ? {} : { at }), tool, target: m[3] ?? m[5] ?? '', error: m[8]!, policy: m[7] === 'was blocked' }]
+   })
+ }
++
++// ---- Working set ------------------------------------------------------------------------------------------------
++
++// A file the session read or edited, with when it last did each, and the last run of each test command, without its
++// counts (an older run's would read as the suite's now). `changed`: whether the file changed on disk after the
++// session last touched it, when the caller could tell.
++export type SeenFile = { path: string; read?: number; edited?: number; changed?: boolean }
++export type SeenTest = { at?: number; command: string; ok: boolean }
++export type WorkingSet = { files: SeenFile[]; tests: SeenTest[] }
++export const WORKING_FILES_MAX = 15
++export const WORKING_TESTS_MAX = 5
++const WORKING_SET_MAX_CHARS = 1_600 // about 400 tokens
++const READERS = new Set(['cat', 'bat', 'head', 'tail', 'nl', 'less', 'more', 'sed'])
++const TEST_RUNNERS = new Set(['bun', 'bunx', 'npm', 'npx', 'pnpm', 'yarn', 'pytest', 'cargo', 'go', 'mvn', 'gradle', 'vitest', 'jest', 'tsc', 'eslint', 'just', 'make', 'claude'])
++const TEST_WORD = /^(?:test|spec|check|lint|tsc|typecheck|validate|pytest|vitest|jest)(?::[\w-]+)?$/
++// The test runs of a Bash command, each simple command that runs one as it reads.
++const testsIn = (command: string) => commands(command).filter((c) => TEST_RUNNERS.has(programOf(c)) && c.some((w) => TEST_WORD.test(w.split('/').at(-1)!))).map((c) => clip(c.filter((w, k) => !REDIRECT.test(w) && !REDIRECT.test(c[k - 1] ?? '')).join(' '), 120))
++// The files a Bash command that only looks prints: the operands of cat, head, sed -n and the like that name a file.
++function bashReads(command: string, cwd: string, home?: string) {
++  if (!inspects(command, cwd, home)) return []
++  return commands(command).flatMap((c) => {
++    const p = programOf(c)
++    if (!READERS.has(p)) return []
++    const operands = c.slice(1).filter((w, k) => !w.startsWith('-') && !REDIRECT.test(w) && !(p !== 'sed' && /^-[nc]$/.test(c[k]!)))
++    return (p === 'sed' ? operands.slice(1) : operands).filter((w) => /^[\w.~/@+-]+$/.test(w) && /[./]/.test(w) && !/^[\d,]+p?$/.test(w)).map((w) => resolvePath(w, cwd, home))
++  })
++}
++/**
++ * The working set after a compaction: `prev` (the memory message's) with the calls in `rows` applied, each file at
++ * its latest read and edit, each test command at its latest run; newest last, at most WORKING_FILES_MAX files and
++ * WORKING_TESTS_MAX tests. Scratch files are left out.
++ */
++export function workingSet(prev: WorkingSet, rows: readonly SessionMessage[], at: readonly (number | undefined)[], cwd: string, home?: string): WorkingSet {
++  const files = new Map(prev.files.map((f) => [f.path, f]))
++  const tests = new Map(prev.tests.map((t) => [t.command, t]))
++  const touch = (abs: string, how: 'read' | 'edited', t: number | undefined) => {
++    if (SCRATCH.test(abs)) return
++    const path = displayPath(abs, cwd, home)
++    const { changed: _, ...f } = files.get(path) ?? { path }
++    files.delete(path)
++    files.set(path, { ...f, [how]: t ?? 0 })
++  }
++  for (const b of normalize(rows, at)) {
++    if (b.kind !== 'tool' || !b.result) continue
++    const command = commandOf(b)
++    for (const key of command ? testsIn(command) : []) {
++      tests.delete(key)
++      tests.set(key, { ...(b.at === undefined ? {} : { at: b.at }), command: key, ok: !b.result.isError })
++    }
++    if (b.result.isError) continue
++    const path = pathOf(b.input)
++    if (b.name === 'Read' && path) touch(resolvePath(path, cwd, home), 'read', b.at)
++    if (EDIT_TOOLS.has(b.name) && path) touch(resolvePath(path, cwd, home), 'edited', b.at)
++    for (const p of command ? bashReads(command, cwd, home) : []) touch(p, 'read', b.at)
++    for (const p of command ? bashWrites(command, cwd, home) : []) touch(p, 'edited', b.at)
++  }
++  return { files: [...files.values()].slice(-WORKING_FILES_MAX), tests: [...tests.values()].slice(-WORKING_TESTS_MAX) }
++}
++const when = (t: number | undefined) => (t ? `${day(t)} ${hhmm(t)}` : 'an unknown time')
++/** A file of the working set as a sentence. */
++export function renderSeen(f: SeenFile) {
++  const touches = (['read', 'edited'] as const).filter((how) => f[how] !== undefined).sort((a, b) => f[a]! - f[b]!)
++  const since = f.changed === undefined ? '' : f.changed ? '; changed on disk since' : '; unchanged on disk since'
++  return `- \`${tick(f.path)}\`: ${touches.map((how) => `${how} at ${when(f[how])}`).join(', ')}${since}.`
++}
++/** A test command's last run as a sentence. */
++export const renderTest = (t: SeenTest) => `- \`${tick(t.command)}\` ${t.ok ? 'passed' : 'failed'} at ${when(t.at)}.`
++/** The working set's lines, the oldest files dropped past about 400 tokens. */
++export function renderWorkingSet(ws: WorkingSet) {
++  const files = ws.files.map(renderSeen)
++  const tests = ws.tests.map(renderTest)
++  while (files.length > 1 && [...files, ...tests].join('\n').length > WORKING_SET_MAX_CHARS) files.shift()
++  return [...files, ...tests].join('\n')
++}
++const STAMPED = String.raw`(?:an unknown time|(\d{4}-\d\d-\d\d) (\d\d:\d\d))`
++const SEEN_LINE = new RegExp(String.raw`^- \`([^\`]*)\`: (read|edited) at ${STAMPED}(?:, (read|edited) at ${STAMPED})?(?:; (?:un)?changed on disk since)?\.$`)
++const TEST_LINE = new RegExp(String.raw`^- \`([^\`]*)\` (passed|failed) at ${STAMPED}\.$`)
++const unstamped = (d: string | undefined, t: string | undefined) => (d ? new Date(`${d}T${t}:00`).getTime() : 0)
++/** The working set renderWorkingSet's lines give back. */
++export function parseWorkingSet(body: string): WorkingSet {
++  const files: SeenFile[] = []
++  const tests: SeenTest[] = []
++  for (const l of body.split('\n').map((l) => l.trim())) {
++    const f = SEEN_LINE.exec(l)
++    if (f) files.push({ path: f[1]!, [f[2]!]: unstamped(f[3], f[4]), ...(f[5] ? { [f[5]]: unstamped(f[6], f[7]) } : {}) })
++    const t = TEST_LINE.exec(l)
++    if (t) tests.push({ ...(t[3] ? { at: unstamped(t[3], t[4]) } : {}), command: t[1]!, ok: t[2] === 'passed' })
++  }
++  return { files, tests }
++}
+diff -ru -x node_modules -x fixtures /tmp/omv-code/fail11/tests/register.test.ts i31-workset/tests/register.test.ts
+--- /tmp/omv-code/fail11/tests/register.test.ts	2026-09-25 06:41:59.076128461 +0000
++++ i31-workset/tests/register.test.ts	2026-09-25 08:01:17.507080058 +0000
+@@ -228,7 +228,7 @@
+   return m ? text!.slice(m.index! + m[0].length, m.index! + m[0].length + Number(m[1])) : undefined
+ }
+ // The continuation record's state of the work: its lines before the quoted request, if any.
+-const recordIn = (text?: string) => text?.match(/\n\n<continuation>\n([\s\S]*?)(?:\n^The user's latest request [^\n]*\(\d+ chars\):\n[\s\S]*)?\n<\/continuation>/m)?.[1]
++const recordIn = (text?: string) => text?.match(/\n\n<continuation>\n([\s\S]*?)(?:\nFiles and test runs seen in this session[^\n]*:(?:\n- [^\n]*)*)?(?:\n^The user's latest request [^\n]*\(\d+ chars\):\n[\s\S]*)?\n<\/continuation>/m)?.[1]
+ const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+ const correctionsIn = (text?: string) => text?.match(/\n<corrections>\n([\s\S]*?)\n<\/corrections>/)?.[1]
+ const observationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
+@@ -3559,7 +3559,7 @@
+         ? { exitCode: 0, stdout: 'f97af54\tbench: accept correct wording in two replay questions\n', stderr: '' }
+         : undefined
+   const ENV_HEAD = 'Environment at compaction, read from git by code, not by a model:'
+-  const environmentIn = (text?: string) => text?.match(/\nEnvironment at compaction[^\n]*\n([\s\S]*?)(?=\nThe user's latest request |\n<\/continuation>)/)?.[1]
++  const environmentIn = (text?: string) => text?.match(/\nEnvironment at compaction[^\n]*\n([\s\S]*?)(?=\nFiles and test runs seen in this session|\nThe user's latest request |\n<\/continuation>)/)?.[1]
+ 
+   test("the context management section keeps core's text and adds the compaction briefing, the same on every call", async ($, on) => {
+     on('prompt.section', ($, e) => ({ text: e.text }))
+diff -ru -x node_modules -x fixtures /tmp/omv-code/fail11/tests/vcc.test.ts i31-workset/tests/vcc.test.ts
+--- /tmp/omv-code/fail11/tests/vcc.test.ts	2026-09-25 06:41:59.077428250 +0000
++++ i31-workset/tests/vcc.test.ts	2026-09-25 08:04:57.894782876 +0000
+@@ -1,7 +1,7 @@
+ import { describe, expect, test } from 'claude-code/testing'
+ import type { SessionMessage } from 'claude-code'
+-import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, renderBrief } from '../hooks/vcc'
+-import type { Brief } from '../hooks/vcc'
++import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, parseWorkingSet, renderBrief, renderWorkingSet, WORKING_FILES_MAX, workingSet } from '../hooks/vcc'
++import type { Brief, WorkingSet } from '../hooks/vcc'
+ 
+ const CWD = '/work/project'
+ const HOME = '/home/u'
+@@ -275,4 +275,42 @@
+     expect(text).not.toContain('</session-brief>')
+     expect(text.split('\n').every((l) => /^[>[\-@]/.test(l))).toBe(true)
+   })
++
++  const seen = (rows: SessionMessage[], prev: WorkingSet = { files: [], tests: [] }) => workingSet(prev, rows, times(rows), CWD, HOME)
++
++  test('working set: files at their latest read and edit, test runs at their latest result; failures, searches and scratch left out', () => {
++    const rows = [
++      prompt('fix it'),
++      ...call('Read', { file_path: `${CWD}/src/a.ts` }, 'contents'),
++      ...bash(`sed -n '1,40p' src/b.ts | head -5; cat ${HOME}/notes.md`, 'text'),
++      ...bash(`rg -n foo src/c.ts`, 'hits'),
++      ...call('Edit', { file_path: `${CWD}/src/a.ts`, old_string: 'x', new_string: 'y' }, 'updated'),
++      ...call('Read', { file_path: `${CWD}/src/missing.ts` }, 'File does not exist.', true),
++      ...bash('cat /tmp/scratch.txt', 'x'),
++      ...bash('bun test 2>&1 | tail -3', 'Exit code 1\n3 pass\n1 fail', true),
++      ...bash('bun test 2>&1 | tail -3', '4 pass\n0 fail'),
++      ...bash('bunx tsc -p . && claude plugin test', 'ok'),
++    ]
++    const ws = seen(rows)
++    expect(ws.files).toEqual([
++      { path: 'src/b.ts', read: times(rows)[3] },
++      { path: '~/notes.md', read: times(rows)[3] },
++      { path: 'src/a.ts', read: times(rows)[1], edited: times(rows)[7] },
++    ])
++    expect(ws.tests.map((t) => [t.command, t.ok])).toEqual([
++      ['bun test', true],
++      ['bunx tsc -p .', true],
++      ['claude plugin test', true],
++    ])
++  })
++
++  test('working set: its lines parse back, and a later read moves a carried file to the newest within the cap', () => {
++    const rows = Array.from({ length: WORKING_FILES_MAX + 2 }, (_, i) => call('Read', { file_path: `${CWD}/f${i}.ts` }, 'x')).flat()
++    const ws = seen(rows)
++    expect(ws.files).toHaveLength(WORKING_FILES_MAX)
++    expect(parseWorkingSet(renderWorkingSet(ws))).toEqual(ws)
++    const again = seen(call('Read', { file_path: `${CWD}/f2.ts` }, 'x'), parseWorkingSet(renderWorkingSet(ws)))
++    expect(again.files.at(-1)!.path).toBe('f2.ts')
++    expect(renderWorkingSet({ files: [{ ...again.files.at(-1)!, changed: true }], tests: [] })).toMatch(/: read at \d{4}-\d\d-\d\d \d\d:\d\d; changed on disk since\.$/)
++  })
+ })

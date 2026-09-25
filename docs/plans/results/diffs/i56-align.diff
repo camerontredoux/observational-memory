@@ -1,0 +1,103 @@
+diff -ru /tmp/omv-code/b8full/hooks/register.ts /tmp/omv-code/i56/hooks/register.ts
+--- /tmp/omv-code/b8full/hooks/register.ts	2026-09-25 14:39:05.378776470 +0000
++++ /tmp/omv-code/i56/hooks/register.ts	2026-09-25 15:15:33.708456066 +0000
+@@ -370,6 +370,27 @@
+   return rows.map((_, i) => i).sort((a, b) => keys[a]! - keys[b]! || a - b)
+ }
+ const inCallOrder = (rows: readonly SessionMessage[]) => callOrder(rows).map((i) => rows[i]!)
++
++// How far from the history's end a live context may sit and still be found in it (see `align`).
++const ALIGN_ROWS = 8
++
++// Where a live context (in call order) sits in its loop's history: the offset at which every context row reads the
++// same as the history's rows there, those in call order too. The context usually ends where the history does, but the
++// history may hold rows past it (the `/compact` command's own, written before the hook runs), so the offsets up to
++// ALIGN_ROWS rows short of the end are tried, nearest first. `persistent` is false when none matches; `offset` and
++// `rows` are then the candidate that matched the most rows, for the log.
++function align(messages: readonly SessionMessage[], history: readonly SessionMessage[]) {
++  const want = messages.map(rowHash)
++  const end = history.length - messages.length
++  let best: { offset: number; rows: SessionMessage[]; matched: number } | undefined
++  for (let offset = end; offset >= 0 && offset >= end - ALIGN_ROWS; offset--) {
++    const rows = [...history.slice(0, offset), ...inCallOrder(history.slice(offset, offset + messages.length)), ...history.slice(offset + messages.length)]
++    const matched = want.filter((h, i) => h === rowHash(rows[offset + i]!)).length
++    if (matched === messages.length) return { offset, rows, persistent: true }
++    if (!best || matched > best.matched) best = { offset, rows, matched }
++  }
++  return { offset: best?.offset ?? end, rows: best?.rows ?? [...history], persistent: false }
++}
+ // A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
+ const isMemory = (m: SessionMessage | undefined) =>
+   m?.role === 'user' && (m.text.startsWith(MEMORY_HEADER) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`))
+@@ -1699,12 +1720,18 @@
+ // Why a compaction's context is not the tail of its loop's history, by shape alone (no content): logged and counted.
+ function notPersistent($: EngineInterface, sessionId: string, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
+   const shape = (m: SessionMessage) => `${m.role}, ${rowText(m).length} chars, ${m.toolUses.length} tool uses, ${m.toolResults?.length ?? 0} tool results`
+-  const i = offset < 0 ? -1 : messages.findIndex((m, i) => rowHash(m) !== rowHash(rows[offset + i]!))
++  const differs = (m: SessionMessage, i: number) => rowHash(m) !== rowHash(rows[offset + i]!)
++  const i = offset < 0 ? -1 : messages.findIndex(differs)
++  // Where the first differing row reads the same in the history nearby, if anywhere: a row one side lacks shifts it.
++  const near = (k: number) =>
++    Array.from({ length: 2 * ALIGN_ROWS + 1 }, (_, d) => k + d - ALIGN_ROWS).find((j) => j !== k && rows[j] && rowHash(rows[j]) === rowHash(messages[i]!))
++  const seen = offset < 0 ? undefined : near(offset + i)
+   log(
+     $,
+     offset < 0
+       ? `compaction not persistent: the context has ${messages.length} messages, the history ${rows.length}`
+-      : `compaction not persistent: context message ${i} differs from history row ${offset + i} (context ${shape(messages[i]!)}; history ${shape(rows[offset + i]!)})`,
++      : `compaction not persistent: context message ${i} differs from history row ${offset + i} (context ${shape(messages[i]!)}; history ${shape(rows[offset + i]!)}); ` +
++          `${messages.filter(differs).length} of ${messages.length} differ, the first reading as history row ${seen ?? `none within ${ALIGN_ROWS}`}`,
+   )
+   record(statsIo($), sessionId, (s) => count(s, 'compaction.notPersistent'))
+ }
+@@ -1761,9 +1788,7 @@
+     const live = history ? unmask(e.messages, history) : e.messages
+     const order = callOrder(live)
+     const messages = order.map((i) => live[i]!)
+-    const offset = (history?.length ?? 0) - messages.length
+-    const rows = !history || offset < 0 ? (history ?? []) : [...history.slice(0, offset), ...inCallOrder(history.slice(offset))]
+-    const persistent = !!history && offset >= 0 && messages.every((m, i) => rowHash(m) === rowHash(rows[offset + i]!))
++    const { offset, rows, persistent } = history ? align(messages, history) : { offset: -messages.length, rows: [], persistent: false }
+     if (history && !persistent) notPersistent($, sessionId, messages, rows, offset)
+     const v = view(messages, persistent ? await loadMarks($, loop.key) : [], persistent ? offset : undefined)
+     const base = v.base
+diff -ru /tmp/omv-code/b8full/tests/register.test.ts /tmp/omv-code/i56/tests/register.test.ts
+--- /tmp/omv-code/b8full/tests/register.test.ts	2026-09-25 14:39:05.381464665 +0000
++++ /tmp/omv-code/i56/tests/register.test.ts	2026-09-25 15:15:33.710395532 +0000
+@@ -3483,6 +3483,27 @@
+     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+   })
+ 
++  test('a compaction finds its context when the history holds rows past it (the /compact command) and keeps the ledger', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history } = world(on)
++    const seen = pi(on)
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
++    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
++    await clock.settle()
++    const observed = seen.prompts.length
++    expect(observed).toBeGreaterThan(0)
++    const context = [...history]
++    history.push({ role: 'user', text: '<command-name>/compact</command-name>', toolUses: [] })
++    await $.session.compact({ trigger: 'manual', messages: context })
++
++    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
++    expect(seen.prompts).toHaveLength(observed)
++    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
++  })
++
+   test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, files } = world(on)
+@@ -3499,7 +3520,7 @@
+ 
+     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([
+       'compaction not persistent: the context has 9 messages, the history 8',
+-      'compaction not persistent: context message 2 differs from history row 2 (context user, 34 chars, 0 tool uses, 1 tool results; history user, 40001 chars, 0 tool uses, 1 tool results)',
++      'compaction not persistent: context message 2 differs from history row 2 (context user, 34 chars, 0 tool uses, 1 tool results; history user, 40001 chars, 0 tool uses, 1 tool results); 1 of 8 differ, the first reading as history row none within 8',
+     ])
+     const file = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
+     expect(file.counts['compaction.notPersistent']).toBe(2)

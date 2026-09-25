@@ -1,0 +1,67 @@
+--- /tmp/omv-refl/b5/hooks/register.ts	2026-09-25 12:08:27.755398942 +0000
++++ .scratch/rt/hooks/register.ts	2026-09-25 12:11:22.192733407 +0000
+@@ -53,6 +53,7 @@
+ const REFLECT_MIN_TARGET_TOKENS = 2_000 // the least the 🔴 lines and the kept observations leave the Reflector (boundPins)
+ const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
+ const REFLECT_ATTEMPTS = 4
++const REFLECT_NEAR_FLOOR = 0.75 // with no reply in range, the fullest under the floor is installed when at least this share of it
+ const SKILLS_MAX_TOKENS = 15_000
+ const SKILLS_WHOLE_TURNS = 3 // a skill invoked in the last this many main-thread turns, the running one counted, keeps its text
+ const TOOL_ARGS_MAX_TOKENS = 2_000
+@@ -153,6 +154,8 @@
+ let running: Job[] = []
+ let lock: Promise<unknown> = Promise.resolve()
+ const reflecting = new Set<string>()
++// Per loop, the Reflector input that last failed at every attempt: the same input is not sent again.
++const failedInput = new Map<string, string>()
+ // OM_BRIEF=always: every compaction's memory message carries the session brief of all the rows it compacted, not
+ // only where the floor runs. Off by default: on replayed questions it made no difference while the Observer worked.
+ const briefAlways = ($: EngineInterface) => $.env.get('OM_BRIEF').then((v) => v === 'always', () => false)
+@@ -1500,6 +1503,7 @@
+       const floor = Math.ceil(REFLECT_FLOOR * target)
+       if (target < 1_000) throw new Error(`the 🔴 lines and the newest observations leave ~${target} tokens of the ~${REFLECT_TARGET_TOKENS}-token target`)
+       const input = renderLines(sent)
++      if (failedInput.get(key) === input) return log($, 'reflection skipped: the observations to condense are those of the last failed reflection')
+       const times = sent.flatMap((e) => {
+         const m = e.line.match(/^\S+ (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) /)
+         return m ? [new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])).getTime()] : []
+@@ -1510,10 +1514,15 @@
+       let lines: Omit<Entry, 'id'>[] = []
+       let level = 1
+       let retry: { tokens?: number } | undefined
+-      for (let attempt = 1; !lines.length && attempt <= REFLECT_ATTEMPTS; attempt++) {
++      let fullest: { lines: Omit<Entry, 'id'>[]; tokens: number } | undefined // the largest reply under the floor
++      let under = 0 // replies under the floor in a row: after the second, asking again returns the same length
++      const asked = new Set<string>()
++      for (let attempt = 1; !lines.length && attempt <= REFLECT_ATTEMPTS && under < 2; attempt++) {
+         if (!isLive(loop, stamp)) throw new LoopEnded()
+         if (retry) level = retry.tokens !== undefined && retry.tokens < floor ? Math.max(1, level - 1) : Math.min(4, level + 1)
+         const prompt = reflectionPrompt(input, level, target, floor, estimateTokens(input), retry)
++        if (asked.has(prompt)) break
++        asked.add(prompt)
+         const reply = await complete($, `reflector level ${level}`, REFLECTOR_SYSTEM_PROMPT, prompt, REFLECTOR_TIMEOUT_MS, { phase: 'background' })
+         const parsed = parseLines(observationsOf(reply), bounds, false, noteUnmarked($, 'reflector.background', `reflector reply at level ${level}`)).map((l) => {
+           const { line, source } = splitSource(l)
+@@ -1522,9 +1531,21 @@
+         })
+         const tokens = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
+         if (tokens !== undefined && tokens <= target && tokens >= floor) lines = parsed
++        under = tokens !== undefined && tokens < floor ? under + 1 : 0
++        if (under && tokens! > (fullest?.tokens ?? 0)) fullest = { lines: parsed, tokens: tokens! }
+         retry = { tokens }
+       }
+-      if (!lines.length) throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
++      // No reply in range, but one near the floor: the fullest is installed when within REFLECT_NEAR_FLOOR of it, since
++      // asking again returns the same length, and the observations would stay over the trigger meanwhile.
++      if (!lines.length && fullest && fullest.tokens >= REFLECT_NEAR_FLOOR * floor) {
++        log($, `no reflection came between ~${floor} and ~${target} tokens; installing the fullest, ~${fullest.tokens} tokens`)
++        lines = fullest.lines
++      }
++      if (!lines.length) {
++        failedInput.set(key, input)
++        throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
++      }
++      failedInput.delete(key)
+       lines = withDroppedPaths(lines, sent)
+       await locked(async () => {
+         const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined

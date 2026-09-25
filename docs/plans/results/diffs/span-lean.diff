@@ -1,0 +1,33 @@
+diff -ru /tmp/omv-code/fail11/hooks/register.ts span-lean/hooks/register.ts
+--- /tmp/omv-code/fail11/hooks/register.ts	2026-09-25 07:20:25.875928945 +0000
++++ span-lean/hooks/register.ts	2026-09-25 07:43:39.386238814 +0000
+@@ -33,7 +33,7 @@
+ const PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low']
+ const PI_ISOLATION = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
+ const PI_CWD = '/tmp'
+-const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
++const CHUNK_TOKENS = 7_000 // each Observer call reads about this much history
+ const MAX_PARALLEL = 4 // background Observer calls in flight at once, across the main loop and every subagent's
+ const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
+ const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
+@@ -50,7 +50,7 @@
+ const SKILLS_MAX_TOKENS = 15_000
+ const SKILLS_WHOLE_TURNS = 3 // a skill invoked in the last this many main-thread turns, the running one counted, keeps its text
+ const TOOL_ARGS_MAX_TOKENS = 2_000
+-const TOOL_RESULT_MAX_TOKENS = 5_000
++const TOOL_RESULT_MAX_TOKENS = 1_000
+ // The raw tail a compaction keeps: past its newest TAIL_WHOLE_RESULTS tool results, each successful result over
+ // TAIL_RESULT_MAX_TOKENS keeps its head and tail around an om_recall marker (maskTail).
+ const TAIL_WHOLE_RESULTS = 3
+diff -ru /tmp/omv-code/fail11/tests/register.test.ts span-lean/tests/register.test.ts
+--- /tmp/omv-code/fail11/tests/register.test.ts	2026-09-25 06:41:59.076128461 +0000
++++ span-lean/tests/register.test.ts	2026-09-25 07:46:08.920203152 +0000
+@@ -49,7 +49,7 @@
+ }
+ const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
+ const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
+-const TOOL_RESULT_MAX_CHARS = 5_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/register.ts
++const TOOL_RESULT_MAX_CHARS = 1_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/register.ts
+ 
+ // Local time on a day of September 2026.
+ const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()

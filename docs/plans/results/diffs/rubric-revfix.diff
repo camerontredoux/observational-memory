@@ -1,0 +1,43 @@
+--- .claude/worktrees/agent-a519773dc159f74c7/tests/eval/rubric.ts	2026-09-25 05:16:46.066198594 +0000
++++ tests/eval/rubric.ts	2026-09-25 08:15:06.834445141 +0000
+@@ -155,7 +155,7 @@
+   const ids = idCount(line)
+   return ids >= 3 && ids > line.split(/\s+/).filter(Boolean).length * LIST_DENSITY
+ }
+-const proseOnly = (text: string) => text.split('\n').filter((l) => isProse(l) && !isList(l)).join('\n')
++const proseOnly = (text: string, keep?: (line: string) => boolean) => text.split('\n').filter((l) => keep?.(l) || (isProse(l) && !isList(l))).join('\n')
+ 
+ // ---- Grounding: an identifier counts where its context line says what the transcript said about it ----
+ 
+@@ -206,13 +206,13 @@
+  * The context as the token gates read it: the summary's prose lines, and the raw tail's rows whole when they are the
+  * transcript's own rows (anything else in the tail, prose lines only). A list of bare identifiers counts for nothing.
+  */
+-export function proseContext(context: Context, before: readonly Row[]): string {
++export function proseContext(context: Context, before: readonly Row[], keep?: (line: string) => boolean): string {
+   const genuine = new Set(before.map(messageText))
+   const kept = context.kept.map((m) => {
+     const s = messageText(m)
+-    return { text: genuine.has(s) ? s : proseOnly(s), toolUses: [], toolResults: undefined }
++    return { text: genuine.has(s) ? s : proseOnly(s, keep), toolUses: [], toolResults: undefined }
+   })
+-  return contextText({ summary: proseOnly(context.summary), kept })
++  return contextText({ summary: proseOnly(context.summary, keep), kept })
+ }
+ 
+ // A line that reports a claim as gone ("the $30 cap was dropped") does not state it as current.
+@@ -317,9 +317,12 @@
+     for (const c of spec.constraints.filter((c) => c.setIn < n && !(c.reversal && c.reversal.in < n)))
+       items.push(pass('verbatim', n, c.id, text.includes(squash(c.quote)), cut(c.quote)))
+     // A reversal: its new form held, and after the last place the stale form is (the context reads oldest first).
++    // A line quoting the user's own words for either form counts too: a short reply ("no its 001.41") is not prose.
+     for (const c of spec.constraints.filter((c) => c.reversal && c.reversal.in < n)) {
+-      const now = Math.max(...c.reversal!.held.map((p) => lastMatch(pr, p)))
+-      const stale = Math.max(...c.held.map((p) => lastMatch(pr, p)))
++      const quotes = [c.quote, c.reversal!.quote].map(squash)
++      const rv = proseContext(context, before, (l) => quotes.some((q) => squash(l).includes(q)))
++      const now = Math.max(...c.reversal!.held.map((p) => lastMatch(rv, p)))
++      const stale = Math.max(...c.held.map((p) => lastMatch(rv, p)))
+       items.push(pass('reversals', n, c.id, now >= 0 && now > stale, now < 0 ? (stale >= 0 ? 'stale form only' : 'neither form') : now > stale ? 'new form last' : 'stale form after the new'))
+       items.push(pass('verbatim', n, `${c.id}:reversal`, text.includes(squash(c.reversal!.quote)), cut(c.reversal!.quote)))
+     }

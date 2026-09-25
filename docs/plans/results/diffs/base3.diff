@@ -1,0 +1,685 @@
+diff -ruN -x node_modules -x .git /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/hooks/register.ts /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/hooks/register.ts
+--- /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/hooks/register.ts	2026-09-25 08:10:07.795671557 +0000
++++ /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/hooks/register.ts	2026-09-25 08:46:08.845052407 +0000
+@@ -35,6 +35,9 @@
+ const PI_CWD = '/tmp'
+ const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
+ const MAX_PARALLEL = 4 // background Observer calls in flight at once, across the main loop and every subagent's
++// After a failed background call its loop starts none for this long, doubled with each failure in a row up to the cap.
++const RETRY_MS = 5_000
++const RETRY_MAX_MS = 300_000
+ const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
+ const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
+ const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
+@@ -45,6 +48,9 @@
+ // The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
+ // whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
+ const REFLECT_KEEP_TOKENS = 12_000
++const REFLECT_CUE_TOKENS = 300 // the paths a reflection dropped, each with its clause, up to this
++const REFLECT_TIER_TOKENS = 6_000 // earlier reflections' lines kept as they were, up to this: condensing a line twice loses it
++const REFLECT_MIN_TARGET_TOKENS = 2_000 // the least the 🔴 lines and the kept observations leave the Reflector (boundPins)
+ const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
+ const REFLECT_ATTEMPTS = 4
+ const SKILLS_MAX_TOKENS = 15_000
+@@ -68,7 +74,7 @@
+ const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
+ const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the rest counted
+ const ENV_LINE_MAX_CHARS = 200 // each line of the environment
+-const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force, shown whole or not at all
++const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force shown whole; past it the oldest shorten (boundPins)
+ const NEWEST_RESERVE_TOKENS = 2_000 // of USER_MESSAGES_MAX_TOKENS, kept from the brief for the newest prompt
+ const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say, or for a subagent's model: the smallest in use
+ const OVERHEAD_TOKENS = 20_000 // the system prompt and built-in tool schemas every request carries beside the messages
+@@ -90,7 +96,7 @@
+ // `currentTask`: where the work stands, in the Observer's <continuation> fields (an older reply's Primary/Secondary).
+ type Observed = { lines: string[]; corrections: string[]; currentTask?: string; source?: Source }
+ type Chunk = Range & Observed
+-type Entry = { id: string; line: string; source?: Source } // line: `🔴 2026-09-23 14:30 User asked …`
++type Entry = { id: string; line: string; source?: Source; r?: true } // line: `🔴 2026-09-23 14:30 User asked …`; r: the Reflector wrote it
+ type Ledger = {
+   anchor?: string // the observations of the memory message the live context starts with, hashed
+   watermark: Range // rows [base, to), observed and committed to `entries`
+@@ -143,6 +149,7 @@
+ const briefAlways = ($: EngineInterface) => $.env.get('OM_BRIEF').then((v) => v === 'always', () => false)
+ const sinceScheduled = new Map<string, { rows: number; tokens: number }>() // history seen by the last step, and its growth since a pass
+ const waiting = new Map<string, { loop: Loop; stamp: string }>() // loops a pass left short of a slot, first in line when one frees
++const backoff = new Map<string, { failures: number; until: number }>() // loops whose last background call failed
+ 
+ // How many times each loop has ended, and under `<sessionId>/` how many times every subagent of the session has:
+ // counted up, never reset, so a session that goes on after /clear or a resume starts a new life rather than being
+@@ -156,7 +163,7 @@
+ function end(key: string) {
+   ends.set(key, endsOf(key) + 1)
+   const prefix = key.endsWith('/')
+-  for (const k of [...sinceScheduled.keys(), ...waiting.keys()]) if (prefix ? k.startsWith(key) : k === key) (sinceScheduled.delete(k), waiting.delete(k))
++  for (const k of [...sinceScheduled.keys(), ...waiting.keys(), ...backoff.keys()]) if (prefix ? k.startsWith(key) : k === key) (sinceScheduled.delete(k), waiting.delete(k), backoff.delete(k))
+ }
+ 
+ // Thrown to stop work whose loop ended under it.
+@@ -416,6 +423,42 @@
+   return minute(cut.from) <= minute(cut.to) ? cut : undefined
+ }
+ 
++// The Reflector drops paths it cannot fit. Each path the condensed notes name and its reply does not (by last
++// segment) comes back as the clause of its latest note that names it, at that note's time, most-named first, up to
++// REFLECT_CUE_TOKENS: the file stays findable, with what was done to it.
++function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
++  const out = lines.map((l) => l.line.toLowerCase()).join('\n')
++  const count = new Map<string, number>()
++  const latest = new Map<string, Entry>()
++  for (const e of sent)
++    for (const [p] of e.line.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g))
++      if (/^[~./]/.test(p) || /\.\w+$/.test(p) || p.split('/').length > 2) count.set(p, (count.get(p) ?? 0) + 1), latest.set(p, e)
++  const named = new Set<string>()
++  const cues: Omit<Entry, 'id'>[] = []
++  let chars = 0
++  for (const [p] of [...count].sort((a, b) => b[1] - a[1])) {
++    const base = p.split('/').filter(Boolean).at(-1)!.toLowerCase()
++    if (!base || out.includes(base) || named.has(base)) continue
++    const m = latest.get(p)!.line.match(/^(\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.*)$/)
++    if (!m) continue
++    const clause = m[2]!.split(/(?<=[.;])\s+/).find((c) => c.includes(p)) ?? m[2]!
++    const at = clause.indexOf(p)
++    const text = clause.length <= 220 ? clause : `…${clause.slice(Math.max(0, at - 100), at + p.length + 100).trim()}…`
++    const line = `${m[1]} ${text}`
++    if (chars + line.length + 3 > REFLECT_CUE_TOKENS * 4) continue
++    chars += line.length + 3
++    for (const [q] of text.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g)) named.add(q.split('/').filter(Boolean).at(-1)!.toLowerCase())
++    cues.push({ line, r: true })
++  }
++  const timeOf = (l: { line: string }) => l.line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? ''
++  const merged = [...lines]
++  for (const c of cues) {
++    const i = merged.findIndex((l) => timeOf(l) > timeOf(c))
++    merged.splice(i < 0 ? merged.length : i, 0, c)
++  }
++  return merged
++}
++
+ // `red` placed among `lines` in time order, each before the first line later than it; one without a time goes where
+ // the one before it did.
+ function interleave(lines: Omit<Entry, 'id'>[], red: Entry[]) {
+@@ -514,6 +557,46 @@
+     .trim()
+ const idOf = (key: string) => `k${hash(key)}`
+ const constraintId = (line: string) => idOf(keyOf(line))
++
++// A pinned line (a constraint, or a 🔴 observation) past its tier's cap, as an index line: its time, first words and
++// the om_recall query that finds its whole text. The ledger keeps the whole line; only the rendering shortens.
++const SHORTENED = /\(older (?:constraint|🔴 line), shortened: om_recall "/
++const PIN_WORDS = 10
++function shortenPin(line: string, what: 'constraint' | '🔴 line') {
++  if (SHORTENED.test(line)) return line
++  const m = /^(🔴\s*(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}\s+)?)(.*)$/s.exec(baseOf(line))!
++  const [, head, body] = m as unknown as [string, string, string]
++  const quote = /^(User:\s*)"((?:[^"\\]|\\.)*)"?/.exec(body)
++  const words = (quote ? quote[2]! : body).split(/(?:\s|\\n)+/).filter(Boolean)
++  const lead = words.slice(0, PIN_WORDS).join(' ').replace(/\\?"/g, "'")
++  const more = words.length > PIN_WORDS ? '…' : ''
++  const shown = quote ? `${quote[1]}"${lead}${more}"` : `${lead}${more}`
++  return `${head}${shown} (older ${what}, shortened: om_recall "${lead.split(' ').slice(0, 6).join(' ')}")`
++}
++// Whole terms a pinned line shares with the work in view: paths, identifiers and long words.
++const pinTerms = (line: string) => new Set((baseOf(line).toLowerCase().match(/[a-z_][\w./-]{5,}/g) ?? []).filter((t) => !/^(?:should|always|before|instead|because|without|please|there|their|which|about|would|could)$/.test(t)))
++// A row's text and its tool calls' inputs, where the work in view names things.
++const rowTerms = (m: SessionMessage) => [m.text, ...m.toolUses.map((u) => JSON.stringify(u.input ?? ''))].join('\n')
++const referenced = (line: string, inView: string) => [...pinTerms(line)].filter((t) => inView.includes(t)).length >= 2
++/**
++ * The pinned lines rendered within `maxTokens` (as `measure` counts them): whole while they fit; past that, every line
++ * starts as an index line (shortenPin), and lines go back to whole while they fit, those the work in view still names
++ * first, then the newest. Over the cap even as index lines, every line stays, shortened: nothing is dropped.
++ */
++function boundPins(lines: readonly string[], maxTokens: number, inView: string, what: 'constraint' | '🔴 line', measure: (l: readonly string[]) => number) {
++  if (measure(lines) <= maxTokens) return [...lines]
++  // A line no longer than its index line stays whole.
++  const shorter = (l: string, s = shortenPin(l, what)) => (s.length < l.length ? s : l)
++  const out = lines.map((l) => shorter(l))
++  const view = inView.toLowerCase()
++  const order = lines.map((_, i) => i).reverse()
++  const byUse = [...order.filter((i) => referenced(lines[i]!, view)), ...order.filter((i) => !referenced(lines[i]!, view))]
++  for (const i of byUse) {
++    const whole = out.with(i, lines[i]!)
++    if (measure(whole) <= maxTokens) out[i] = lines[i]!
++  }
++  return out
++}
+ function applyConstraints(active: readonly string[], lines: readonly string[]) {
+   const out = new Map<string, string>() // by key, in the order last said
+   const put = (raw: string) => {
+@@ -522,11 +605,12 @@
+     const key = keyOf(line)
+     const ids = new Set(ref?.[1]!.match(/k[0-9a-f]+/gi)?.map((id) => id.toLowerCase()))
+     const replaced: string[] = []
+-    for (const [k, l] of out)
+-      if (k !== key && ids.has(idOf(k))) {
+-        replaced.push(l)
+-        out.delete(k)
+-      }
++    if (ids.size)
++      for (const [k, l] of out)
++        if (k !== key && ids.has(idOf(k))) {
++          replaced.push(l)
++          out.delete(k)
++        }
+     const again = out.get(key) ?? ''
+     out.delete(key)
+     const note = replaced.length
+@@ -747,6 +831,7 @@
+   entries.map((e) => `* ${e.line}${sources && e.source ? ` ${renderSource(e.source)}` : ''}`).join('\n')
+ // The memory's form: a run of lines drawn from the same source range gives it once, after its last line, and each
+ // day's date is written once, on an `@ YYYY-MM-DD` line before its first line; a line and a source then give the time alone.
++// A run of lines with no source that a run with one follows ends on NO_SOURCE, so it is not read back as part of it.
+ const renderGrouped = (entries: readonly Entry[], sources = true) => {
+   let day = ''
+   return entries
+@@ -755,10 +840,12 @@
+       const last = !next || next.from !== e.source?.from || next.to !== e.source?.to
+       const m = e.line.match(LINE_DAY)
+       const head = m && m[2] !== day ? `${DAY_MARK}${(day = m[2]!)}\n` : ''
+-      return `${head}* ${m ? m[1] + e.line.slice(m[0].length) : e.line}${sources && e.source && last ? ` ${renderSource(e.source, day)}` : ''}`
++      const trailer = !sources ? '' : e.source ? (last ? ` ${renderSource(e.source, day)}` : '') : next ? ` ${NO_SOURCE}` : ''
++      return `${head}* ${m ? m[1] + e.line.slice(m[0].length) : e.line}${trailer}`
+     })
+     .join('\n')
+ }
++const NO_SOURCE = '(source none)'
+ const LINE_DAY = /^(\S+ )(\d{4}-\d{2}-\d{2}) (?=\d{2}:\d{2} )/
+ const DAY_MARK = '@ '
+ // The observations with each line's date written on it again, as the ledger keeps them.
+@@ -905,8 +992,6 @@
+ // A memory message that would not fit the compacted context's budget: the built-in compaction runs instead. The
+ // fallback reads it by its message, as the engine hands a hook's error on rewrapped.
+ const OVER_BUDGET = 'the compacted context is over its budget'
+-// The user's constraints in force over CONSTRAINTS_MAX_TOKENS: shown whole or not at all, so the built-in compaction runs.
+-const OVER_CAP = "the user's constraints are over their cap"
+ // A context that is the memory message alone: nothing for the floor to compile either.
+ const MEMORY_ALONE = 'nothing to compact after the memory message'
+ const overLimit = (what: string, tokens: number, limit: number) => `${what}: ~${tokens} tokens, ~${limit} allowed`
+@@ -973,8 +1058,8 @@
+     observations,
+     anchor: hash(observations),
+     entries: parseLines(dated(observations), undefined)
+-      .map(splitSource)
+-      .reduceRight<ReturnType<typeof splitSource>[]>((out, e) => [e.source || !out[0]?.source ? e : { ...e, source: out[0].source }, ...out], []),
++      .map((l): ReturnType<typeof splitSource> & { none?: true } => (l.endsWith(` ${NO_SOURCE}`) ? { line: l.slice(0, -NO_SOURCE.length - 1), none: true } : splitSource(l)))
++      .reduceRight<ReturnType<typeof splitSource>[]>((out, { none, ...e }) => [e.source || none || !out[0]?.source ? e : { ...e, source: out[0].source }, ...out], []),
+     currentTask: parseContinuation(first.text, user.end || own.length) ?? tag(head.slice(end), 'current-task'),
+     failures: failuresOf(first.text, user.end || own.length),
+     skills,
+@@ -1146,10 +1231,13 @@
+ 
+ // Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight across every loop: gaps a failed
+ // call left first, then whole chunks at the frontier, which stops KEEP_RAW_TOKENS short of the end. A loop left short
+-// of a slot waits for the next one to free. A pass for a loop that ended, before it or while it read, does nothing.
++// of a slot waits for the next one to free. A pass for a loop that ended, before it or while it read, does nothing,
++// and so does one while the loop backs off after a failed call.
+ function schedule($: EngineInterface, loop: Loop, stamp: string) {
+   return locked(async () => {
+     if (!isLive(loop, stamp)) return
++    const held = backoff.get(loop.key)
++    if (held && (await $.clock.now()) < held.until) return
+     const v = await liveView($, loop)
+     const ledger = await loadLedger($, loop.key, v)
+     if (!isLive(loop, stamp)) return
+@@ -1225,13 +1313,28 @@
+       )
+     return !!at
+   }).catch((error) => (log($, errorText(error)), false))
++  if (landed) backoff.delete(loop.key)
++  else if (!chunk && isLive(loop, stamp)) await backOff($, loop, stamp)
+   // The slot it held goes to a loop waiting for one first, whether this chunk landed or not.
+   const next = [...waiting.values(), ...(landed ? [{ loop, stamp }] : [])].filter((l, i, all) => all.findIndex((o) => o.loop.key === l.loop.key) === i)
+   await Promise.all([landed && maybeReflect($, loop, stamp), ...next.map((l) => schedule($, l.loop, l.stamp))]).catch((error) => log($, errorText(error)))
+ }
+ 
++// A failed call holds its loop's passes back until its back-off ends, then runs one. Calls that fail while it lasts
++// (others in flight when pi began failing) count as the same failure.
++async function backOff($: EngineInterface, loop: Loop, stamp: string) {
++  const now = await $.clock.now()
++  const last = backoff.get(loop.key)
++  if (last && now < last.until) return
++  const failures = (last?.failures ?? 0) + 1
++  const ms = Math.min(RETRY_MS * 2 ** (failures - 1), RETRY_MAX_MS)
++  backoff.set(loop.key, { failures, until: now + ms })
++  $.clock.after(ms, () => void schedule($, loop, stamp).catch((error) => log($, errorText(error))))
++}
++
+ // The Reflector over a snapshot of the entries, in the background. The newest, up to REFLECT_KEEP_TOKENS, and every
+-// 🔴 line (exact repeats once) pass through unchanged; the Reflector condenses the rest into what is left of
++// 🔴 line (exact repeats once) pass through unchanged, as do the lines earlier reflections wrote while they fit
++// REFLECT_TIER_TOKENS (condensing a line twice loses it); the Reflector condenses the rest into what is left of
+ // REFLECT_TARGET_TOKENS, and a 🔴 line it writes is kept as 🟡. A result over that target is tried again with stronger
+ // compression, one under REFLECT_FLOOR of it with a request for more detail, up to REFLECT_ATTEMPTS; with none in
+ // range, nothing changes. The replaced entries are then replaced in place, so entries committed while it ran survive.
+@@ -1256,9 +1359,23 @@
+       const older = snapshot.slice(0, recent)
+       const kept = snapshot.slice(recent)
+       const isRed = (e: Entry) => e.line.startsWith('🔴')
+-      const red = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
+-      const sent = older.filter((e) => !isRed(e))
+-      const target = REFLECT_TARGET_TOKENS - estimateTokens(renderLines([...red, ...kept]))
++      const pinned = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
++      // The 🔴 lines' share is bounded so the Reflector keeps at least REFLECT_MIN_TARGET_TOKENS: past it the oldest
++      // shorten to index lines (boundPins), and still over, the oldest go to the Reflector with the rest.
++      const share = REFLECT_TARGET_TOKENS - REFLECT_MIN_TARGET_TOKENS
++      const measure = (es: readonly Entry[]) => estimateTokens(renderLines([...es, ...kept]))
++      const pins = boundPins(pinned.map((e) => e.line), share, renderLines(kept), '🔴 line', (ls) => measure(pinned.map((e, i) => ({ ...e, line: ls[i]! }))))
++      let red = pinned.map((e, i) => (pins[i] === e.line ? e : { ...e, line: pins[i]! }))
++      const moved = new Set<string>()
++      while (red.length && measure(red) > share) moved.add(red.shift()!.id)
++      if (red.length < pinned.length || pins.some((l, i) => l !== pinned[i]!.line))
++        log($, `the 🔴 lines were over their share of the reflection target: ${pins.filter((l, i) => l !== pinned[i]!.line).length} shortened, ${moved.size} condensed`)
++      // Lines an earlier reflection wrote pass through while they fit REFLECT_TIER_TOKENS; past it they are condensed again.
++      const tier = estimateTokens(renderLines(older.filter((e) => e.r && !isRed(e)))) <= REFLECT_TIER_TOKENS
++      const through = older.flatMap((e) => red.find((r) => r.id === e.id) ?? (tier && e.r && !isRed(e) ? [e] : []))
++      const sent = older.filter((e) => (!isRed(e) || moved.has(e.id)) && !(tier && e.r))
++      if (!sent.length) throw new Error('nothing to condense but earlier reflections')
++      const target = REFLECT_TARGET_TOKENS - measure(red)
+       const floor = Math.ceil(REFLECT_FLOOR * target)
+       if (target < 1_000) throw new Error(`the 🔴 lines and the newest observations leave ~${target} tokens of the ~${REFLECT_TARGET_TOKENS}-token target`)
+       const input = renderLines(sent)
+@@ -1280,13 +1397,14 @@
+         const parsed = parseLines(observationsOf(reply), bounds, false, noteUnmarked($, 'reflector.background', `reflector reply at level ${level}`)).map((l) => {
+           const { line, source } = splitSource(l)
+           const kept = reflectedSource(source, span, sources.length === sent.length)
+-          return { line: isRed({ id: '', line }) ? `🟡${line.slice('🔴'.length)}` : line, ...(kept ? { source: kept } : {}) }
++          return { line: isRed({ id: '', line }) ? `🟡${line.slice('🔴'.length)}` : line, ...(kept ? { source: kept } : {}), r: true as const }
+         })
+         const tokens = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
+         if (tokens !== undefined && tokens <= target && tokens >= floor) lines = parsed
+         retry = { tokens }
+       }
+       if (!lines.length) throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
++      lines = withDroppedPaths(lines, sent)
+       await locked(async () => {
+         const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
+         if (!isLive(loop, stamp)) throw new LoopEnded()
+@@ -1297,7 +1415,7 @@
+           return
+         }
+         let seq = ledger.seq
+-        const reflected = interleave(lines, red).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
++        const reflected = interleave(lines, through).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
+         const rest = ledger.entries.filter((e) => !ids.has(e.id))
+         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
+         const after = estimateTokens(renderLines([...reflected, ...kept]))
+@@ -1552,11 +1670,9 @@
+     // The memory message from the ledger once this compaction's chunks commit: cut at the watermark, as observed.
+     // Where that cannot stand (nothing observed, the Observer failed, or over the budget), the floor: the same memory
+     // with the raw tail cut later, the rows between the watermark and the cut compiled by code into the session brief.
+-    // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for constraints
+-    // over their cap, and for a context that is the memory message alone.
++    // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for a context that
++    // is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
+     const build = async (ledger: Ledger) => {
+-      const constraintTokens = estimateTokens(renderCorrections(ledger.corrections))
+-      if (constraintTokens > CONSTRAINTS_MAX_TOKENS) throw new Error(overLimit(OVER_CAP, constraintTokens, CONSTRAINTS_MAX_TOKENS))
+       const observed = ledger.watermark.to
+       const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
+       const attempt = async (cut: number, floor: boolean) => {
+@@ -1569,7 +1685,9 @@
+         dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
+         const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
+         let memory: Memory = {
+-          corrections: ledger.corrections,
++          corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
++            estimateTokens(renderCorrections(l)),
++          ),
+           observations: renderGrouped(ledger.entries),
+           currentTask: ledger.currentTask,
+           ...(covered ? { stateAt: stamp(covered.to) } : {}),
+@@ -1594,7 +1712,7 @@
+         let message = memoryMessage(memory)
+         // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
+         // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
+-        // find; the corrections, observations and continuation record stay whole.
++        // find; the corrections (within their cap), observations and continuation record stay whole.
+         const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', briefer]]
+         if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ({ ...m, observations: renderGrouped(ledger.entries, false) })])
+         const over = contextTokens(message)
+@@ -1686,7 +1804,7 @@
+     if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
+     log($, `${next.error.message}; using the built-in compaction`)
+     const message = next.error.message ?? ''
+-    const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message.startsWith(OVER_CAP) ? 'Constraints over their cap' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
++    const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
+     show($, `${why}. Using built-in compaction`, e.agentId)
+     return delegateToBuiltin($, e, next, true)
+   })
+diff -ruN -x node_modules -x .git /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/tests/register.test.ts /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/tests/register.test.ts
+--- /home/cameron/work/mods/observational-memory/.scratch/omv-code/base2/tests/register.test.ts	2026-09-25 08:10:48.170865331 +0000
++++ /home/cameron/work/mods/observational-memory/.scratch/omv-code/base3/tests/register.test.ts	2026-09-25 08:46:08.846402741 +0000
+@@ -232,6 +232,8 @@
+ const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
+ const correctionsIn = (text?: string) => text?.match(/\n<corrections>\n([\s\S]*?)\n<\/corrections>/)?.[1]
+ const renderedObservationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
++// A memory message with its observations replaced by `observations`, as rendered.
++const withObservations = (m: SessionMessage, observations: string): SessionMessage => ({ ...m, text: m.text.replace(/(<observations>\n)[\s\S]*?(\n<\/observations>)/, (_, a, b) => `${a}${observations}${b}`) })
+ // The observations with each day's date, written once on its `@ YYYY-MM-DD` line, put back on its lines and source ends.
+ function observationsIn(text?: string) {
+   let day = ''
+@@ -715,7 +717,7 @@
+ 
+     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+     await clock.settle()
+-    await runTurn($, turn('b', 'b', 100), at(22, 14, 40))
++    await clock.advance(5_000) // its back-off over, the loop calls pi again
+     await clock.settle()
+ 
+     expect(seen.logs.filter((l) => l.startsWith('background observation'))).toEqual([
+@@ -751,9 +753,9 @@
+     expect(seen.screen).toEqual(['Observed 7 messages in 0 ms · +4 notes · memory 4 notes'])
+     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+     // Clamped into the chunk's times, 13:59 to 14:32 (the latest time recorded plus a minute); a line without a
+-    // real time gets the chunk's latest.
++    // real time gets the chunk's latest. The chunk's source range closes its run of lines.
+     expect(observationsIn(result.messages?.[0]?.text)).toBe(
+-      ['🔴 2026-09-22 14:30 User asked a', '🟡 2026-09-22 13:59 Too early', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail'].map((l) => `* ${l} (source 2026-09-22 14:00 to 2026-09-22 14:31)`).join('\n'),
++      ['🔴 2026-09-22 14:30 User asked a', '🟡 2026-09-22 13:59 Too early', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail (source 2026-09-22 14:00 to 2026-09-22 14:31)'].map((l) => `* ${l}`).join('\n'),
+     )
+     expect(result.messages?.slice(1)).toEqual(history.slice(7))
+   })
+@@ -780,6 +782,38 @@
+     expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23) // the last ~6k tokens left raw
+   })
+ 
++  test('a failing pi with more chunks than slots is called again only as each back-off ends, doubling, and the chunks land once it answers', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    let failing = true
++    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
++    await clock.settle()
++    expect(seen.prompts).toHaveLength(4) // the four in flight fail as one failure, and their slots start nothing
++    await clock.advance(4_999)
++    expect(seen.prompts).toHaveLength(4)
++    await clock.advance(1)
++    expect(seen.prompts).toHaveLength(8)
++    await clock.advance(9_999)
++    expect(seen.prompts).toHaveLength(8)
++    await clock.advance(1)
++    expect(seen.prompts).toHaveLength(12)
++    failing = false
++    await clock.advance(20_000)
++
++    expect(seen.prompts).toHaveLength(18)
++    expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23)
++    // Landed, the loop is back to no back-off: a failure now waits the first 5 s again.
++    failing = true
++    await runTurn($, [...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000)], at(22, 15, 0))
++    await clock.settle()
++    const calls = seen.prompts.length
++    await clock.advance(5_000)
++    expect(seen.prompts.length - calls).toBe(1)
++  })
++
+   test('chunks landing out of order commit to the ledger only once the watermark reaches them', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, stored } = world(on)
+@@ -948,6 +982,51 @@
+     expect(lines).toContain('🟡 2026-09-22 14:30 Read the auth module')
+   })
+ 
++  test("a later reflection passes an earlier reflection's lines through as they were, and condenses only the notes", async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    const notes = (time: string) => `<observations>\n${`* 🟡 ${time} read a file with a long name\n`.repeat(4_000)}</observations>`
++    const seen = pi(on, {
++      reply: (prompt) => notes(prompt.includes('[User @ 2026-09-22 14:30]: a') ? '2026-09-22 14:30' : '2026-09-22 15:00'),
++      reflect: (n, prompt) => nearTarget(prompt, `* 🟡 ${n === 1 ? '2026-09-22 14:30 First condensed' : '2026-09-22 15:00 Second condensed'}`),
++    })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await clock.settle()
++    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
++    await clock.settle()
++
++    const reflections = seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
++    expect(reflections).toHaveLength(2)
++    expect(reflections[1]).not.toContain('First condensed')
++    expect(reflections[1]).not.toContain(' filler detail ')
++    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
++    expect(lines).toContain('🟡 2026-09-22 14:30 First condensed')
++    expect(lines).toContain('🟡 2026-09-22 15:00 Second condensed')
++    expect(lines.indexOf('🟡 2026-09-22 14:30 First condensed')).toBeLessThan(lines.indexOf('🟡 2026-09-22 15:00 Second condensed'))
++  })
++
++  test('a path the condensed notes name and the reflection drops comes back as the clause that named it, at its time', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    const pi_ = pi(on, {
++      reply: () =>
++        `<observations>\n* 🟡 2026-09-22 14:30 Assistant read the plan. Assistant fixed the totals in \`hooks/stats.ts\`.\n* 🟡 2026-09-22 14:30 Assistant pruned \`hooks/prune.ts\`.\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
++      reflect: (_n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Assistant pruned sessions in `hooks/prune.ts`'),
++    })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await clock.settle()
++
++    expect(pi_.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
++    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
++    expect(lines).toContain('🟡 2026-09-22 14:30 Assistant fixed the totals in `hooks/stats.ts`.')
++    expect(lines.filter((l) => l.includes('prune.ts'))).toHaveLength(1)
++    expect(lines.some((l) => l.includes('read the plan'))).toBe(false)
++  })
++
+   test('a reflection that stays far under its target at every attempt leaves the observations as they were', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, stored } = world(on)
+@@ -1000,6 +1079,47 @@
+     expect(after.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([api, '🟡 2026-09-22 15:00 User required concise output behind `full`', table])
+   })
+ 
++  test("🔴 lines over their share of the reflection target shorten to om_recall index lines, and still over, the oldest go to the Reflector, which then keeps its target", async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    const red = (i: number) => `🔴 2026-09-22 14:30 User required that module ${i} keep ${'its public interface and its tests unchanged, '.repeat(8)}always`
++    const { gate, open } = gates()
++    const seen = pi(on, {
++      hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
++      reply: () => `<observations>\n${Array.from({ length: 350 }, (_, i) => `* ${red(i)}`).join('\n')}\n</observations>`,
++      reflect: (n, prompt) => nearTarget(prompt),
++    })
++    const runTurn = live(on, clock, history)
++
++    // ~42k tokens of 🔴 lines pass REFLECT_AT_TOKENS; the newest ~12k are kept, and unbounded, the older ~30k leave no target.
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await clock.settle()
++    const prompt = seen.prompts.find((p) => p.startsWith('## OBSERVATIONS'))!
++    open(seen.prompts.indexOf(prompt) + 1)
++    await clock.settle()
++
++    expect(seen.logs).toContainEqual(expect.stringMatching(/^the 🔴 lines were over their share of the reflection target: \d+ shortened, \d+ condensed$/))
++    const target = Number(prompt.match(/Size target: at most ~(\d+) tokens/)![1])
++    expect(target).toBeGreaterThanOrEqual(2_000)
++    expect(prompt).toContain(`* ${red(0)}`) // the oldest, condensed
++    expect(prompt).not.toContain(`module 349 keep`)
++    const after = (stored['ledger:session-1'] as Ledger).entries
++    const pinned = after.filter((e) => e.line.startsWith('🔴'))
++    // Shortened: the older 🔴 lines that stay. Whole: the newest, up to REFLECT_KEEP_TOKENS, kept as they were.
++    const module = (line: string) => Number(line.match(/module (\d+) keep/)![1])
++    const short = pinned.filter((e) => e.line.includes('(older 🔴 line, shortened'))
++    const whole = pinned.filter((e) => !short.includes(e))
++    expect(short.length).toBeGreaterThan(0)
++    for (const e of short)
++      expect(e.line).toBe(`🔴 2026-09-22 14:30 User required that module ${module(e.line)} keep its public interface and… (older 🔴 line, shortened: om_recall "User required that module ${module(e.line)} keep")`)
++    for (const e of whole) expect(e.line).toBe(red(module(e.line)))
++    expect(Math.max(...short.map((e) => module(e.line)))).toBeLessThan(Math.min(...whole.map((e) => module(e.line))))
++    expect(Math.min(...short.map((e) => module(e.line)))).toBeGreaterThan(0) // the oldest went to the Reflector
++    expect(after.some((e) => e.line.includes('module 0 keep'))).toBe(false)
++    expect(tokensOf(after)).toBeLessThanOrEqual(20_000)
++    expect(seen.logs.filter((l) => l.startsWith('reflection failed'))).toEqual([])
++  })
++
+   test("a reflected line keeps a source range it gives inside the reflected span, cut to it; one outside it, or none, gets none", async ($, on) => {
+     const clock = mock.clock(on)
+     const { history } = world(on)
+@@ -1027,13 +1147,16 @@
+     expect(reflections).toHaveLength(1)
+     expect(reflections[0]).toContain('* 🟡 2026-09-22 14:30 read a file with a long name (source 2026-09-22 14:30 to 2026-09-22 14:31)\n')
+     expect(reflections[0]).toContain('* 🟡 2026-09-22 15:00 read a file with a long name (source 2026-09-22 14:31 to 2026-09-22 15:01)\n')
+-    const reflected = observationsIn(result.messages?.[0]?.text)!.split('\n').filter((l) => !isFiller(l) && !l.includes('long name'))
++    const observed = observationsIn(result.messages?.[0]?.text)!.split('\n')
++    const reflected = observed.filter((l) => !isFiller(l.replace(' (source none)', '')) && !l.includes('long name'))
+     expect(reflected).toEqual([
+       '* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)',
+       '* 🟡 2026-09-22 14:50 Read the refresh handler (source 2026-09-22 14:50 to 2026-09-22 15:01)',
+       '* 🟡 2026-09-22 15:00 Ran the tests',
+       '* 🟡 2026-09-22 15:00 Fixed the expiry check',
+     ])
++    // The lines with none, the fillers after them included, end on a marker before the kept lines' run.
++    expect(observed[observed.findIndex((l) => l.includes('long name')) - 1]).toMatch(/ filler detail \d+ \(source none\)$/)
+   })
+ 
+   test('a memory from before source ranges is read as unknown provenance: its observations get none, and a reflection over them invents none', async ($, on) => {
+@@ -1062,8 +1185,8 @@
+     await clock.settle()
+     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+ 
+-    expect(observationsIn(result.messages?.[0]?.text)!.split('\n').filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
+-      '* 🟡 2026-09-22 14:30 Saw a, before the ranges',
++    expect(observationsIn(result.messages?.[0]?.text)!.split('\n').filter((l) => !isFiller(l.replace(' (source none)', '')) && !l.includes('long name'))).toEqual([
++      '* 🟡 2026-09-22 14:30 Saw a, before the ranges (source none)',
+       '* 🟡 2026-09-22 14:30 Read files (source 2026-09-22 14:30 to 2026-09-22 14:31)',
+       '* 🟡 2026-09-22 14:30 Ran the tests',
+     ])
+@@ -1211,15 +1334,41 @@
+     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual([correction])
+     const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+     const text = first.messages?.[0]?.text ?? ''
+-    expect(text).toContain(`\n\n<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)\n`)
++    expect(text).toContain(`\n\n<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
+     expect(recordIn(text)).toBe(`${WHERE} (2026-09-22 14:31):\nActive: fixing the refresh endpoint`)
+     // Carried forward from the memory message itself.
+     for (const key of Object.keys(stored)) delete stored[key]
+     const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)] })
+-    expect(second.messages?.[0]?.text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)\n`)
++    expect(second.messages?.[0]?.text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
+     expect(seen.modelCalls).toBe(0)
+   })
+ 
++  test('a memory mixing lines with and without a source reads back as it was written: rendered, carried forward and rendered again, it is the same', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history, stored } = world(on)
++    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw a\n</observations>' })
++    const runTurn = live(on, clock, history)
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
++    await clock.settle()
++    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
++    const mixed = [
++      '@ 2026-09-22',
++      '* 🟡 14:00 Saw a, before the ranges',
++      '* 🟡 14:01 Asked about b (source none)',
++      '* 🟡 14:30 Read files',
++      '* 🟡 14:30 Ran the tests (source 14:30 to 14:31)',
++      '* 🟢 14:40 Condensed from no one place (source none)',
++      '* 🟡 14:45 Fixed the check (source 14:40 to 14:46)',
++      '* 🟡 15:00 Noted the rest',
++    ].join('\n')
++    for (const key of Object.keys(stored)) delete stored[key]
++    const second = await $.session.compact({ trigger: 'manual', messages: [withObservations(first.messages![0]!, mixed), ...first.messages!.slice(1)] })
++
++    expect(renderedObservationsIn(second.messages?.[0]?.text)).toBe(mixed)
++  })
++
+   test('an observation carries the span of transcript times it came from, never a range the Observer wrote, and keeps it through the memory message', async ($, on) => {
+     const clock = mock.clock(on)
+     const { history, stored } = world(on)
+@@ -1748,30 +1897,42 @@
+ 
+   test('a memory over its budget with source ranges and within it without leaves them out of that message only, before touching skills or user messages', async ($, on) => {
+     const clock = mock.clock(on)
+-    const { history } = world(on)
+-    const seen = pi(on, { reply: (prompt) => (prompt.includes(']: a\n') ? `<observations>\n${'* 🟡 2026-09-22 14:30 read a file\n'.repeat(800)}</observations>` : undefined) })
+-    // A 15k-token budget: the ~7k tokens of observations fit it, and with their ranges, ~16k, they do not.
+-    let window = 50_000
++    const { history, stored } = world(on)
++    const seen = pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 ${prompt.includes(']: a\n') ? '14:30 read a file' : '15:30 read c'}\n</observations>` })
++    let window = 200_000
+     on('session.usage', () => ({ value: { context: { window }, rateLimits: [] } }) as never)
+     const runTurn = live(on, clock, history)
+ 
+     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+     await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+     await clock.settle()
++    const observed = await $.session.compact({ trigger: 'auto', messages: [...history] })
++    // A run of lines gives its range once: lines from two ranges in turn, carried forward from the memory message, are
++    // each a run, and a line with none before them ends on its marker. A 15k-token budget: the ~7k tokens of
++    // observations fit it, and with their ranges, ~14k, they do not.
++    const minute = (i: number) => `14:3${i % 2}`
++    const lines = Array.from({ length: 1200 }, (_, i) => `* 🟡 ${minute(i)} read a file (source ${minute(i)} to ${minute(i)})`)
++    for (const key of Object.keys(stored)) delete stored[key]
++    history.splice(0, history.length, withObservations(observed.messages![0]!, ['@ 2026-09-22', '* 🟡 14:29 Saw a, before the ranges (source none)', ...lines].join('\n')), ...observed.messages!.slice(1))
++    window = 50_000
++    await runTurn($, turn('c', 'c', CHUNK), at(22, 15, 30))
++    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 0))
++    await clock.settle()
+     const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+ 
+     const text = first.messages?.[0]?.text ?? ''
+-    expect(observationsIn(text)).toBe(Array(800).fill('* 🟡 2026-09-22 14:30 read a file').join('\n'))
+-    expect(userMessagesIn(text)).toEqual(['a'])
++    // Left out, the ranges take the marker with them.
++    expect(observationsIn(text)).toBe(['* 🟡 2026-09-22 14:29 Saw a, before the ranges', ...Array.from({ length: 1200 }, (_, i) => `* 🟡 2026-09-22 ${minute(i)} read a file`), '* 🟡 2026-09-22 15:30 read c'].join('\n'))
++    expect(userMessagesIn(text)).toEqual(['a', 'b', 'c'])
+     expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: source ranges left out$/))
+     // The ledger keeps them: a compaction with room for them gives them back.
+     window = 200_000
+     history.splice(0, history.length, ...first.messages!)
+-    await runTurn($, turn('c', 'c', CHUNK), at(22, 15, 30))
+-    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 0))
++    await runTurn($, turn('e', 'e', CHUNK), at(22, 16, 30))
++    await runTurn($, turn('f', 'f', 8_000), at(22, 17, 0))
+     await clock.settle()
+     const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+-    expect(observationsIn(second.messages?.[0]?.text)?.split('\n')[0]).toBe('* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:31)')
++    expect(observationsIn(second.messages?.[0]?.text)?.split('\n').slice(0, 3)).toEqual(['* 🟡 2026-09-22 14:29 Saw a, before the ranges (source none)', '* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:30)', '* 🟡 2026-09-22 14:31 read a file (source 2026-09-22 14:31 to 2026-09-22 14:31)'])
+   })
+ 
+   test('over its budget at every cut the floor tries while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
+@@ -1844,22 +2005,32 @@
+     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
+   })
+ 
+-  test("a memory whose constraints are over their own cap falls back rather than drop any, though the memory fits its budget", async ($, on) => {
++  test("constraints over their own cap shorten, the oldest first, to om_recall index lines: one the work in view names, and the newest that fit, stay whole; the ledger keeps every one whole", async ($, on) => {
+     mock.clock(on)
+     const { history, stored } = world(on)
+-    const corrections = Array.from({ length: 2_000 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
++    const long = (i: number) => `🔴 User: "Leave module ${i} as it is, ${'and do not touch its tests or its fixtures '.repeat(9)}"`
++    const named = '🔴 User: "Keep src/widget_registry.ts as it is: widget_registry is public"'
++    const corrections = [named, ...Array.from({ length: 100 }, (_, i) => long(i))]
+     const seen = pi(on, {
+       reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
+     })
+-    // The default 90k-token budget holds the ~20k the corrections take; their 8k-token cap does not.
++    // The default 90k-token budget holds the ~10k the corrections take whole; their 8k-token cap does not.
+     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+-    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
++    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('widget_registry', 8_000))
+ 
+     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+ 
+-    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+-    expect(seen.logs).toContainEqual(expect.stringMatching(/^the user's constraints are over their cap: ~\d+ tokens, ~8000 allowed; using the built-in compaction$/))
+-    expect(seen.screen.at(-1)).toBe('Constraints over their cap. Using built-in compaction')
++    const shown = correctionsIn(result.messages![0]!.text)!.split('\n')
++    expect(shown).toHaveLength(corrections.length)
++    expect(Math.ceil(shown.join('\n').length / 4)).toBeLessThanOrEqual(8_000)
++    const short = shown.flatMap((l, i) => (l.includes('(older constraint, shortened: om_recall') ? [i] : []))
++    expect(short.length).toBeGreaterThan(0)
++    expect(shown[0]).toBe(`* ${named}`) // the oldest, but named by the raw tail's Read
++    // The shortened run is the oldest after it; every line after the run is whole.
++    expect(short).toEqual(Array.from({ length: short.length }, (_, i) => i + 1))
++    expect(shown.slice(short.length + 1)).toEqual(corrections.slice(short.length + 1).map((c) => `* ${c}`))
++    expect(shown[1]).toBe('* 🔴 User: "Leave module 0 as it is, and do not touch…" (older constraint, shortened: om_recall "Leave module 0 as it is,")')
++    expect(seen.screen.at(-1)).not.toContain('built-in')
+     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
+   })
+ 

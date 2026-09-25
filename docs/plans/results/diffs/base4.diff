@@ -1,0 +1,264 @@
+diff -ru '--exclude=node_modules' base3/hooks/recall.ts base4/hooks/recall.ts
+--- base3/hooks/recall.ts	2026-09-25 06:41:59.070495516 +0000
++++ base4/hooks/recall.ts	2026-09-25 09:09:09.451958076 +0000
+@@ -83,10 +83,14 @@
+ // `>`, so the tag alone is optionally followed by an attribute list, for every name here.
+ export const INJECTED_WRAPPER =
+   /^<(?:task-notification|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args|fork-boilerplate|bash-stdout|bash-input|bash-stderr|cross-session-message|teammate-message|user-memory-input|mcp-resource-update|mcp-polling-update|channel)(?:\s[^>]*)?>/
+-// What the user typed: not an injected block (a system reminder, a named wrapper, image note).
++// The markers the host puts before a prompt for the images pasted into it (`[Image #10]`), or alone in an image note
++// (`[Image: source: /tmp/….png]`). Shared with register.ts's `typed`.
++export const IMAGE_MARKERS = /^(?:\s*\[Image(?: #\d+|: [^\]\n]*)\])+\s*/
++// What the user typed: not an injected block (a system reminder, a named wrapper, an image note with no text).
+ function typedText(text: string) {
+   const t = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+-  return !t || INJECTED_WRAPPER.test(t) || t.startsWith('[Image') ? undefined : t
++  const said = t.replace(IMAGE_MARKERS, '')
++  return !said || INJECTED_WRAPPER.test(said) ? undefined : t
+ }
+ const pad = (n: number) => String(n).padStart(2, '0')
+ const day = (ms: number) => {
+diff -ru '--exclude=node_modules' base3/hooks/register.ts base4/hooks/register.ts
+--- base3/hooks/register.ts	2026-09-25 08:46:08.845052407 +0000
++++ base4/hooks/register.ts	2026-09-25 09:09:26.439512718 +0000
+@@ -17,7 +17,7 @@
+ import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
+ import type { Io, LunaCall } from './stats'
+ import { registerPrune } from './prune'
+-import { INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
++import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
+ import type { RecallInput, RecallIo } from './recall'
+ import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
+ import type { Brief, OpenFailure } from './vcc'
+@@ -61,6 +61,10 @@
+ // TAIL_RESULT_MAX_TOKENS keeps its head and tail around an om_recall marker (maskTail).
+ const TAIL_WHOLE_RESULTS = 3
+ const TAIL_RESULT_MAX_TOKENS = 250
++// Past the newest TAIL_WHOLE_INPUTS tool calls, each string argument of a call that did not fail over
++// TAIL_INPUT_MAX_TOKENS keeps its head and tail the same way (a heredoc, a subagent's prompt, an edit's text).
++const TAIL_WHOLE_INPUTS = 3
++const TAIL_INPUT_MAX_TOKENS = 500
+ const OBSERVER_TIMEOUT_MS = 120_000 // a ~10k-token chunk takes Luna about 15 s
+ const REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens of output, in the background
+ const MAX_MARKS = 4_000
+@@ -195,7 +199,7 @@
+ const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
+ // The marker excerpt leaves in a brief it cut (see capUserMessages).
+ const BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/
+-function excerpt(text: string, maxTokens: number, what: 'result' | 'message' = 'result') {
++function excerpt(text: string, maxTokens: number, what: 'result' | 'message' | 'input' = 'result') {
+   if (text.length <= maxTokens * 4) return text
+   const room = maxTokens * 4
+   const headChars = Math.floor(room / 2)
+@@ -209,9 +213,28 @@
+ // result over TAIL_RESULT_MAX_TOKENS cut to its head and tail. om_recall finds the whole result in the transcript.
+ function maskTail(rows: readonly SessionMessage[]) {
+   let seen = 0
++  let calls = 0
++  const cutValue = (v: unknown): unknown => {
++    if (typeof v === 'string') {
++      const text = excerpt(v, TAIL_INPUT_MAX_TOKENS, 'input')
++      return text.length < v.length ? text : v
++    }
++    if (Array.isArray(v)) return v.map(cutValue)
++    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cutValue(x)]))
++    return v
++  }
++  const cutInputs = (m: SessionMessage): SessionMessage => {
++    const toolUses = m.toolUses.toReversed().map((u) => {
++      if (++calls <= TAIL_WHOLE_INPUTS || u.isError || u.tool === 'Agent' || JSON.stringify(u.input).length <= TAIL_INPUT_MAX_TOKENS * 4) return u
++      const input = cutValue(u.input) as Record<string, unknown>
++      return JSON.stringify(input).length < JSON.stringify(u.input).length ? { ...u, input } : u
++    })
++    return toolUses.every((u, i) => u === m.toolUses.at(-1 - i)) ? m : { ...m, toolUses: toolUses.toReversed() }
++  }
+   return rows
+     .toReversed()
+     .map((m) => {
++      if (m.toolUses.length) m = cutInputs(m)
+       if (!m.toolResults?.length) return m
+       // A cut that would not shorten the result (the marker outweighs what it omits) leaves it whole.
+       const cut = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
+@@ -224,18 +247,56 @@
+     .toReversed()
+ }
+ const MASKED = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/
++const isWrapper = (m: SessionMessage) => isPrompt(m) && INJECTED_WRAPPER.test(m.text.trim())
++// An injected wrapper row in the raw tail (a task notification, hook feedback) that a newer one repeats keeps its
++// first line and the lines no newer one has, then names the whole row by its hash for unmask.
++const REPEATED = /\n\(repeated lines as in the newer notice below; ([0-9a-f]+)\)$/
++function dedupWrappers(rows: readonly SessionMessage[]) {
++  const newer = new Set<string>()
++  return rows
++    .toReversed()
++    .map((m) => {
++      if (!isWrapper(m)) return m
++      const lines = m.text.split('\n')
++      const keep = lines.filter((l, i) => i === 0 || !l.trim() || !newer.has(l))
++      for (const l of lines) if (l.trim()) newer.add(l)
++      const text = `${keep.join('\n').replace(/\n{2,}/g, '\n')}\n(repeated lines as in the newer notice below; ${hash(m.text)})`
++      return keep.length < lines.length && text.length < m.text.length ? { ...m, text } : m
++    })
++    .toReversed()
++}
+ // A result maskTail cut reads whole again wherever the history still holds it (the rows before the compaction that
+-// cut it, under the same tool use id): the Observer, the row hashes and the times see the result as it was.
++// cut it, under the same tool use id), and so does a wrapper row dedupWrappers cut (under its hash): the Observer, the
++// row hashes and the times see the row as it was.
+ function unmask(rows: readonly SessionMessage[], history: readonly SessionMessage[]) {
+   const whole = new Map<string, string>()
+-  for (const m of history) for (const r of m.toolResults ?? []) if (r.text.length > (whole.get(r.tool_use_id)?.length ?? -1)) whole.set(r.tool_use_id, r.text)
++  const wrappers = new Map<string, string>()
++  for (const m of history) {
++    for (const r of m.toolResults ?? []) if (r.text.length > (whole.get(r.tool_use_id)?.length ?? -1)) whole.set(r.tool_use_id, r.text)
++    if (isWrapper(m)) wrappers.set(hash(m.text), m.text)
++  }
+   const original = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
+     const at = r.text.search(MASKED)
+     const w = at < 0 ? undefined : whole.get(r.tool_use_id)
+     return w && w.length > r.text.length && w.startsWith(r.text.slice(0, at)) ? w : undefined
+   }
+-  return rows.map((m) => (m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m))
++  const wrapper = (m: SessionMessage) => {
++    const id = isPrompt(m) ? m.text.match(REPEATED)?.[1] : undefined
++    const w = id && wrappers.get(id)
++    return w && w.startsWith(m.text.slice(0, m.text.indexOf('\n'))) ? w : undefined
++  }
++  const inputs = new Map<string, Record<string, unknown>>()
++  for (const m of history) for (const u of m.toolUses) if (!INPUT_MASKED.test(JSON.stringify(u.input))) inputs.set(u.tool_use_id, u.input)
++  const input = (u: SessionMessage['toolUses'][number]) => (INPUT_MASKED.test(JSON.stringify(u.input)) ? inputs.get(u.tool_use_id) : undefined)
++  return rows
++    .map((m) => (m.toolUses.some(input) ? { ...m, toolUses: m.toolUses.map((u) => ({ ...u, input: input(u) ?? u.input })) } : m))
++    .map((m) => {
++      const w = wrapper(m)
++      if (w) return { ...m, text: w }
++      return m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m
++    })
+ }
++const INPUT_MASKED = /\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full input\] \.\.\./
+ const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+ // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
+ const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
+@@ -301,14 +362,16 @@
+ const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
+ 
+ // What the user typed, if a row is a real prompt: no tool results, compaction summary, injected block (a system
+-// reminder, a named wrapper, image note) or skill text. A system reminder a hook appended to a prompt is cut from it.
+-// `SessionMessage` carries no origin field (no host metadata for a user prompt's source reaches this hook, unlike
+-// `prompt.submit`'s or `session.receive`'s own `origin`), so a genuine structured prompt is told from an injected
+-// one by name, using recall.ts's `INJECTED_WRAPPER` so the two modules agree on what counts as typed.
++// reminder, a named wrapper, an image note with no text) or skill text. A system reminder a hook appended to a prompt
++// is cut from it. A prompt typed after pasted images keeps their markers, as sent. `SessionMessage` carries no origin field (no host metadata
++// for a user prompt's source reaches this hook, unlike `prompt.submit`'s or `session.receive`'s own `origin`), so a
++// genuine structured prompt is told from an injected one by name, using recall.ts's `INJECTED_WRAPPER` and
++// `IMAGE_MARKERS` so the two modules agree on what counts as typed.
+ function typed(m: SessionMessage, skills: readonly Skill[]) {
+   if (!isPrompt(m) || isMemory(m) || isSummary(m)) return undefined
+   const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+-  if (!text || INJECTED_WRAPPER.test(text) || text.startsWith('[Image')) return undefined
++  const said = text.replace(IMAGE_MARKERS, '')
++  if (!said || INJECTED_WRAPPER.test(said)) return undefined
+   return skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
+ }
+ 
+@@ -1797,7 +1860,7 @@
+     // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
+     // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
+     // In the context's own order.
+-    return { messages: [message, ...maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m))] }
++    return { messages: [message, ...dedupWrappers(maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m)))] }
+   }).catch(async ($, e, next) => {
+     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
+     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
+diff -ru '--exclude=node_modules' base3/tests/recall.test.ts base4/tests/recall.test.ts
+--- base3/tests/recall.test.ts	2026-09-25 06:41:59.075742517 +0000
++++ base4/tests/recall.test.ts	2026-09-25 09:09:09.452859619 +0000
+@@ -190,6 +190,18 @@
+     expect(await run({ query: 'GIZMO-7' }, io)).toMatch(/^0 match/)
+   })
+ 
++  test('a prompt typed after pasted images is the asking one; an earlier one is found, and an image note alone is not a prompt', async () => {
++    const rows = [
++      msg('user', 1, [{ type: 'text', text: '[Image #10]\n\nNeed a follow up PR for the GORMAN PR' }, { type: 'image' }]),
++      msg('assistant', 2, [{ type: 'text', text: 'On it' }]),
++      msg('user', 3, [{ type: 'text', text: '[Image #11] [Image #12]\n\nand fix the WIDGET-3 street address' }, { type: 'image' }]),
++      msg('user', 3, '[Image: source: /tmp/clipboard-1.png]'),
++    ]
++    const io = memoryIo({ [`${DIR}/${NEW}.jsonl`]: rows.join('\n') })
++    expect(await run({ query: 'GORMAN' }, io)).toMatch(/^1 match/)
++    expect(await run({ query: 'WIDGET-3' }, io)).toMatch(/^0 match/)
++  })
++
+   test('regex and quoted phrases', async () => {
+     expect(await run({ query: '/needle-\\d+/' })).toMatch(/^1 match\(es\) for \/needle-\\d\+\/ in .*\n\[aaaaaaaa:3 [^\n]*\n  250: row 250 has the NEEDLE-42 marker/)
+     expect(await run({ query: '/NEEDLE-4[0-9]/' })).toContain('250: row 250')
+diff -ru '--exclude=node_modules' base3/tests/register.test.ts base4/tests/register.test.ts
+--- base3/tests/register.test.ts	2026-09-25 08:46:08.846402741 +0000
++++ base4/tests/register.test.ts	2026-09-25 09:09:09.453399267 +0000
+@@ -2606,6 +2606,26 @@
+     expect(userMessagesIn(text)).toEqual(['a', '<myapp-config>\n  <env>prod</env>\n</myapp-config>\nplease review this and tell me if it looks right', 'b'])
+   })
+ 
++  test('a prompt typed after pasted images is kept with their markers; an image note with no text is not a prompt', async ($, on) => {
++    mock.clock(on)
++    world(on)
++    pi(on)
++    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
++    const messages = [
++      ...turn('a', 'a', CHUNK),
++      row('[Image #10]\n\nNeed a follow up PR for the gorman PR'),
++      row('[Image: source: /tmp/clipboard-1.png]'),
++      row('[Image #11] [Image #12] these two'),
++      row('[Image #13]\n<system-reminder>hook note</system-reminder>'),
++      ...turn('b', 'b', CHUNK),
++      ...turn('c', 'c', 8_000),
++    ]
++
++    const result = await $.session.compact({ trigger: 'manual', messages })
++
++    expect(userMessagesIn(result.messages?.[0]?.text)).toEqual(['a', '[Image #10]\n\nNeed a follow up PR for the gorman PR', '[Image #11] [Image #12] these two', 'b'])
++  })
++
+   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
+     mock.clock(on)
+     world(on)
+@@ -3258,6 +3278,39 @@
+     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+     expect(seen.prompts).toHaveLength(observed)
+     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
++  })
++
++  test('an older wrapper row in the raw tail keeps only the lines a newer one does not repeat, and reads whole again after the compaction', async ($, on) => {
++    const clock = mock.clock(on)
++    const { history } = world(on)
++    const seen = pi(on)
++    const runTurn = live(on, clock, history)
++    const notice = (id: string) => `<task-notification>\n<task-id>${id}</task-id>\nThe watcher woke: read the inbox, act on each new file, then reply to the lead with what changed.\n</task-notification>`
++
++    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
++    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
++    await clock.settle()
++    await runTurn($, [{ role: 'user', text: notice('w1'), toolUses: [] }, { role: 'assistant', text: 'read the inbox', toolUses: [] }], at(22, 15, 10))
++    await runTurn($, [{ role: 'user', text: notice('w2'), toolUses: [] }, { role: 'assistant', text: 'read it again', toolUses: [] }], at(22, 15, 20))
++    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
++    const tail = first.messages!.slice(1).map((m) => m.text)
++    expect(tail).toContain(notice('w2'))
++    expect(tail.find((t) => t.includes('w1'))).toMatch(/^<task-notification>\n<task-id>w1<\/task-id>\n\(repeated lines as in the newer notice below; [0-9a-f]+\)$/)
++
++    history.push(...first.messages!)
++    const memory = first.messages![0]!
++    await runTurn($, turn('c', 'c', CHUNK), at(22, 16, 0))
++    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 30))
++    await clock.settle()
++    const observed = seen.prompts.length
++    await $.session.compact({ trigger: 'auto', messages: history.slice(history.indexOf(memory)) })
++
++    // The Observer read both notices whole, and the next compaction matched the history with no Observer call.
++    expect(seen.prompts.some((p) => p.includes('repeated lines as in the newer notice'))).toBe(false)
++    expect(seen.prompts.join('\n').split('then reply to the lead').length - 1).toBe(2)
++    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
++    expect(seen.prompts).toHaveLength(observed)
++    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+   })
+ 
+   // A compaction writes its kept tail back in the context's order, so the history then holds a parallel block

@@ -1,0 +1,61 @@
+--- .scratch/b3now/hooks/register.ts	2026-09-25 08:39:48.121567354 +0000
++++ .scratch/b3now-i35/hooks/register.ts	2026-09-25 08:39:48.140265237 +0000
+@@ -48,6 +48,7 @@
+ // The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
+ // whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
+ const REFLECT_KEEP_TOKENS = 12_000
++const REFLECT_CUE_TOKENS = 300 // the paths a reflection dropped, each with its clause, up to this
+ const REFLECT_TIER_TOKENS = 6_000 // earlier reflections' lines kept as they were, up to this: condensing a line twice loses it
+ const REFLECT_MIN_TARGET_TOKENS = 2_000 // the least the 🔴 lines and the kept observations leave the Reflector (boundPins)
+ const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
+@@ -422,6 +423,42 @@
+   return minute(cut.from) <= minute(cut.to) ? cut : undefined
+ }
+ 
++// The Reflector drops paths it cannot fit. Each path the condensed notes name and its reply does not (by last
++// segment) comes back as the clause of its latest note that names it, at that note's time, most-named first, up to
++// REFLECT_CUE_TOKENS: the file stays findable, with what was done to it.
++function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
++  const out = lines.map((l) => l.line.toLowerCase()).join('\n')
++  const count = new Map<string, number>()
++  const latest = new Map<string, Entry>()
++  for (const e of sent)
++    for (const [p] of e.line.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g))
++      if (/^[~./]/.test(p) || /\.\w+$/.test(p) || p.split('/').length > 2) count.set(p, (count.get(p) ?? 0) + 1), latest.set(p, e)
++  const named = new Set<string>()
++  const cues: Omit<Entry, 'id'>[] = []
++  let chars = 0
++  for (const [p] of [...count].sort((a, b) => b[1] - a[1])) {
++    const base = p.split('/').filter(Boolean).at(-1)!.toLowerCase()
++    if (!base || out.includes(base) || named.has(base)) continue
++    const m = latest.get(p)!.line.match(/^(\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.*)$/)
++    if (!m) continue
++    const clause = m[2]!.split(/(?<=[.;])\s+/).find((c) => c.includes(p)) ?? m[2]!
++    const at = clause.indexOf(p)
++    const text = clause.length <= 220 ? clause : `…${clause.slice(Math.max(0, at - 100), at + p.length + 100).trim()}…`
++    const line = `${m[1]} ${text}`
++    if (chars + line.length + 3 > REFLECT_CUE_TOKENS * 4) continue
++    chars += line.length + 3
++    for (const [q] of text.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g)) named.add(q.split('/').filter(Boolean).at(-1)!.toLowerCase())
++    cues.push({ line, r: true })
++  }
++  const timeOf = (l: { line: string }) => l.line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? ''
++  const merged = [...lines]
++  for (const c of cues) {
++    const i = merged.findIndex((l) => timeOf(l) > timeOf(c))
++    merged.splice(i < 0 ? merged.length : i, 0, c)
++  }
++  return merged
++}
++
+ // `red` placed among `lines` in time order, each before the first line later than it; one without a time goes where
+ // the one before it did.
+ function interleave(lines: Omit<Entry, 'id'>[], red: Entry[]) {
+@@ -1367,6 +1404,7 @@
+         retry = { tokens }
+       }
+       if (!lines.length) throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
++      lines = withDroppedPaths(lines, sent)
+       await locked(async () => {
+         const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
+         if (!isLive(loop, stamp)) throw new LoopEnded()

@@ -1,0 +1,7 @@
+## observer lane: purpose rubric items and behavior probe (for I26/I27)
+
+- Staged diff: ~/.claude/jobs/40c779b6/tmp/purpose/purpose-rubric.diff (170 lines). It's applied only in /tmp/obs-bench2, not in the worktree or main.
+- Files: tests/eval/rubric.ts (new `purpose` gate, weight 3; one-line purpose matching), tests/eval/behavior.ts (a purpose probe: "What is this session working on, and why?"), tests/replay.test.ts (unit test), plus one hand-written `purpose:` item in each of om-v04, om-orchestration and firstmate-11 .rubric.local.ts.
+- Matching: a `purpose:` item holds only when every expect is on ONE prose line of at most 600 chars (PURPOSE_LINE_MAX). This stops tokens spread across the context, or across a one-line JSON tool-result dump, from counting as a statement of the goal.
+- Negative control: the first `controls` run caught om-v04's purpose item matching om-orchestration@4 through a subagent result JSON on one line of the raw tail. The 600-char cap fixed it. After that, `controls --plugin /tmp/omv/grp` and plugin tests passed 346/0 in /tmp/obs-bench2. Baseline grp pass rates on cached contexts (before the cap): om-v04 0/1,731, om-orchestration 1/981, firstmate-11 0/2,094, with no cross-transcript passes. So on grp the gate is almost always failed, which gives I26/I27 room to show a gain.
+- Caution: in the worktree, tests/fixtures/*.local.ts are symlinks into the MAIN checkout. Applying the diff or running `controls` there writes into main's fixtures. /tmp/obs-bench2 uses real copies.

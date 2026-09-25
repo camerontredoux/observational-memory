@@ -1,0 +1,13 @@
+--- tests/fixtures/firstmate-11.rubric.local.ts	2026-09-25 11:58:38.731628774 +0000
++++ tests/fixtures/firstmate-11.rubric.local.ts	2026-09-25 14:14:04.220215520 +0000
+@@ -20,8 +20,8 @@
+     { id: 'contract', from: 9, expect: ['CON-2026-0082'] },
+     // What the whole session is about, on one line (purpose: items hold only when every expect is on one line).
+     { id: 'purpose:firstmate-crew', from: 2,
+-      expect: [['firstmate'], ['crewmate', 'crewmates'], ['oasis', 'opie'], ['gorman', 'sbom', 'uspa', 'line item', 'line items']],
+-      ask: PURPOSE, answer: '^(?=[\\s\\S]*firstmate)(?=[\\s\\S]*crew)' },
++      expect: [['firstmate'], ['crewmate', 'crewmates', 'fleet'], ['oasis', 'opie'], ['gorman', 'sbom', 'uspa', 'line item', 'line items']],
++      ask: PURPOSE, answer: '^(?=[\\s\\S]*firstmate)(?=[\\s\\S]*(crew|fleet))' },
+   ],
+   absent: [
+     { id: 'upstream-push', from: 4, pattern: '(?<!not |never |nothing )(pushed|sent) to (the )?upstream', ask: 'Which commit did you push to the upstream firstmate repository?' },
