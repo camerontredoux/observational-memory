@@ -523,7 +523,7 @@ describe('register', () => {
       reply: (prompt) => {
         const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
         return name === 'a'
-          ? `Here are the observations:\n* 🔴 Saw a\n  * -> read a.ts`
+          ? `Here are the observations:\n* 🟡 Saw a\n  * -> read a.ts`
           : `<corrections>\n* 🔴 Keep b\n<observations>\n* 🔴 Saw b\n<continuation>\nActive: b`
       },
     })
@@ -532,9 +532,59 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(2)
     const text = result.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe('* 🔴 Saw a; read a.ts\n* 🔴 Saw b')
+    expect(observationsIn(text)).toBe('* 🟡 Saw a; read a.ts\n* 🔴 Saw b')
     expect(text).toContain('* 🔴 Keep b')
     expect(text).not.toContain('Keep b; ')
+  })
+
+  test('an unmarked line continues the observation before it, but after a 🔴 line stands as its own 🟡 line; each is logged and counted', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    const seen = pi(on, {
+      reply: () =>
+        '<corrections>\n* 🔴 User: "use pnpm, never npm"\nUser: "and keep the lockfile"\n</corrections>\n' +
+        '<observations>\n* 🔴 Saw a\nUser asked for b\n* 🟡 Read a.ts\n  and found the bug\n</observations>',
+    })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+
+    const text = result.messages?.[0]?.text
+    expect(correctionsIn(text)).toBe('* 🔴 User: "use pnpm, never npm"')
+    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🟡 User asked for b\n* 🟡 Read a.ts; and found the bug\n* 🟡 User: "and keep the lockfile"')
+    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
+      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User: \\"and keep the lockfile\\""',
+      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User asked for b"',
+      'an unmarked line in the observer reply for rows 0-3 joined the line before it: "and found the bug"',
+    ])
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
+    expect(stats.counts['observer.compaction.merged']).toBe(1)
+    expect(stats.counts['observer.compaction.orphaned']).toBe(2)
+  })
+
+  test("a 🔴 correction whose quote runs over several lines stays one line; after its closing quote an unmarked line is its own 🟡 line", async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    const seen = pi(on, {
+      reply: () =>
+        '<corrections>\n* 🔴 User: "Go a bit deeper yes please.\nI want you to compare them\nside by side." (replaces k1)\nUser asked for a table\n</corrections>\n' +
+        '<observations>\n* 🟡 Saw a\n</observations>',
+    })
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+
+    const text = result.messages?.[0]?.text
+    expect(correctionsIn(text)).toBe('* 🔴 User: "Go a bit deeper yes please.; I want you to compare them; side by side."')
+    expect(observationsIn(text)).toBe('* 🟡 Saw a\n* 🟡 User asked for a table')
+    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
+      'an unmarked line in the observer reply for rows 0-3 continued the open quote of the 🔴 line before it: "I want you to compare them"',
+      'an unmarked line in the observer reply for rows 0-3 continued the open quote of the 🔴 line before it: "side by side.\\" (replaces k1)"',
+      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User asked for a table"',
+    ])
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
+    expect(stats.counts['observer.compaction.merged']).toBe(2)
+    expect(stats.counts['observer.compaction.orphaned']).toBe(1)
   })
 
   test('at compaction, a gap with nothing to show (thinking-only rows) is observed with no Observer call', async ($, on) => {
@@ -1040,6 +1090,33 @@ describe('register', () => {
     expect(reflector).toContain('You are the reflection agent')
     expect(markers(reflector)).toHaveLength(4)
     expect(markers(reflector)).toEqual(markers(observer))
+  })
+
+  test('an unmarked line in a reflection continues the line before it, but after a 🔴 line stands as its own 🟡 line', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored, files } = world(on)
+    const seen = pi(on, {
+      reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
+      reflect: (n, prompt) => nearTarget(prompt, '* 🔴 2026-09-22 14:30 Use pnpm\nnever npm\n* 🟡 2026-09-22 14:30 Read files\nand a.ts'),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect((stored['ledger:session-1'] as Ledger).entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
+      '🟡 2026-09-22 14:30 Use pnpm',
+      '🟡 2026-09-22 14:30 never npm',
+      '🟡 2026-09-22 14:30 Read files; and a.ts',
+    ])
+    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
+      'an unmarked line in the reflector reply at level 1 followed a 🔴 line; kept as its own 🟡 line: "never npm"',
+      'an unmarked line in the reflector reply at level 1 joined the line before it: "and a.ts"',
+    ])
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
+    expect(stats.counts['reflector.background.merged']).toBe(1)
+    expect(stats.counts['reflector.background.orphaned']).toBe(1)
   })
 
   test('a reflection in the older date-group form, which the prompts no longer ask for, is still read', async ($, on) => {
