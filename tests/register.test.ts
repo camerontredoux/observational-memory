@@ -986,6 +986,47 @@ describe('register', () => {
     expect(after.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([api, '🟡 2026-09-22 15:00 User required concise output behind `full`', table])
   })
 
+  test("🔴 lines over their share of the reflection target shorten to om_recall index lines, and still over, the oldest go to the Reflector, which then keeps its target", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const red = (i: number) => `🔴 2026-09-22 14:30 User required that module ${i} keep ${'its public interface and its tests unchanged, '.repeat(8)}always`
+    const { gate, open } = gates()
+    const seen = pi(on, {
+      hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
+      reply: () => `<observations>\n${Array.from({ length: 350 }, (_, i) => `* ${red(i)}`).join('\n')}\n</observations>`,
+      reflect: (n, prompt) => nearTarget(prompt),
+    })
+    const runTurn = live(on, clock, history)
+
+    // ~42k tokens of 🔴 lines pass REFLECT_AT_TOKENS; the newest ~12k are kept, and unbounded, the older ~30k leave no target.
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+    const prompt = seen.prompts.find((p) => p.startsWith('## OBSERVATIONS'))!
+    open(seen.prompts.indexOf(prompt) + 1)
+    await clock.settle()
+
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the 🔴 lines were over their share of the reflection target: \d+ shortened, \d+ condensed$/))
+    const target = Number(prompt.match(/Size target: at most ~(\d+) tokens/)![1])
+    expect(target).toBeGreaterThanOrEqual(2_000)
+    expect(prompt).toContain(`* ${red(0)}`) // the oldest, condensed
+    expect(prompt).not.toContain(`module 349 keep`)
+    const after = (stored['ledger:session-1'] as Ledger).entries
+    const pinned = after.filter((e) => e.line.startsWith('🔴'))
+    // Shortened: the older 🔴 lines that stay. Whole: the newest, up to REFLECT_KEEP_TOKENS, kept as they were.
+    const module = (line: string) => Number(line.match(/module (\d+) keep/)![1])
+    const short = pinned.filter((e) => e.line.includes('(older 🔴 line, shortened'))
+    const whole = pinned.filter((e) => !short.includes(e))
+    expect(short.length).toBeGreaterThan(0)
+    for (const e of short)
+      expect(e.line).toBe(`🔴 2026-09-22 14:30 User required that module ${module(e.line)} keep its public interface and… (older 🔴 line, shortened: om_recall "User required that module ${module(e.line)} keep")`)
+    for (const e of whole) expect(e.line).toBe(red(module(e.line)))
+    expect(Math.max(...short.map((e) => module(e.line)))).toBeLessThan(Math.min(...whole.map((e) => module(e.line))))
+    expect(Math.min(...short.map((e) => module(e.line)))).toBeGreaterThan(0) // the oldest went to the Reflector
+    expect(after.some((e) => e.line.includes('module 0 keep'))).toBe(false)
+    expect(tokensOf(after)).toBeLessThanOrEqual(20_000)
+    expect(seen.logs.filter((l) => l.startsWith('reflection failed'))).toEqual([])
+  })
+
   test("a reflected line keeps a source range it gives inside the reflected span, cut to it; one outside it, or none, gets none", async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
@@ -1800,22 +1841,32 @@ describe('register', () => {
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
   })
 
-  test("a memory whose constraints are over their own cap falls back rather than drop any, though the memory fits its budget", async ($, on) => {
+  test("constraints over their own cap shorten, the oldest first, to om_recall index lines: one the work in view names, and the newest that fit, stay whole; the ledger keeps every one whole", async ($, on) => {
     mock.clock(on)
     const { history, stored } = world(on)
-    const corrections = Array.from({ length: 2_000 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
+    const long = (i: number) => `🔴 User: "Leave module ${i} as it is, ${'and do not touch its tests or its fixtures '.repeat(9)}"`
+    const named = '🔴 User: "Keep src/widget_registry.ts as it is: widget_registry is public"'
+    const corrections = [named, ...Array.from({ length: 100 }, (_, i) => long(i))]
     const seen = pi(on, {
       reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
     })
-    // The default 90k-token budget holds the ~20k the corrections take; their 8k-token cap does not.
+    // The default 90k-token budget holds the ~10k the corrections take whole; their 8k-token cap does not.
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
-    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('widget_registry', 8_000))
 
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
 
-    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
-    expect(seen.logs).toContainEqual(expect.stringMatching(/^the user's constraints are over their cap: ~\d+ tokens, ~8000 allowed; using the built-in compaction$/))
-    expect(seen.screen.at(-1)).toBe('Constraints over their cap. Using built-in compaction')
+    const shown = correctionsIn(result.messages![0]!.text)!.split('\n')
+    expect(shown).toHaveLength(corrections.length)
+    expect(Math.ceil(shown.join('\n').length / 4)).toBeLessThanOrEqual(8_000)
+    const short = shown.flatMap((l, i) => (l.includes('(older constraint, shortened: om_recall') ? [i] : []))
+    expect(short.length).toBeGreaterThan(0)
+    expect(shown[0]).toBe(`* ${named}`) // the oldest, but named by the raw tail's Read
+    // The shortened run is the oldest after it; every line after the run is whole.
+    expect(short).toEqual(Array.from({ length: short.length }, (_, i) => i + 1))
+    expect(shown.slice(short.length + 1)).toEqual(corrections.slice(short.length + 1).map((c) => `* ${c}`))
+    expect(shown[1]).toBe('* 🔴 User: "Leave module 0 as it is, and do not touch…" (older constraint, shortened: om_recall "Leave module 0 as it is,")')
+    expect(seen.screen.at(-1)).not.toContain('built-in')
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
   })
 
