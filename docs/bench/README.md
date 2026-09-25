@@ -258,3 +258,11 @@ most boundaries. Runs 2 and 3 recorded it from boundary 4 on, as v1.2.0 did.
 
 Cost: $13.44 in question sessions, $0.28 in pi. The question stage's estimates ran about twice the actual cost.
 
+
+## 2026-09-25, BM25 inside the whole-term gate (issue #20)
+
+`2026-09-25-bm25.md` gives the details. `scripts/bench-bm25.ts` ranks 90 real `om_recall` queries (17 from benchmark
+runs, 73 from replay question sessions) and 8 synthetic ones two ways, with no model. It compares the current order
+with pi's BM25-lite (k1 = 1.2, b = 0.75, 20% noise floor on multi-term queries, cap 50) inside the same whole-term
+gate. BM25 ranked the needed block higher on 7 real queries and lower on 12, and first on 70 against 75. The current
+ranking stays, and BM25 stays rejected.
