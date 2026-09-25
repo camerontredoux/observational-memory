@@ -521,9 +521,9 @@ function realTime(y: number, mo: number, d: number, h: number, mi: number) {
 // Observation lines as `<marker> YYYY-MM-DD HH:MM <text>`: the timestamp read from the line, or from an older
 // reply's `Date:` header and `(HH:MM)`; checked against `bounds` and clamped into them, a line without a real one given
 // the latest time the source shows. Without bounds a time is kept only if real, and never invented. An unmarked line
-// continues the one before, as a wrapped line does, except a 🔴 line: a user's constraint takes in nothing unmarked, so
-// the line stands as its own 🟡 one. `unmarked` hears of each, with the 🟡 line it became.
-function parseLines(text: string, bounds: Bounds, stripTimes = false, unmarked?: (text: string, own?: string) => void) {
+// continues the one before, as a wrapped line does, except a 🔴 line whose quote is closed: a user's constraint takes in
+// nothing past the user's words, so the line stands as its own 🟡 one. `unmarked` hears of each, with how it was taken.
+function parseLines(text: string, bounds: Bounds, stripTimes = false, unmarked?: (text: string, how: Unmarked) => void) {
   const lines: string[] = []
   let day: [number, number, number] | undefined
   for (const raw of text.split('\n')) {
@@ -543,9 +543,11 @@ function parseLines(text: string, bounds: Bounds, stripTimes = false, unmarked?:
     else {
       if (!lines.length || /^<\/?[a-z-]+>$/.test(line)) continue
       line = line.replace(/^->\s*/, '')
-      if (!lines.at(-1)!.startsWith('🔴')) {
+      const last = lines.at(-1)!
+      const quoting = last.startsWith('🔴') && openQuote(last)
+      if (quoting || !last.startsWith('🔴')) {
         lines[lines.length - 1] += `; ${line}`
-        unmarked?.(line)
+        unmarked?.(line, quoting ? { quote: true } : {})
         continue
       }
       marker = '🟡'
@@ -561,15 +563,24 @@ function parseLines(text: string, bounds: Bounds, stripTimes = false, unmarked?:
     if (stripTimes) at = undefined
     else if (bounds) at = Math.min(Math.max(at ?? bounds.latest, bounds.lo), bounds.hi)
     lines.push(at === undefined ? `${marker} ${line}` : `${marker} ${stamp(at)} ${line}`)
-    if (own) unmarked?.(said, lines.at(-1))
+    if (own) unmarked?.(said, { own: lines.at(-1) })
   }
   return lines
 }
 
+// How parseLines took an unmarked line: into the line before (`quote` when into a 🔴 line's open quote), or as `own`.
+type Unmarked = { quote?: true; own?: string }
+// A 🔴 line's quote of the user runs on while it holds an odd number of double quotes after `User:`.
+const openQuote = (line: string) => {
+  const at = line.indexOf('User:')
+  return at >= 0 && (line.slice(at).match(/"/g)?.length ?? 0) % 2 === 1
+}
+
 // Logs each unmarked line of a reply, where from and how it began, and counts it as `<key>.merged`, or as
 // `<key>.orphaned` when it stands as its own 🟡 line.
-const noteUnmarked = ($: EngineInterface, key: string, where: string) => (text: string, own?: string) => {
-  log($, `an unmarked line in the ${where} ${own ? 'followed a 🔴 line; kept as its own 🟡 line' : 'joined the line before it'}: ${JSON.stringify(text.slice(0, 80))}`)
+const noteUnmarked = ($: EngineInterface, key: string, where: string) => (text: string, { quote, own }: Unmarked) => {
+  const how = own ? 'followed a 🔴 line; kept as its own 🟡 line' : quote ? 'continued the open quote of the 🔴 line before it' : 'joined the line before it'
+  log($, `an unmarked line in the ${where} ${how}: ${JSON.stringify(text.slice(0, 80))}`)
   void $.session.id().then((id) => record(statsIo($), id, (s) => count(s, `${key}.${own ? 'orphaned' : 'merged'}`)), () => {})
 }
 
@@ -678,7 +689,7 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
   const note = noteUnmarked($, `observer.${phase}`, `observer reply for rows ${from}-${to}`)
   // An unmarked line after a correction is no constraint of the user's: it joins the observations.
   const moved: string[] = []
-  const corrections = parseLines(correctionsOf(text), bounds, !bounds, (t, own) => (note(t, own), own && moved.push(own)))
+  const corrections = parseLines(correctionsOf(text), bounds, !bounds, (t, how) => (note(t, how), how.own && moved.push(how.own)))
     .filter((l) => l.startsWith('🔴'))
     .map((l) => splitSource(l).line)
   const lines = [...parseLines(observed, bounds, !bounds, note), ...moved].map((l) => splitSource(l).line)
