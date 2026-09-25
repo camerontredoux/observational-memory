@@ -708,6 +708,15 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
 // Without `sources`, the lines alone: what a memory over its budget sheds first.
 const renderLines = (entries: readonly Entry[], sources = true) =>
   entries.map((e) => `* ${e.line}${sources && e.source ? ` ${renderSource(e.source)}` : ''}`).join('\n')
+// The memory's form: a run of lines drawn from the same source range gives it once, after its last line.
+const renderGrouped = (entries: readonly Entry[]) =>
+  entries
+    .map((e, i) => {
+      const next = entries[i + 1]?.source
+      const last = !next || next.from !== e.source?.from || next.to !== e.source?.to
+      return `* ${e.line}${e.source && last ? ` ${renderSource(e.source)}` : ''}`
+    })
+    .join('\n')
 const renderCorrections = (lines: readonly string[]) => (lines.length ? `<corrections>\n${lines.map((l) => `* ${l}`).join('\n')}\n</corrections>\n\n` : '')
 const section = (name: string, value?: string) => (value ? `\n\n<${name}>\n${value}\n</${name}>` : '')
 
@@ -864,7 +873,9 @@ function parseMemory(first: SessionMessage) {
     corrections: applyConstraints([], start < 0 ? [] : parseLines(tag(head.slice(0, start), 'corrections') ?? '', undefined).filter((l) => l.startsWith('🔴'))),
     observations,
     anchor: hash(observations),
-    entries: parseLines(observations, undefined).map(splitSource),
+    entries: parseLines(observations, undefined)
+      .map(splitSource)
+      .reduceRight<ReturnType<typeof splitSource>[]>((out, e) => [e.source || !out[0]?.source ? e : { ...e, source: out[0].source }, ...out], []),
     currentTask: parseContinuation(first.text, user.end || own.length) ?? tag(head.slice(end), 'current-task'),
     skills,
     userMessages: user.messages,
@@ -1453,7 +1464,7 @@ export const register: Register = (on) => {
         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
         let memory: Memory = {
           corrections: ledger.corrections,
-          observations: renderLines(ledger.entries),
+          observations: renderGrouped(ledger.entries),
           currentTask: ledger.currentTask,
           ...(covered ? { stateAt: stamp(covered.to) } : {}),
           skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
