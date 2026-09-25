@@ -751,8 +751,8 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
   const deadline = async () => (m.regex ? (await c.now()) + SEARCH_BUDGET_MS : Infinity)
   const past = async (by: number) => by < Infinity && (await c.now()) > by
   const scanBy = await deadline()
-  let stopped: Block | undefined // the first block not searched, when the budget ran out
-  scan: for (const t of threads) {
+  let stopped: { b: Block; left: number } | undefined // the first block not searched, and the threads after its own
+  scan: for (const [n, t] of threads.entries()) {
     const r = range(t, input.from, input.to, home)
     if (typeof r === 'string') return { mode: 'search', text: `om_recall: ${r}.`, matches: 0 }
     const times = timesOf(t)
@@ -760,7 +760,7 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
       const b = t.blocks[i]!
       if (b.own || b.asking || b.kind === 'memory') continue
       if (await past(scanBy)) {
-        stopped = b
+        stopped = { b, left: threads.length - 1 - n }
         break scan
       }
       const text = b.tool ? `${b.tool}\n${b.text}` : b.text
@@ -788,7 +788,7 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
   const shown: Hit[] = []
   let chars = 0
   for (const h of ranked) {
-    if (shown.length >= limit) break
+    if (shown.length >= limit || !h.x) break
     if (shown.length && chars + h.x!.text.length > SEARCH_MAX_CHARS) break
     shown.push(h)
     chars += h.x!.text.length + 1
@@ -804,9 +804,14 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
     `${hits.length} match(es) for ${m.shown} in ${plural(pool.length, 'block')} of ${where}${c.note ? ` (${c.note})` : ''}` +
     (loose && hits.length ? `; no block holds every term, so these hold some, chosen by the rarest` : '') +
     (rest.length ? `; showing ${shown.length}${loose ? '' : older ? ', the newest' : ', those with the most terms on one line'}` : '') +
-    (stopped
-      ? `; the search stopped after ${SEARCH_BUDGET_MS / 1000} s, before ${stopped.ref}: simplify the pattern, or search the rest with "from": "${stopped.ref}"`
-      : '') +
+    (!stopped
+      ? ''
+      : threads.length === 1
+        ? `; the search stopped after ${SEARCH_BUDGET_MS / 1000} s, before ${stopped.b.ref}: simplify the pattern, or search the rest with "from": "${stopped.b.ref}"`
+        : // With "subagents", "from" bounds the other transcripts by time, skipping blocks of theirs never searched.
+          `; the search stopped after ${SEARCH_BUDGET_MS / 1000} s, before ${stopped.b.ref}` +
+          (stopped.left ? `, with ${plural(stopped.left, 'subagent transcript')} not searched` : '') +
+          `: simplify the pattern, or search one transcript at a time, without "subagents": "from": "${stopped.b.ref}" searches the rest of this one`) +
     '.'
   const out = [head]
   // Terms no block holds, whole or (a compound) by parts found anywhere: absent, so not worth searching for again.

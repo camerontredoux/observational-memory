@@ -218,6 +218,28 @@ describe('recall', () => {
     expect(out.filter((l) => l.startsWith('[bbbbbbbb:'))).toHaveLength(3)
   })
 
+  test('hits the excerpt budget leaves without an excerpt are counted, not shown', async () => {
+    const io = session(Array.from({ length: 4 }, (_, i) => msg('assistant', 20 + i, `aaaa ${i + 1}`)))
+    let calls = 0
+    // The clock stands still through the scan (its deadline and a look before each of the 4 blocks) and the excerpt
+    // deadline, then jumps: only the newest hit is excerpted.
+    io.now = async () => (++calls > 6 ? 10_000 : 0)
+    const out = (await run({ query: '/a+ \\d/' }, io)).split('\n')
+    expect(out[0]).toBe('4 match(es) for /a+ \\d/ in 4 blocks of 1 transcript file; showing 1, the newest.')
+    expect(out.filter((l) => l.startsWith('[bbbbbbbb:'))).toEqual(['[bbbbbbbb:4 · 2026-09-22 ' + hm(23) + ' · assistant] 1 line'])
+    expect(out).toContain('3 older matches not shown; only if none above answers, repeat with "to": "bbbbbbbb:3".')
+  })
+
+  test('a search over subagents that runs out of time says how to search the rest one transcript at a time', async () => {
+    const sub = `${DIR}/${OLD}/subagents`
+    const io = chain({ [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: subagent, [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: '{}' })
+    let t = 0
+    io.now = async () => (t += 1_000)
+    expect((await run({ query: '/(a|a)+/', subagents: true }, io)).split('\n')[0]).toMatch(
+      /; the search stopped after 3 s, before aaaaaaaa:\S+, with 1 subagent transcript not searched: simplify the pattern, or search one transcript at a time, without "subagents": "from": "aaaaaaaa:\S+" searches the rest of this one\.$/,
+    )
+  })
+
   test('a regex still finds a match deep in a block longer than one test runs over', async () => {
     const long = `${'filler line\n'.repeat(20_000)}the DEEP-7 marker`
     expect(await run({ query: '/deep-\\d/' }, session([msg('assistant', 20, long)]))).toMatch(/^1 match/)
