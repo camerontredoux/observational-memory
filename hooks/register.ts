@@ -41,7 +41,7 @@ const PI_CWD = '/tmp'
 // Handoff test arms (not shipped): 'amp' replaces the observations with a goal-conditioned handoff written at
 // compaction from the conversation; 'hybrid' adds a short note of the assistant's own beside them. The writer stands
 // in for the working model (`$.model.fork`), which the benchmark cannot run.
-const HANDOFF_ARM = 'hybrid' as 'off' | 'amp' | 'hybrid'
+const HANDOFF_ARM = 'amp' as 'off' | 'amp' | 'hybrid'
 const HANDOFF_PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-sol', '--thinking', 'low']
 const HANDOFF_INPUT_TOKENS = 120_000 // the conversation the writer reads, newest first
 const HANDOFF_WHOLE_TOKENS = 60_000 // of those, the newest rows whole; older rows keep their text alone
