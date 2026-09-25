@@ -19,6 +19,9 @@ function busy() {
   addCompaction(s, { trigger: 'subagent', fellBack: false, ms: 60, syncCalls: 0, syncMs: 0, rowsObservedNow: 0, memoryTokens: 5_000, observations: 40 }, T0 + 600_000)
   count(s, 'observer.compaction.failed.no-observations', 2)
   count(s, 'compaction.notPersistent')
+  count(s, 'observer.background.merged', 3)
+  count(s, 'reflector.background.merged')
+  count(s, 'observer.compaction.orphaned')
   addRecall(s, 3, false, T0 + 600_000)
   addRecall(s, 0, true, T0 + 600_000)
   return s
@@ -133,7 +136,7 @@ describe('stats', () => {
         '  Fallbacks  1 used the built-in compaction',
         'Context      after a main compaction: ~27,000 tokens (median), ~236 notes',
         'Background   3 calls, median 20.0 s each, ~9 notes each',
-        'Problems     2 observer replies had no notes; 1 context/history mismatch',
+        'Problems     2 observer replies had no notes; 1 context/history mismatch; 4 unmarked lines joined the line before; 1 unmarked line after a 🔴 line kept as its own 🟡 line',
         'Recall       2 searches',
         '',
         '/om-stats full for every metric · /om-stats all for every session',

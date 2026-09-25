@@ -282,10 +282,14 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const empty = failed.get('no-observations') ?? 0
   failed.delete('no-observations')
   const other = [...failed.values()].reduce((t, n) => t + n, 0)
+  const unmarked = (kind: string) => Object.entries(s.counts).reduce((t, [k, n]) => (k.match(/^(?:observer|reflector)\.\w+\.(\w+)$/)?.[1] === kind ? t + n : t), 0)
+  const [joined, orphaned] = [unmarked('merged'), unmarked('orphaned')]
   const problems = [
     empty && `${plural(empty, 'observer reply', 'observer replies')} had no notes`,
     other && `${plural(other, 'call')} failed (${[...failed].map(([c, n]) => `${c} ${n}`).join(', ')})`,
     s.counts['compaction.notPersistent'] && plural(s.counts['compaction.notPersistent'], 'context/history mismatch', 'context/history mismatches'),
+    joined && `${plural(joined, 'unmarked line')} joined the line before`,
+    orphaned && `${plural(orphaned, 'unmarked line')} after a 🔴 line kept as its own 🟡 line`,
   ].filter(Boolean)
   if (problems.length) row('Problems', problems.join('; '))
   const recall = s.metrics['recall.matches']?.count
