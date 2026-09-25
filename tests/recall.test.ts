@@ -61,6 +61,7 @@ function memoryIo(files: Record<string, string>): RecallIo & { reads: string[] }
       return [...new Set(names)]
     },
     continuing: async (dir, names, id) => names.find((n) => files[`${dir}/${n}`]?.includes(`"continuedInSessionId":"${id}"`)),
+    now: async () => 0,
   }
 }
 const chain = (extra: Record<string, string> = {}) =>
@@ -197,6 +198,29 @@ describe('recall', () => {
     // A phrase must appear as written: failing that, blocks holding some of the terms, chosen by the rarest.
     expect(await run({ query: '"ALPHA plan"' })).toMatch(/^0 match/)
     expect(await run({ query: 'ALPHA plan' })).toMatch(/^1 match/)
+  })
+
+  test('a regex that nests an unbounded quantifier is refused', async () => {
+    expect(await run({ query: '/(a+)+$/' })).toMatch(/^om_recall: \/\(a\+\)\+\$\/ repeats a group that already repeats/)
+    expect(await run({ query: '/(?:x|\\w*)*y/' })).toMatch(/^om_recall: .* repeats a group that already repeats/)
+    // Bounded, or in a class: not nested.
+    expect(await run({ query: '/(needle-\\d{1,3})+/' })).toMatch(/^1 match/)
+    expect(await run({ query: '/([+*]a)+ needle|NEEDLE/' })).toMatch(/^1 match/)
+  })
+
+  test('a slow regex the check misses stops at the time budget with the matches found so far', async () => {
+    const rows = Array.from({ length: 6 }, (_, i) => msg('assistant', 20 + i, `aaaa ${i + 1}\naaaa`))
+    const io = session(rows)
+    let t = 0
+    io.now = async () => (t += 1_000) // each look at the clock a second later: the 3 s budget runs out after 3 blocks
+    const out = (await run({ query: '/(a|a)+$/' }, io)).split('\n')
+    expect(out[0]).toMatch(/^3 match\(es\) for \/\(a\|a\)\+\$\/ in 3 blocks of 1 transcript file; the search stopped after 3 s, before bbbbbbbb:4: simplify the pattern, or search the rest with "from": "bbbbbbbb:4"\.$/)
+    expect(out.filter((l) => l.startsWith('[bbbbbbbb:'))).toHaveLength(3)
+  })
+
+  test('a regex still finds a match deep in a block longer than one test runs over', async () => {
+    const long = `${'filler line\n'.repeat(20_000)}the DEEP-7 marker`
+    expect(await run({ query: '/deep-\\d/' }, session([msg('assistant', 20, long)]))).toMatch(/^1 match/)
   })
 
   // A session of its own: one file, the given user and assistant rows, then the prompt that asked.
@@ -405,7 +429,7 @@ describe('recall', () => {
     expect([refOf(0), refOf(1), refOf(1, 'p1'), refOf(3), refOf(1, 'nope')]).toEqual(['bbbbbbbb:1', 'bbbbbbbb:2', 'bbbbbbbb:3', undefined, undefined])
     // A subagent's rows are found in its own transcript.
     expect((await refsOf(corpus, [], 'a1b2c3d4e5f6a7b8c'))(0, 's1')).toBe('a1b2c3d4:1')
-    expect((await refsOf(liveTranscript(live, [], false), live))(1, 'p1')).toBeUndefined()
+    expect((await refsOf(liveTranscript(live, [], false, async () => 0), live))(1, 'p1')).toBeUndefined()
   })
 
   test('every mode keeps its whole response under one size cap', async () => {
@@ -537,6 +561,7 @@ describe('recall', () => {
       ],
       [],
       true,
+      async () => 0,
     )
     const found = (await recall(c, { query: 'MANGO' })).text
     expect(found).toBe(

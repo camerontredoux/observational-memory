@@ -38,6 +38,7 @@ const recallIo = ($: EngineInterface): RecallIo => ({
     const hit = r.stdout.split('\n')[0]
     return hit ? hit.slice(hit.lastIndexOf('/') + 1) : undefined
   },
+  now: () => $.clock.now(),
 })
 
 async function noteTranscript($: EngineInterface, e: { session_id: string; transcript_path: string }) {
@@ -88,7 +89,7 @@ export const register: Register = (on) => {
     const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
     let corpus: Awaited<ReturnType<typeof loadTranscript>> | undefined
     if (path) corpus = await loadTranscript(recallIo($), path, { asking: true }).catch((error) => (log($, `could not read ${path} (${errorText(error)})`), undefined))
-    const found = await recall(corpus?.main.blocks.length ? corpus : liveTranscript(rows, rows.map(() => undefined), rows.length >= 4096), e)
+    const found = await recall(corpus?.main.blocks.length ? corpus : liveTranscript(rows, rows.map(() => undefined), rows.length >= 4096, () => $.clock.now()), e)
     return { result: found.text }
   })
 

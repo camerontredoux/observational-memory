@@ -37,6 +37,7 @@ const ioOver = (all: Record<string, string>): RecallIo => ({
   },
   list: async (d) => [...new Set(Object.keys(all).filter((p) => p.startsWith(`${d}/`)).map((p) => p.slice(d.length + 1).split('/')[0]!))],
   continuing: async (d, names, id) => names.find((n) => all[`${d}/${n}`]?.includes(`"continuedInSessionId":"${id}"`)),
+  now: async () => Date.now(),
 })
 // Each block as the test's chain reads it: its file and line, its kind, and all of it to compare.
 const blocksOf = async (all: Record<string, string>) => {

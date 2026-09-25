@@ -1233,6 +1233,7 @@ const recallIo = ($: EngineInterface): RecallIo => ({
     const hit = r.stdout.split('\n')[0]
     return hit ? hit.slice(hit.lastIndexOf('/') + 1) : undefined
   },
+  now: () => $.clock.now(),
 })
 
 function noteRecall($: EngineInterface, sessionId: string, result: string, fromFile: boolean) {
@@ -1621,7 +1622,7 @@ export const register: Register = (on) => {
       }
     }
     const fromFile = !!corpus?.main.blocks.length
-    const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, sessionId), 0).at, rows.length >= ROWS_CAP), e)
+    const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, sessionId), 0).at, rows.length >= ROWS_CAP, () => $.clock.now()), e)
     return { result: noteRecall($, sessionId, found.text, fromFile) }
   })
 
