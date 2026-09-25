@@ -313,6 +313,111 @@ export const SCENARIOS: readonly Scenario[] = [
       'Three compactions of a short session: the plugin reflects only when its memory passes its reflection threshold, which a sub-$1 run does not reach. The report gives the reflections the plugin recorded (from its stats file) rather than assuming one ran; deterministic reflection coverage is in tests/register.test.ts.',
   },
   {
+    // Issue #22: state only the assistant's reasoning holds. The failing test's name points at rounding (src/rounding.py),
+    // a hypothesis the numbers rule out (56.68 against 62.97 is no rounding error); the cause is order_total applying the
+    // discount a second time. The history allows print() calls under src/ and keeps every reply to one word, so what the
+    // assistant ruled out, and that its print is a temporary debug edit to undo, are never said: only its reasoning
+    // holds them. check.sh prints what src/ printed during the tests under "stdout:", so a check run shows whether a
+    // debug print was left in.
+    id: 'reasoning-state',
+    title: 'A ruled-out hypothesis and a temporary debug edit, held only in reasoning',
+    files: {
+      'src/rounding.py': [
+        '"""Money rounding."""',
+        'from decimal import Decimal, ROUND_HALF_EVEN',
+        '',
+        '',
+        'def to_cents(value):',
+        "    # Banker's rounding, as finance requires: 0.125 -> 0.12, 0.135 -> 0.14.",
+        '    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)',
+        '',
+      ].join('\n'),
+      'src/pricing.py': [
+        '"""Order pricing."""',
+        'from src.rounding import to_cents',
+        '',
+        '',
+        'def apply_discount(amount, percent):',
+        '    return amount * (100 - percent) / 100',
+        '',
+        '',
+        'def line_total(price, qty, percent):',
+        '    return apply_discount(price * qty, percent)',
+        '',
+        '',
+        'def order_total(lines, percent):',
+        '    subtotal = sum(line_total(price, qty, percent) for price, qty in lines)',
+        '    return to_cents(apply_discount(subtotal, percent))',
+        '',
+      ].join('\n'),
+      'tests/test_pricing.py': [
+        'import unittest',
+        'from decimal import Decimal',
+        '',
+        'from src.pricing import line_total, order_total',
+        'from src.rounding import to_cents',
+        '',
+        '',
+        'class PricingTest(unittest.TestCase):',
+        '    def test_to_cents_is_bankers_rounding(self):',
+        '        self.assertEqual(to_cents(0.125), Decimal("0.12"))',
+        '        self.assertEqual(to_cents(0.135), Decimal("0.14"))',
+        '',
+        '    def test_line_total_applies_the_discount(self):',
+        '        self.assertEqual(line_total(10, 3, 10), 27)',
+        '',
+        '    def test_order_total_rounds_to_cents(self):',
+        '        self.assertEqual(order_total([(19.99, 3), (5.00, 2)], 10), Decimal("62.97"))',
+        '',
+        '',
+        'if __name__ == "__main__":',
+        '    unittest.main()',
+        '',
+      ].join('\n'),
+      'check.sh': [
+        '#!/usr/bin/env bash',
+        '# Runs the pricing tests. What the code printed while they ran follows "stdout:"; ALL CHECKS PASSED when they pass.',
+        'cd "$(dirname "$0")" || exit 1',
+        'out=$(python3 -m unittest tests.test_pricing 2>.check-log)',
+        'status=$?',
+        'cat .check-log',
+        'if [ -n "$out" ]; then printf "stdout:\\n%s\\n" "$out"; fi',
+        'if [ $status -ne 0 ]; then exit 1; fi',
+        'echo "ALL CHECKS PASSED"',
+        '',
+      ].join('\n'),
+      'docs/handbook-16.md': handbook(16, 'Pricing'),
+      'docs/handbook-17.md': handbook(17, 'Discounts'),
+    },
+    commands: ['bash check.sh'],
+    steps: [
+      {
+        prompt:
+          '`bash check.sh` fails. Find the cause, but do not fix it yet. You may add print() calls under src/ to trace values. Reply with only the word "found" once you know the cause, and nothing else.',
+      },
+      read(16, 'Pricing'),
+      read(17, 'Discounts'),
+      COMPACT,
+    ],
+    setup: [
+      { id: 'ran-check', category: 'correctness', description: 'the history ran the failing check', kind: 'tool', tool: '^Bash$', path: 'check\\.sh', result: '56\\.68', expect: 'present' },
+      { id: 'read-rounding', category: 'correctness', description: 'the history read the rounding module it could rule out', kind: 'tool', tool: '^Read$', path: 'rounding\\.py$', expect: 'present' },
+      { id: 'debug-print', category: 'correctness', description: 'the history added a debug print under src/', kind: 'tool', tool: WRITES, path: 'src/\\w+\\.py$', text: 'print\\(', expect: 'present' },
+    ],
+    continuation: 'Fix the bug now, leave src/ as you would commit it, and run `bash check.sh` to confirm.',
+    checks: [
+      { id: 'fixes-pricing', category: 'correctness', description: 'fixes src/pricing.py', kind: 'tool', tool: WRITES, path: 'pricing\\.py$', expect: 'present' },
+      { id: 'checks-pass', category: 'correctness', description: 'a check run passes', kind: 'tool', tool: '^Bash$', path: 'check\\.sh', result: 'ALL CHECKS PASSED', flags: '', expect: 'present' },
+      // A check run that shows the code printing: the debug print was still in when the continuation first checked.
+      { id: 'debug-removed', category: 'correctness', description: 'removes the debug print before running the checks', kind: 'tool', tool: '^Bash$', path: 'check\\.sh', result: '^stdout:', flags: 'm', expect: 'absent' },
+      { id: 'no-rounding-edit', category: 'violation', description: 'does not change the ruled-out rounding module', kind: 'tool', tool: WRITES, path: 'rounding\\.py$', expect: 'absent' },
+      { id: 'no-reinvestigation', category: 'repeated-work', description: 'does not read the ruled-out rounding module again', kind: 'tool', tool: '^(Read|Grep)$', path: 'rounding\\.py$', expect: 'absent' },
+    ],
+    facts: ['rounding', 'apply_discount', 'print('],
+    limits:
+      "The assistant's reasoning is not scripted: whether it weighs rounding, and says so only in thinking, varies by run, and no check can read the thinking. Claude Code keeps the thinking's text only when thinking summaries are shown (the showThinkingSummaries setting); otherwise every thinking block is empty and the Observer gets none. The history's permission to add print() calls says debug output is allowed, not that it is temporary.",
+  },
+  {
     // A large session that Claude Code compacts on its own, and a detail no summary keeps: only om_recall gives the
     // answer; without it the honest reply is "I cannot find it" (scored apart, as abstention).
     //

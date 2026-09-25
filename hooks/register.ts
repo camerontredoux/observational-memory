@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
+import type { ApiMessage, EngineInterface, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 import {
   COMPACT_RECENT,
   COMPACT_RESUME,
@@ -51,6 +51,9 @@ const SKILLS_MAX_TOKENS = 15_000
 const SKILLS_WHOLE_TURNS = 3 // a skill invoked in the last this many main-thread turns, the running one counted, keeps its text
 const TOOL_ARGS_MAX_TOKENS = 2_000
 const TOOL_RESULT_MAX_TOKENS = 5_000
+// Each block of the assistant's reasoning the Observer reads, cut in the middle past this. Chunks are sized by what
+// the conversation shows, reasoning not counted: a chunk's rows stay the same with or without it.
+const REASONING_MAX_TOKENS = 1_000
 const OBSERVER_TIMEOUT_MS = 120_000 // a ~10k-token chunk takes Luna about 15 s
 const REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens of output, in the background
 const MAX_MARKS = 4_000
@@ -180,10 +183,12 @@ const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(tex
 // and acceptance rules, usually sits at the start or the end, never only in the middle. The omission is marked
 // explicitly, never silently dropped; om_recall can still find the full `what` in the transcript. The tail starts at
 // a line boundary so its first line is whole.
-const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
+// om_recall does not search reasoning: a cut there says only what it left out.
+const omissionMarker = (tokens: number, what: string) =>
+  what === 'reasoning' ? `\n... [~${tokens} tokens of reasoning omitted] ...\n` : `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
 // The marker excerpt leaves in a brief it cut (see capUserMessages).
 const BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/
-function excerpt(text: string, maxTokens: number, what: 'result' | 'message' = 'result') {
+function excerpt(text: string, maxTokens: number, what: 'result' | 'message' | 'reasoning' = 'result') {
   if (text.length <= maxTokens * 4) return text
   const room = maxTokens * 4
   const headChars = Math.floor(room / 2)
@@ -329,15 +334,70 @@ function chunkEnd(v: View, from: number, end: number, frontier: boolean) {
   return !frontier || tokens >= CHUNK_TOKENS ? end : undefined
 }
 
-// pi's serialization: one block per row, its time, tool calls inline, results capped.
-function serialize(v: View, from: number, to: number) {
+// The assistant's reasoning, by the action it led to: a tool call's id, or a reply's text after the id of the call
+// before it (see replyKey). Rows carry no thinking; the Messages API form of the history does, and joins a row's
+// blocks into one message, so the two meet by these keys, never by index. Empty and redacted thinking carry no text
+// and are left out; a key two replies share is dropped rather than given the wrong reasoning.
+type Reasoning = Map<string, string[]>
+const replyKey = (lastCall: string, text: string) => `${lastCall}\n${text}`
+function reasoningOf(messages: readonly ApiMessage[]): Reasoning {
+  const found: Reasoning = new Map()
+  const seen = new Set<string>()
+  const shared = new Set<string>()
+  let pending: string[] = []
+  let lastCall = ''
+  for (const m of messages) {
+    if (m.role !== 'assistant' || !Array.isArray(m.content)) {
+      pending = [] // reasoning that led to no action
+      continue
+    }
+    for (const b of m.content) {
+      if (b.type === 'thinking') {
+        if (typeof b.thinking === 'string' && b.thinking.trim()) pending.push(b.thinking.trim())
+        continue
+      }
+      const call = b.type === 'tool_use' && typeof b.id === 'string' ? b.id : undefined
+      const key = call ?? (b.type === 'text' && typeof b.text === 'string' && b.text ? replyKey(lastCall, b.text) : undefined)
+      if (call) lastCall = call
+      if (key === undefined) continue
+      if (seen.has(key)) shared.add(key)
+      seen.add(key)
+      if (pending.length) found.set(key, pending)
+      pending = []
+    }
+  }
+  for (const key of shared) found.delete(key)
+  return found
+}
+
+// The reasoning in a loop's live context; none when the host cannot give it, which leaves the chunk as it was.
+async function reasoningIn($: EngineInterface, agentId?: string): Promise<Reasoning> {
+  try {
+    const messages = await $.session.messages({ as: 'api', agentId })
+    if (Array.isArray(messages)) return reasoningOf(messages)
+    log($, `no reasoning for the Observer: ${messages.deny}`)
+  } catch (error) {
+    log($, `no reasoning for the Observer: ${errorText(error)}`)
+  }
+  return new Map()
+}
+
+// pi's serialization: one block per row, its time, tool calls inline, results capped. The reasoning that led to an
+// assistant row goes before it, in a block of its own, each thinking block capped.
+function serialize(v: View, from: number, to: number, reasoning: Reasoning) {
   const names = new Map<string, string>()
   for (let i = v.base; i < to; i++) for (const u of v.messages[i]!.toolUses) names.set(u.tool_use_id, u.tool)
+  let lastCall = ''
+  for (let i = v.base; i < from; i++) lastCall = v.messages[i]!.toolUses.at(-1)?.tool_use_id ?? lastCall
   const blocks: string[] = []
   for (let i = from; i < to; i++) {
     const m = v.messages[i]!
     const at = v.at[i] === undefined ? '' : ` @ ${stamp(v.at[i]!)}`
     if (m.role === 'assistant') {
+      const keys = [...(m.text ? [replyKey(lastCall, m.text)] : []), ...m.toolUses.map((u) => u.tool_use_id)]
+      const thoughts = keys.flatMap((k) => reasoning.get(k) ?? [])
+      if (thoughts.length) blocks.push(`[Assistant reasoning${at}]: ${thoughts.map((t) => excerpt(t, REASONING_MAX_TOKENS, 'reasoning')).join('\n\n')}`)
+      lastCall = m.toolUses.at(-1)?.tool_use_id ?? lastCall
       const text = [m.text, ...m.toolUses.map((u) => `[${u.tool}(${truncate(JSON.stringify(u.input), TOOL_ARGS_MAX_TOKENS)})]`)].filter(Boolean).join('\n')
       if (text) blocks.push(`[Assistant${at}]: ${text}`)
       continue
@@ -665,9 +725,10 @@ const noteObservations = ($: EngineInterface, sessionId: string, phase: Call['ph
   record(statsIo($), sessionId, (s, at) => add(s, `observer.${phase}.observations`, n, at))
 
 // One chunk, read alone: the Observer never sees the observations so far.
-async function observe($: EngineInterface, v: View, from: number, to: number, phase: Call['phase'], { constraints, state }: Before): Promise<Chunk> {
-  const chunk = serialize(v, from, to)
-  // Rows with nothing to show (thinking alone) have nothing to observe; Luna would answer with no observations.
+async function observe($: EngineInterface, v: View, from: number, to: number, phase: Call['phase'], { constraints, state }: Before, reasoning: Reasoning): Promise<Chunk> {
+  const chunk = serialize(v, from, to, reasoning)
+  // Rows with nothing to show (thinking alone, its reasoning shown with the action it led to) have nothing to
+  // observe; Luna would answer with no observations.
   if (!chunk) return { ...range(v, from, to), lines: [], corrections: [] }
   const bounds = boundsOf(v, from, to)
   const prompt =
@@ -1081,7 +1142,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
   const started = await $.clock.now()
   if (isLive(loop, stamp))
     try {
-      chunk = await observe($, v, job.range.from, job.range.to, 'background', job.before)
+      chunk = await observe($, v, job.range.from, job.range.to, 'background', job.before, await reasoningIn($, loop.agentId))
     } catch (error) {
       log($, `background observation of rows ${job.range.from}-${job.range.to} failed (${errorText(error)}); it will be retried`)
       if (isLive(loop, stamp)) show($, `Observation failed (${reason(error, OBSERVER_TIMEOUT_MS)}) and will retry`, loop.agentId)
@@ -1369,13 +1430,14 @@ export const register: Register = (on) => {
       // A chunk that failed fast (a bad reply, a pi error) is observed again once: a chunk left raw holds back every
       // chunk after it. A timeout is not, as it would hold the compaction for another timeout.
       let retries = 0
+      const reasoning = await reasoningIn($, e.agentId)
       const once = (from: number, to: number) => {
         const before = beforeRows(initial, from)
-        return observe($, v, from, to, 'compaction', before).catch((error) => {
+        return observe($, v, from, to, 'compaction', before, reasoning).catch((error) => {
           if (failureClass(errorText(error)) === 'timeout') throw error
           retries++
           log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
-          return observe($, v, from, to, 'compaction', before)
+          return observe($, v, from, to, 'compaction', before, reasoning)
         })
       }
       if (!isLive(loop, life)) throw new LoopEnded()

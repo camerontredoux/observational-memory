@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
+import type { ApiMessage, On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_HEADER, MEMORY_RECALL } from '../hooks/prompts'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
@@ -71,7 +71,13 @@ function world(
   on('session.id', () => ({ value: 'session-1' }))
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
-  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? history : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
+  // The Messages API form (`as: 'api'`), where thinking is: the main conversation's is `api`, a subagent's none.
+  const api: ApiMessage[] = []
+  on('session.messages', ($, e) => {
+    const rows = e.agentId === undefined ? history : agents[e.agentId]
+    if (!rows) return { value: { deny: `no agent ${e.agentId} in this session` } }
+    return { value: e.as !== 'api' ? rows : e.agentId === undefined ? api : [] }
+  })
   const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
   const type = (id: string) => (options.teammates?.includes(id) ? 'teammate' : 'general-purpose')
   on('agent.list', async () => {
@@ -109,7 +115,7 @@ function world(
   on('fs.exists', ($, e) => ({ value: e.path in files || Object.keys(files).some((p) => p.startsWith(`${e.path}/`)) }))
   on('session.cwd', () => ({ value: '/work/project' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  return { history, agents, stored, files, reads }
+  return { history, agents, api, stored, files, reads }
 }
 
 type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
@@ -392,6 +398,77 @@ describe('register', () => {
     const block = prompt.match(/\[Tool result for Bash \(error\)[^\]]*\]: [\s\S]*?(?=\n\n\[|\n===== END CHUNK)/)?.[0]
     expect(block).toBeDefined()
     expect(block!.length).toBeLessThan(TOOL_RESULT_MAX_CHARS + 200) // bounded to the excerpt limit plus the marker
+  })
+
+  test("the Observer reads the assistant's reasoning before the action it led to, each block capped; empty and redacted thinking are left out", async ($, on) => {
+    mock.clock(on)
+    const { api } = world(on)
+    const seen = pi(on)
+    const long = `LONG-START ${'weighing it '.repeat(2_000)}LONG-END the cause is the parser`
+    // Rows as the engine keeps them, a block each; the API form joins one response's blocks, thinking included.
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'why does the build fail', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [] },
+      { role: 'assistant', text: 'Let me look.', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: '/src/cache.ts' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: 'export const ttl = 60', isError: false }] },
+      { role: 'assistant', text: 'Still looking.', toolUses: [] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+    api.push(
+      { role: 'user', content: [{ type: 'text', text: 'why does the build fail' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'The cache is my first suspect.', signature: 's' },
+          { type: 'text', text: 'Let me look.' },
+          { type: 'thinking', thinking: '', signature: 's' },
+          { type: 'redacted_thinking', data: 'REDACTED-DATA' },
+          { type: 'thinking', thinking: long, signature: 's' },
+          { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/src/cache.ts' } },
+        ],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'export const ttl = 60' }] },
+      // Empty and redacted alone: no reasoning block for the reply.
+      { role: 'assistant', content: [{ type: 'thinking', thinking: '  ', signature: 's' }, { type: 'redacted_thinking', data: 'REDACTED-DATA' }, { type: 'text', text: 'Still looking.' }] },
+    )
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    const prompt = seen.prompts[0]!
+    expect(prompt).toContain('[Assistant reasoning]: The cache is my first suspect.\n\n[Assistant]: Let me look.')
+    const cut = prompt.match(/\[Assistant reasoning\]: LONG-START[\s\S]*?(?=\n\n\[Assistant\]: \[Read)/)?.[0]
+    expect(cut).toBeDefined()
+    expect(cut).toMatch(/\n\.\.\. \[~\d+ tokens of reasoning omitted\] \.\.\.\n/)
+    expect(cut).toContain('LONG-END the cause is the parser')
+    expect(cut!.length).toBeLessThan(1_000 * 4 + 100) // REASONING_MAX_TOKENS * 4, plus the header and the marker
+    expect(prompt.match(/\[Assistant reasoning/g)).toHaveLength(2)
+    expect(prompt).not.toContain('REDACTED-DATA')
+    expect(seen.systems[0]).toContain('never as 🔴, ✅, a correction, a fact, a result or something the assistant told the user')
+  })
+
+  test('reasoning before a reply whose text another reply repeats is left out rather than given to the wrong one', async ($, on) => {
+    mock.clock(on)
+    const { api } = world(on)
+    const seen = pi(on)
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'first', toolUses: [] },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+      { role: 'user', text: 'second', toolUses: [] },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+    const reply = (thought: string): ApiMessage => ({ role: 'assistant', content: [{ type: 'thinking', thinking: thought }, { type: 'text', text: 'ok' }] })
+    api.push({ role: 'user', content: [{ type: 'text', text: 'first' }] }, reply('FIRST-THOUGHT'), { role: 'user', content: [{ type: 'text', text: 'second' }] }, reply('SECOND-THOUGHT'))
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts[0]).toContain('[Assistant]: ok')
+    expect(seen.prompts[0]).not.toContain('THOUGHT')
   })
 
   test('when pi fails at compaction with nothing observed, the floor compiles a brief by code of what leaves context', async ($, on) => {
