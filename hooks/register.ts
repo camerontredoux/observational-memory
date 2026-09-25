@@ -19,8 +19,8 @@ import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
 import { INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
-import { compileBrief, mergeBriefs, parseBrief, renderBrief } from './vcc'
-import type { Brief } from './vcc'
+import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
+import type { Brief, OpenFailure } from './vcc'
 
 declare module 'claude-code' {
   interface McpToolInputs {
@@ -117,6 +117,7 @@ type Memory = {
   userMessages: UserMessage[]
   nextStep?: string // the user's latest request, verbatim
   environment?: string // the working directory and git state at compaction (see environmentOf)
+  failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
   brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
   transcript?: string
@@ -789,21 +790,33 @@ const CONTINUATION = '\n\n<continuation>\n'
 // The environment, read afresh at each compaction, sits between them and is never read back as the state.
 const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
 const ENVIRONMENT = 'Environment at compaction, read from git by code, not by a model'
+const FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded'
 const LATEST = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
 function renderContinuation(memory: Memory) {
   const state = memory.currentTask ? `${WHERE}${memory.stateAt ? ` (${memory.stateAt})` : ''}:\n${memory.currentTask}\n` : ''
   const environment = memory.environment ? `${ENVIRONMENT}:\n${memory.environment}\n` : ''
+  const failures = memory.failures?.length ? `${FAILURES}:\n${memory.failures.map(renderFailure).join('\n')}\n` : ''
   const latest = memory.nextStep && truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)
-  return state || environment || latest ? `${CONTINUATION}${state}${environment}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
+  return state || environment || failures || latest ? `${CONTINUATION}${state}${environment}${failures}${latest ? `${LATEST} (${latest.length} chars):\n${latest}\n` : ''}</continuation>` : ''
 }
 // The state of the work a record gives, read from `from` on, past the user's text.
 function parseContinuation(text: string, from: number) {
   const start = text.indexOf(CONTINUATION, from)
   if (start < 0) return undefined
   const body = text.slice(start + CONTINUATION.length)
-  const end = [`\n${ENVIRONMENT}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
   const lines = body.slice(0, end.length ? Math.min(...end) : 0).split('\n')
   return (lines[0]?.startsWith(WHERE) ? lines.slice(1) : lines).join('\n').trim() || undefined
+}
+
+// The open failures a record lists, read from `from` on, past the user's text.
+function failuresOf(text: string, from: number) {
+  const record = text.indexOf(CONTINUATION, from)
+  const start = record < 0 ? -1 : text.indexOf(`\n${FAILURES}:\n`, record)
+  if (start < 0) return []
+  const body = text.slice(start + FAILURES.length + 3)
+  const end = [`\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+  return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
 }
 
 // The session's first message, the standing brief, then the newest within what is left of USER_MESSAGES_MAX_TOKENS,
@@ -912,6 +925,7 @@ function parseMemory(first: SessionMessage) {
       .map(splitSource)
       .reduceRight<ReturnType<typeof splitSource>[]>((out, e) => [e.source || !out[0]?.source ? e : { ...e, source: out[0].source }, ...out], []),
     currentTask: parseContinuation(first.text, user.end || own.length) ?? tag(head.slice(end), 'current-task'),
+    failures: failuresOf(first.text, user.end || own.length),
     skills,
     userMessages: user.messages,
     brief: briefAt < 0 || briefEnd < briefAt ? undefined : parseBrief(whole.slice(briefAt + SESSION_BRIEF.length, briefEnd)),
@@ -1501,6 +1515,8 @@ export const register: Register = (on) => {
         // it holds rows the Observer never observed, which no observation covers.
         const from = always ? base : floor ? observed : cut
         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
+        dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
+        const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
         let memory: Memory = {
           corrections: ledger.corrections,
           observations: renderGrouped(ledger.entries),
@@ -1513,6 +1529,7 @@ export const register: Register = (on) => {
           // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
           nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
           ...(environment ? { environment } : {}),
+          ...(failures.length ? { failures } : {}),
           ...(brief ? { brief } : {}),
           ...(floor ? { floor } : {}),
           transcript,

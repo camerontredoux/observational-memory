@@ -745,3 +745,87 @@ export function parseBrief(body: string): Brief {
   }
   return b
 }
+
+// ---- Open failures ----------------------------------------------------------------------------------------------
+
+// A tool failure still open when its rows leave context: no later call of the same command or file succeeded. A
+// policy block (a hook, a Blocked:, a missing tool) counts even where a later call worked around it.
+export type OpenFailure = { at?: number; tool: string; target: string; error: string; policy: boolean }
+export const OPEN_FAILURES_MAX = 8
+const OPEN_FAILURES_MAX_CHARS = 2_000 // about 500 tokens
+const POLICY_FAILURE = /^(?:<tool_use_error>)?Blocked: |PreToolUse:\w+ hook error|No such tool available/
+const tick = (s: string) => s.replace(/`/g, "'")
+// Not a failure to carry: the user declined the call, or interrupted it.
+const DECLINED = /^The user doesn't want to proceed|^\[Request interrupted|^User rejected/
+const ERROR_LINE = /\b(?:\w*error(?:s)?|\w*Exception|fatal|cannot|can't|denied|refused|invalid|not found|No such|panic|failed|failure)\b|✗|\b[1-9]\d* (?:fail(?:ed|ures?)?|errors?)\b/i
+// The line that says what went wrong: a hook's script and the reason it gave, a Python error's last line, or the
+// first line that reads as an error.
+function failureText(text: string) {
+  const hook = /^PreToolUse:\w+ hook error: .*?([\w.-]+\.sh)\b/.exec(text)
+  if (hook) {
+    const why = /"(?:systemMessage|reason|permissionDecisionReason)":"((?:[^"\\]|\\.)*)"/.exec(text)?.[1]
+    return clip(oneLine(`hook ${hook[1]}${why ? `: ${why.replace(/\\"/g, '"')}` : ''}`), 160)
+  }
+  const lines = text.replace(/<\/?tool_use_error>/g, '').split('\n').map((l) => l.trim()).filter(Boolean)
+  const body = lines.filter((l) => !/^Exit code \d+$/.test(l))
+  if (POLICY_FAILURE.test(text)) return clip(oneLine(body[0] ?? ''), 160)
+  const traceback = body.findIndex((l) => l.startsWith('Traceback'))
+  const line = traceback >= 0 ? body.slice(traceback).findLast((l) => /^[\w.]+(?:Error|Exception)\b/.test(l)) : undefined
+  return clip(oneLine(line ?? body.find((l) => ERROR_LINE.test(l)) ?? body[0] ?? ''), 160)
+}
+const failureTarget = (b: Extract<Block, { kind: 'tool' }>, cwd: string, home?: string) => {
+  const command = commandOf(b)
+  if (command !== undefined) return clip(oneLine(compressBash(command)), 120)
+  const path = pathOf(b.input)
+  return path ? displayPath(resolvePath(path, cwd, home), cwd, home) : ''
+}
+// Whether a successful call clears an open failure: the same tool and target, or a Bash command that runs the same
+// programs on the same operands.
+function clears(f: OpenFailure, b: Block, cwd: string, home?: string) {
+  if (b.kind !== 'tool' || !b.result || b.result.isError || b.name !== f.tool) return false
+  if (failureTarget(b, cwd, home) === f.target) return true
+  const command = commandOf(b)
+  const keys = f.tool === 'Bash' ? runKeys(f.target) : []
+  return command !== undefined && keys.length > 0 && keys.every((k) => runKeys(command).includes(k))
+}
+/**
+ * The failures open after a compaction: `prev` (the memory message's) less those a call in `rows` cleared, then the
+ * failures among rows [0, leaving) that no later call in `rows` cleared; newest last, at most OPEN_FAILURES_MAX
+ * within about 500 tokens.
+ */
+export function openFailures(prev: readonly OpenFailure[], rows: readonly SessionMessage[], at: readonly (number | undefined)[], leaving: number, cwd: string, home?: string) {
+  const blocks = normalize(rows, at)
+  const open = prev.filter((f) => !blocks.some((b) => clears(f, b, cwd, home)))
+  blocks.forEach((b, k) => {
+    if (b.kind !== 'tool' || b.i >= leaving || !b.result?.isError || DECLINED.test(b.result.text)) return
+    const policy = POLICY_FAILURE.test(b.result.text)
+    if (!policy && isLook(b, cwd, home)) return
+    const f: OpenFailure = { ...(b.at === undefined ? {} : { at: b.at }), tool: b.name, target: failureTarget(b, cwd, home), error: failureText(b.result.text), policy }
+    if (!f.error || blocks.slice(k + 1).some((later) => clears(f, later, cwd, home))) return
+    // A policy block is one rule, whatever call met it: its newest instance stands for all.
+    const same = open.findIndex((o) => o.tool === f.tool && o.error === f.error && (f.policy || o.target === f.target))
+    if (same >= 0) open.splice(same, 1)
+    open.push(f)
+  })
+  const out = open.slice(-OPEN_FAILURES_MAX)
+  while (out.length > 1 && out.map(renderFailure).join('\n').length > OPEN_FAILURES_MAX_CHARS) out.shift()
+  return out
+}
+/** One open failure as a sentence. */
+export function renderFailure(f: OpenFailure) {
+  const when = f.at === undefined ? 'At an unknown time' : `At ${day(f.at)} ${hhmm(f.at)}`
+  const what = f.tool === 'Bash' ? `the Bash command \`${tick(f.target)}\`` : f.target ? `the ${f.tool} call on \`${tick(f.target)}\`` : `a ${f.tool} call`
+  return `- ${when} ${what} ${f.policy ? 'was blocked' : 'failed'}: \`${tick(f.error)}\`; no later call of it succeeded.`
+}
+const FAILURE_LINE =
+  /^- At (?:an unknown time|(\d{4}-\d\d-\d\d) (\d\d:\d\d)) (?:the Bash command `([^`]*)`|the (\S+) call on `([^`]*)`|a (\S+) call) (failed|was blocked): `([^`]*)`; no later call of it succeeded\.$/
+/** The open failures renderFailure's lines give back. */
+export function parseFailures(body: string): OpenFailure[] {
+  return body.split('\n').flatMap((l) => {
+    const m = FAILURE_LINE.exec(l.trim())
+    if (!m) return []
+    const at = m[1] ? new Date(`${m[1]}T${m[2]}:00`).getTime() : undefined
+    const tool = m[3] !== undefined ? 'Bash' : (m[4] ?? m[6])!
+    return [{ ...(at === undefined || Number.isNaN(at) ? {} : { at }), tool, target: m[3] ?? m[5] ?? '', error: m[8]!, policy: m[7] === 'was blocked' }]
+  })
+}

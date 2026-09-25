@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, parseBrief, renderBrief } from '../hooks/vcc'
-import type { Brief } from '../hooks/vcc'
+import { BRIEF_MAX_TOKENS, bashWrites, capBrief, compileBrief, compressBash, emptyBrief, inspects, mergeBriefs, OPEN_FAILURES_MAX, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from '../hooks/vcc'
+import type { Brief, OpenFailure } from '../hooks/vcc'
 
 const CWD = '/work/project'
 const HOME = '/home/u'
@@ -274,5 +274,44 @@ describe('vcc', () => {
     const text = renderBrief(compile(rows))
     expect(text).not.toContain('</session-brief>')
     expect(text.split('\n').every((l) => /^[>[\-@]/.test(l))).toBe(true)
+  })
+
+  const open = (rows: SessionMessage[], leaving = rows.length, prev: OpenFailure[] = []) => openFailures(prev, rows, times(rows), leaving, CWD, HOME)
+
+  test('open failures: a leaving failure no later call cleared, with the line that names the error', () => {
+    const rows = [
+      prompt('build it'),
+      ...bash('bun run build', 'Exit code 1\n$ tsc\nsrc/a.ts(3,1): error TS2304: Cannot find name x', true),
+      ...bash('python3 gen.py', 'Exit code 1\nTraceback (most recent call last):\n  File "gen.py", line 2\n    raise JSONDecodeError("Expecting value", s, 0)\njson.decoder.JSONDecodeError: Expecting value: line 1 column 1', true),
+      ...call('Edit', { file_path: `${CWD}/src/a.ts`, old_string: 'x', new_string: 'y' }, '<tool_use_error>String to replace not found in file.</tool_use_error>', true),
+    ]
+    expect(open(rows).map((f) => [f.tool, f.target, f.error])).toEqual([
+      ['Bash', 'bun run build', 'src/a.ts(3,1): error TS2304: Cannot find name x'],
+      ['Bash', 'python3 gen.py', 'json.decoder.JSONDecodeError: Expecting value: line 1 column 1'],
+      ['Edit', 'src/a.ts', 'String to replace not found in file.'],
+    ])
+  })
+
+  test('open failures: a later success of the same call clears it, in the kept rows or at a later compaction', () => {
+    const rows = [prompt('go'), ...bash('bun test', 'Exit code 1\n3 fail', true), ...bash('bun test', '12 pass\n0 fail')]
+    expect(open(rows, 3)).toEqual([])
+    const prev = open(rows.slice(0, 3))
+    expect(prev).toHaveLength(1)
+    expect(open(rows.slice(3), 0, prev)).toEqual([])
+  })
+
+  test('open failures: declined calls are left out, and one policy block stands for every call it met', () => {
+    const hook = (cmd: string) =>
+      bash(cmd, `PreToolUse:Bash hook error: [exec "$CLAUDE_PROJECT_DIR"/bin/cd-check.sh]: {"systemMessage":"[persistent-cd] a cd is blocked"}`, true)
+    const rows = [prompt('go'), ...hook('cd a && make x'), ...hook('cd b && make y'), ...bash('rm -rf x', "The user doesn't want to proceed with this tool use.", true)]
+    expect(open(rows).map(({ at: _, ...f }) => f)).toEqual([{ tool: 'Bash', target: 'make y', error: 'hook cd-check.sh: [persistent-cd] a cd is blocked', policy: true }])
+  })
+
+  test('open failures: renderFailure lines parse back, and the list keeps the newest within its cap', () => {
+    const rows = [prompt('go'), ...Array.from({ length: OPEN_FAILURES_MAX + 3 }, (_, i) => bash(`make t${i}`, `Exit code 2\nmake: *** No rule to make target t${i}`, true)).flat()]
+    const failures = open(rows)
+    expect(failures).toHaveLength(OPEN_FAILURES_MAX)
+    expect(failures.at(-1)!.target).toBe(`make t${OPEN_FAILURES_MAX + 2}`)
+    expect(parseFailures(failures.map(renderFailure).join('\n'))).toEqual(failures)
   })
 })
