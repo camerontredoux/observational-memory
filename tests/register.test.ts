@@ -3,6 +3,7 @@ import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_HEADER, MEMORY_RECALL } from '../hooks/prompts'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
+import { OBSERVER_TOOL, recorder } from '../hooks/observer-tool'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -16,6 +17,8 @@ const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 
 const PI_USAGE = { input: 9206, output: 558, cacheRead: 0, cacheWrite: 0, reasoning: 31, totalTokens: 9764, cost: { input: 0.0023, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.0025108 } }
 const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low', '--system-prompt']
 const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
+// The Observer's run: its one tool, loaded from the plugin's hooks/, in place of --no-tools.
+const OBSERVER_FLAGS = ['--tools', 'record_observations', '-e', expect.stringMatching(/\/hooks\/observer-tool\.ts$/), ...PI_FLAGS.slice(1)]
 
 // What pi 0.85.1 prints with `--mode json` for one answer: one event per line, the prompt echoed, the answer
 // streamed, then the final assistant message with its usage (as /tmp/obs-bench/pi1.jsonl, abridged).
@@ -46,6 +49,56 @@ function piOutput(prompt: string, text: string, end: { stopReason?: string; erro
   ]
     .map((event) => JSON.stringify(event))
     .join('\n')
+}
+// The Observer's run as pi prints it: the lines of `text`, a reply in the sections the tests write it in, recorded by
+// one record_observations call that ends the run. A reply with neither an <observations> nor a <corrections> tag makes
+// no call: pi prints its text alone.
+function observerOutput(prompt: string, text: string) {
+  if (!/^<(?:observations|corrections)>/m.test(text)) return piOutput(prompt, text)
+  const by: Record<string, string[]> = {}
+  let at = ''
+  for (const line of text.split('\n')) {
+    const t = line.match(/^<(\/?)(observations|corrections|continuation)>$/)
+    if (t) at = t[1] ? '' : t[2]!
+    else if (line.trim()) (by[at] ??= []).push(line.replace(/^\* /, ''))
+  }
+  const details = { observations: by.observations ?? [], corrections: by.corrections ?? [], continuation: by.continuation?.join('\n'), done: true }
+  const call = { type: 'toolCall', id: 'call-1', name: 'record_observations', arguments: {} }
+  const assistant = { role: 'assistant', content: [call], api: 'openai-codex-responses', provider: 'openai-codex', model: 'gpt-5.6-luna', usage: PI_USAGE, stopReason: 'toolUse', timestamp: 0 }
+  const result = { content: [{ type: 'text', text: 'Recorded. Done: the run ends here.' }], details, terminate: true }
+  return [
+    { type: 'message_end', message: assistant },
+    { type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'record_observations', args: {} },
+    { type: 'tool_execution_end', toolCallId: 'call-1', toolName: 'record_observations', result, isError: false },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join('\n')
+}
+// pi's run of the Observer making `calls`, each checked by the real record_observations tool: a model turn per call,
+// then the tool's answer, a receipt or the error that rejected it (pushed to `answers`). A call the tool accepts with
+// done: true ends the run; otherwise a last turn ends it with no text.
+function toolRun(prompt: string, calls: readonly unknown[], answers: string[]) {
+  const record = recorder(prompt)
+  const turn = (stopReason: string, content: unknown[]) => ({
+    type: 'message_end',
+    message: { role: 'assistant', content, api: 'openai-codex-responses', provider: 'openai-codex', model: 'gpt-5.6-luna', usage: PI_USAGE, stopReason, timestamp: 0 },
+  })
+  const events: unknown[] = []
+  let done = false
+  for (const [i, args] of calls.entries()) {
+    events.push(turn('toolUse', [{ type: 'toolCall', id: `call-${i}`, name: OBSERVER_TOOL, arguments: args }]))
+    try {
+      const { receipt, recorded } = record(args)
+      answers.push(receipt)
+      events.push({ type: 'tool_execution_end', toolCallId: `call-${i}`, toolName: OBSERVER_TOOL, result: { content: [{ type: 'text', text: receipt }], details: recorded }, isError: false })
+      if ((done = recorded.done)) break
+    } catch (error) {
+      answers.push((error as Error).message)
+      events.push({ type: 'tool_execution_end', toolCallId: `call-${i}`, toolName: OBSERVER_TOOL, result: { content: [{ type: 'text', text: (error as Error).message }], details: {} }, isError: true })
+    }
+  }
+  if (!done) events.push(turn('stop', []))
+  return events.map((e) => JSON.stringify(e)).join('\n')
 }
 const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
 const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
@@ -129,10 +182,13 @@ function pi(
     fail?: (n: number, prompt: string) => ProcessRunResult | undefined
     reflect?: (n: number, prompt: string) => string
     reply?: (prompt: string) => string | undefined
+    // The Observer's record_observations calls, in order, each checked by the real tool; the run ends at one with
+    // done: true that the tool accepts, or after the last.
+    calls?: (prompt: string) => unknown[] | undefined
     git?: (argv: readonly string[]) => ProcessRunResult | undefined
   } = {},
 ) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0, git: [] as (readonly string[])[] }
+  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], answers: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0, git: [] as (readonly string[])[] }
   let reflections = 0
   on('process.run', async ($, e) => {
     if (e.argv[0] === 'git') return seen.git.push(e.argv), { value: options.git?.(e.argv) ?? NOT_A_REPO }
@@ -147,6 +203,8 @@ function pi(
     seen.inFlight--
     const failed = options.fail?.(n, prompt)
     if (failed) return { value: failed }
+    const calls = prompt.startsWith('## OBSERVATIONS TO REFLECT ON') ? undefined : options.calls?.(prompt)
+    if (calls) return { value: { exitCode: 0, stdout: toolRun(prompt, calls, seen.answers), stderr: '' } }
     let text: string
     if (prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
       reflections++
@@ -156,7 +214,7 @@ function pi(
         options.reply?.(prompt) ??
         `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>\n` +
         `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
-    return { value: { exitCode: 0, stdout: piOutput(prompt, text), stderr: '' } }
+    return { value: { exitCode: 0, stdout: prompt.startsWith('## OBSERVATIONS TO REFLECT ON') ? piOutput(prompt, text) : observerOutput(prompt, text), stderr: '' } }
   })
   on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
   on('ui.log', ($, e) => ((e.to === 'debug' ? seen.logs : seen.screen).push(e.text), { value: undefined }))
@@ -320,7 +378,7 @@ describe('register', () => {
     expect(seen.prompts[1]).toContain('[User]: b')
     expect(seen.prompts[1]).not.toContain('Saw a') // a pure mapper: no observations so far
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
-    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS], cwd: '/tmp', timeoutMs: 120_000 })
+    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...OBSERVER_FLAGS], cwd: '/tmp', timeoutMs: 120_000 })
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s')
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
@@ -497,94 +555,84 @@ describe('register', () => {
     expect(seen.modelCalls).toBe(0)
   })
 
-  test('a reply that leaves <observations> unclosed before its next section is observed, the section kept apart', async ($, on) => {
-    mock.clock(on)
-    world(on)
-    const seen = pi(on, {
-      reply: (prompt) => {
-        const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
-        return `<corrections>\n* 🔴 Keep ${name}\n</corrections>\n<observations>\n* 🔴 Saw ${name}\n<continuation>\nActive: ${name}\n</continuation>`
-      },
-    })
-
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
-
-    expect(seen.prompts).toHaveLength(2)
-    const text = result.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🔴 Saw b')
-    expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
-    expect(text).toContain('* 🔴 Keep a')
-  })
-
-  test('a reply with no tags at all is observed from its marked lines; unclosed sections still keep apart', async ($, on) => {
-    mock.clock(on)
-    world(on)
-    const seen = pi(on, {
-      reply: (prompt) => {
-        const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
-        return name === 'a'
-          ? `Here are the observations:\n* 🟡 Saw a\n  * -> read a.ts`
-          : `<corrections>\n* 🔴 Keep b\n<observations>\n* 🔴 Saw b\n<continuation>\nActive: b`
-      },
-    })
-
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
-
-    expect(seen.prompts).toHaveLength(2)
-    const text = result.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe('* 🟡 Saw a; read a.ts\n* 🔴 Saw b')
-    expect(text).toContain('* 🔴 Keep b')
-    expect(text).not.toContain('Keep b; ')
-  })
-
-  test('an unmarked line continues the observation before it, but after a 🔴 line stands as its own 🟡 line; each is logged and counted', async ($, on) => {
+  test('a malformed record_observations call records nothing and names every fault; the fixed call is recorded', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
     const seen = pi(on, {
-      reply: () =>
-        '<corrections>\n* 🔴 User: "use pnpm, never npm"\nUser: "and keep the lockfile"\n</corrections>\n' +
-        '<observations>\n* 🔴 Saw a\nUser asked for b\n* 🟡 Read a.ts\n  and found the bug\n</observations>',
+      calls: () => [
+        { observations: [{ priority: '🔵', text: 'Saw a' }, { priority: '🟡', text: '  ' }, { priority: '🟡', text: '🟡 Read a.ts' }], corrections: [{ quote: 'use npm' }] },
+        { observations: [{ priority: '🟡', text: 'Saw a' }], corrections: [{ quote: 'a' }], continuation: { active: 'a' }, done: true },
+      ],
     })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
+    expect(seen.answers[0]).toBe(
+      'Rejected: nothing from this call was recorded. Fix each of these and call record_observations again:\n' +
+        '- observations[0].priority "🔵" is not one of 🔴 🟡 🟢 ✅\n' +
+        '- observations[1].text is missing or empty\n' +
+        '- observations[2].text begins with a marker or a time: give those in priority and timestamp, and the observation alone in text\n' +
+        `- corrections[0].quote "use npm" is not copied word for word from a [User] block of the chunk: quote the user's own words exactly, or record it as an observation instead`,
+    )
+    expect(seen.answers[1]).toBe('Recorded 1 observation and 1 correction. So far: 1 observation, 1 correction, a continuation record. Done: the run ends here.')
     const text = result.messages?.[0]?.text
-    expect(correctionsIn(text)).toBe('* 🔴 User: "use pnpm, never npm"')
-    expect(observationsIn(text)).toBe('* 🔴 Saw a\n* 🟡 User asked for b\n* 🟡 Read a.ts; and found the bug\n* 🟡 User: "and keep the lockfile"')
-    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
-      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User: \\"and keep the lockfile\\""',
-      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User asked for b"',
-      'an unmarked line in the observer reply for rows 0-3 joined the line before it: "and found the bug"',
-    ])
+    expect(observationsIn(text)).toBe('* 🟡 Saw a')
+    expect(correctionsIn(text)).toBe('* 🔴 User: "a"')
+    expect(recordIn(text)).toBe(`${WHERE}:\nActive: a`)
+    expect(seen.logs).toContain('observer for rows 0-3: record_observations rejected 1 call')
+    expect(seen.logs).toContain('Luna observer: 18412 in, 1116 out, $0.0050, 2 turns, 0s') // both turns' cost
     await clock.advance(5_000)
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
-    expect(stats.counts['observer.compaction.merged']).toBe(1)
-    expect(stats.counts['observer.compaction.orphaned']).toBe(2)
+    expect(stats.counts['observer.compaction.rejected']).toBe(1)
   })
 
-  test("a 🔴 correction whose quote runs over several lines stays one line; after its closing quote an unmarked line is its own 🟡 line", async ($, on) => {
-    const clock = mock.clock(on)
-    const { files } = world(on)
+  test('a line already recorded in the run is dropped and the receipt says so; later calls add to earlier ones', async ($, on) => {
+    mock.clock(on)
+    world(on)
     const seen = pi(on, {
-      reply: () =>
-        '<corrections>\n* 🔴 User: "Go a bit deeper yes please.\nI want you to compare them\nside by side." (replaces k1)\nUser asked for a table\n</corrections>\n' +
-        '<observations>\n* 🟡 Saw a\n</observations>',
+      calls: () => [
+        { observations: [{ priority: '🟡', text: 'Saw a' }, { priority: '🟡', text: 'Read /src/a.ts' }], continuation: { active: 'reading' } },
+        { observations: [{ priority: '🟡', text: 'Read   /src/a.ts' }, { priority: '✅', text: 'Found the bug' }, { priority: '🟡', text: 'Saw a' }], continuation: { active: 'a' }, done: true },
+      ],
     })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
+    expect(seen.answers[0]).toStartWith('Recorded 2 observations and 0 corrections. So far: 2 observations, 0 corrections, a continuation record. If the chunk holds events not yet recorded, call record_observations again')
+    expect(seen.answers[1]).toBe(
+      'Recorded 1 observation and 0 corrections (2 exact duplicates of lines already recorded dropped). So far: 3 observations, 0 corrections, a continuation record. Done: the run ends here.',
+    )
     const text = result.messages?.[0]?.text
-    expect(correctionsIn(text)).toBe('* 🔴 User: "Go a bit deeper yes please.; I want you to compare them; side by side."')
-    expect(observationsIn(text)).toBe('* 🟡 Saw a\n* 🟡 User asked for a table')
-    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
-      'an unmarked line in the observer reply for rows 0-3 continued the open quote of the 🔴 line before it: "I want you to compare them"',
-      'an unmarked line in the observer reply for rows 0-3 continued the open quote of the 🔴 line before it: "side by side.\\" (replaces k1)"',
-      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User asked for a table"',
-    ])
-    await clock.advance(5_000)
-    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
-    expect(stats.counts['observer.compaction.merged']).toBe(2)
-    expect(stats.counts['observer.compaction.orphaned']).toBe(1)
+    expect(observationsIn(text)).toBe('* 🟡 Saw a\n* 🟡 Read /src/a.ts\n* ✅ Found the bug')
+    expect(recordIn(text)).toBe(`${WHERE}:\nActive: a`) // the last call's continuation replaces the first's
+  })
+
+  test('a correction replaces a listed constraint by its id; an id not listed is rejected', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on, {
+      calls: (prompt) => {
+        if (prompt.includes(']: setup\n')) return [{ corrections: [{ timestamp: '2026-09-22 14:00', quote: 'setup' }], observations: [{ priority: '🟡', timestamp: '2026-09-22 14:00', text: 'User set a rule' }], done: true }]
+        if (!prompt.includes(']: reverse\n')) return undefined
+        const id = prompt.match(/^\[(k[0-9a-f]+)\] 🔴 .*"setup"/m)![1]
+        return [
+          { corrections: [{ timestamp: '2026-09-22 14:10', quote: 'reverse', replaces: 'k0000000' }], done: true },
+          { corrections: [{ timestamp: '2026-09-22 14:10', quote: 'reverse', replaces: id }], done: true },
+        ]
+      },
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('setup', 'r', CHUNK), at(22, 14, 0))
+    await clock.settle()
+    await runTurn($, turn('reverse', 'r', CHUNK), at(22, 14, 10))
+    await clock.settle()
+    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 20))
+    await clock.settle()
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(seen.answers.find((a) => a.startsWith('Rejected'))).toMatch(/^Rejected: [^\n]*\n- corrections\[0\]\.replaces "k0000000" is not the id of a listed constraint \(k[0-9a-f]+\)$/)
+    expect(correctionsIn(result.messages?.[0]?.text)).toMatch(/^\* 🔴 2026-09-22 14:10 User: "reverse" \(this replaces the earlier constraint 2026-09-22 14:00 User: "setup"\)$/)
   })
 
   test('at compaction, a gap with nothing to show (thinking-only rows) is observed with no Observer call', async ($, on) => {
@@ -604,32 +652,32 @@ describe('register', () => {
     expect(result.messages?.slice(1)).toEqual(messages.slice(5))
   })
 
-  test('an empty <observations> block and corrections alone are valid replies; marker-only and timestamp-only lines are not', async ($, on) => {
+  test('a call with nothing new, or corrections alone, is a valid record; a run with no accepted call is not', async ($, on) => {
     mock.clock(on)
     world(on)
-    const correction = '🔴 User: "Never touch the migrations folder"'
-    const replies: Record<string, string> = {
-      a: '<observations></observations>',
-      b: `<corrections>\n* ${correction}\n</corrections>\n<observations>\n</observations>`,
-      c: '<observations>\n* 🔴\n* 🟡 2026-09-22 14:30\n</observations>',
+    const calls: Record<string, unknown[]> = {
+      a: [{ done: true }],
+      b: [{ corrections: [{ quote: 'b' }], done: true }],
+      c: [{ observations: [{ priority: '🔴' }] }],
     }
-    const seen = pi(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)$/m)![1]!] })
+    const seen = pi(on, { calls: (prompt) => calls[prompt.match(/^\[User\]: (\w+)$/m)![1]!] })
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)]
 
     const result = await $.session.compact({ trigger: 'manual', messages })
 
     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([expect.stringMatching(/^retrying rows 7-11 /)])
-    expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer answered without an <observations> block); left unobserved')
+    expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer made no accepted record_observations call); left unobserved')
     const text = result.messages?.[0]?.text ?? ''
-    expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n\n</observations>`)
+    expect(text).toContain('<corrections>\n* 🔴 User: "b"\n</corrections>\n\n<observations>\n\n</observations>')
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
   })
 
-  test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
+  test('a run that answers in text without recording through the tool stays rejected, and the debug log keeps how it began', async ($, on) => {
     mock.clock(on)
     world(on)
-    const reply = `<observations>\nNothing worth noting.\n${'x'.repeat(600)}`
-    const seen = pi(on, { reply: () => reply })
+    const reply = `<observations>\n* 🟡 Saw a\n</observations>\n${'x'.repeat(600)}`
+    // pi's run of a model that wrote the old text reply and never called the tool: text alone, stopReason stop.
+    const seen = pi(on, { fail: () => ({ exitCode: 0, stdout: piOutput('', reply), stderr: '' }) })
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)]
 
@@ -639,9 +687,9 @@ describe('register', () => {
     expect(observationsIn(result.messages![0]!.text)).toBe('')
     expect(briefIn(result.messages![0]!.text)).toContain('\n- said: a')
     expect(result.messages?.slice(1)).toEqual(messages.slice(3))
-    const rejected = seen.logs.filter((l) => l.startsWith('observer reply without observations'))
+    const rejected = seen.logs.filter((l) => l.startsWith('observer run without an accepted record_observations call'))
     expect(rejected).toHaveLength(2) // the call and its retry
-    expect(rejected[0]).toBe(`observer reply without observations (${reply.length} chars), began: ${JSON.stringify(reply.slice(0, 500))}`)
+    expect(rejected[0]).toBe(`observer run without an accepted record_observations call (${reply.length} chars of text), began: ${JSON.stringify(reply.slice(0, 500))}`)
   })
 
   test('at compaction, a chunk whose pi call timed out is not observed again', async ($, on) => {
@@ -2569,17 +2617,14 @@ describe('register', () => {
     expect(kept[0]!.startsWith('brief ')).toBe(true)
   })
 
-  test('only 🔴 corrections are quoted; the observer reserves 🔴 for the user\'s constraints', async ($, on) => {
+  test('a correction is always a quoted 🔴 line; the observer reserves 🔴 for the user\'s constraints', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
-      reply: () => '<corrections>\n* 🔴 User: "use pnpm, never npm"\n* 🟡 User: "I meant the other file"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
-    })
+    const seen = pi(on, { calls: () => [{ corrections: [{ quote: '"a"' }], observations: [{ priority: '🟡', text: 'Saw a' }], done: true }] })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
-    expect(result.messages?.[0]?.text).toContain('<corrections>\n* 🔴 User: "use pnpm, never npm"\n</corrections>')
-    expect(result.messages?.[0]?.text).not.toContain('I meant the other file')
+    expect(result.messages?.[0]?.text).toContain('<corrections>\n* 🔴 User: "a"\n</corrections>') // its own quotes dropped, not doubled
     expect(seen.systems[0]).toContain("🔴 The user's constraints: what the user decided, required, forbade or set as a rule or preference that stays in force.")
     expect(seen.systems[0]).not.toContain('suggested-response')
   })

@@ -22,6 +22,7 @@ function busy() {
   count(s, 'observer.background.merged', 3)
   count(s, 'reflector.background.merged')
   count(s, 'observer.compaction.orphaned')
+  count(s, 'observer.background.rejected', 2)
   addRecall(s, 3, false, T0 + 600_000)
   addRecall(s, 0, true, T0 + 600_000)
   return s
@@ -59,6 +60,7 @@ describe('stats', () => {
     expect(failureClass('pi exited 0, stopReason error: overloaded')).toBe('stop-error')
     expect(failureClass('pi exited 0 with no assistant message')).toBe('no-message')
     expect(failureClass('observer answered without an <observations> block')).toBe('no-observations')
+    expect(failureClass('observer made no accepted record_observations call')).toBe('no-observations')
     expect(failureClass('process timed out after 120000ms')).toBe('timeout')
   })
 
@@ -136,7 +138,7 @@ describe('stats', () => {
         '  Fallbacks  1 used the built-in compaction',
         'Context      after a main compaction: ~27,000 tokens (median), ~236 notes',
         'Background   3 calls, median 20.0 s each, ~9 notes each',
-        'Problems     2 observer replies had no notes; 1 context/history mismatch; 4 unmarked lines joined the line before; 1 unmarked line after a 🔴 line kept as its own 🟡 line',
+        'Problems     2 observer replies had no notes; 2 malformed record_observations calls rejected for the Observer to fix; 1 context/history mismatch; 4 unmarked lines joined the line before; 1 unmarked line after a 🔴 line kept as its own 🟡 line',
         'Recall       2 searches',
         '',
         '/om-stats full for every metric · /om-stats all for every session',

@@ -189,9 +189,11 @@ describe('the om chain through hooks/register.ts', () => {
       const prompt = e.init?.stdin ?? ''
       const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
       observed.push(words)
-      const text = `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
-      const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage: { input: 1, output: 1, cost: { total: 0 } } }
-      return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'message_end', message }), stderr: '' } }
+      // One record_observations call that ends the run.
+      const details = { observations: words.length ? words.map((w) => `🔴 Saw ${w}`) : ['🟡 Nothing'], corrections: [], continuation: `Active: ${words.at(-1)}`, done: true }
+      const message = { role: 'assistant', content: [], stopReason: 'toolUse', usage: { input: 1, output: 1, cost: { total: 0 } } }
+      const stdout = [{ type: 'message_end', message }, { type: 'tool_execution_end', toolName: 'record_observations', result: { details }, isError: false }]
+      return { value: { exitCode: 0, stdout: stdout.map((e) => JSON.stringify(e)).join('\n'), stderr: '' } }
     })
 
     const inputs: string[][] = []

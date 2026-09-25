@@ -76,7 +76,8 @@ export function failureClass(message: string) {
   if (exit?.[2]) return `stop-${exit[2]}`
   if (exit && exit[1] !== '0') return `exit-${exit[1]}`
   if (message.includes('no assistant message')) return 'no-message'
-  if (message.includes('<observations>')) return 'no-observations'
+  // The Observer recorded nothing: no accepted record_observations call (before v1.3.4, no <observations> block).
+  if (message.includes('<observations>') || message.includes('no accepted record_observations call')) return 'no-observations'
   return 'error'
 }
 
@@ -283,9 +284,10 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   failed.delete('no-observations')
   const other = [...failed.values()].reduce((t, n) => t + n, 0)
   const unmarked = (kind: string) => Object.entries(s.counts).reduce((t, [k, n]) => (k.match(/^(?:observer|reflector)\.\w+\.(\w+)$/)?.[1] === kind ? t + n : t), 0)
-  const [joined, orphaned] = [unmarked('merged'), unmarked('orphaned')]
+  const [joined, orphaned, rejected] = [unmarked('merged'), unmarked('orphaned'), unmarked('rejected')]
   const problems = [
     empty && `${plural(empty, 'observer reply', 'observer replies')} had no notes`,
+    rejected && `${plural(rejected, 'malformed record_observations call')} rejected for the Observer to fix`,
     other && `${plural(other, 'call')} failed (${[...failed].map(([c, n]) => `${c} ${n}`).join(', ')})`,
     s.counts['compaction.notPersistent'] && plural(s.counts['compaction.notPersistent'], 'context/history mismatch', 'context/history mismatches'),
     joined && `${plural(joined, 'unmarked line')} joined the line before`,

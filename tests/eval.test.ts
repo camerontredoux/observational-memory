@@ -355,9 +355,10 @@ function pi(on: On) {
     if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } }
     const prompt = e.init?.stdin ?? ''
     seen.prompts.push(prompt)
-    const text = `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>`
-    const event = { role: 'assistant', content: [{ type: 'text', text }], api: 'openai-codex-responses', provider: 'openai-codex', model: 'gpt-5.6-luna', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: 'stop', timestamp: 0 }
-    const stdout = [{ type: 'message_start', message: { ...event, content: [] } }, { type: 'message_end', message: event }, { type: 'turn_end', message: event, toolResults: [] }].map((e) => JSON.stringify(e)).join('\n')
+    // One record_observations call that ends the run.
+    const details = { observations: [...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `🔴 ${m[1] ?? ''} Saw ${m[2]}`), corrections: [], done: true }
+    const event = { role: 'assistant', content: [], api: 'openai-codex-responses', provider: 'openai-codex', model: 'gpt-5.6-luna', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: 'toolUse', timestamp: 0 }
+    const stdout = [{ type: 'message_start', message: { ...event, content: [] } }, { type: 'message_end', message: event }, { type: 'tool_execution_end', toolName: 'record_observations', result: { details }, isError: false }, { type: 'turn_end', message: event, toolResults: [] }].map((e) => JSON.stringify(e)).join('\n')
     return { value: { exitCode: 0, stdout, stderr: '' } }
   })
   on('model.complete', () => ({ value: { isAnswered: false, reason: 'empty-reply', usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }))

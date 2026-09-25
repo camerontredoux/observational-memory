@@ -199,25 +199,34 @@ const REFLECTED = /reflected \d+ observations \(~(\d+) tokens\) into \d+ \(~(\d+
 
 function piMessage(stdout: string) {
   let message: any
+  const usage = { input: 0, output: 0, cost: { total: 0 } }
   for (const line of stdout.split('\n'))
     if (line.startsWith('{"type":"message_end"'))
       try {
         const e = JSON.parse(line)
-        if (e.message?.role === 'assistant') message = e.message
+        if (e.message?.role !== 'assistant') continue
+        message = e.message
+        usage.input += e.message.usage?.input ?? 0
+        usage.output += e.message.usage?.output ?? 0
+        usage.cost.total += e.message.usage?.cost?.total ?? 0
       } catch {}
-  return message
+  // The Observer runs a turn per record_observations call: its cost is every turn's.
+  return message && { ...message, usage }
 }
-// A canned reply from the prompt alone: each block's first words as an observation (the Reflector's: every other
-// line). Enough for the chain to run; says nothing about what Luna would keep.
+// A canned reply from the prompt alone: each block's first words as an observation, recorded by one
+// record_observations call that ends the run (the Reflector's: every other line, as text). Enough for the chain to
+// run; says nothing about what Luna would keep.
 function stub(prompt: string): PiResult {
   const reflect = prompt.startsWith('## OBSERVATIONS TO REFLECT ON')
   const lines = reflect
     ? [...prompt.matchAll(/^\* .+$/gm)].map((m) => m[0]).filter((_, i) => i % 2 === 0)
-    : [...prompt.matchAll(/^\[(User|Assistant)(?: @ ([\d-]+ [\d:]+))?\]: (.{0,60})/gm)].map((m) => `* 🟡 ${m[2] ?? ''} ${m[1]} said ${m[3]!.replace(/\s+/g, ' ')}`)
-  const text = `<observations>\n${lines.join('\n') || '* 🟡 Nothing to note'}\n</observations>` + (reflect ? '' : '\n<continuation>\nActive: stub\n</continuation>')
-  const usage = { input: estimateTokens(prompt), output: estimateTokens(text), cost: { total: 0 } }
-  const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage }
-  return { exitCode: 0, stderr: '', stdout: JSON.stringify({ type: 'message_end', message }) }
+    : [...prompt.matchAll(/^\[(User|Assistant)(?: @ ([\d-]+ [\d:]+))?\]: (.{0,60})/gm)].map((m) => `🟡 ${m[2] ?? ''} ${m[1]} said ${m[3]!.replace(/\s+/g, ' ')}`)
+  const text = reflect ? `<observations>\n${lines.join('\n') || '* 🟡 Nothing to note'}\n</observations>` : ''
+  const details = { observations: lines.length ? lines : ['🟡 Nothing to note'], corrections: [], continuation: 'Active: stub', done: true }
+  const usage = { input: estimateTokens(prompt), output: estimateTokens(text || JSON.stringify(details)), cost: { total: 0 } }
+  const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: reflect ? 'stop' : 'toolUse', usage }
+  const events = [{ type: 'message_end', message }, ...(reflect ? [] : [{ type: 'tool_execution_end', toolName: 'record_observations', result: { details }, isError: false }])]
+  return { exitCode: 0, stderr: '', stdout: events.map((e) => JSON.stringify(e)).join('\n') }
 }
 
 async function om(o: Options) {
@@ -272,6 +281,7 @@ async function om(o: Options) {
 
   const inOut = (p: string) => p === out || p.startsWith(`${out}/`)
   const $: any = {
+    plugin: { name: 'observational-memory', root: src },
     session: {
       id: async () => SESSION,
       messages: async () => (history.length > ROWS_CAP ? history.slice(-ROWS_CAP) : history),
