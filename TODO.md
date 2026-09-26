@@ -43,3 +43,21 @@ pass or at compaction, do not see each other's. When one sets a constraint and t
 the second cannot name the first by its id, and both stand as constraints in force, the reversal after it: nothing is
 dropped, and the memory shows both, newest last. The continuation record is that of the newest chunk that writes one, so a gate or a
 completed request that only the chunk before it recorded drops out of the record; the observations still hold it.
+
+## Auto and subagent compactions sometimes find a context that differs from the history
+
+Before a compaction uses the background notes, it checks that the live context matches the session history. v1.4.0
+fixed the manual `/compact` case, where the check failed on a trailing `/compact` row. Auto and subagent compactions
+still fail it sometimes: 43 of 82 in session `40c779b6`, mostly subagents. On 2026-09-25 the opie session
+(`0554dd5a`) failed it at 18:05 (auto) and at 18:10 (subagent), 0 rows observed beforehand, and blocked 17.8 s and
+24.4 s. Its compactions that matched took about 0.2 s.
+
+The cause is not known. The current guess is task notifications injected into the context (`queued_command`
+attachments). Since v1.4.1 (`62ee8ee`) a mismatch keeps the background notes up to the first differing row, and
+`notPersistent` in `hooks/register.ts` counts how the two differ: `compaction.notPersistent.<trigger>`, the shape
+(`extra`, `missing`, `changed`, `short`), `compaction.notPersistent.rows.<context kind>-<history kind>`, and the
+`fromEnd`, `differing` and `rowsKept` metrics.
+
+No mismatch had happened on v1.4.1 yet at 2026-09-25 21:45. Next: after a mismatch on v1.4.1, read those counts with
+`/om-stats full` or in `~/.claude/plugins/data/observational-memory/stats/<session>.json`, then fix the cause. The
+compaction A/B benchmark cannot test this: its replays never produce a mismatch.
