@@ -61,3 +61,19 @@ attachments). Since v1.4.1 (`62ee8ee`) a mismatch keeps the background notes up 
 No mismatch had happened on v1.4.1 yet at 2026-09-25 21:45. Next: after a mismatch on v1.4.1, read those counts with
 `/om-stats full` or in `~/.claude/plugins/data/observational-memory/stats/<session>.json`, then fix the cause. The
 compaction A/B benchmark cannot test this: its replays never produce a mismatch.
+
+## Engine bug: the kept raw tail shows twice after a compaction
+
+After the plugin compacts, Claude Code shows the kept raw tail again, after the compaction notice. Auto-compaction
+fires as a new prompt arrives, so the tail usually holds the previous turn's full answer, and the user sees it twice.
+The memory message also shows as one long user prompt.
+
+The cause is in the engine (2.1.282). When a `session.compact` hook's result stands, the engine gives every returned
+message a new uuid, handle or not, and appends it after the boundary. Built-in compaction keeps the kept rows' uuids
+and records them in the boundary's `preservedSegment`, so nothing shows twice. `SessionMessage` has no field that
+marks the memory message as the compact summary. No plugin-side fix exists. Keeping the handles on all rows brings
+back the resume leak that `e547d11` fixed.
+
+`docs/plans/results/1515-dup-tail.md` has the live test arms, the evidence and a draft Claude Code bug report. The bug
+is not filed yet. Arm C there (keep `handle` except on rows with `toolResults`) keeps the real assistant rows with
+their thinking signatures and attachments, but it does not fix the duplicate.
