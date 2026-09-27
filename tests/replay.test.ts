@@ -40,6 +40,7 @@ import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } 
 import type { Configuration } from './eval/runner'
 import { factHolds, grade, negativeControl, norm, score } from './eval/rubric'
 import { gradeAnswer, parse as parseReply } from './eval/behavior'
+import { categoryOf, continuation, continuationBehavior, probeCategory } from './eval/continuation'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 
 // The test runner prints what a test file logs; the hooks module's own globals have no console.
@@ -852,6 +853,33 @@ describe('the compaction rubric', () => {
     const mech = score([{ gate: 'identifiers', boundary: 1, id: 'commit:abc1234', score: 0, evidence: '' }, { gate: 'decisions', boundary: 1, id: 'why', score: 1, evidence: '' }])
     expect(r(mech.total)).toBe(r((100 * 5) / 15))
     expect(r(mech.tiered)).toBe(r((100 * 5) / (5 + 10 * 0.25)))
+  })
+
+  test('the continuation score regroups the items by what continuing needs: history recital weighs least, a pointed lookup nearly in full', () => {
+    const r = (x: number) => Math.round(x * 1e6) / 1e6
+    const it = (gate: Parameters<typeof categoryOf>[0]['gate'], id: string, score: number, extra: { tier?: 'core' | 'lookup'; pointed?: boolean } = {}) => ({ gate, boundary: 1, id, score, evidence: '', ...extra })
+    expect(categoryOf(it('purpose', 'purpose:goal', 1))).toBe('goal')
+    expect(categoryOf(it('reversals', 'sup:test-count', 1))).toBe('state') // a superseded value is state, not a rule
+    expect(categoryOf(it('reversals', 'sup:main-head', 1, { tier: 'lookup' }))).toBe('references')
+    expect(categoryOf(it('chronology', 'order:a-then-b', 1))).toBe('history')
+    expect(categoryOf(it('facts', 'exact:port', 1, { tier: 'lookup' }))).toBe('references')
+    expect(categoryOf(it('lessons', 'neg:cookie', 1))).toBe('lessons')
+    expect(categoryOf(it('budget', 'size', 1))).toBeUndefined()
+    expect(probeCategory({ gate: 'value', id: 'om-v04/ord:5-after-7', tier: 'lookup' })).toBe('history')
+    expect(probeCategory({ gate: 'rule', id: 'om-v04/scope:no-lavish' })).toBe('rules')
+    // Rules held, history lost: the total weighs rules 10 against history 1.
+    const s = continuation([it('constraints', 'c1', 1), it('chronology', 'span0', 0)])
+    expect(s.categories.rules).toEqual({ score: 100, items: 1 })
+    expect(r(s.total)).toBe(r((100 * 10) / 11))
+    // A missed lookup reference pointed to by a source range earns 0.9; a missed core finding pointed to, 0.25.
+    expect(r(continuation([it('facts', 'exact:x', 0, { tier: 'lookup', pointed: true })]).total)).toBe(90)
+    expect(r(continuation([it('facts', 'f', 0, { pointed: true })]).total)).toBe(25)
+    // Over budget, the budget fit scales it, as the totals.
+    expect(r(continuation([it('constraints', 'c1', 1), it('budget', 'size', 0.5)]).total)).toBe(50)
+    // Behavior: majority passes by category, a lookup probe weighing a quarter inside its category.
+    const b = continuationBehavior([{ gate: 'purpose', id: 'x/purpose:a', pass: true }, { gate: 'value', id: 'x/path:p', pass: false, tier: 'lookup' }, { gate: 'value', id: 'x/v', pass: true }])
+    expect(b.categories).toEqual({ goal: { score: 100, items: 1 }, findings: { score: 100, items: 1 }, references: { score: 0, items: 1 } })
+    expect(r(b.total)).toBe(r((100 * 10 + 100 * 6) / 20))
   })
 
   test('counts an identifier only on a line that says what the transcript said about it, never in a bare list', () => {

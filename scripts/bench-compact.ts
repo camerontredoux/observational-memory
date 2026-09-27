@@ -36,6 +36,9 @@
 //     fresh reader draws on the same contexts, the noise floor of the behavior total.
 //     --behavior-sample K: read sample K's contexts instead of the first sample's (with --samples K or more).
 //   bun scripts/bench-compact.ts run --contexts DIR          # grade ready-made contexts: DIR/<name>/compaction-N.md
+//   --continuation (run, ab): also print the continuation score (tests/eval/continuation.ts): the same retention items
+//     and behavior probes regrouped by what continuing the work needs (goal, status, rules, decisions, lessons, state,
+//     findings, references, history) and weighted by it, history recital least. Additive: every total above is unchanged.
 //   bun scripts/bench-compact.ts controls [--plugin <ref|dir>] # write tests/fixtures/rubric-controls{,.<name>}.local.ts, the
 //     negative control's fixture: rerun it after editing a rubric (the test fails any fact or latest item that another
 //     transcript's context passes, unless the item lists that transcript in `shared`)
@@ -68,6 +71,8 @@ import type { Gate, Item, Pointed, RubricSpec, Scores, Tier } from '../tests/eva
 import { grade, hasExpect, itemTier, norm, pointed, proseContext, score, TIER, tierOf, WEIGHTS } from '../tests/eval/rubric'
 import type { BGate, Probe } from '../tests/eval/behavior'
 import { BGATES, contextSquashed, gradeAnswer, input, isUnknown, parse, probes, PROMPT } from '../tests/eval/behavior'
+import type { Category, ContinuationScore } from '../tests/eval/continuation'
+import { CATEGORIES, CATEGORY_WEIGHTS, continuation, continuationBehavior } from '../tests/eval/continuation'
 import { fail, mainCheckout, num, options, str } from './cli'
 
 const HERE = resolve(import.meta.dir, '..')
@@ -761,6 +766,35 @@ function behaviorAb(a: Run, b: Run) {
   return out.join('\n')
 }
 
+// ---- The continuation score (--continuation): additive, beside the totals ----
+
+/** Per sample: the retention items' continuation score; the behavior probes' once (one set of majority votes). */
+const contSamples = (xs: readonly Sample[] | undefined) => (xs ?? []).map((s) => continuation(s.items))
+const contMean = (cs: readonly ContinuationScore[], c?: Category) => mean(cs.map((x) => (c ? (x.categories[c]?.score ?? NaN) : x.total)))
+const cell = (x: number) => (Number.isNaN(x) ? '–' : f1(x))
+/** One table: a row per category, a column pair per run (retention, behavior), A/B deltas when two runs. */
+function continuationCard(runs: readonly Run[], track: (r: Run) => readonly Sample[] | undefined = (r) => r.samples, title = 'Continuation score') {
+  const ret = runs.map((r) => contSamples(track(r)))
+  const beh = runs.map((r) => (track(r) === r.samples && r.behavior ? continuationBehavior(r.behavior) : undefined))
+  const two = runs.length === 2
+  const head = runs.map((r) => `${r.label.split(' ')[0]} retention | ${r.label.split(' ')[0]} behavior`).join(' | ')
+  const out = [`## ${title}`, '', `| category | weight | ${head} |${two ? ' Δ retention | Δ behavior |' : ''}`, `|---|---:|${runs.map(() => '---:|---:|').join('')}${two ? '---:|---:|' : ''}`]
+  const row = (name: string, w: string, r: (i: number) => number, b: (i: number) => number) =>
+    `| ${name} | ${w} | ${runs.map((_, i) => `${cell(r(i))} | ${cell(b(i))}`).join(' | ')} |${two ? ` ${signed(r(1) - r(0))} | ${Number.isNaN(b(0)) ? '–' : signed(b(1) - b(0))} |` : ''}`
+  for (const c of CATEGORIES) {
+    if (ret.every((x) => Number.isNaN(contMean(x, c))) && beh.every((x) => !x?.categories[c])) continue
+    out.push(row(c, String(CATEGORY_WEIGHTS[c]), (i) => contMean(ret[i]!, c), (i) => beh[i]?.categories[c]?.score ?? NaN))
+  }
+  out.push(row('**total**', '', (i) => contMean(ret[i]!), (i) => beh[i]?.total ?? NaN), '')
+  const spread = ret.map((x, i) => (x.length > 1 ? `${runs[i]!.label}: ${x.map((y) => f1(y.total)).join(', ')}` : '')).filter(Boolean)
+  if (spread.length) out.push(`Retention continuation per sample: ${spread.join('; ')}.`, '')
+  return { text: out.join('\n'), json: runs.map((r, i) => ({ label: r.label, retention: { total: contMean(ret[i]!), samples: ret[i]!.map((x) => x.total), categories: Object.fromEntries(CATEGORIES.map((c) => [c, contMean(ret[i]!, c)])) }, behavior: beh[i] ?? null })) }
+}
+const continuationCards = (runs: readonly Run[]) => [
+  continuationCard(runs),
+  ...(runs.every((r) => r.long) ? [continuationCard(runs, (r) => r.long, 'Continuation score: long chain (retention only)')] : []),
+]
+
 const [command, ...rest] = process.argv.slice(2)
 const o = options(rest)
 const record = !!o.record
@@ -785,7 +819,9 @@ else if (command === 'run') {
   if (r.chain) console.log(scorecard(chainOf(r), !!o.items))
   if (r.long) console.log(longCard(r, !!o.items))
   if (r.behavior) console.log(behaviorCard(r, !!o.items))
-  json(strip(r), 'run')
+  const cc = o.continuation ? continuationCards([r]) : []
+  for (const c of cc) console.log(c.text)
+  json({ ...(strip(r) as object), ...(cc.length ? { continuation: cc.map((c) => c.json) } : {}) }, 'run')
 } else if (command === 'ab') {
   const sa = source(str(o, 'a') ?? fail('--a <ref|dir>'))
   // Several Bs, comma-separated, each against the one A: a summary table first.
@@ -848,8 +884,9 @@ else if (command === 'run') {
     ...(a.behavior ? [`Behavior (probes passed): A ${bRate(a.behavior)}%; ${bs.map((b) => `${b.label} ${bRate(b.behavior!)}%`).join('; ')}`, ''] : []),
   ]
   const cards = (r: Run) => [scorecard(r, false), ...(r.holdout ? [scorecard(holdoutOf(r), false)] : []), ...(r.chain ? [scorecard(chainOf(r), false)] : []), ...(r.long ? [longCard(r, false)] : [])]
-  console.log([summary.join('\n'), ...rs.flatMap((r, i) => [r.text, ...(a.behavior ? [behaviorAb(a, bs[i]!)] : [])]), ...cards(a), ...bs.flatMap(cards)].join('\n'))
-  json({ a: strip(a), b: bs.map(strip), ...(a.long ? { long: longs.map((x) => x?.json ?? null) } : {}) }, 'ab')
+  const cc = o.continuation ? bs.map((b) => continuationCards([a, b])) : []
+  console.log([summary.join('\n'), ...cc.flatMap((x) => x.map((c) => c.text)), ...rs.flatMap((r, i) => [r.text, ...(a.behavior ? [behaviorAb(a, bs[i]!)] : [])]), ...cards(a), ...bs.flatMap(cards)].join('\n'))
+  json({ a: strip(a), b: bs.map(strip), ...(a.long ? { long: longs.map((x) => x?.json ?? null) } : {}), ...(cc.length ? { continuation: cc.map((x) => x.map((c) => c.json)) } : {}) }, 'ab')
 } else if (command === 'controls') {
   // The negative-control fixture (tests/replay.test.ts): each transcript's fact and latest items, and a plugin's prose
   // contexts at every cut, cut down to the lines any item could match (the test module must stay under 1 MiB).
