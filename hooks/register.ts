@@ -6,10 +6,13 @@ import {
   COMPACT_WRAPPER,
   COMPACTION_BRIEFING,
   FLOOR_NOTE,
-  MEMORY_CONTINUATION,
+  MEMORY_GUIDE,
+  MEMORY_GUIDE_RECALL,
   MEMORY_HEADER,
-  MEMORY_INSTRUCTIONS,
+  MEMORY_MARK,
   MEMORY_RECALL,
+  MEMORY_RESUME,
+  MEMORY_RESUME_END,
   OBSERVER_SYSTEM_PROMPT,
   REFLECTOR_SYSTEM_PROMPT,
   reflectionPrompt,
@@ -391,9 +394,10 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
   }
   return { offset: best?.offset ?? end, rows: best?.rows ?? [...history], persistent: false }
 }
-// A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
+// A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it. Every version's
+// header starts with MEMORY_MARK.
 const isMemory = (m: SessionMessage | undefined) =>
-  m?.role === 'user' && (m.text.startsWith(MEMORY_HEADER) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`))
+  m?.role === 'user' && (m.text.startsWith(MEMORY_MARK) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`))
 const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
 const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
@@ -1246,11 +1250,15 @@ function unstamp(text: string) {
 const SESSION_BRIEF = '\n\n<session-brief>\n'
 const SESSION_BRIEF_END = '\n</session-brief>'
 
-// Built as the built-in summary is framed: its wrapper first, the memory, then its notes after the summary; last,
-// where the model can call om_recall, the note that sends it there, so it is the last thing read before the messages.
+// Built as the built-in summary is framed: its wrapper first, the memory with the guide to reading it before its data,
+// then its notes after the summary; last, the resume rules (with, where the model can call om_recall, the line that
+// sends it there), so they are the last thing read before the messages. A guide line never starts with a tag, so
+// parseMemory reads no section from it.
 function memoryMessage(memory: Memory): SessionMessage {
+  const guide = `${MEMORY_GUIDE}${memory.recall ? MEMORY_GUIDE_RECALL : ''}`
+  const resume = [MEMORY_RESUME, memory.recall ? MEMORY_RECALL : '', MEMORY_RESUME_END].filter(Boolean).join('\n')
   const text =
-    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n${MEMORY_INSTRUCTIONS}\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
+    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${guide}\n</memory-guide>\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
     section('session-brief', [memory.floor ? FLOOR_NOTE : '', memory.brief ? renderBrief(memory.brief, memory.recall) : ''].filter(Boolean).join('\n')) +
     // The text parseMemory reads the section back as: a message is found in the same text it was matched in.
@@ -1260,8 +1268,7 @@ function memoryMessage(memory: Memory): SessionMessage {
     (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
     (memory.recentKept ? `\n${COMPACT_RECENT}` : '') +
     (memory.resumeDirectly ? `\n${COMPACT_RESUME}` : '') +
-    `\n\n<system-reminder>${MEMORY_CONTINUATION}</system-reminder>` +
-    (memory.recall ? `\n\n${MEMORY_RECALL}` : '')
+    `\n\n<resume>\n${resume}\n</resume>`
   return { role: 'user', text, toolUses: [] }
 }
 

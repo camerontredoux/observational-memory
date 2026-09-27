@@ -5,7 +5,7 @@
 // instead, its blocks addressed `#<row>`. No `$` here: the engine never lets it cross an import, so the caller passes
 // what reads files as `RecallIo`.
 import type { SessionMessage } from 'claude-code'
-import { COMPACT_WRAPPER, MEMORY_HEADER } from './prompts'
+import { COMPACT_WRAPPER, MEMORY_MARK } from './prompts'
 
 const RECALL_TOOL = 'om_recall'
 export const SEARCH_MAX_HITS = 20
@@ -73,7 +73,7 @@ type Thread = { tag: string; label: string; blocks: Block[]; path?: string; load
 type Corpus = { main: Thread; files: string[]; subagents: Thread[]; live: boolean; note?: string; load: (t: Thread) => Promise<void>; now: () => Promise<number> }
 
 // A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
-const isMemoryText = (text: string) => text.startsWith(MEMORY_HEADER) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`)
+const isMemoryText = (text: string) => text.startsWith(MEMORY_MARK) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`)
 // Known wrappers the host or another session delivers into context, not any text that merely starts with a tag (a
 // real user message may itself start with one). Shared with register.ts's `typed`, so a row counts as a genuine
 // prompt or an injected one the same way in compaction and in recall. Add a name here only once it is confirmed

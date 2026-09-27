@@ -4,7 +4,7 @@
 // `tests/recall.test.ts` use it.
 
 import type { SessionMessage } from 'claude-code'
-import { COMPACT_WRAPPER, MEMORY_HEADER } from '../../hooks/prompts'
+import { COMPACT_WRAPPER, MEMORY_MARK } from '../../hooks/prompts'
 import { SEARCH_MAX_HITS } from '../../hooks/recall'
 
 const RECALL_TOOL = 'om_recall'
@@ -16,7 +16,7 @@ type Row = {
 }
 type Content = { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean }
 
-const isMemoryText = (text: string) => text.startsWith(MEMORY_HEADER) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`)
+const isMemoryText = (text: string) => text.startsWith(MEMORY_MARK) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`)
 function typedText(text: string) {
   const t = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
   return !t || /^<[a-z][a-z-]*>/.test(t) || t.startsWith('[Image') ? undefined : t
