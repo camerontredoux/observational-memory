@@ -678,6 +678,40 @@ describe('register', () => {
     expect(kept.length).toBeLessThan(3_000)
   })
 
+  test("an Assistant said line quoting a reply the memory shows is left out, kept in the ledger, and shown again once the reply leaves the section", async ($, on) => {
+    mock.clock(on)
+    const { stored, history } = world(on)
+    // Each chunk: a quote of its own closing reply, in other case and spacing, and a quote no reply holds.
+    pi(on, {
+      reply: (prompt) => {
+        const p = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
+        return `<observations>\n* 🟡 2026-09-22 14:30 Assistant said: "found  the bug in \`${p}.ts\` today"\n* 🟡 2026-09-22 14:31 Assistant said: "Nothing is deleted from ${p} anywhere"\n</observations>`
+      },
+    })
+    const messages = [...turn('a', 'Found the bug in `a.ts` today.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'c', 8_000)]
+    history.push(...messages)
+
+    const first = await $.session.compact({ trigger: 'manual', messages })
+
+    const text = first.messages?.[0]?.text ?? ''
+    expect(repliesIn(text)).toContain('Found the bug in `a.ts` today. done')
+    const shown = observationsIn(text) ?? ''
+    expect(shown).not.toContain('found  the bug in `a.ts` today')
+    expect(shown).toContain('Assistant said: "Nothing is deleted from a anywhere"')
+    // The ledger keeps the line left out.
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(ledger.entries.some((e) => e.line.includes('found  the bug in `a.ts` today'))).toBe(true)
+
+    // Two replies over the section's cap between them (the last closing reply starts the raw tail) push a's out: its quote is shown again.
+    const big = (ch: string) => ch.repeat(700 * 4)
+    const more = [...turn('d', big('y'), CHUNK), ...turn('e', big('z'), CHUNK), ...turn('g', 'g', CHUNK), ...turn('f', 'f', 8_000)]
+    history.push(...first.messages!, ...more)
+    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...more] })
+    const again = second.messages?.[0]?.text ?? ''
+    expect(repliesIn(again)).not.toContain('Found the bug in `a.ts`')
+    expect(observationsIn(again)).toContain('Assistant said: "found  the bug in `a.ts` today"')
+  })
+
   test('the replies take only the room the compacted context leaves below REPLIES_ROOM_TOKENS', async ($, on) => {
     mock.clock(on)
     world(on)

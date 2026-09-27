@@ -955,6 +955,20 @@ function carryClauses(v: View, from: number, to: number, lines: string[]) {
   return out
 }
 
+// An "Assistant said" line that only quotes a sentence a reply in <your-replies> shows verbatim says it twice: the
+// memory message leaves it out. The ledger keeps it, so it is shown again once that reply leaves the section. The
+// quote is compared with the reply's shown text, bold and code marks and spacing aside, case ignored.
+const SAID_LINE = /\bAssistant said:? "([^"]{12,})"$/
+const plainOf = (text: string) => text.replace(/\*\*|`/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+function unsaid<T extends { line: string }>(entries: readonly T[], replies: readonly UserMessage[] | undefined): T[] {
+  const shown = (replies ?? []).map((r) => plainOf(r.text))
+  if (!shown.length) return [...entries]
+  return entries.filter((e) => {
+    const q = e.line.match(SAID_LINE)?.[1]
+    return !q || !shown.some((r) => r.includes(plainOf(q)))
+  })
+}
+
 // One chunk, read alone: the Observer never sees the observations so far.
 async function observe($: EngineInterface, v: View, from: number, to: number, phase: Call['phase'], { constraints, state }: Before): Promise<Chunk> {
   const chunk = serialize(v, from, to)
@@ -2051,7 +2065,8 @@ export const register: Register = (on) => {
     // with the raw tail cut later, the rows between the watermark and the cut compiled by code into the session brief.
     // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for a context that
     // is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
-    const build = async (ledger: Ledger) => {
+    // `kept`: the ledger is stored with the memory message, so a line the message leaves out (see unsaid) comes back.
+    const build = async (ledger: Ledger, kept: boolean) => {
       const observed = ledger.watermark.to
       const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
       const attempt = async (cut: number, floor: boolean) => {
@@ -2092,12 +2107,16 @@ export const register: Register = (on) => {
         // The replies fill what room is left below REPLIES_ROOM_TOKENS, at most REPLIES_MAX_TOKENS.
         const room = REPLIES_ROOM_TOKENS - contextTokens(memoryMessage(memory))
         memory.replies = capReplies([...(priorMemory?.replies ?? []), ...replyRows.filter((r) => r.i < cut).map((r) => r.message)], Math.min(REPLIES_MAX_TOKENS, Math.floor(room / MEMORY_HEADROOM)))
+        // The observations as shown beside the replies: where the ledger keeps every line, one quoting a reply is left out.
+        let sources = true
+        const shown = (m: Memory): Memory => ({ ...m, observations: renderGrouped(kept ? unsaid(ledger.entries, m.replies) : ledger.entries, sources) })
+        memory = shown(memory)
         let message = memoryMessage(memory)
         // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
         // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
         // find; the corrections (within their cap), observations and continuation record stay whole.
-        const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', briefer]]
-        if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ({ ...m, observations: renderGrouped(ledger.entries, false) })])
+        const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(briefer(m))]]
+        if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
         const over = contextTokens(message)
         let tokens = over
         const made: string[] = []
@@ -2128,7 +2147,7 @@ export const register: Register = (on) => {
       const stores = persistent && ledger.watermark.to > base && isLive(loop, life) // under the lock, as a loop's end deletes
       let built
       try {
-        built = await build(ledger)
+        built = await build(ledger, stores && installs)
       } catch (error) {
         if (stores && chunks.length) await $.store.set(ledgerKey(loop.key), ledger)
         throw error
