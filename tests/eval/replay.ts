@@ -322,7 +322,9 @@ export type ConstraintSpec = {
  * the assistant was about to do when that context begins, say); `expect` are strings an answer must all hold, or none
  * with a model grader.
  */
-export type Question = { id: string; ask: string; from: number; to?: number; expect?: readonly string[] }
+/** What an item is worth to the next agent (tests/eval/rubric.ts TIER): core, or an exact value om_recall can look up. */
+export type Tier = 'core' | 'lookup'
+export type Question = { id: string; ask: string; from: number; to?: number; expect?: readonly string[]; tier?: Tier }
 /** A transcript's constraints and questions. */
 export type ReplaySpec = { constraints: readonly ConstraintSpec[]; questions: readonly Question[] }
 

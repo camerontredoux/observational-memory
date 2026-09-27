@@ -2,6 +2,8 @@
 // compactions): each quote is the user's own words in the span named, which `bench-replay.ts dry-run` checks against
 // the transcript. A pattern shows the constraint in a compacted context; it is loose on purpose, since a summary
 // paraphrases. No constraint here was reversed later in the session.
+// Tiers (tests/eval/rubric.ts TIER): an item tagged tier: 'lookup' is an exact value om_recall can recover (a hash, path,
+// PR number, exact string or count); an untagged item is core (an exact:/str: id is lookup by default).
 import type { ReplaySpec } from '../replay'
 
 export const spec: ReplaySpec = {
@@ -19,13 +21,13 @@ export const spec: ReplaySpec = {
   ],
   questions: [
     { id: 'worktrees', ask: 'In which directory must the agents create their git worktrees?', from: 1, expect: ['.worktrees'] },
-    { id: 'base-spec', ask: 'Which GitHub issue is the base spec for the open tickets?', from: 1, expect: ['#1'] },
+    { id: 'base-spec', tier: 'lookup', ask: 'Which GitHub issue is the base spec for the open tickets?', from: 1, expect: ['#1'] },
     { id: 'reviewers', ask: 'How does the code review step split its work between agents?', from: 1, expect: ['spec', 'standards'] },
     { id: 'budget', ask: 'What spending limit did the user set for benchmark runs with paid models?', from: 1, expect: ['50'] },
     { id: 'runs', ask: 'How many runs per configuration did the user ask for?', from: 1 },
     { id: 'reviewer-effort', ask: "How must a reviewer agent's effort level compare with the implementer's?", from: 1 },
     { id: 'larger-window', ask: 'What new benchmark scenario did the user ask for after asking how big the context windows were?', from: 4 },
-    { id: 'pi-extension', ask: 'Where did the user say the Pi observational-memory extension lives?', from: 5, expect: ['.pi'] },
+    { id: 'pi-extension', tier: 'lookup', ask: 'Where did the user say the Pi observational-memory extension lives?', from: 5, expect: ['.pi'] },
     // The handoff, each at one boundary (#15's continuation record): what the assistant did right after the cut
     // in the real session, and its last report to the user before it.
     { id: 'next-1', ask: 'What was the assistant about to do next when this context begins?', from: 1, to: 1, expect: ['#4'] },
