@@ -17,7 +17,7 @@ export type SessionStats = {
   metrics: Record<string, Metric>
 }
 export type LunaCall = {
-  kind: 'observer' | 'reflector' | 'session'
+  kind: 'observer' | 'reflector' | 'session' | 'state'
   phase: 'background' | 'compaction'
   ok: boolean
   failure?: string

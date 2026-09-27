@@ -196,7 +196,8 @@ async function dryRun(o: Options) {
 type PiResult = { exitCode: number; stdout: string; stderr: string }
 // `inTokens` is the prompt's size estimated before the call; `in`, `out` and `cost` are pi's own usage record.
 // `level`: a Reflector call's compression level, read from its prompt.
-type Call = { kind: 'observer' | 'reflector'; level?: number; atCompaction: boolean; start: number; prompt: string; key?: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
+// `writer`: a background writer's call (the Session line's, the state page's), tallied with the Observer's.
+type Call = { kind: 'observer' | 'reflector'; writer?: 'session' | 'state'; level?: number; atCompaction: boolean; start: number; prompt: string; key?: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
 const LEVELS = ['## COMPRESSION REQUIRED', '## AGGRESSIVE COMPRESSION REQUIRED', '## CRITICAL COMPRESSION REQUIRED', '## EXTREME COMPRESSION REQUIRED']
 const REFLECTED = /reflected \d+ observations \(~(\d+) tokens\) into \d+ \(~(\d+) tokens\) at compression level (\d+)/
 
@@ -379,7 +380,8 @@ async function om(o: Options) {
         const stdin = init.stdin ?? ''
         const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : 'observer'
         const level = kind === 'reflector' ? LEVELS.findLastIndex((l) => stdin.includes(`\n${l}\n`)) + 1 : 0
-        const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
+        const writer = stdin.endsWith('Write the Session line.') ? 'session' : stdin.endsWith('Rewrite the state page.') ? 'state' : undefined
+        const call: Call = { kind, ...(writer ? { writer } : {}), ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
         calls.push(call)
         const result = runPi(argv, stdin, init, kind).then(
           ({ r, hit, realMs }) => {
@@ -524,6 +526,10 @@ async function om(o: Options) {
       tokensIn: sum((c) => c.in),
       tokensOut: sum((c) => c.out),
       cost: +sum((c) => c.cost).toFixed(5),
+      writers: Object.fromEntries((['session', 'state'] as const).map((w) => {
+        const cs = calls.filter((c) => c.writer === w)
+        return [w, { calls: cs.length, atCompaction: cs.filter((c) => c.atCompaction).length, tokensIn: cs.reduce((s, c) => s + c.in, 0), tokensOut: cs.reduce((s, c) => s + c.out, 0), cost: +cs.reduce((s, c) => s + c.cost, 0).toFixed(5) }]
+      })),
     },
     fallbacks,
     wallMs: Math.round(performance.now() - wall0),

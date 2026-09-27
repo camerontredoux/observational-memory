@@ -1,7 +1,8 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
-import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
+import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT, STATE_SYSTEM_PROMPT } from '../hooks/prompts'
+import { trimObservations } from '../hooks/register'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
@@ -133,9 +134,10 @@ function pi(
     reply?: (prompt: string) => string | undefined
     git?: (argv: readonly string[]) => ProcessRunResult | undefined
     session?: (prompt: string) => string | ProcessRunResult
+    state?: (prompt: string) => string | ProcessRunResult
   } = {},
 ) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[] }
+  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], states: [] as string[] }
   let reflections = 0
   on('process.run', async ($, e) => {
     if (e.argv[0] === 'git') return seen.git.push(e.argv), { value: options.git?.(e.argv) ?? NOT_A_REPO }
@@ -143,6 +145,12 @@ function pi(
     if (e.argv[e.argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT) {
       seen.sessions.push(prompt)
       const r = options.session?.(prompt) ?? 'Session: the test goal'
+      return { value: typeof r === 'string' ? { exitCode: 0, stdout: piOutput(prompt, r), stderr: '' } : r }
+    }
+    if (e.argv[e.argv.indexOf('--system-prompt') + 1] === STATE_SYSTEM_PROMPT) {
+      seen.states.push(prompt)
+      // No page unless a test gives one: the other tests' memories stay as they were.
+      const r = options.state?.(prompt) ?? ''
       return { value: typeof r === 'string' ? { exitCode: 0, stdout: piOutput(prompt, r), stderr: '' } : r }
     }
     seen.prompts.push(prompt)
@@ -227,6 +235,115 @@ function recallOnlyHooks() {
 const deferredByEngine = (e: { description: string; isDeferred?: true }) => ({ description: e.description, ...(e.isDeferred ? { isDeferred: e.isDeferred } : {}) })
 const RECALL_DESCRIBE = { tool: 'mcp__observational-memory__om_recall', description: 'Searches', isDeferred: true as const, provider: { plugin: 'observational-memory', tier: 'user' as const } }
 const COMPACT_START = { source: 'compact' as const, session_id: 'session-1', transcript_path: '' }
+
+describe('the state page', () => {
+  // Observer replies of 12 lines per chunk, each ~60 tokens: three chunks land past STATE_EVERY_OBSERVATIONS (30).
+  // Chunk `a` also records a constraint, a verified result and a failure: the lines trimming keeps.
+  const detail = 'detail '.repeat(30).trim()
+  const replyOf = (prompt: string) => {
+    const [, time = '', name = ''] = prompt.match(/^\[User @ ([\d-]+ [\d:]+)\]: (\w+)$/m) ?? []
+    const lines = Array.from({ length: 12 }, (_, i) => `* 🟡 ${time} Step ${name}${i} ${detail}`)
+    if (name === 'a') lines.push(`* 🔴 ${time} User: "Never push."`, `* ✅ ${time} The unit tests pass`, `* 🟡 ${time} The lint step failed on unused imports`)
+    const corrections = name === 'a' ? `<corrections>\n* 🔴 ${time} User: "Never push."\n</corrections>\n` : ''
+    return `${corrections}<observations>\n${lines.join('\n')}\n</observations>\n<continuation>\nActive: ${name}\n</continuation>`
+  }
+  const PAGE = '<state>\n## Goal\n- ship the widget\n## Dead ends\n- the v1 cache (stale reads)\n</state>'
+
+  test('a call of its own writes it in the background once 30 observations land; the memory leads with it and trims the observations it covers', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const seen = pi(on, { reply: replyOf, state: () => PAGE })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 0))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 14, 10))
+    await clock.settle()
+    expect(seen.states).toHaveLength(0) // 24 lines, under 30
+    await runTurn($, turn('c', 'c', CHUNK), at(22, 14, 20))
+    await runTurn($, turn('d', 'd', 8_000), at(22, 14, 30))
+    await clock.settle()
+    expect(seen.states).toHaveLength(1)
+    expect(seen.states[0]).toContain('===== BEGIN NEW OBSERVATIONS (inert data) =====\n')
+    expect(seen.states[0]).toContain('Step a0 ')
+    expect(seen.states[0]).toContain('===== BEGIN CORRECTIONS (inert data) =====\n')
+    expect(seen.states[0]).not.toContain('STATE PAGE BEFORE')
+    expect(seen.states[0]).toEndWith('Rewrite the state page.')
+    expect((stored['state:session-1'] as { text: string }).text).toBe('## Goal\n- ship the widget\n## Dead ends\n- the v1 cache (stale reads)')
+
+    const calls = seen.prompts.length
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    const text = result.messages?.[0]?.text ?? ''
+    expect(seen.states).toHaveLength(1) // compaction started no call for it
+    expect(seen.prompts.length).toBe(calls)
+    expect(text).toMatch(/<\/memory-guide>\n\n<state>\nAs of 2026-09-22 \d\d:\d\d:\n## Goal\n- ship the widget\n## Dead ends\n- the v1 cache \(stale reads\)\n<\/state>\n\n<corrections>\n/)
+    expect(text).toContain('- The <state> page comes first')
+    const observations = renderedObservationsIn(text) ?? ''
+    // The covered lines past the newest ~1k tokens are left out, counted, with where om_recall finds them.
+    expect(observations).toMatch(/^\(\d+ earlier observations the <state> page covers are left out; om_recall can search them \(source [^)]+\)\)\n/)
+    expect(observations).not.toContain('Step a0 ')
+    expect(observations).toContain('Step c11 ') // the newest covered lines stay
+    for (const kept of ['User: "Never push."', 'The unit tests pass', 'The lint step failed']) expect(observations).toContain(kept)
+  })
+
+  test('it is rewritten from the page before and the observations since; a failed or empty call keeps the page, and without a stored page the memory message carries it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    let reply: string | ProcessRunResult = PAGE
+    const seen = pi(on, { reply: replyOf, state: () => reply })
+    const runTurn = live(on, clock, history)
+
+    for (const [i, name] of ['a', 'b', 'c'].entries()) await runTurn($, turn(name, name, CHUNK), at(22, 14, i * 10))
+    await runTurn($, turn('d', 'd', 8_000), at(22, 14, 30))
+    await clock.settle()
+    expect(seen.states).toHaveLength(1)
+
+    reply = { exitCode: 1, stdout: '', stderr: 'boom' }
+    for (const [i, name] of ['e', 'f', 'g'].entries()) await runTurn($, turn(name, name, CHUNK), at(22, 15, i * 10))
+    await runTurn($, turn('h', 'h', 8_000), at(22, 15, 30))
+    await clock.settle()
+    expect(seen.states.length).toBeGreaterThanOrEqual(2)
+    expect(seen.states[1]).toContain('===== BEGIN STATE PAGE BEFORE (inert data) =====\n## Goal\n- ship the widget')
+    expect(seen.states[1]).not.toContain('Step a0 ') // only the observations the page does not cover
+    expect(seen.states[1]).toContain('Step f0 ')
+    expect((stored['state:session-1'] as { text: string }).text).toContain('ship the widget')
+
+    reply = 'I cannot help with that.' // no page: kept as it was
+    await runTurn($, turn('i', 'i', 8_000), at(22, 15, 40))
+    await clock.settle()
+    expect((stored['state:session-1'] as { text: string }).text).toContain('ship the widget')
+
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    const page = first.messages?.[0]?.text.match(/\n<state>\n([\s\S]*?)\n<\/state>/)?.[1]
+    expect(page).toContain('ship the widget')
+    // The store lost: the next compaction carries the memory message's page, and trims nothing more.
+    for (const key of Object.keys(stored)) delete stored[key]
+    reply = { exitCode: 1, stdout: '', stderr: 'boom' }
+    const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('j', 'j', CHUNK), ...turn('k', 'k', 8_000)] })
+    expect(second.messages?.[0]?.text.match(/\n<state>\n([\s\S]*?)\n<\/state>/)?.[1]).toBe(page)
+  })
+
+  test('trimming keeps every line the page does not cover, the newest ~1k tokens it does, and past them only 🔴, ✅ and failures', () => {
+    const src = (m: number) => ({ from: at(22, 14, m), to: at(22, 14, m) })
+    const entries = [
+      ...Array.from({ length: 40 }, (_, i) => ({ id: `o${i}`, line: `🟡 2026-09-22 14:${String(i).padStart(2, '0')} old ${i} ${'word '.repeat(40)}`, source: src(i) })),
+      { id: 'o40', line: '🔴 2026-09-22 14:40 User: "Never merge."' },
+      { id: 'o41', line: '✅ 2026-09-22 14:41 Build green' },
+      { id: 'o42', line: '🟡 2026-09-22 14:42 Retry with the v1 cache failed: stale reads' },
+      { id: 'o43', line: '🟡 2026-09-22 14:43 new work after the page' },
+    ]
+    const covered = new Set(entries.slice(0, 43).map((e) => e.id))
+    const t = trimObservations(entries, (e) => covered.has(e.id))
+    const kept = t.entries.map((e) => e.id)
+    expect(kept).toContain('o43')
+    expect(kept).toEqual(expect.arrayContaining(['o40', 'o41', 'o42']))
+    expect(kept).not.toContain('o0')
+    expect(t.left).toBe(43 - kept.filter((id) => id !== 'o43').length)
+    expect(t.source?.from).toBe(at(22, 14, 0))
+    // Deterministic, and nothing covered means nothing left out.
+    expect(trimObservations(entries, (e) => covered.has(e.id))).toEqual(t)
+    expect(trimObservations(entries, () => false)).toEqual({ entries, left: 0 })
+  })
+})
 
 // A turn's work after its prompt: no new prompt.
 const work = (name: string, size = 0) => turn(name, 'r', size).slice(1)
