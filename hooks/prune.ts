@@ -9,7 +9,7 @@ import { brief } from './stats'
 const PRUNE_AFTER_DAYS = 30
 const DAY = 24 * 60 * 60 * 1000
 const STORE_CAP = 4 * 1024 * 1024
-const KINDS = ['ledger', 'times', 'live', 'skills', 'turns', 'transcript', 'seen']
+const KINDS = ['ledger', 'times', 'live', 'skills', 'turns', 'transcript', 'seen', 'goal']
 const LAST_RUN = 'prune:last' // outside KINDS: shared by every process, never pruned
 // The engine's refusal of a write that would take the whole file over its cap.
 const CAP_ERROR = /the store would be \d+ characters, over the \d+ limit/

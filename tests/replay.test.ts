@@ -40,6 +40,7 @@ import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } 
 import type { Configuration } from './eval/runner'
 import { factHolds, grade, negativeControl, norm, score } from './eval/rubric'
 import { gradeAnswer, parse as parseReply } from './eval/behavior'
+import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 
 // The test runner prints what a test file logs; the hooks module's own globals have no console.
 declare const console: { warn: (message: string) => void }
@@ -192,9 +193,10 @@ describe('the om chain through hooks/register.ts', () => {
     on('process.run', ($, e) => {
       if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } } // outside a repository
       const prompt = e.init?.stdin ?? ''
+      const session = e.argv[e.argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT // the Session line's writer
       const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
-      observed.push(words)
-      const text = `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
+      if (!session) observed.push(words)
+      const text = session ? 'Session: replay goal' : `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
       const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage: { input: 1, output: 1, cost: { total: 0 } } }
       return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'message_end', message }), stderr: '' } }
     })
