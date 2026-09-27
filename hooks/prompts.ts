@@ -83,6 +83,9 @@ Size. The request gives a size target: about how many observation lines the chun
 What to observe:
 - Group repeated similar tool calls into a single observation rather than one per call.
 - Skip routine, low-information events.
+- Skip routine housekeeping: acknowledgements, heartbeats, polling, and the lock holders, process, pane or job ids and wake or sequence numbers it passes through. Record it only when it failed, changed the state of the work, or the user asked about it. Skip "Assistant acknowledged ping 3307 and released the lock of PID 88121"; keep "Assistant's deploy stalled because a dead process still held the queue lock; it removed the lock and the deploy ran".
+- Skip the content of instruction files (CLAUDE.md, AGENTS.md) and of digests injected at session start: the harness loads them again after compaction. Record what the assistant did or decided because of them, and a fact from them the session then acted on.
+- Skip a tool slip the assistant corrected at once, such as a mistyped flag rerun correctly.
 - Always record which files were read, created or edited (full paths) and which commands ran, with what outcome: the assistant may later be asked what it did.
 - When a tool's output lists many records (lines, rows, entries), record what it listed, not only its last or summary line: the kind of record, how many, their range and the fields each has, in one observation, without copying the records. For example: Assistant ran psql -c "select * from orders", which printed 75 order rows (ids 1001 to 1075, each with customer, total, status and created_at), then "(75 rows)".
 - Record what happened, never what did not happen in the chunk: other chunks cover the rest of the session, so "no files were edited", "no tests were run" or "nothing is recorded yet" is soon false. A negative result is an event and stays: a command or test failed, a search for X found nothing.
