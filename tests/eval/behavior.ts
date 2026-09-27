@@ -2,15 +2,16 @@
 // (Luna) given a compacted context, and graded by code. Pure: the caller makes the model and om_recall calls.
 import type { Context, ReplaySpec, Transcript } from './replay'
 import { contextText, holds, isTyped, neededIdentifiers } from './replay'
-import type { Expect, Gate, RubricSpec } from './rubric'
-import { hasExpect, itemGate, norm } from './rubric'
+import type { Expect, Gate, RubricSpec, Tier } from './rubric'
+import { hasExpect, itemGate, itemTier, norm } from './rubric'
 
 export type BGate = 'rule' | 'permission' | 'done' | 'next' | 'value' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale' | 'purpose' | 'dropped' | 'false'
 export const BGATES: BGate[] = ['rule', 'permission', 'done', 'next', 'value', 'lessons', 'file-state', 'multi-hop', 'rationale', 'purpose', 'dropped', 'false']
 /** A rubric item's probe gate: the hard types keep their retention gate's name; constraints and reversals are rules. */
 const bgate = (g: Gate): BGate => (g === 'constraints' || g === 'reversals' ? 'rule' : g === 'lessons' || g === 'file-state' || g === 'multi-hop' || g === 'rationale' || g === 'purpose' ? g : 'value')
 /** `answer`: a pattern (case-insensitive) for rule/value/next, the word for permission, the short SHA for done. */
-export type Probe = { gate: BGate; id: string; ask: string; answer?: string; expect?: readonly Expect[]; quoteOf?: string; query?: readonly string[] }
+/** `tier`: as the retention item's (rubric.ts TIER); the report's tiered pass rate weights a lookup probe TIER.weight.lookup; unset is core. */
+export type Probe = { gate: BGate; id: string; ask: string; answer?: string; expect?: readonly Expect[]; quoteOf?: string; query?: readonly string[]; tier?: Tier }
 export type Answer = { id?: string; answer?: unknown; evidence?: unknown; note?: unknown; recall_query?: unknown }
 
 export const PROMPT = `You are a continuation auditor. Below is the complete context an AI coding agent
@@ -37,14 +38,14 @@ const rank = (s: string) => [...s].reduce((h, c) => (Math.imul(h, 31) + c.charCo
 /** The probes at boundary `n`, from the ReplaySpec, the RubricSpec, and mechanically from the transcript. */
 export function probes(t: Transcript, n: number, spec?: ReplaySpec, rubric?: RubricSpec): Probe[] {
   const out: Probe[] = []
-  for (const p of rubric?.probes ?? []) if (inSpan(p, n)) out.push({ gate: p.kind, id: `${p.kind}:${p.of}`, ask: p.ask, answer: p.answer })
+  for (const p of rubric?.probes ?? []) if (inSpan(p, n)) out.push({ gate: p.kind, id: `${p.kind}:${p.of}`, ask: p.ask, answer: p.answer, tier: 'core' })
   for (const q of spec?.questions ?? [])
-    if (q.expect?.length && inSpan(q, n)) out.push({ gate: q.to === undefined ? 'value' : 'next', id: q.id, ask: q.ask, expect: q.expect })
+    if (q.expect?.length && inSpan(q, n)) out.push({ gate: q.to === undefined ? 'value' : 'next', id: q.id, ask: q.ask, expect: q.expect, tier: itemTier(q.id, q.tier) })
   for (const f of rubric?.facts ?? [])
-    if (f.ask && inSpan(f, n)) out.push({ gate: bgate(itemGate(f.id, f.gate, 'facts')), id: f.id, ask: f.ask, answer: f.answer, expect: f.expect })
-  for (const l of rubric?.latest ?? []) if (l.ask && inSpan(l, n)) out.push({ gate: bgate(itemGate(l.id, l.gate, 'reversals')), id: l.id, ask: l.ask, answer: l.answer ?? l.current })
-  for (const a of rubric?.absent ?? []) if (a.ask && inSpan(a, n)) out.push({ gate: 'false', id: a.id, ask: a.ask, answer: a.pattern })
-  for (const r of rubric?.recall ?? []) if (r.ask && inSpan(r, n)) out.push({ gate: 'dropped', id: r.id, ask: r.ask, expect: r.expect, query: r.expect })
+    if (f.ask && inSpan(f, n)) out.push({ gate: bgate(itemGate(f.id, f.gate, 'facts')), id: f.id, ask: f.ask, answer: f.answer, expect: f.expect, tier: itemTier(f.id, f.tier) })
+  for (const l of rubric?.latest ?? []) if (l.ask && inSpan(l, n)) out.push({ gate: bgate(itemGate(l.id, l.gate, 'reversals')), id: l.id, ask: l.ask, answer: l.answer ?? l.current, tier: itemTier(l.id, l.tier) })
+  for (const a of rubric?.absent ?? []) if (a.ask && inSpan(a, n)) out.push({ gate: 'false', id: a.id, ask: a.ask, answer: a.pattern, tier: itemTier(a.id, a.tier) })
+  for (const r of rubric?.recall ?? []) if (r.ask && inSpan(r, n)) out.push({ gate: 'dropped', id: r.id, ask: r.ask, expect: r.expect, query: r.expect, tier: r.tier ?? 'lookup' })
 
   const before = t.spans.slice(0, n).flat()
   // Done or not: the newest commits of the last three spans, asked by subject.
@@ -53,7 +54,7 @@ export function probes(t: Transcript, n: number, spec?: ReplaySpec, rubric?: Rub
   for (const m of made.reverse()) {
     if (subjects.has(m[3]!) || subjects.size >= 2) continue
     subjects.add(m[3]!)
-    out.push({ gate: 'done', id: `commit:${m[2]!.slice(0, 7)}`, ask: `Has a commit with the subject "${m[3]}" already been made? If it has, answer "done" and give its short SHA; if not, "not done". Should you make it again?`, answer: m[2]!.slice(0, 7) })
+    out.push({ gate: 'done', id: `commit:${m[2]!.slice(0, 7)}`, ask: `Has a commit with the subject "${m[3]}" already been made? If it has, answer "done" and give its short SHA; if not, "not done". Should you make it again?`, answer: m[2]!.slice(0, 7), tier: 'core' })
   }
   // And the newest pull requests the assistant reported merged in the last three spans.
   const merged = new Set<string>()
@@ -61,16 +62,16 @@ export function probes(t: Transcript, n: number, spec?: ReplaySpec, rubric?: Rub
     if (r.role === 'assistant')
       for (const m of r.text.matchAll(/[^.\n]*github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)[^.\n]*/g))
         if (/\bmerged\b/i.test(m[0]) && !/\b(not|n't|once|when|after|until)\b[^.]{0,30}merged/i.test(m[0]) && merged.size < 2) merged.add(m[1]!)
-  for (const pr of merged) out.push({ gate: 'done', id: `pr:${pr}`, ask: `Is the work of PR #${pr} finished and merged? Answer "done" or "not done". Should you redo it?` })
+  for (const pr of merged) out.push({ gate: 'done', id: `pr:${pr}`, ask: `Is the work of PR #${pr} finished and merged? Answer "done" or "not done". Should you redo it?`, tier: 'core' })
   // The next step: the user's newest message, quoted.
   const last = before.filter(isTyped).at(-1)
-  if (last) out.push({ gate: 'next', id: `last-ask:${last.line}`, ask: "What is the user's most recent request to you? Quote it in evidence.", quoteOf: last.text })
+  if (last) out.push({ gate: 'next', id: `last-ask:${last.line}`, ask: "What is the user's most recent request to you? Quote it in evidence.", quoteOf: last.text, tier: 'core' })
   // Exact values: two paths used after the cut, asked by their file name.
   const paths = neededIdentifiers(t, n).filter((x) => x.kind === 'path')
   const base = (p: string) => p.slice(p.lastIndexOf('/') + 1)
   const unique = paths.filter((x) => base(x.key).length >= 6 && paths.filter((y) => base(y.key) === base(x.key)).length === 1)
   for (const x of unique.sort((a, b) => rank(a.key) - rank(b.key)).slice(0, 2))
-    out.push({ gate: 'value', id: `path:${x.key}`, ask: `What is the full path of \`${base(x.key)}\` in this session?`, answer: x.key })
+    out.push({ gate: 'value', id: `path:${x.key}`, ask: `What is the full path of \`${base(x.key)}\` in this session?`, answer: x.key, tier: 'lookup' })
   return out
 }
 

@@ -2,6 +2,8 @@
 // each quote is the user's own words in the span named, which `bench-replay.ts dry-run` checks against the
 // transcript. A pattern shows the constraint in a compacted context; it is loose on purpose, since a summary
 // paraphrases. No constraint here was reversed later in the session.
+// Tiers (tests/eval/rubric.ts TIER): an item tagged tier: 'lookup' is an exact value om_recall can recover (a hash, path,
+// PR number, exact string or count); an untagged item is core (an exact:/str: id is lookup by default).
 import type { ReplaySpec } from '../replay'
 
 export const spec: ReplaySpec = {
@@ -22,7 +24,7 @@ export const spec: ReplaySpec = {
     { id: 'subagent-model', ask: 'Which model and effort level did the user choose for the build subagent?', from: 1, expect: ['opus', 'low'] },
     { id: 'standing-brief', ask: 'What did the user say must always stay in the context as the standing brief?', from: 2, expect: ['first'] },
     { id: 'log-notes', ask: 'Which part of the compaction logs did the user ask to keep when standardizing them?', from: 3, expect: ['+11 notes'] },
-    { id: 'vcc-repo', ask: 'Which GitHub repository did the user link as the official VCC implementation?', from: 7, expect: ['lllyasviel/VCC'] },
+    { id: 'vcc-repo', tier: 'lookup', ask: 'Which GitHub repository did the user link as the official VCC implementation?', from: 7, expect: ['lllyasviel/VCC'] },
     { id: 'subagent-logs', ask: 'What did the user want done about subagent compaction messages?', from: 8 },
     { id: 'lavish', ask: 'What did the user say about lavish?', from: 9 },
     // The handoff, each at one boundary (#15's continuation record): what the assistant did right after the cut

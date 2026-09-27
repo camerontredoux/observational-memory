@@ -1,7 +1,7 @@
 // The compaction A/B rubric (`scripts/bench-compact.ts`): fixed, code-checked gates every compacted context is graded
 // against at every cut point. Mechanical gates are derived from the transcript; the rest come from the transcript's
 // ReplaySpec and its local RubricSpec. Pure: no file system or model.
-import type { Context, ReplaySpec, Row, Transcript } from './replay'
+import type { Context, ReplaySpec, Row, Tier, Transcript } from './replay'
 import { contextText, earlyNeeded, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, normalize, scoreConstraints } from './replay'
 
 export type Gate =
@@ -15,6 +15,22 @@ export const WEIGHTS: Record<Gate, number> = {
   'files-edited': 5, commits: 4, failures: 6, facts: 5, decisions: 5, lessons: 7, 'file-state': 7, 'multi-hop': 7, rationale: 7,
   chronology: 6, recall: 5, absent: 5, purpose: 5, tokens: 6, budget: 3,
 }
+export type { Tier }
+/**
+ * Tiers: what an item is worth to the next agent. `core` is what a compaction exists to carry (the goal, what is done and
+ * what is next, standing rules, decisions and their reasons, findings and lessons, open risks and cleanup, the current
+ * state of files and features); `lookup` is an exact value whose only use is to be looked up (a commit hash, a path, a PR
+ * number, an exact string or count), which om_recall recovers from the transcript. The flat `total` ignores tiers; the
+ * `tiered` total (score) weights a lookup item TIER.weight.lookup of a core one, and credits a missed hand-authored fact
+ * that the context points to by a source range om_recall can follow (pointed) TIER.pointed of a hold: nearly all for a
+ * lookup item, a little for a core one (knowing where to look is not knowing it).
+ */
+export const TIER = { weight: { core: 1, lookup: 0.25 }, pointed: { core: 0.25, lookup: 0.9 } } as const
+/** A mechanical item's tier, by its gate: exact identifiers, quotes, paths and hashes are lookup; the rest core. */
+export const GATE_TIER: Partial<Record<Gate, Tier>> = { identifiers: 'lookup', verbatim: 'lookup', commits: 'lookup', 'files-edited': 'lookup', 'in-progress': 'lookup', chronology: 'lookup', recall: 'lookup' }
+/** A hand-authored item's tier: its own `tier`, else lookup for an exact:/str: item, else core (lookups are hand-tagged). */
+export const itemTier = (id: string, tier?: Tier): Tier => tier ?? (isExact(id) ? 'lookup' : 'core')
+export const tierOf = (i: Pick<Item, 'gate' | 'tier'>): Tier => i.tier ?? GATE_TIER[i.gate] ?? 'core'
 /**
  * A hard hand-authored item's gate, by its id's type prefix (docs/research/hard-compaction-items.md), when its own gate
  * is facts, decisions or unset: neg → lessons (tried and dropped, and why), file → file-state (what a file does after its
@@ -35,7 +51,7 @@ export function itemGate(id: string, gate: Gate | undefined, dflt: Gate): Gate {
 export const TOKENS = { FLOOR: 4_000, LO: 12_000, HI: 40_000, BUDGET: 40_000 }
 
 export /** `shared`: transcripts that state the same fact (the negative control does not count their contexts against it). */
-type Span = { from: number; to?: number; shared?: readonly string[] }
+type Span = { from: number; to?: number; shared?: readonly string[]; tier?: Tier }
 /** A behavior probe on an item (tests/eval/behavior.ts): the question, and a pattern the answer must match (default: every `expect`). */
 type Ask = { ask?: string; answer?: string }
 /** Hand-authored gates for one transcript: kept local (tests/fixtures/<name>.rubric.local.ts). */
@@ -52,7 +68,8 @@ export type RubricSpec = {
   probes?: (Span & { of: string; kind: 'rule' | 'permission' | 'done'; ask: string; answer: string })[]
 }
 
-export type Item = { gate: Gate; boundary: number; id: string; score: number; evidence: string }
+/** `tier`: set on hand-authored items (itemTier), else by gate (tierOf). `pointed`: a missed fact the context points to. */
+export type Item = { gate: Gate; boundary: number; id: string; score: number; evidence: string; tier?: Tier; pointed?: boolean }
 
 const squash = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase()
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
@@ -336,7 +353,7 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
       items.push(pass('verbatim', n, `${c.id}:reversal`, text.includes(squash(normalize(c.reversal!.quote))), cut(c.reversal!.quote)))
     }
     for (const q of spec.questions.filter((q) => q.expect?.length && q.from <= n && (q.to === undefined || n <= q.to)))
-      items.push(pass(q.to === undefined ? 'facts' : 'handoff', n, q.id, expectAll(q.expect!, q.id), `${q.expect!.length} tokens`))
+      items.push({ ...pass(q.to === undefined ? 'facts' : 'handoff', n, q.id, expectAll(q.expect!, q.id), `${q.expect!.length} tokens`), tier: itemTier(q.id, q.tier) })
   }
 
   // The user's corrections and standing rules, verbatim, for the rest of the session.
@@ -440,17 +457,23 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
   const invented = [...identifiersIn(context.summary)].filter(([key, kind]) => kind === 'commit' && !holds(source, key, 'commit')).map(([key]) => key)
   items.push(pass('absent', n, 'invented-hashes', !invented.length, invented.length ? invented.join(', ') : 'none'))
 
-  for (const f of rubric?.facts ?? []) if (inSpan(f, n)) items.push(pass(itemGate(f.id, f.gate, 'facts'), n, f.id, factHolds(f, ptext, pnorm, pr), `${f.expect.length} tokens`))
-  for (const a of rubric?.absent ?? []) if (inSpan(a, n)) items.push(pass('absent', n, a.id, !statedAsCurrent(raw, a.pattern), 'stale or false claim'))
+  // A missed fact the context points to by a source range om_recall can follow: part credit in the tiered total.
+  const pts = rubric?.facts?.some((f) => inSpan(f, n)) ? new Map(pointed(t, n, context, rubric).map((p) => [p.id, p.pointed])) : undefined
+  for (const f of rubric?.facts ?? [])
+    if (inSpan(f, n)) {
+      const ok = factHolds(f, ptext, pnorm, pr)
+      items.push({ ...pass(itemGate(f.id, f.gate, 'facts'), n, f.id, ok, `${f.expect.length} tokens`), tier: itemTier(f.id, f.tier), ...(!ok && pts?.get(f.id) ? { pointed: true } : {}) })
+    }
+  for (const a of rubric?.absent ?? []) if (inSpan(a, n)) items.push({ ...pass('absent', n, a.id, !statedAsCurrent(raw, a.pattern), 'stale or false claim'), tier: itemTier(a.id, a.tier) })
   for (const l of rubric?.latest ?? [])
     if (inSpan(l, n)) {
       const now = lastMatch(pr, l.current)
-      items.push(pass(itemGate(l.id, l.gate, 'reversals'), n, l.id, latestHolds(l, pr), now < 0 ? 'current form missing' : latestHolds(l, pr) ? 'current form last' : 'stale form after the current'))
+      items.push({ ...pass(itemGate(l.id, l.gate, 'reversals'), n, l.id, latestHolds(l, pr), now < 0 ? 'current form missing' : latestHolds(l, pr) ? 'current form last' : 'stale form after the current'), tier: itemTier(l.id, l.tier) })
     }
   for (const r of rubric?.recall ?? [])
     if (inSpan(r, n)) {
       const got = squash(recallTexts?.get(`${r.id}@${n}`) ?? '')
-      items.push(pass('recall', n, r.id, r.expect.every((e) => got.includes(squash(e))), `${r.expect.length} tokens`))
+      items.push({ ...pass('recall', n, r.id, r.expect.every((e) => got.includes(squash(e))), `${r.expect.length} tokens`), tier: r.tier ?? 'lookup' })
     }
 
   const tokens = estimateTokens(raw)
@@ -461,25 +484,49 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
   return items
 }
 
-export type Scores = { total: number; gates: Partial<Record<Gate, { score: number; items: number; passed: number }>> }
-/** Each gate's mean item score and passed count, and the weighted total over gates with items times the budget fit, 0-100. */
+/**
+ * `total`: the flat weighted total (tiers ignored), comparable with every earlier report. `tiered`: the same gates and
+ * weights, but inside each gate an item weighs TIER.weight of its tier (a gate of lookups alone weighs a quarter of its
+ * WEIGHTS), and a missed pointed fact earns TIER.pointed of its tier. `core`, `lookup`: the tiered total over one tier's
+ * items alone (the size gates, tokens and budget, left out), to show where a change comes from.
+ */
+export type Scores = { total: number; tiered: number; core: number; lookup: number; gates: Partial<Record<Gate, { score: number; items: number; passed: number }>> }
+/** An item's credit in the tiered total: its score, or TIER.pointed of its tier for a missed fact the context points to. */
+export const tieredCredit = (i: Item) => (i.pointed && i.score < 1 ? Math.max(i.score, TIER.pointed[tierOf(i)]) : i.score)
+const SIZE_GATES = new Set<Gate>(['tokens', 'budget'])
+/** Each gate's mean item score and passed count, and the weighted totals over gates with items times the budget fit, 0-100. */
 export function score(items: readonly Item[]): Scores {
   const gates: Scores['gates'] = {}
+  const byGate = new Map<Gate, Item[]>()
+  for (const i of items) byGate.set(i.gate, [...(byGate.get(i.gate) ?? []), i])
   for (const g of Object.keys(WEIGHTS) as Gate[]) {
-    const xs = items.filter((i) => i.gate === g)
+    const xs = byGate.get(g) ?? []
     if (xs.length) gates[g] = { score: (100 * xs.reduce((s, i) => s + i.score, 0)) / xs.length, items: xs.length, passed: xs.filter((i) => i.score >= 1).length }
   }
   const used = Object.keys(gates) as Gate[]
   const w = used.reduce((s, g) => s + WEIGHTS[g], 0)
   // An over-budget context buys its recall with room it does not have: the total is scaled by the budget gate's mean fit.
   const fit = gates.budget ? gates.budget.score / 100 : 1
-  return { total: w ? (fit * used.reduce((s, g) => s + WEIGHTS[g] * gates[g]!.score, 0)) / w : 0, gates }
+  // Each item weighs its gate's weight over the gate's item count, times its tier's weight.
+  const tiered = (keep: (i: Item) => boolean) => {
+    let [num, den] = [0, 0]
+    for (const g of used)
+      for (const i of byGate.get(g)!)
+        if (keep(i)) {
+          const x = (WEIGHTS[g] / byGate.get(g)!.length) * TIER.weight[tierOf(i)]
+          num += x * tieredCredit(i)
+          den += x
+        }
+    return den ? (100 * fit * num) / den : 0
+  }
+  const only = (t: Tier) => (i: Item) => !SIZE_GATES.has(i.gate) && tierOf(i) === t
+  return { total: w ? (fit * used.reduce((s, g) => s + WEIGHTS[g] * gates[g]!.score, 0)) / w : 0, tiered: tiered(() => true), core: tiered(only('core')), lookup: tiered(only('lookup')), gates }
 }
 
 const SOURCE = /\(source:? (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d) to (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d)\)/
 // A day header of grouped observations ("@ 2026-09-10"): a source range of times alone is on that day.
 const DAY = /^@ (\d{4}-\d\d-\d\d)\s*$/
-export type Pointed = { boundary: number; id: string; held: boolean; pointed: boolean; evidence: string }
+export type Pointed = { boundary: number; id: string; held: boolean; pointed: boolean; evidence: string; tier: Tier }
 /**
  * Recall-aware credit, apart from the total: each hand-authored fact at cut n is held (as grade scores it) or, when missed,
  * pointed: a summary line on its subject (holding one of its expects, or two words of its ask) sits in a run of
@@ -519,7 +566,8 @@ export function pointed(t: Transcript, n: number, context: Context, rubric: Rubr
     return x
   }
   return facts.map((f) => {
-    if (factHolds(f, ptext, pnorm)) return { boundary: n, id: f.id, held: true, pointed: false, evidence: '' }
+    const tier = itemTier(f.id, f.tier)
+    if (factHolds(f, ptext, pnorm)) return { boundary: n, id: f.id, held: true, pointed: false, evidence: '', tier }
     const exact = isExact(f.id)
     const ask = f.ask ? contentWords(f.ask) : new Set<string>()
     const hit = runs.find((r) => {
@@ -529,6 +577,6 @@ export function pointed(t: Transcript, n: number, context: Context, rubric: Rubr
       const src = range(r)
       return f.expect.every((e) => hasExpect(src.sq, src.nm, e, exact))
     })
-    return { boundary: n, id: f.id, held: false, pointed: !!hit, evidence: hit ? cut(hit.line) : '' }
+    return { boundary: n, id: f.id, held: false, pointed: !!hit, evidence: hit ? cut(hit.line) : '', tier }
   })
 }
