@@ -144,7 +144,7 @@ type View = {
   at: (number | undefined)[]
   base: number // 1 when a memory message leads
 }
-type UserMessage = { at?: string; text: string; omitted?: number } // `omitted`: a line standing for that many dropped
+type UserMessage = { at?: string; text: string; omitted?: number; acks?: boolean } // `omitted`: a line standing for that many dropped; `acks`: all of them content-free (see contentFree)
 type Memory = {
   corrections: string[]
   observations: string
@@ -1045,7 +1045,8 @@ const section = (name: string, value?: string) => (value ? `\n\n<${name}>\n${val
 const USER_MESSAGES = '\n\n<all-user-messages>\n'
 const USER_MESSAGES_END = '</all-user-messages>'
 const NEXT_STEP = '\n\n<optional-next-step>\n' // an older memory message's: its user's latest request
-const omittedLine = (n: number, recoverable: boolean) => `* (${n} earlier user messages omitted${recoverable ? '; om_recall can search them' : ''})\n`
+const omittedLine = (n: number, recoverable: boolean, acks?: boolean) =>
+  `* (${n} ${acks ? ACKS : 'earlier user messages'} omitted${recoverable ? '; om_recall can search them' : ''})\n`
 // Each day's date is written once, as in the observations. A message the corrections quote whole, as the first
 // `User: "…"` of its length there, is not repeated but for the newest, quoted for its exact wording; its header gives
 // its length, which finds its text in them again.
@@ -1059,7 +1060,7 @@ function renderUserMessages(messages: readonly UserMessage[], recoverable: boole
     ? `${USER_MESSAGES}${messages
         .map((m, i) =>
           m.omitted
-            ? omittedLine(m.omitted, recoverable)
+            ? omittedLine(m.omitted, recoverable, m.acks)
             : `${m.at ? header(m.at) : '* User'} (${m.text.length} chars):${i < messages.length - 1 && m.text.length > QUOTED.length && quotedIn(corrections, m.text.length) === m.text ? QUOTED : `\n${m.text}\n`}`,
         )
         .join('')}${USER_MESSAGES_END}`
@@ -1126,13 +1127,13 @@ function parseUserMessages(text: string, corrections: string) {
   const messages: UserMessage[] = []
   const start = text.indexOf(USER_MESSAGES)
   if (start < 0) return { messages, end: 0 }
-  const entry = /\* User(?: @ ((?:[\d-]+ )?[\d:]+))? \((\d+) chars\):(?:\n|( quoted in the corrections above\n))|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ (\d{4}-\d{2}-\d{2})\n/y
+  const entry = /\* User(?: @ ((?:[\d-]+ )?[\d:]+))? \((\d+) chars\):(?:\n|( quoted in the corrections above\n))|\* \((\d+) (?:earlier user messages|(short acknowledgements)) omitted(?:; om_recall can search them)?\)\n|@ (\d{4}-\d{2}-\d{2})\n/y
   entry.lastIndex = start + USER_MESSAGES.length
   let end = entry.lastIndex
   let day = ''
   for (let m; (m = entry.exec(text)); end = entry.lastIndex)
-    if (m[5]) day = m[5]
-    else if (m[4]) messages.push({ text: '', omitted: Number(m[4]) })
+    if (m[6]) day = m[6]
+    else if (m[4]) messages.push({ text: '', omitted: Number(m[4]), ...(m[5] ? { acks: true } : {}) })
     else {
       const at = m[1] && day && !m[1].includes(' ') ? `${day} ${m[1]}` : m[1]
       if (m[3]) messages.push({ ...(at ? { at } : {}), text: quotedIn(corrections, Number(m[2])) ?? '' })
@@ -1181,11 +1182,37 @@ function failuresOf(text: string, from: number) {
   return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
 }
 
+// A user message that carries nothing on its own: an acknowledgement or approval ("ok", "Yeah go for it"), or a short
+// passing question ("Progress?", "Tests are really still running?"). What it led to is in the observations and the
+// continuation record, and the transcript keeps it for om_recall. When in doubt it is kept: a message with a digit, a
+// path, a URL, code, a quote or any other symbol, a capital past a sentence's first word, a rule word, more than
+// CONTENT_FREE_WORDS words, or any word past the acknowledgements and the few a question about progress is made of.
+const ACKS = 'short acknowledgements'
+const CONTENT_FREE_WORDS = 8
+const CONTENT_FREE_CHARS = 60
+const words = (list: string) => new Set(list.split(' '))
+const ACK_WORDS = words('yes yeah yea yep yup ya ok okay k sure cool great awesome nice perfect good sounds thanks thank you thx ty please pls go ahead for it do that this and just lets alright got')
+const STATUS_WORDS = words('progress update updates status results any yet so still check')
+const RULE_WORDS = words("never always dont don't not no must only instead stop without avoid rather prefer unless except remember make wait but")
+const PASSING_WORDS = words("is are was were did does has have it it's its this that they we you the all still really now again yet there running done finished working pushed merged committed ready passing tests test")
+function contentFree(text: string) {
+  const t = text.trim()
+  if (!t || t.length > CONTENT_FREE_CHARS || /[^\p{L}\s'.,!?-]/u.test(t) || /\p{L}\.\p{L}/u.test(t)) return false
+  const tokens = t.split(/\s+/)
+  if (tokens.length > CONTENT_FREE_WORDS || tokens.some((w, i) => i > 0 && /^\p{Lu}/u.test(w) && w !== 'I' && !/[.!?]$/.test(tokens[i - 1]!))) return false
+  const ws = tokens.map((w) => w.toLowerCase().replace(/^[^\p{L}]+|[^\p{L}']+$/gu, ''))
+  if (ws.some((w) => RULE_WORDS.has(w))) return false
+  if (ws.every((w) => ACK_WORDS.has(w) || STATUS_WORDS.has(w))) return true
+  return t.endsWith('?') && ws.every((w) => ACK_WORDS.has(w) || STATUS_WORDS.has(w) || PASSING_WORDS.has(w))
+}
+
 // The session's first message, the standing brief, cut to BRIEF_MAX_TOKENS keeping its head and its tail; then, oldest
 // first with one line counting each run of those dropped between: the newest within what is left of
 // USER_MESSAGES_MAX_TOKENS (at least NEWEST_RESERVE_TOKENS, the newest over it cut, and always kept), the rest of the
-// last three whole within USER_RECENT_TOKENS, and the short ones whole within USER_SHORT_TOKENS.
-function capUserMessages(messages: readonly UserMessage[]) {
+// last three whole within USER_RECENT_TOKENS, and the short ones whole within USER_SHORT_TOKENS. Past the newest, a
+// content-free message is dropped unless the constraints quote it, a run of those alone counted as acknowledgements.
+// It is gone from the memory from then on, as any omitted one is; the transcript keeps it.
+function capUserMessages(messages: readonly UserMessage[], corrections: readonly string[] = []) {
   const [first, ...rest] = messages
   if (!first) return []
   // A brief an earlier compaction cut is kept as it was, with the marker that counts what it lost: cut again, its
@@ -1207,6 +1234,7 @@ function capUserMessages(messages: readonly UserMessage[]) {
       left -= t
       continue
     }
+    if (contentFree(m.text) && !corrections.some((c) => c.includes(`"${m.text}"`))) continue
     if (!longDone && t <= left) {
       keep.set(i, m)
       left -= t
@@ -1220,16 +1248,19 @@ function capUserMessages(messages: readonly UserMessage[]) {
     if (m.text.length > USER_SHORT_CHARS) longDone = true
     else if (t <= shortLeft) keep.set(i, m), (shortLeft -= t)
   }
-  // In order: the brief, then each kept message, one line counting the messages dropped between.
+  // In order: the brief, then each kept message, one line counting the messages dropped between; a run of content-free
+  // ones alone is counted as acknowledgements.
   const out: UserMessage[] = [brief]
   let omitted = 0
+  let acks = true
+  const flush = () => omitted && (out.push({ text: '', omitted, ...(acks ? { acks } : {}) }), (omitted = 0), (acks = true))
   rest.forEach((m, i) => {
     const k = keep.get(i)
-    if (!k) return void (omitted += m.omitted ?? 1)
-    if (omitted) out.push({ text: '', omitted }), (omitted = 0)
+    if (!k) return void ((omitted += m.omitted ?? 1), (acks &&= m.omitted ? !!m.acks : contentFree(m.text)))
+    flush()
     out.push(k)
   })
-  if (omitted) out.push({ text: '', omitted })
+  flush()
   return out
 }
 
@@ -2072,7 +2103,7 @@ export const register: Register = (on) => {
           ...(goal ? { session: goal } : {}),
           ...(covered ? { stateAt: stamp(covered.to) } : {}),
           skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
-          userMessages: capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)]),
+          userMessages: capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)], ledger.corrections),
           // The session's first prompt, a crewmate's whole brief, is quoted above; quoted again as the latest request it
           // would send the agent back to the top of its brief.
           // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.

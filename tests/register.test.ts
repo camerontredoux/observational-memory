@@ -259,16 +259,16 @@ function observationsIn(text?: string) {
     .join('\n')
 }
 // The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters, or an
-// omission line, read as `(n omitted)`; a day's `@ YYYY-MM-DD` line is skipped.
+// omission line, read as `(n omitted)`, or `(n acks omitted)` for content-free ones; a day's `@ YYYY-MM-DD` line is skipped.
 function userMessagesIn(text?: string) {
   const start = text?.indexOf('\n\n<all-user-messages>\n') ?? -1
   if (!text || start < 0) return undefined
   const out: string[] = []
-  const entry = /\* User(?: @ (?:[\d-]+ )?[\d:]+)? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ [\d-]+\n/y
+  const entry = /\* User(?: @ (?:[\d-]+ )?[\d:]+)? \((\d+) chars\):\n|\* \((\d+) (?:earlier user messages|(short acknowledgements)) omitted(?:; om_recall can search them)?\)\n|@ [\d-]+\n/y
   entry.lastIndex = start + '\n\n<all-user-messages>\n'.length
   for (let m; (m = entry.exec(text)); )
     if (!m[1] && !m[2]) continue
-    else if (m[2]) out.push(`(${m[2]} omitted)`)
+    else if (m[2]) out.push(`(${m[2]} ${m[3] ? 'acks ' : ''}omitted)`)
     else out.push(text.slice(entry.lastIndex, entry.lastIndex + Number(m[1]))), (entry.lastIndex += Number(m[1]) + 1)
   return out
 }
@@ -3985,6 +3985,39 @@ describe('active constraints and the continuation record', () => {
     const known = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
     expect(known).toContain('\n* (2 earlier user messages omitted; om_recall can search them)\n')
     expect(userMessagesIn(known)).toEqual(userMessagesIn(unknown))
+  })
+
+  test('content-free user messages are counted, not quoted, and the count and the rest survive the next compaction', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const dropped = ['ok', 'Tests are really still running?', 'yeah go for it', 'Is it done?']
+    const kept = ['yes, never push to main', 'ok use 2 workers', 'Is it running on main?', 'yeah merge it', 'Check docs/plan.md', 'see https://x.io']
+    const said = ['cool', ...dropped, ...kept, 'Progress?']
+    const messages = [...said.flatMap((p) => turn(p, 'r', 2_000)), ...turn('thanks', 'r', CHUNK), ...work('w', 8_000)]
+
+    const first = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
+
+    // The session's first message and the newest stay, whatever they say.
+    const expected = ['cool', '(4 acks omitted)', ...kept, '(1 acks omitted)', 'thanks']
+    expect(userMessagesIn(first)).toEqual(expected)
+    expect(first).toContain('\n* (4 short acknowledgements omitted)\n')
+
+    // Read back and capped again: the newest of before is dropped now, its run merged with the one before it.
+    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+    const second = (await $.session.compact({ trigger: 'manual', messages: [row(first), ...turn('next', 'r', CHUNK), ...work('v', 8_000)] })).messages?.[0]?.text ?? ''
+    expect(userMessagesIn(second)).toEqual(['cool', '(4 acks omitted)', ...kept, '(2 acks omitted)', 'next'])
+  })
+
+  test('a content-free user message the corrections quote is kept', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: constraining({ ok: { quote: 'ok' } }) })
+    const messages = [...turn('start', 'r', 2_000), ...turn('ok', 'r', 2_000), ...turn('yeah', 'r', 2_000), ...turn('last', 'r', CHUNK), ...work('w', 8_000)]
+
+    const text = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
+
+    expect(userMessagesIn(text)).toEqual(['start', 'ok', '(1 acks omitted)', 'last'])
   })
 
   test("the memory message ends by sending the model to om_recall before it says a detail is gone, only while the model can call om_recall", async ($, on) => {
