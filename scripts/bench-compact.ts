@@ -32,6 +32,8 @@
 //     sha256(context + probes + prompt + reader argv), so identical contexts in A and B cost nothing; misses are called.
 //     --b-reflector-sample K (ab): B's Reflector calls read and write their own cache CACHE-r<K> (its Observer calls stay
 //     in CACHE): with B = A's plugin, a resample of the Reflector draws alone, the noise floor of the chain and long tracks.
+//     --b-reader-sample K (ab, with --behavior): B's reader answers are cached apart, under sample K: with B = A's plugin,
+//     fresh reader draws on the same contexts, the noise floor of the behavior total.
 //     --behavior-sample K: read sample K's contexts instead of the first sample's (with --samples K or more).
 //   bun scripts/bench-compact.ts run --contexts DIR          # grade ready-made contexts: DIR/<name>/compaction-N.md
 //   bun scripts/bench-compact.ts controls [--plugin <ref|dir>] # write tests/fixtures/rubric-controls{,.<name>}.local.ts, the
@@ -249,7 +251,7 @@ async function slot<T>(f: () => Promise<T>): Promise<T> {
 async function replay(name: string, dir: string, record: boolean, sample: number, reflectorSample?: number): Promise<Replay> {
   const cache = sample === 1 ? CACHE : `${CACHE}-s${sample}`
   const refl = reflectorSample ? ['--reflector-cache', `${CACHE}-r${reflectorSample}`] : []
-  const out = `${OUT}/runs/${createHash('sha256').update(`${dir}\0${sample}\0${Date.now()}`).digest('hex').slice(0, 10)}-${name}`
+  const out = `${OUT}/runs/${createHash('sha256').update(`${dir}\0${sample}\0${Date.now()}\0${process.pid}\0${Math.random()}`).digest('hex').slice(0, 10)}-${name}`
   const long = name === LONG.name ? ['--gap-hours', String(LONG_GAP_HOURS), '--fallback', 'recorded'] : []
   const args = ['scripts/bench-replay.ts', 'om', '--transcript', members(name).join('+'), ...long, '--src', dir, '--cache', cache, ...refl, '--out', out, '--dir', corpusDir(), '--pi', record ? 'live' : 'strict', ...(record ? ['--max-calls', '2000'] : [])]
   const p = Bun.spawn(['bun', ...args], { cwd: HERE, stdout: 'ignore', stderr: 'pipe' })
@@ -308,7 +310,7 @@ async function ask(inp: string, file: string): Promise<boolean> {
   return false
 }
 
-async function behavior(label: string, dir: string, replays: Replay[]): Promise<BItem[]> {
+async function behavior(label: string, dir: string, replays: Replay[], readerSample?: number): Promise<BItem[]> {
   mkdirSync(BCACHE, { recursive: true })
   type Job = { name: string; b: ReturnType<typeof parseTranscript>['boundaries'][number]; ctx: Context; ps: Probe[]; files: string[]; inp: string }
   const jobs: Job[] = []
@@ -324,7 +326,7 @@ async function behavior(label: string, dir: string, replays: Replay[]): Promise<
       const ps = ctx ? probes(t, b.n, spec, rubric) : []
       if (!ctx || !ps.length) return
       const inp = input(ctx, ps)
-      const h = createHash('sha256').update([inp, PROMPT, ...READER].join('\0')).digest('hex').slice(0, 24)
+      const h = createHash('sha256').update([inp, PROMPT, ...READER, ...(readerSample ? [`reader-sample ${readerSample}`] : [])].join('\0')).digest('hex').slice(0, 24)
       jobs.push({ name: r.name, b, ctx, ps, inp, files: Array.from({ length: BSAMPLES }, (_, k) => `${BCACHE}/${h}-s${k + 1}.txt`) })
     })
   }
@@ -366,7 +368,7 @@ async function behavior(label: string, dir: string, replays: Replay[]): Promise<
 }
 
 /** `first`: the first sample's number (default 1). `lenient`: a cache miss throws instead of ending the run. */
-async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; reflectorSample?: number }): Promise<Run> {
+async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; reflectorSample?: number; readerSample?: number }): Promise<Run> {
   if (o.record && o.dir) {
     const model = /'--model', '([^']+)'/.exec(readFileSync(`${o.dir}/hooks/register.ts`, 'utf8'))?.[1] ?? ''
     if (!model.startsWith('openai-codex/')) fail(`--record: ${o.dir}'s pi model is "${model}"; only openai-codex models may be called`)
@@ -413,7 +415,7 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
     if (run.chain) run.chain.push(await gradeAll(CHAIN, s.k, 'chain', s.chain))
     if (run.long) run.long.push(await gradeAll([LONG], s.k, 'long', s.long))
   }
-  if (o.behavior) run.behavior = await behavior(label, o.dir ?? HERE, (run.samples[behaviorSample - (o.first ?? 1)] ?? fail(`--behavior-sample ${behaviorSample}: no such sample`)).replays)
+  if (o.behavior) run.behavior = await behavior(label, o.dir ?? HERE, (run.samples[behaviorSample - (o.first ?? 1)] ?? fail(`--behavior-sample ${behaviorSample}: no such sample`)).replays, o.readerSample)
   return run
 }
 /** The holdout as a run of its own, for the scorecard and the A/B table. */
@@ -763,7 +765,7 @@ else if (command === 'run') {
   // A and every B at once: their replays share the JOBS slots.
   const [a, ...bs] = await Promise.all([
     evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior }),
-    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, reflectorSample: num(o, 'b-reflector-sample') })),
+    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, reflectorSample: num(o, 'b-reflector-sample'), readerSample: num(o, 'b-reader-sample') })),
   ])
   // A Reflector change that nothing reflects on ties exactly and says nothing: refuse to call it a tie.
   for (const [sb, b] of sbs.map((x, i) => [x, bs[i]!] as const))

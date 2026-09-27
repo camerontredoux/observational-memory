@@ -39,7 +39,7 @@ import {
 import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } from './eval/replay'
 import type { Configuration } from './eval/runner'
 import { factHolds, grade, negativeControl, norm, score } from './eval/rubric'
-import { gradeAnswer } from './eval/behavior'
+import { gradeAnswer, parse as parseReply } from './eval/behavior'
 
 // The test runner prints what a test file logs; the hooks module's own globals have no console.
 declare const console: { warn: (message: string) => void }
@@ -875,6 +875,21 @@ describe('the compaction rubric', () => {
     const dropped = { gate: 'dropped' as const, id: 'sum', ask: 'The checksum?', expect: ['ck-1'], query: ['ck-1'] }
     expect(gradeAnswer(dropped, { answer: 'unknown', recall_query: 'checksum' }, ctx, 'the checksum was ck-1').pass).toBe(true)
     expect(gradeAnswer(dropped, { answer: 'unknown', recall_query: 'sum' }, ctx, 'nothing').pass).toBe(false)
+    // A false-claim probe: a denial passes even when it names the claim; a clause that makes the claim fails.
+    const claim = { gate: 'false' as const, id: 'no-remote', ask: 'Which commit did you push to GitHub?', answer: "(?<!not |n't |never |nothing )pushed to (github|origin)" }
+    expect(gradeAnswer(claim, { answer: 'None; nothing was pushed to GitHub.', evidence: 'Never push to origin.' }, ctx).pass).toBe(true)
+    expect(gradeAnswer(claim, { answer: 'None; no commit was pushed to GitHub.', evidence: 'Never push to origin.' }, ctx).pass).toBe(true)
+    expect(gradeAnswer(claim, { answer: 'None. I pushed to GitHub as abc123.', evidence: 'Never push to origin.' }, ctx).pass).toBe(false)
+  })
+
+  test("reads a reader reply whose evidence joins quotes unescaped, answer by answer", () => {
+    const reply = `[
+  {"id":"p1","answer":"2%","evidence":"about 3.7k tokens"; "on branch \`pin-brief\`","note":"","recall_query":""},
+  {"id":"p2","answer":"no","evidence":"Nothing is pushed.","note":"","recall_query":""}
+]`
+    const xs = parseReply(reply, 2)
+    expect(xs[0]!.evidence).toBe('about 3.7k tokens"; "on branch `pin-brief`')
+    expect(xs[1]!.answer).toBe('no')
   })
 
   test('takes an answer that joins facts when it quotes up to three places, each verbatim in the context', () => {
@@ -888,6 +903,10 @@ describe('the compaction rubric', () => {
     // One part not in the context, one too short, or more than three parts: no evidence.
     expect(gradeAnswer(hop, { answer: 'The subscription', evidence: '"bill against the Max subscription"; "a monthly card limit"' }, ctx).pass).toBe(false)
     expect(gradeAnswer(hop, { answer: 'The subscription', evidence: '"bill against the Max subscription"; "40%"' }, ctx).pass).toBe(false)
+    // An order item is graded as a value, but its evidence quotes both events.
+    const ord = { gate: 'value' as const, id: 'ord:weekly-after-max', ask: 'Which came later?', answer: 'weekly' }
+    expect(gradeAnswer(ord, { answer: 'The weekly limit', evidence: '"the Max subscription" / "40% of the weekly limit"' }, ctx).pass).toBe(true)
+    expect(gradeAnswer({ ...ord, id: 'weekly' }, { answer: 'The weekly limit', evidence: '"the Max subscription" / "40% of the weekly limit"' }, ctx).pass).toBe(false)
     const four = '"The runs bill"; "the Max subscription"; "The pane showed"; "Merged as 1dee8ac"'
     expect(gradeAnswer(hop, { answer: 'The subscription', evidence: four }, ctx).pass).toBe(false)
     expect(gradeAnswer(hop, { answer: 'The subscription, weekly', evidence: 'bill against the Max subscription; 40% of the weekly limit' }, ctx).pass).toBe(true)

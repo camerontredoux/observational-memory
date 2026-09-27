@@ -83,11 +83,25 @@ export function input(context: Context, ps: readonly Probe[]) {
 export function parse(reply: string, n: number): Answer[] {
   const a = reply.indexOf('[')
   const b = reply.lastIndexOf(']')
+  const pick = (xs: Answer[]) => Array.from({ length: n }, (_, i) => xs.find((x) => x.id === `p${i + 1}`) ?? xs[i] ?? {})
   try {
-    const xs = JSON.parse(reply.slice(a, b + 1)) as Answer[]
-    return Array.from({ length: n }, (_, i) => xs.find((x) => x.id === `p${i + 1}`) ?? xs[i] ?? {})
+    return pick(JSON.parse(reply.slice(a, b + 1)) as Answer[])
   } catch {
-    return Array.from({ length: n }, () => ({}))
+    // The reader sometimes writes joined quotes as the prompt shows them, "a"; "b", unescaped inside the evidence
+    // string. Each answer is then read on its own, with the evidence's bare quotes escaped; one it can't read stays empty.
+    const objs = reply.slice(a + 1, b).match(/\{\s*"id"[\s\S]*?\}(?=\s*,?\s*(?:\{\s*"id"|$))/g) ?? []
+    return pick(objs.map((o) => {
+      try {
+        return JSON.parse(o) as Answer
+      } catch {
+        const fixed = o.replace(/("evidence"\s*:\s*)"([\s\S]*?)"(\s*,\s*"(?:note|recall_query)"\s*:|\s*\}$)/, (_, k: string, v: string, tail: string) => `${k}"${v.replace(/(?<!\\)"/g, '\\"')}"${tail}`)
+        try {
+          return JSON.parse(fixed) as Answer
+        } catch {
+          return {}
+        }
+      }
+    }))
   }
 }
 
@@ -95,13 +109,17 @@ const squash = (s: string) => s.replace(/\s+/g, ' ').trim()
 const str = (x: unknown) => (typeof x === 'string' ? x : x === undefined || x === null ? '' : JSON.stringify(x))
 export const isUnknown = (a: Answer) => /^unknown\b/i.test(str(a.answer).trim())
 
-// An answer that joins facts (multi-hop, rationale, lessons) may quote up to three places, as "a"; "b", a; b, a … b, or
-// a JSON array of quotes. Any other probe's evidence is one quote: a path or value stitched from pieces is no quote.
+// An answer that joins facts (multi-hop, rationale, lessons, an order item) may quote up to three places, as "a"; "b",
+// "a" / "b", a; b, a … b, or a JSON array of quotes. Any other probe's evidence is one quote: a path or value stitched
+// from pieces is no quote.
 export const QUOTE_PARTS_MAX = 3
+const DENIES = /\b(no|none|never|not|nothing)\b|n't\b/i
 const JOINED: readonly BGate[] = ['multi-hop', 'rationale', 'lessons']
-export const QUOTE_JOIN = /["”]\s*[;,]?\s*(?:and\s+)?["“]|\s(?:…|\.\.\.)\s|;\s+/
+// An order item (ord:, order:) asks which of two events came later: its evidence quotes both.
+const ORDERS = /^ord(?:er)?[:-]/
+export const QUOTE_JOIN = /["”]\s*[;,/]?\s*(?:and\s+)?["“]|\s(?:…|\.\.\.)\s|;\s+/
 /** Grades one answer. `ctx` is the squashed context text; `recalled`, what om_recall's search returned for its recall_query; `parts`, how many quotes the evidence may join (1: one quote; by default QUOTE_PARTS_MAX for a probe that joins facts). */
-export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string, parts = JOINED.includes(p.gate) ? QUOTE_PARTS_MAX : 1): { pass: boolean; why: string } {
+export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string, parts = JOINED.includes(p.gate) || ORDERS.test(p.id) ? QUOTE_PARTS_MAX : 1): { pass: boolean; why: string } {
   const ans = squash(str(a.answer))
   const ev = squash(Array.isArray(a.evidence) ? a.evidence.map(str).join('"; "') : str(a.evidence))
   const short = (s: string) => (s.length > 70 ? `${s.slice(0, 70)}…` : s)
@@ -129,7 +147,8 @@ export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string,
       case 'done':
         return /^(done|yes)\b/i.test(ans) && !/\bnot done\b/i.test(ans) && (!p.answer || new RegExp(`\\b${p.answer}`, 'i').test(both))
       case 'false':
-        return /^(no|none|never|not|nothing)\b/i.test(ans) && !new RegExp(p.answer!, 'i').test(ans)
+        // A denial passes unless a clause of it makes the false claim: "None; nothing was pushed to GitHub" denies it.
+        return /^(no|none|never|not|nothing)\b/i.test(ans) && !ans.split(/[.;:,!?]\s*|\s+(?:but|and)\s+/i).some((c) => !DENIES.test(c) && new RegExp(p.answer!, 'i').test(c))
       case 'next':
         if (p.quoteOf) {
           const q = squash(p.quoteOf).toLowerCase()
