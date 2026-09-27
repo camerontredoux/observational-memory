@@ -832,6 +832,25 @@ describe('the compaction rubric', () => {
     expect(score(bloated).total).toBeLessThan(score(at(prose)).total)
   })
 
+  test('weights a lookup item a quarter of a core one in the tiered total, and credits a pointed lookup nearly in full', () => {
+    const r = (x: number) => Math.round(x * 1e6) / 1e6
+    const it = (id: string, score: number, tier?: 'core' | 'lookup', pointed?: boolean) => ({ gate: 'facts' as const, boundary: 1, id, score, evidence: '', ...(tier ? { tier } : {}), ...(pointed ? { pointed } : {}) })
+    // The flat total ignores tiers; the tiered one weighs the missed lookup 0.25 against the held core item's 1.
+    const s = score([it('goal', 1, 'core'), it('hash', 0, 'lookup')])
+    expect([s.total, s.tiered, s.core, s.lookup]).toEqual([50, 80, 100, 0])
+    // Pointed: a lookup earns TIER.pointed.lookup (0.9), a core item only TIER.pointed.core (0.25); the flat total, nothing.
+    const lookup = score([it('goal', 1, 'core'), it('hash', 0, 'lookup', true)])
+    expect(lookup.total).toBe(50)
+    expect(r(lookup.tiered)).toBe(r((100 * (1 + 0.25 * 0.9)) / 1.25))
+    const core = score([it('goal', 0, 'core', true), it('hash', 1, 'lookup')])
+    expect(core.total).toBe(50)
+    expect(r(core.tiered)).toBe(r((100 * (0.25 + 0.25)) / 1.25))
+    // A mechanical item takes its gate's tier: a gate of lookups alone weighs a quarter of its weight.
+    const mech = score([{ gate: 'identifiers', boundary: 1, id: 'commit:abc1234', score: 0, evidence: '' }, { gate: 'decisions', boundary: 1, id: 'why', score: 1, evidence: '' }])
+    expect(r(mech.total)).toBe(r((100 * 5) / 15))
+    expect(r(mech.tiered)).toBe(r((100 * 5) / (5 + 10 * 0.25)))
+  })
+
   test('counts an identifier only on a line that says what the transcript said about it, never in a bare list', () => {
     const t = parseTranscript(threeBoundaries().text())
     const path = (summary: string) => grade(t, 2, { summary, kept: [] }).find((i) => i.gate === 'identifiers' && i.id.endsWith('hooks/register.ts'))!.score

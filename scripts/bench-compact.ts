@@ -48,6 +48,12 @@
 // --jobs N (default 3): the most replays run at once, across transcripts, samples and the sides of an ab.
 // Token gates read the context's prose only (rubric.ts proseContext): a bare list of identifiers counts for nothing.
 // Hand-authored items print their ids, not their expected strings.
+// Tiers (rubric.ts TIER): every item is core (what the next agent must know: goal, done and next, rules, decisions and
+// why, findings, open risks, file state) or lookup (an exact hash, path, PR number, string or count om_recall recovers).
+// Mechanical items take their gate's tier (GATE_TIER); hand-authored ones their `tier`, else core (exact:/str: lookup).
+// Beside the flat total (unchanged, comparable with earlier reports) every card and A/B prints the tiered total: a lookup
+// item weighs ¼, a missed fact pointed to by a source range (rubric.ts pointed) earns 0.9 if lookup, 0.25 if core; and
+// its core and lookup parts. The long chain's recall-aware credit gets the same tiered form, the behavior pass rate too.
 // Corpus: CORPUS below, prefixes of real sessions copied into the main checkout's gitignored tests/fixtures/replay/.
 // Rubric specs: tests/eval/replay-specs/<name>.ts or tests/fixtures/<name>.replay.local.ts (constraints, questions)
 // and tests/fixtures/<name>.{rubric,hard}.local.ts (facts, absent, latest, recall; concatenated), the worktree's before the
@@ -59,7 +65,7 @@ import { resolve } from 'path'
 import type { Context, ReplaySpec, Transcript } from '../tests/eval/replay'
 import { chainSpec, chainTranscripts, contextText, estimateTokens, messageText, parseTranscript } from '../tests/eval/replay'
 import type { Gate, Item, Pointed, RubricSpec, Scores } from '../tests/eval/rubric'
-import { grade, hasExpect, norm, pointed, proseContext, score, WEIGHTS } from '../tests/eval/rubric'
+import { grade, hasExpect, norm, pointed, proseContext, score, TIER, tierOf, WEIGHTS } from '../tests/eval/rubric'
 import type { BGate, Probe } from '../tests/eval/behavior'
 import { BGATES, contextSquashed, gradeAnswer, input, isUnknown, parse, probes, PROMPT } from '../tests/eval/behavior'
 import { fail, mainCheckout, num, options, str } from './cli'
@@ -296,7 +302,7 @@ const BCACHE = `${process.env.HOME}/.cache/om-bench-compact/behavior`
 const READER = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'max', '--system-prompt', PROMPT, '--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--append-system-prompt', '']
 const BSAMPLES = 3
 const PARALLEL = 20
-type BItem = { gate: BGate; boundary: number; id: string; pass: boolean; votes: number; why: string }
+type BItem = { gate: BGate; boundary: number; id: string; pass: boolean; votes: number; why: string; tier?: 'core' | 'lookup' }
 
 async function ask(inp: string, file: string): Promise<boolean> {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -361,7 +367,7 @@ async function behavior(label: string, dir: string, replays: Replay[], readerSam
       }
       const votes = grades.filter((g) => g.pass).length
       const pass = votes * 2 > grades.length
-      items.push({ gate: p.gate, boundary: j.b.n, id: `${j.name}/${p.id}`, pass, votes, why: grades.find((g) => g.pass === pass)!.why })
+      items.push({ gate: p.gate, boundary: j.b.n, id: `${j.name}/${p.id}`, pass, votes, why: grades.find((g) => g.pass === pass)!.why, tier: p.tier ?? 'core' })
     }
   }
   return items
@@ -428,12 +434,20 @@ function longStats(r: Run) {
   const p = s.pointed ?? []
   const held = p.filter((x) => x.held).length
   const ptd = p.filter((x) => x.pointed).length
+  // Tiered: each fact weighs TIER.weight of its tier; held earns 1, pointed TIER.pointed of its tier.
+  const tw = (t: 'core' | 'lookup') => TIER.weight[t]
+  const tden = p.reduce((a, f) => a + tw(f.tier), 0)
+  const tnum = p.reduce((a, f) => a + tw(f.tier) * (f.held ? 1 : f.pointed ? TIER.pointed[f.tier] : 0), 0)
+  const byTier = (t: 'core' | 'lookup') => {
+    const q = p.filter((f) => f.tier === t)
+    return { facts: q.length, held: q.filter((f) => f.held).length, pointed: q.filter((f) => f.pointed).length }
+  }
   const x = s.replays[0]!
   const cap = x.fallbacks.filter((f) => /over their cap/.test(f.reason))
   const corrections = x.contexts.map((c) => estimateTokens(/<corrections>[\s\S]*?<\/corrections>/.exec(c?.summary ?? '')?.[0] ?? ''))
   const peak = Math.max(0, ...corrections)
   return {
-    held, pointed: ptd, facts: p.length, credit: p.length ? (100 * (held + ptd / 2)) / p.length : 0,
+    held, pointed: ptd, facts: p.length, credit: p.length ? (100 * (held + ptd / 2)) / p.length : 0, tieredCredit: tden ? (100 * tnum) / tden : 0, core: byTier('core'), lookup: byTier('lookup'),
     reflections: x.reflections ?? 0, reflector: x.eff.reflector.calls, observer: x.eff.observer.calls, peakCorrections: peak, peakAt: corrections.indexOf(peak) + 1, capFallbacks: cap.map((f) => f.n), otherFallbacks: x.fallbacks.filter((f) => !cap.includes(f)),
   }
 }
@@ -441,6 +455,7 @@ function longCard(r: Run, items: boolean) {
   const st = longStats(r)
   const out = [
     `Recall-aware credit (not in any total): **${f1(st.credit)}** — ${st.held} of ${st.facts} hand-authored facts held, ${st.pointed} more pointed to by a source range om_recall can follow (½ each).`,
+    `Tiered recall-aware credit: **${f1(st.tieredCredit)}** — core ${st.core.held} of ${st.core.facts} held, ${st.core.pointed} pointed (${TIER.pointed.core} each); lookup ${st.lookup.held} of ${st.lookup.facts} held, ${st.lookup.pointed} pointed (${TIER.pointed.lookup} each), a lookup fact weighing ${TIER.weight.lookup}.`,
     `Reached: ${st.reflections} reflections (${st.reflector} Reflector calls), ${st.observer} Observer calls; constraint tier peak ~${st.peakCorrections} tokens at cut ${st.peakAt}; constraint-cap fallbacks at ${st.capFallbacks.length ? st.capFallbacks.join(', ') : 'none'}${st.otherFallbacks.length ? `; other fallbacks: ${st.otherFallbacks.map((f) => `${f.n} (${f.reason.slice(0, 80)})`).join('; ')}` : ''}.`,
     '',
   ]
@@ -470,6 +485,8 @@ const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length
 const gates = Object.keys(WEIGHTS) as Gate[]
 const gateScore = (r: Run, g: Gate) => mean(r.samples.map((s) => s.scores.gates[g]?.score ?? NaN))
 const total = (r: Run) => mean(r.samples.map((s) => s.scores.total))
+const tiered = (r: Run, k: 'tiered' | 'core' | 'lookup' = 'tiered') => mean(r.samples.map((s) => s.scores[k]))
+const tierLine = (r: Run) => `Tiered total: **${f1(tiered(r))}** (core ${f1(tiered(r, 'core'))}, lookup ${f1(tiered(r, 'lookup'))}); flat total ${f1(total(r))}.`
 
 // ---- Efficiency: apart from the quality total (docs/plans/compaction-goals.md).
 type EffRow = { tokens: number; max: number; ratio: number; observer: Tally; reflector: Tally; model: number; critical: Tally }
@@ -533,7 +550,7 @@ function provenance(r: Run) {
 
 function scorecard(r: Run, items: boolean) {
   const s = r.samples[0]!
-  const out = [`## ${r.label}`, '', `Total: **${f1(total(r))}**${r.samples.length > 1 ? ` (mean of ${r.samples.length} samples: ${r.samples.map((x) => f1(x.scores.total)).join(', ')})` : ''}`, '', provenance(r), '']
+  const out = [`## ${r.label}`, '', `Total: **${f1(total(r))}**${r.samples.length > 1 ? ` (mean of ${r.samples.length} samples: ${r.samples.map((x) => f1(x.scores.total)).join(', ')})` : ''}`, '', tierLine(r), '', provenance(r), '']
   const names = Object.keys(s.perTranscript).map((name) => ({ name }))
   out.push(`| gate | weight | score | passed | ${names.map((c) => c.name).join(' | ')} |`, `|---|---:|---:|---:|${names.map(() => '---:|').join('')}`)
   const tGate = (name: string, g: Gate) => mean(r.samples.map((x) => x.perTranscript[name]?.gates[g]?.score ?? NaN))
@@ -573,8 +590,8 @@ function flips(a: Sample[], b: Sample[]) {
       if (y && x.gate !== 'tokens' && passes(x) !== passes(y)) (passes(y) ? up : down).push([x, y])
     }
   }
-  const net = new Map<string, { gate: Gate; id: string; up: number[]; down: number[] }>()
-  const unit = ([x]: Pair) => net.get(`${x.gate} ${x.id}`) ?? net.set(`${x.gate} ${x.id}`, { gate: x.gate, id: x.id, up: [], down: [] }).get(`${x.gate} ${x.id}`)!
+  const net = new Map<string, { gate: Gate; id: string; tier: 'core' | 'lookup'; up: number[]; down: number[] }>()
+  const unit = ([x]: Pair) => net.get(`${x.gate} ${x.id}`) ?? net.set(`${x.gate} ${x.id}`, { gate: x.gate, id: x.id, tier: tierOf(x), up: [], down: [] }).get(`${x.gate} ${x.id}`)!
   for (const x of up) unit(x).up.push(x[0].boundary)
   for (const x of down) unit(x).down.push(x[0].boundary)
   const units = [...net.values()]
@@ -616,7 +633,14 @@ function ab(a: Run, b: Run, o: { informational?: boolean } = {}) {
   const names = Object.keys(a.samples[0]!.perTranscript)
   const dT = names.map((name) => [name, tTotal(b, name) - tTotal(a, name)] as const)
   out.push(`Per transcript: ${dT.map(([name, x]) => `${name} ${f1(tTotal(a, name))} → ${f1(tTotal(b, name))} (${signed(x)})`).join('; ')}.`)
-  out.push(`Flips: ${f.up.length} up, ${f.down.length} down (item × cut, over ${n} paired sample${n > 1 ? 's' : ''}); by unique item (gate, id; net over its cuts): ${f.uu} up, ${f.ud} down, sign test p=${f.p.toPrecision(2)}. Passed counts are over all samples.`, '')
+  out.push(`Flips: ${f.up.length} up, ${f.down.length} down (item × cut, over ${n} paired sample${n > 1 ? 's' : ''}); by unique item (gate, id; net over its cuts): ${f.uu} up, ${f.ud} down, sign test p=${f.p.toPrecision(2)}. Passed counts are over all samples.`)
+  const byTier = (t: 'core' | 'lookup') => {
+    const [u, d] = [f.up, f.down].map((xs) => xs.filter(([x]) => tierOf(x) === t).length)
+    const us = f.units.filter((x) => x.tier === t)
+    return `${t} ${u} up, ${d} down (unique ${us.filter((x) => x.up.length > x.down.length).length} up, ${us.filter((x) => x.down.length > x.up.length).length} down)`
+  }
+  const dt = tiered(b) - tiered(a)
+  out.push(`Tiered total: A ${f1(tiered(a))} → B ${f1(tiered(b))} (${signed(dt)}); core ${f1(tiered(a, 'core'))} → ${f1(tiered(b, 'core'))} (${signed(tiered(b, 'core') - tiered(a, 'core'))}), lookup ${f1(tiered(a, 'lookup'))} → ${f1(tiered(b, 'lookup'))} (${signed(tiered(b, 'lookup') - tiered(a, 'lookup'))}). Flips by tier: ${byTier('core')}; ${byTier('lookup')}. The verdict reads the flat total.`, '')
 
   // The noise floor: A's own sample spread, or A against its resample A' (sample 2 from A's cache CACHE-s2).
   const totals = (r: Run) => r.samples.map((s) => s.scores.total)
@@ -668,8 +692,8 @@ function ab(a: Run, b: Run, o: { informational?: boolean } = {}) {
   const better = verdict.startsWith('A is') ? 'A' : verdict.startsWith('B is') ? 'B' : undefined
   const perT = dT.map(([, x]) => signed(x)).join(' / ')
   return {
-    d, up: f.up.length, down: f.down.length, uu: f.uu, ud: f.ud, p: f.p, units: f.units, exact, better, text: out.join('\n'), effFlag,
-    row: `| ${b.label} | ${f1(total(b))} | ${signed(d)} | ${perT} | ${f.uu} | ${f.ud} | ${f.p.toPrecision(2)} | ${exact ? 'exact' : nz ? `A' ${signed(nz.d)}` : 'noise unknown'} | ${better ?? (verdict.startsWith('tradeoff') ? 'tradeoff' : '–')} | ${e.verdict}${effFlag ? ' **(!)**' : ''} | ${top || '–'} |`,
+    d, dt, up: f.up.length, down: f.down.length, uu: f.uu, ud: f.ud, p: f.p, units: f.units, exact, better, text: out.join('\n'), effFlag,
+    row: `| ${b.label} | ${f1(total(b))} | ${signed(d)} | ${f1(tiered(b))} (${signed(dt)}) | ${perT} | ${f.uu} | ${f.ud} | ${f.p.toPrecision(2)} | ${exact ? 'exact' : nz ? `A' ${signed(nz.d)}` : 'noise unknown'} | ${better ?? (verdict.startsWith('tradeoff') ? 'tradeoff' : '–')} | ${e.verdict}${effFlag ? ' **(!)**' : ''} | ${top || '–'} |`,
   }
 }
 
@@ -697,11 +721,17 @@ const bPassed = (xs: readonly BItem[], g?: BGate) => {
   return ys.length ? `${ys.filter((i) => i.pass).length}/${ys.length}` : '–'
 }
 const bRate = (xs: readonly BItem[]) => (xs.length ? f1((100 * xs.filter((i) => i.pass).length) / xs.length) : '–')
+/** The pass rate with a lookup probe weighing TIER.weight.lookup of a core one. */
+const bTiered = (xs: readonly BItem[]) => {
+  const w = (i: BItem) => TIER.weight[i.tier ?? 'core']
+  const den = xs.reduce((s, i) => s + w(i), 0)
+  return den ? f1((100 * xs.reduce((s, i) => s + (i.pass ? w(i) : 0), 0)) / den) : '–'
+}
 const split = (xs: readonly BItem[]) => xs.filter((i) => i.votes > 0 && i.votes < BSAMPLES)
 
 function behaviorCard(r: Run, items: boolean) {
   const xs = r.behavior!
-  const out = [`## Behavior: ${r.label}`, '', `Passed: **${bRate(xs)}%** (${bPassed(xs)} probes, majority of ${BSAMPLES} Luna samples). Not part of the retention total.`, '']
+  const out = [`## Behavior: ${r.label}`, '', `Passed: **${bRate(xs)}%** (${bPassed(xs)} probes, majority of ${BSAMPLES} Luna samples); tiered ${bTiered(xs)}%. Not part of the retention total.`, '']
   out.push(`| gate | passed | ${CORPUS.map((c) => c.name).join(' | ')} |`, `|---|---:|${CORPUS.map(() => '---:|').join('')}`)
   for (const g of BGATES) if (xs.some((i) => i.gate === g)) out.push(`| ${g} | ${bPassed(xs, g)} | ${CORPUS.map((c) => bPassed(xs.filter((i) => i.id.startsWith(`${c.name}/`)), g)).join(' | ')} |`)
   out.push('')
@@ -719,7 +749,7 @@ function behaviorAb(a: Run, b: Run) {
   const out = [`## Behavior A/B (Luna reader; not blended into retention)`, '', '| gate | A passed | B passed | ↑ | ↓ |', '|---|---:|---:|---:|---:|']
   for (const g of BGATES)
     if (pairs.some(([x]) => x.gate === g)) out.push(`| ${g} | ${bPassed(a.behavior!, g)} | ${bPassed(b.behavior!, g)} | ${up.filter(([x]) => x.gate === g).length || ''} | ${down.filter(([x]) => x.gate === g).length || ''} |`)
-  out.push(`| **all** | **${bRate(a.behavior!)}%** | **${bRate(b.behavior!)}%** | **${up.length}** | **${down.length}** |`, '')
+  out.push(`| **all** | **${bRate(a.behavior!)}%** | **${bRate(b.behavior!)}%** | **${up.length}** | **${down.length}** |`, `| tiered | ${bTiered(a.behavior!)}% | ${bTiered(b.behavior!)}% | | |`, '')
   const same = pairs.filter(([x, y]) => x.why === y.why && x.votes === y.votes).length
   out.push(`${same} of ${pairs.length} probes got the same answers in A and B (identical contexts reuse the cached answers).`, '')
   const line = ([x, y]: readonly [BItem, BItem]) => `- ${bKey(x)}: A ${x.votes}/${BSAMPLES} ${x.why} → B ${y.votes}/${BSAMPLES} ${y.why}`
@@ -781,14 +811,15 @@ else if (command === 'run') {
     if (!a.long || !b.long) return undefined
     const l = ab(longOf(a), longOf(b), { informational: !sameKeys(a.long, b.long) && samples === 1 })
     const [ca, cb] = [longStats(a).credit, longStats(b).credit]
-    const cell = `${signed(l.d)} (${l.uu}↑ ${l.ud}↓)${l.better ? ` ${l.better}` : ''}; recall-aware ${f1(cb)} (${signed(cb - ca)})`
-    const json = { b: b.label, total: { a: total(longOf(a)), b: total(longOf(b)) }, recallAware: { a: ca, b: cb }, d: l.d, up: l.up, down: l.down, uniqueUp: l.uu, uniqueDown: l.ud, p: l.p, better: l.better ?? null, units: l.units }
-    return { l, ca, cb, cell, json }
+    const [ta, tb] = [longStats(a).tieredCredit, longStats(b).tieredCredit]
+    const cell = `${signed(l.d)} (${l.uu}↑ ${l.ud}↓)${l.better ? ` ${l.better}` : ''}; tiered ${signed(l.dt)}; recall-aware ${f1(cb)} (${signed(cb - ca)}), tiered ${f1(tb)} (${signed(tb - ta)})`
+    const json = { b: b.label, total: { a: total(longOf(a)), b: total(longOf(b)) }, tiered: { a: tiered(longOf(a)), b: tiered(longOf(b)) }, recallAware: { a: ca, b: cb }, tieredRecallAware: { a: ta, b: tb }, d: l.d, up: l.up, down: l.down, uniqueUp: l.uu, uniqueDown: l.ud, p: l.p, better: l.better ?? null, units: l.units }
+    return { l, ca, cb, ta, tb, cell, json }
   })
   const rs = bs.map((b, i) => {
     const main0 = ab(a, b)
     const lg = longs[i]
-    if (lg) main0.text += `\n${lg.l.text.replace('# Compaction A/B', '## Long chain (not in the total)')}\nRecall-aware credit (not in any total): A ${f1(lg.ca)}, B ${f1(lg.cb)} (${signed(lg.cb - lg.ca)})\n`
+    if (lg) main0.text += `\n${lg.l.text.replace('# Compaction A/B', '## Long chain (not in the total)')}\nRecall-aware credit (not in any total): A ${f1(lg.ca)}, B ${f1(lg.cb)} (${signed(lg.cb - lg.ca)}); tiered A ${f1(lg.ta)}, B ${f1(lg.tb)} (${signed(lg.tb - lg.ta)})\n`
     // The reflection chain: its own verdict, informational when its Observer draws differ (no resample of it is recorded).
     const c = a.chain && b.chain ? ab(chainOf(a), chainOf(b), { informational: !sameKeys(a.chain, b.chain) && samples === 1 }) : undefined
     const main = c
@@ -805,10 +836,10 @@ else if (command === 'run') {
   })
   const names = CORPUS.map((c) => c.name).join(' / ')
   const summary = [
-    `# Against ${a.label}: ${f1(total(a))}${a.holdout ? `; holdout ${f1(total(holdoutOf(a)))}` : ''}${a.chain ? `; reflection chain ${f1(total(chainOf(a)))}` : ''}${a.long ? `; long chain ${f1(total(longOf(a)))}, recall-aware ${f1(longStats(a).credit)}` : ''}`,
+    `# Against ${a.label}: ${f1(total(a))} (tiered ${f1(tiered(a))})${a.holdout ? `; holdout ${f1(total(holdoutOf(a)))}` : ''}${a.chain ? `; reflection chain ${f1(total(chainOf(a)))} (tiered ${f1(tiered(chainOf(a)))})` : ''}${a.long ? `; long chain ${f1(total(longOf(a)))} (tiered ${f1(tiered(longOf(a)))}), recall-aware ${f1(longStats(a).credit)} (tiered ${f1(longStats(a).tieredCredit)})` : ''}`,
     '',
-    `| B | total | Δ | Δ ${names} | unique ↑ | unique ↓ | p | noise | verdict | efficiency | gates that moved the total |${a.holdout ? ' holdout Δ (informational) |' : ''}${a.chain ? ' chain Δ |' : ''}${a.long ? ' long Δ |' : ''}`,
-    `|---|---:|---:|---|---:|---:|---:|---|---|---|---|${a.holdout ? '---:|' : ''}${a.chain ? '---:|' : ''}${a.long ? '---|' : ''}`,
+    `| B | total | Δ | tiered (Δ) | Δ ${names} | unique ↑ | unique ↓ | p | noise | verdict | efficiency | gates that moved the total |${a.holdout ? ' holdout Δ (informational) |' : ''}${a.chain ? ' chain Δ |' : ''}${a.long ? ' long Δ |' : ''}`,
+    `|---|---:|---:|---:|---|---:|---:|---:|---|---|---|---|${a.holdout ? '---:|' : ''}${a.chain ? '---:|' : ''}${a.long ? '---|' : ''}`,
     ...rs.map((r, i) => r.row + (a.holdout ? ` ${r.hd}${r.warn ? ' **(!)**' : ''} |` : '') + (a.chain ? ` ${r.cd} |` : '') + (a.long ? ` ${longs[i]?.cell ?? '–'} |` : '')),
     '',
     ...rs.filter((r) => r.warn).map((r) => r.warn),
