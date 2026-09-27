@@ -2,7 +2,7 @@
 // against at every cut point. Mechanical gates are derived from the transcript; the rest come from the transcript's
 // ReplaySpec and its local RubricSpec. Pure: no file system or model.
 import type { Context, ReplaySpec, Row, Tier, Transcript } from './replay'
-import { contextText, earlyNeeded, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, normalize, scoreConstraints } from './replay'
+import { contextText, earlyNeeded, itemTier, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, normalize, scoreConstraints } from './replay'
 
 export type Gate =
   | 'identifiers' | 'constraints' | 'verbatim' | 'corrections' | 'reversals' | 'approvals' | 'asks' | 'in-progress' | 'handoff'
@@ -28,8 +28,7 @@ export type { Tier }
 export const TIER = { weight: { core: 1, lookup: 0.25 }, pointed: { core: 0.25, lookup: 0.9 } } as const
 /** A mechanical item's tier, by its gate: exact identifiers, quotes, paths and hashes are lookup; the rest core. */
 export const GATE_TIER: Partial<Record<Gate, Tier>> = { identifiers: 'lookup', verbatim: 'lookup', commits: 'lookup', 'files-edited': 'lookup', 'in-progress': 'lookup', chronology: 'lookup', recall: 'lookup' }
-/** A hand-authored item's tier: its own `tier`, else lookup for an exact:/str: item, else core (lookups are hand-tagged). */
-export const itemTier = (id: string, tier?: Tier): Tier => tier ?? (isExact(id) ? 'lookup' : 'core')
+export { itemTier }
 export const tierOf = (i: Pick<Item, 'gate' | 'tier'>): Tier => i.tier ?? GATE_TIER[i.gate] ?? 'core'
 /**
  * A hard hand-authored item's gate, by its id's type prefix (docs/research/hard-compaction-items.md), when its own gate

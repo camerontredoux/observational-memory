@@ -64,8 +64,8 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync,
 import { resolve } from 'path'
 import type { Context, ReplaySpec, Transcript } from '../tests/eval/replay'
 import { chainSpec, chainTranscripts, contextText, estimateTokens, messageText, parseTranscript } from '../tests/eval/replay'
-import type { Gate, Item, Pointed, RubricSpec, Scores } from '../tests/eval/rubric'
-import { grade, hasExpect, norm, pointed, proseContext, score, TIER, tierOf, WEIGHTS } from '../tests/eval/rubric'
+import type { Gate, Item, Pointed, RubricSpec, Scores, Tier } from '../tests/eval/rubric'
+import { grade, hasExpect, itemTier, norm, pointed, proseContext, score, TIER, tierOf, WEIGHTS } from '../tests/eval/rubric'
 import type { BGate, Probe } from '../tests/eval/behavior'
 import { BGATES, contextSquashed, gradeAnswer, input, isUnknown, parse, probes, PROMPT } from '../tests/eval/behavior'
 import { fail, mainCheckout, num, options, str } from './cli'
@@ -128,8 +128,9 @@ async function rubricFor(name: string): Promise<RubricSpec | undefined> {
   if (name !== LONG.name) return rubricFiles(name)
   textOf(name)
   const offsets = textCache.get(name)!.offsets
-  type X = { id: string; from: number; to?: number }
-  const shift = <T extends X>(m: string, o: number, xs: readonly T[] | undefined) => (xs ?? []).map((x) => ({ ...x, id: `${m}-${x.id}`, from: x.from + o, ...(x.to !== undefined ? { to: x.to + o } : {}) }))
+  type X = { id: string; from: number; to?: number; tier?: Tier }
+  // The tier is settled before the prefix hides an exact:/str: id.
+  const shift = <T extends X>(m: string, o: number, xs: readonly T[] | undefined) => (xs ?? []).map((x) => ({ ...x, id: `${m}-${x.id}`, tier: itemTier(x.id, x.tier), from: x.from + o, ...(x.to !== undefined ? { to: x.to + o } : {}) }))
   const parts = await Promise.all(members(name).map(async (m, i) => {
     const r = await rubricFiles(m)
     return { facts: shift(m, offsets[i]!, r?.facts), absent: shift(m, offsets[i]!, r?.absent), latest: shift(m, offsets[i]!, r?.latest) }

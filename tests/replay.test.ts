@@ -736,6 +736,9 @@ describe('a chain of transcripts', () => {
       ['b-next-1', 4, 4],
     ])
     expect(checkSpec(parseTranscript(text), spec)).toEqual([])
+    const tiers = chainSpec([{ name: 'a', offset: 0, spec: { constraints: [], questions: [{ id: 'exact:sha', ask: '?', from: 0 }, { id: 'why', ask: '?', from: 0 }, { id: 'pr', ask: '?', from: 0, tier: 'lookup' }] } }])
+    // The member prefix would hide exact:, so the tier is settled first.
+    expect(tiers.questions.map((q) => [q.id, q.tier])).toEqual([['a-exact:sha', 'lookup'], ['a-why', 'core'], ['a-pr', 'lookup']])
   })
 })
 

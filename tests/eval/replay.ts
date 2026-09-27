@@ -168,7 +168,7 @@ export function chainSpec(members: readonly { name: string; offset: number; spec
       (spec?.constraints ?? []).map((c) => ({ ...c, id: `${name}-${c.id}`, setIn: c.setIn + offset, ...(c.reversal ? { reversal: { ...c.reversal, in: c.reversal.in + offset } } : {}) })),
     ),
     questions: members.flatMap(({ name, offset, spec }) =>
-      (spec?.questions ?? []).map((q) => ({ ...q, id: `${name}-${q.id}`, from: q.from + offset, ...(q.to !== undefined ? { to: q.to + offset } : {}) })),
+      (spec?.questions ?? []).map((q) => ({ ...q, id: `${name}-${q.id}`, tier: itemTier(q.id, q.tier), from: q.from + offset, ...(q.to !== undefined ? { to: q.to + offset } : {}) })),
     ),
   }
 }
@@ -324,6 +324,8 @@ export type ConstraintSpec = {
  */
 /** What an item is worth to the next agent (tests/eval/rubric.ts TIER): core, or an exact value om_recall can look up. */
 export type Tier = 'core' | 'lookup'
+/** A hand-authored item's tier: its own `tier`, else lookup for an exact:/str: item, else core (lookups are hand-tagged). Settle it before a chain prefixes the id with its member's name. */
+export const itemTier = (id: string, tier?: Tier): Tier => tier ?? (/^(?:exact|str)[:-]/.test(id) ? 'lookup' : 'core')
 export type Question = { id: string; ask: string; from: number; to?: number; expect?: readonly string[]; tier?: Tier }
 /** A transcript's constraints and questions. */
 export type ReplaySpec = { constraints: readonly ConstraintSpec[]; questions: readonly Question[] }
