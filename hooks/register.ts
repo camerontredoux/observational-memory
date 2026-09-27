@@ -813,6 +813,74 @@ const openQuote = (line: string) => {
   return at >= 0 && (line.slice(at).match(/"/g)?.length ?? 0) % 2 === 1
 }
 
+// A 🔴 line is the user's: the Observer sometimes marks one from a tool result, a worker's report or its own summary
+// ("User constraints in force: …" with a clause no user said). Checked by code against the user's messages in the
+// chunk and the constraints in force before it: a quote in the line must be in one of them, or the line must share
+// most of its words with one (GROUNDED_SHARE of its content words, cut to STEM_CHARS). An ungrounded line is kept as
+// 🟡, never dropped.
+const GROUNDED_SHARE = 0.3
+const STEM_CHARS = 5
+// Injected rows that carry no words of the user's: agent and tool reports, command output, polling updates.
+const NOT_SAID = /^<(?:task-notification|local-command-caveat|local-command-stdout|local-command-stderr|bash-stdout|bash-stderr|fork-boilerplate|mcp-resource-update|mcp-polling-update)(?:\s[^>]*)?>/
+const GROUND_STOP = new Set(
+  'the and for that this with from was were are has have had not but you your its it\'s into onto then than them they their there what when where which who will would should could can must also just only very more most some any all each every such about over under after before again user users asked asks asking said says told tell wants wanted want requested request requests required requires decided noted added stated confirmed approved clarified corrected instructed insisted directed specified reiterated emphasized explicitly constraint constraints force rule rules still now that\'s dont don\'t doesn\'t isn\'t'.split(' '),
+)
+const normSaid = (text: string) =>
+  ` ${text
+    .toLowerCase()
+    .replace(/\\n/g, ' ')
+    .replace(/[‘’‚‛′]/g, "'")
+    .replace(/[^a-z0-9']+/g, ' ')
+    .replace(/'/g, '')
+    .trim()} `
+// A word's stem: lower case, no apostrophe, without a plural, past or -ing ending, cut to STEM_CHARS.
+const stem = (w: string) => w.replace(/'/g, '').replace(/(?:ing|ed|es|s)$/, '').slice(0, STEM_CHARS)
+const stems = (text: string) =>
+  new Set(
+    (text.toLowerCase().replace(/[\u2018\u2019]/g, "'").match(/[a-z0-9](?:[a-z0-9'._-]*[a-z0-9])?/g) ?? [])
+      .filter((w) => w.length >= 3 && !GROUND_STOP.has(w))
+      .map(stem)
+      .filter((w) => w.length >= 3),
+  )
+// What the user said in rows [from, to): each prompt's text without system reminders, and the answers the user
+// picked or typed for AskUserQuestion; no compaction summary or report.
+function userSaid(v: View, from: number, to: number) {
+  const asked = new Set<string>()
+  for (let i = v.base; i < to; i++) for (const u of v.messages[i]!.toolUses) if (u.tool === 'AskUserQuestion') asked.add(u.tool_use_id)
+  const said: string[] = []
+  for (let i = from; i < to; i++) {
+    const m = v.messages[i]!
+    if (m.role !== 'user' || isSummary(m)) continue
+    const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+    if (text && !NOT_SAID.test(text)) said.push(text)
+    for (const r of m.toolResults ?? []) if (asked.has(r.tool_use_id) && r.text) said.push(r.text)
+  }
+  return said
+}
+/** Whether a 🔴 line (marker, time and any "(replaces …)" or replaced note included) is grounded in `said`. */
+function grounded(line: string, said: readonly string[]) {
+  if (!said.length) return false
+  const body = baseOf(line)
+    .replace(REPLACES, '')
+    .replace(/^🔴\s*(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}\s+)?/, '')
+  const texts = said.map(normSaid)
+  // Each quote, its parts around an ellipsis, all found in one message.
+  for (const [, quote] of body.matchAll(/["“”]((?:[^"“”\\]|\\.)+)["“”]/g)) {
+    const parts = quote!.split(/\.\.\.|…|\[\.\.\.\]/).map(normSaid).filter((p) => p.trim())
+    if (parts.length && texts.some((t) => parts.every((p) => t.includes(p)))) return true
+  }
+  const words = stems(body)
+  if (!words.size) return false
+  const share = (t: string) => {
+    const theirs = stems(t)
+    return [...words].filter((w) => theirs.has(w)).length / words.size
+  }
+  return said.some((t) => share(t) >= GROUNDED_SHARE)
+}
+// The 🔴 lines not grounded in `said`, as 🟡 lines; the others as they were.
+const groundRed = (lines: readonly string[], said: readonly string[], demoted: (line: string) => void) =>
+  lines.map((l) => (l.startsWith('🔴') && !grounded(l, said) ? (demoted(l), `🟡${l.slice('🔴'.length)}`) : l))
+
 // Logs each unmarked line of a reply, where from and how it began, and counts it as `<key>.merged`, or as
 // `<key>.orphaned` when it stands as its own 🟡 line.
 const noteUnmarked = ($: EngineInterface, key: string, where: string) => (text: string, { quote, own }: Unmarked) => {
@@ -982,10 +1050,27 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
   const note = noteUnmarked($, `observer.${phase}`, `observer reply for rows ${from}-${to}`)
   // An unmarked line after a correction is no constraint of the user's: it joins the observations.
   const moved: string[] = []
-  const corrections = parseLines(correctionsOf(text), bounds, !bounds, (t, how) => (note(t, how), how.own && moved.push(how.own)))
-    .filter((l) => l.startsWith('🔴'))
-    .map((l) => splitSource(l).line)
-  const lines = carryClauses(v, from, to, [...parseLines(observed, bounds, !bounds, note), ...moved].map((l) => splitSource(l).line))
+  // A 🔴 line no user message in the chunk (or constraint in force) bears out is kept as 🟡: a correction among the
+  // observations, without its "(replaces …)".
+  // A line that replaces a constraint is grounded in the user's messages alone: it shares the words of the one it
+  // replaces.
+  const users = userSaid(v, from, to)
+  const said = [...users, ...constraints.map((c) => keyOf(c))]
+  const demoted: string[] = []
+  const demote = (l: string) => void demoted.push(l)
+  const corrections: string[] = []
+  for (const l of parseLines(correctionsOf(text), bounds, !bounds, (t, how) => (note(t, how), how.own && moved.push(how.own)))) {
+    const line = splitSource(l).line
+    if (!line.startsWith('🔴')) continue
+    const [kept] = groundRed([line], REPLACES.test(baseOf(line)) ? users : said, demote)
+    if (kept!.startsWith('🔴')) corrections.push(kept!)
+    else moved.push(baseOf(kept!).replace(REPLACES, ''))
+  }
+  const lines = carryClauses(v, from, to, groundRed([...parseLines(observed, bounds, !bounds, note), ...moved].map((l) => splitSource(l).line), said, demote))
+  if (demoted.length) {
+    for (const l of demoted) log($, `a 🔴 line in the observer reply for rows ${from}-${to} is not in the user's messages; kept as 🟡: ${JSON.stringify(l.slice(0, 160))}`)
+    void $.session.id().then((id) => record(statsIo($), id, (s) => count(s, `observer.${phase}.demoted`, demoted.length)), () => {})
+  }
   // A marker or a time alone is no observation. With none, the reply counts only when it says so: an empty block,
   // or corrections and no observations.
   const saysNothingNew = !observed.trim() && (corrections.length > 0 || EMPTY_OBSERVATIONS.test(text))
