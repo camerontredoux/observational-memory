@@ -332,6 +332,22 @@ const readsIn = (prompt: string) => `<observations>\n* 🟡 Read ${[...prompt.ma
 const readers = (text: string) => new Set([...text.matchAll(/\b(main|one|two)-\d+/g)].map((m) => m[1]))
 
 describe('register', () => {
+  test('an older status report a newer one repeats is left out of the memory', async ($, on) => {
+    mock.clock(on, { now: at(23, 12, 0) })
+    world(on)
+    const reports: Record<string, string> = {
+      a: '* 🟡 2026-09-22 14:30 PR #1417 checks were pending.\n* 🟡 2026-09-22 14:31 PR #1417 checks pending because CI is slow.',
+      b: '* ✅ 2026-09-22 15:00 PR #1417 checks were green.',
+    }
+    pi(on, { reply: (prompt) => `<observations>\n${reports[prompt.match(/^\[User\]: (\w+)$/m)?.[1] ?? '']}\n</observations>` })
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    // Untimed history: the times are stripped. The line with a reason stays.
+    expect(observationsIn(result.messages?.[0]?.text ?? '')).toBe('* 🟡 PR #1417 checks pending because CI is slow.\n* ✅ PR #1417 checks were green.')
+  })
+
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
     mock.clock(on, { now: at(23, 12, 0) })
     world(on)

@@ -23,6 +23,7 @@ import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
 import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
+import { superseded } from './supersede'
 import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
 
@@ -1016,6 +1017,12 @@ const renderGrouped = (entries: readonly Entry[], sources = true) => {
       return `${head}* ${m ? m[1] + e.line.slice(m[0].length) : e.line}${trailer}`
     })
     .join('\n')
+}
+// The entries the memory shows: an older status report a newer one repeats is left out (supersede.ts); the ledger
+// keeps it for the Reflector, and om_recall still finds its source.
+function shown(entries: readonly Entry[]) {
+  const hidden = new Set(superseded(entries.map((e) => e.line)).map((s) => s.index))
+  return hidden.size ? entries.filter((_, i) => !hidden.has(i)) : entries
 }
 const NO_SOURCE = '(source none)'
 const LINE_DAY = /^(\S+ )(\d{4}-\d{2}-\d{2}) (?=\d{2}:\d{2} )/
@@ -2067,7 +2074,7 @@ export const register: Register = (on) => {
           corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
             estimateTokens(renderCorrections(l)),
           ),
-          observations: renderGrouped(ledger.entries),
+          observations: renderGrouped(shown(ledger.entries)),
           currentTask: ledger.currentTask,
           ...(goal ? { session: goal } : {}),
           ...(covered ? { stateAt: stamp(covered.to) } : {}),
@@ -2097,7 +2104,7 @@ export const register: Register = (on) => {
         // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
         // find; the corrections (within their cap), observations and continuation record stay whole.
         const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', briefer]]
-        if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ({ ...m, observations: renderGrouped(ledger.entries, false) })])
+        if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ({ ...m, observations: renderGrouped(shown(ledger.entries), false) })])
         const over = contextTokens(message)
         let tokens = over
         const made: string[] = []
