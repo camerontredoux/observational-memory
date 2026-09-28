@@ -843,13 +843,24 @@ const stems = (text: string) =>
       .filter((w) => w.length >= 3),
   )
 // What the user said in rows [from, to): each prompt's text without system reminders, and the answers the user
-// picked or typed for AskUserQuestion; no compaction summary or report.
+// picked or typed for AskUserQuestion; no report. Also words of the user's that reach the chunk another way: a
+// compaction summary's corrections and user messages up to `to` (the corrections quote the user; the user messages
+// are copied by code), and a quote the chunk relays as the user's "verbatim" (a message typed while the assistant
+// worked reaches no row of its own, only the assistant's echo of it).
+const SAID_SECTIONS = /<(corrections|all-user-messages)>\n([\s\S]*?)\n<\/\1>/g
+const RELAYED = /verbatim\W{0,12}["“]([^"”\n]{2,400})["”]/gi
 function userSaid(v: View, from: number, to: number) {
   const asked = new Set<string>()
   for (let i = v.base; i < to; i++) for (const u of v.messages[i]!.toolUses) if (u.tool === 'AskUserQuestion') asked.add(u.tool_use_id)
   const said: string[] = []
+  for (let i = 0; i < to; i++) {
+    const m = v.messages[i]!
+    if (isSummary(m)) for (const [, , body] of m.text.matchAll(SAID_SECTIONS)) said.push(...body!.split(/\n(?=\* )/))
+  }
   for (let i = from; i < to; i++) {
     const m = v.messages[i]!
+    const relayed = [m.text, ...m.toolUses.map((u) => JSON.stringify(u.input ?? '').replace(/\\"/g, '"')), ...(m.toolResults ?? []).map((r) => r.text ?? '')]
+    for (const t of relayed) for (const [, q] of t.matchAll(RELAYED)) said.push(q!)
     if (m.role !== 'user' || isSummary(m)) continue
     const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
     if (text && !NOT_SAID.test(text)) said.push(text)

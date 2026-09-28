@@ -624,6 +624,23 @@ describe('register', () => {
     expect(stats.counts['observer.compaction.demoted']).toBe(2)
   })
 
+  test('a quote the chunk relays as the user\'s verbatim words is grounded; one it only mentions is not', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, {
+      reply: () =>
+        '<corrections>\n* 🔴 User: "You never merge for me. Ever."\n* 🔴 User: "Always squash before merging"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
+    })
+    const chunk = turn('status?', 'a', CHUNK)
+    // A message typed while the assistant worked reaches no row of its own: the assistant writes it down.
+    chunk[1]!.toolUses[0]!.input = { file_path: '/data/captain.md', note: 'The captain, verbatim: "You never merge for me. Ever." Squash before merging is the repo default.' }
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...chunk, ...turn('b', 'b', 8_000)] })
+
+    expect(correctionsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "You never merge for me. Ever."')
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('* 🟡 User: "Always squash before merging"')
+  })
+
   test('a grounded correction that replaces a constraint in force still replaces it; an ungrounded one leaves it standing', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
