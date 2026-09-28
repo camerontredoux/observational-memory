@@ -1,6 +1,6 @@
 # Grader tiers: core vs lookup
 
-Branch `exp-grader` (worktree `.scratch/par/grader`): 86c97db adds the tiers and 282aa48 fixes how the long chain assigns them. No model calls were made. The HEAD vs v1.5.1 numbers are a cache-only regrade (`out/r3.md` and `out/r3.json` in the worktree). They were produced under 86c97db and then recounted offline under the 282aa48 tier fix; the fix changes only the tiered figures.
+Branch `exp-grader` (worktree `.scratch/par/grader`): 86c97db adds the tiers and 282aa48 fixes how the long chain assigns them. No model calls were made. Both comparisons are cache-only regrades under 282aa48 with 0 fresh calls: `out/r3b.md` for HEAD vs v1.5.1 and `out/af.md` for af0940d vs HEAD, in the worktree. The earlier `out/r3.md` from 86c97db differs only in the tiered long-chain figures.
 
 ## Tiers
 
@@ -32,10 +32,8 @@ The same prefix also turns off exact matching (`isExact`) for those items in the
 |---|---|---|
 | main | 84.4 → 84.7 (+0.3) | 86.7 → 86.8 (+0.1); core 87.9 → 88.1, lookup 84.3 → 84.1 |
 | reflection chain | 81.0 → 81.3 (+0.3) | 84.3 → 84.8 (+0.5) |
-| long chain | 61.7 → 64.0 (+2.3) | 63.7 → 65.8 (+2.1); core 69.7 → 71.5, lookup 57.0 → 60.4 |
-| long recall-aware | 42.0 → 37.8 (-4.2) | 37.9 → 35.2 (-2.7) (fixed tiers; 36.9 → 34.4 before the fix) |
-
-The long-chain figures come from 86c97db. They count members' exact:/str: items as core. That affects only the recall-aware row, which was recounted with the fix.
+| long chain | 61.7 → 64.0 (+2.3) | 63.9 → 66.0 (+2.1); core 70.1 → 72.0, lookup 56.5 → 59.8 |
+| long recall-aware | 42.0 → 37.8 (-4.2) | 37.9 → 35.2 (-2.7); 36.9 → 34.4 before the fix |
 
 ### Where v1.5.1's long-chain recall-aware loss comes from
 
@@ -63,9 +61,17 @@ Long-chain pass counts by gate and tier (A → B) confirm the same pattern:
 
 I could not reproduce the "facts 829→754" figure from `r3.md`. The long facts gate there reads 421 → 373 of 903, and hand-authored holds read 478 → 428 of 1284.
 
-## af0940d vs HEAD
+## af0940d (9/24 main) vs HEAD (v1.5.0)
 
-Not run yet. The first attempt died in the machine crash. The rerun, and a rerun of HEAD vs v1.5.1 under 282aa48, are queued on `.scratch/bench.lock` behind six other runs. They will write `.scratch/par/grader/out/af.md` and `out/r3b.md`.
+| track | flat A → B | tiered A → B |
+|---|---|---|
+| main | 73.9 → 84.4 (+10.5) | 76.3 → 86.7 (+10.5); core 76.0 → 87.9 (+12.0), lookup 79.1 → 84.3 (+5.2) |
+| holdout | 75.3 → 83.6 | 81.0 → 90.8 |
+| reflection chain | 70.0 → 81.0 (+11.0) | 72.5 → 84.3 (+11.8) |
+| long chain | 53.8 → 61.7 (+7.9) | 54.8 → 63.9 (+9.1); core 59.2 → 70.1 (+10.9), lookup 51.9 → 56.5 (+4.6) |
+| long recall-aware | 32.7 → 42.0 (+9.2) | 28.9 → 37.9 (+9.0) |
+
+The gain since af0940d is mostly core. Long-chain core holds went from 211 to 285 of 849, while lookup holds went only from 153 to 193 of 435. Main-track core items flipped 43 up and 7 down by unique item. Tiering makes HEAD's lead over af0940d a little larger (long +9.1 vs +7.9), where it makes v1.5.1's long-chain gain over HEAD a little smaller (+2.1 vs +2.3).
 
 ## Checks
 
