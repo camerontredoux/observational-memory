@@ -52,7 +52,7 @@ const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so th
 // The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
 // whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
 const REFLECT_KEEP_TOKENS = 12_000
-const REFLECT_CUE_TOKENS = 300 // the paths a reflection dropped, each with its clause, up to this
+const REFLECT_CUE_TOKENS = 600 // the cues a reflection dropped (paths, SHAs, PR ids, quotes, numbers), each with its clause, up to this
 const REFLECT_TIER_TOKENS = 6_000 // earlier reflections' lines kept as they were, up to this: condensing a line twice loses it
 const REFLECT_MIN_TARGET_TOKENS = 2_000 // the least the 🔴 lines and the kept observations leave the Reflector (boundPins)
 const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
@@ -539,31 +539,65 @@ function reflectedSource(given: Source | undefined, span: Source | undefined, al
   return minute(cut.from) <= minute(cut.to) ? cut : undefined
 }
 
-// The Reflector drops paths it cannot fit. Each path the condensed notes name and its reply does not (by last
-// segment) comes back as the clause of its latest note that names it, at that note's time, most-named first, up to
-// REFLECT_CUE_TOKENS: the file stays findable, with what was done to it.
-function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
-  const out = lines.map((l) => l.line.toLowerCase()).join('\n')
-  const count = new Map<string, number>()
-  const latest = new Map<string, Entry>()
-  for (const e of sent)
-    for (const [p] of e.line.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g))
-      if (/^[~./]/.test(p) || /\.\w+$/.test(p) || p.split('/').length > 2) count.set(p, (count.get(p) ?? 0) + 1), latest.set(p, e)
+// The retrieval cues a note names, in the order their kinds claim REFLECT_CUE_TOKENS: pull request and ticket ids
+// (#238, PR 238, /pull/238), commit SHAs (hex with a letter and a digit), paths, quoted commands and error messages
+// (two words or more: a lone `name` is a symbol the reply keeps or om_recall finds), and versions, dollar amounts and
+// numbers with a unit. A bare number is no cue: "3" says nothing alone. `raw` is the text as the note has it, `key`
+// what a reply names it by (a path by its last segment, a SHA by its first 7, a PR as #N), lowercased.
+const CUES = {
+  pr: /(?:#|\bPR ?#?|\/pull\/)\d{2,}\b/gi,
+  sha: /(?<![\w-])[0-9a-f]{7,40}(?![\w-])/gi,
+  path: /[~.\w@-]*\/[\w@.\/-]*[\w@-]/g,
+  quote: /`[^`\n]+`|"[^"\n]+"|“[^”\n]+”/g,
+  number: /(?<![\w.$])(?:v?\d+(?:\.\d+){2,}|v\d+\.\d+|\$\d[\d,]*(?:\.\d+)?|\d[\d,]*(?:\.\d+)?\s?(?:%|ms|s|min|k|KiB|MiB|GiB|KB|MB|GB|tokens|bytes|lines|files|tests|calls|rows)(?!\w))/gi,
+}
+type CueKind = keyof typeof CUES
+const CUE_KINDS = Object.keys(CUES) as CueKind[]
+function cuesIn(text: string) {
+  return CUE_KINDS.flatMap((kind) =>
+    [...text.matchAll(CUES[kind])].flatMap(([raw]) => {
+      if (kind === 'sha' && !(/[a-f]/i.test(raw) && /\d/.test(raw))) return []
+      if (kind === 'path' && !(/^[~./]/.test(raw) || /\.\w+$/.test(raw) || raw.split('/').length > 2)) return []
+      if (kind === 'quote' && !(/\S\s+\S/.test(raw.slice(1, -1)) && raw.length <= 122)) return []
+      const key = kind === 'pr' ? `#${raw.match(/\d+$/)![0]}` : kind === 'sha' ? raw.slice(0, 7) : kind === 'path' ? raw.split('/').filter(Boolean).at(-1) : kind === 'quote' ? raw.slice(1, -1) : raw
+      return key ? [{ kind, raw, key: key.toLowerCase() }] : []
+    }),
+  )
+}
+
+// The Reflector drops cues it cannot fit. Each cue the condensed notes name and the memory after it does not (the
+// reply, the lines that pass through, the newest kept as they were) comes back as the clause of its latest note that
+// names it, at that note's time, up to REFLECT_CUE_TOKENS: what it names stays findable, with what was done to it.
+// The kinds take turns, each its most-named (then newest) first, so no one kind takes the whole budget (the SHAs of a
+// busy stretch alone would); a clause that names a later cue answers for it. 600 tokens is ~15 clauses: the replies
+// drop far more (dozens of paths, SHAs and numbers per reflection), so these are the most-named of each kind.
+function withDroppedCues(lines: Omit<Entry, 'id'>[], sent: Entry[], rest: readonly Entry[]) {
+  const out = [...lines, ...rest].map((l) => l.line.toLowerCase().replace(/\bpr ?#?(?=\d)|\/pull\//g, '#')).join('\n')
+  const found = new Map<string, { kind: CueKind; raw: string; count: number; latest: number }>()
+  sent.forEach((e, i) => {
+    for (const c of cuesIn(e.line)) {
+      const was = found.get(c.key)
+      found.set(c.key, { kind: was?.kind ?? c.kind, raw: c.raw, count: (was?.count ?? 0) + 1, latest: i })
+    }
+  })
+  const dropped = CUE_KINDS.map((k) => [...found].filter(([key, c]) => c.kind === k && !out.includes(key)).sort(([, a], [, b]) => b.count - a.count || b.latest - a.latest))
+  const turns = dropped.flatMap((d, k) => d.map((c, i) => ({ c, order: i * CUE_KINDS.length + k }))).sort((a, b) => a.order - b.order)
   const named = new Set<string>()
   const cues: Omit<Entry, 'id'>[] = []
+  const kinds = new Map<string, number>()
   let chars = 0
-  for (const [p] of [...count].sort((a, b) => b[1] - a[1])) {
-    const base = p.split('/').filter(Boolean).at(-1)!.toLowerCase()
-    if (!base || out.includes(base) || named.has(base)) continue
-    const m = latest.get(p)!.line.match(/^(\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.*)$/)
+  for (const { c: [key, { kind, raw, latest }] } of turns) {
+    if (named.has(key)) continue
+    const m = sent[latest]!.line.match(/^(\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.*)$/)
     if (!m) continue
-    const clause = m[2]!.split(/(?<=[.;])\s+/).find((c) => c.includes(p)) ?? m[2]!
-    const at = clause.indexOf(p)
-    const text = clause.length <= 220 ? clause : `…${clause.slice(Math.max(0, at - 100), at + p.length + 100).trim()}…`
+    const clause = m[2]!.split(/(?<=[.;])\s+/).find((c) => c.includes(raw)) ?? m[2]!
+    const at = clause.indexOf(raw)
+    const text = clause.length <= 220 ? clause : `…${clause.slice(Math.max(0, at - 100), at + raw.length + 100).trim()}…`
     const line = `${m[1]} ${text}`
     if (chars + line.length + 3 > REFLECT_CUE_TOKENS * 4) continue
     chars += line.length + 3
-    for (const [q] of text.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g)) named.add(q.split('/').filter(Boolean).at(-1)!.toLowerCase())
+    for (const q of cuesIn(text)) named.add(q.key)
+    kinds.set(kind, (kinds.get(kind) ?? 0) + 1)
     cues.push({ line, r: true })
   }
   const timeOf = (l: { line: string }) => l.line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? ''
@@ -572,7 +606,7 @@ function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
     const i = merged.findIndex((l) => timeOf(l) > timeOf(c))
     merged.splice(i < 0 ? merged.length : i, 0, c)
   }
-  return merged
+  return { lines: merged, restored: kinds }
 }
 
 // `red` placed among `lines` in time order, each before the first line later than it; one without a time goes where
@@ -1858,7 +1892,9 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
         throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
       }
       failedInput.delete(key)
-      lines = withDroppedPaths(lines, sent)
+      const cued = withDroppedCues(lines, sent, [...through, ...kept])
+      if (cued.restored.size) log($, `the reflection dropped cues; restored ${[...cued.restored].map(([k, n]) => `${n} ${k}`).join(', ')}`)
+      lines = cued.lines
       await locked(async () => {
         const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
         if (!isLive(loop, stamp)) throw new LoopEnded()

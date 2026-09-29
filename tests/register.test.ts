@@ -1199,6 +1199,53 @@ describe('register', () => {
     expect(lines.some((l) => l.includes('read the plan'))).toBe(false)
   })
 
+  test('a SHA, PR id, quoted error or version the reflection drops comes back as its clause; one it keeps and a bare number do not', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const notes = [
+      'Assistant committed the fix as `a1b2c3d`.',
+      'PR #238 was merged.',
+      'The build failed with "cannot find module fixtures".',
+      'Assistant upgraded pi to v0.4.13.',
+      'Assistant retried 3 times.',
+      'Assistant tagged `e4f5a6b`.',
+    ]
+    const seen = pi(on, {
+      reply: () => `<observations>\n${notes.map((n) => `* 🟡 2026-09-22 14:30 ${n}\n`).join('')}${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
+      reflect: (_n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Assistant released the fix, tagged e4f5a6b'),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    for (const n of notes.slice(0, 4)) expect(lines).toContain(`🟡 2026-09-22 14:30 ${n}`)
+    expect(lines.some((l) => l.includes('retried'))).toBe(false)
+    expect(lines.filter((l) => l.includes('e4f5a6b'))).toHaveLength(1)
+    expect(seen.logs).toContainEqual('the reflection dropped cues; restored 1 pr, 1 sha, 1 quote, 1 number')
+  })
+
+  test('the cue kinds take turns: a run of dropped SHAs over the budget leaves room for a dropped path', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const shas = Array.from({ length: 80 }, (_, i) => `* 🟡 2026-09-22 14:30 Assistant committed \`c0ffe${i.toString(16).padStart(2, '0')}\`.\n`).join('')
+    pi(on, {
+      reply: () => `<observations>\n${shas}* 🟡 2026-09-22 14:30 Assistant fixed the totals in \`hooks/stats.ts\`.\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
+      reflect: (_n, prompt) => nearTarget(prompt),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    expect(lines).toContain('🟡 2026-09-22 14:30 Assistant fixed the totals in `hooks/stats.ts`.')
+    const restored = lines.filter((l) => l.includes('committed `c0ffe'))
+    expect(restored.length).toBeGreaterThan(0)
+    expect(restored.length).toBeLessThan(80)
+  })
+
   test('a reflection that stays far under its target leaves the observations as they were: two attempts, no prompt sent twice, and the same observations are not sent again', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
