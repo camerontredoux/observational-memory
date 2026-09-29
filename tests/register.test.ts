@@ -675,6 +675,124 @@ describe('register', () => {
     )
   })
 
+  // Jev over TypeSafe's endpoint: `answer` gives each question's probability from its id and state, or throws for an
+  // HTTP 500.
+  function jev(on: On, answer: (question: 'standing' | 'lifts', state: Record<string, string>) => number) {
+    const asked: { question: 'standing' | 'lifts'; state: Record<string, string>; auth?: string }[] = []
+    on('http.fetch', ($, e) => {
+      const body = JSON.parse(e.init?.body ?? '{}') as { state: Record<string, string>; questions: { q: { instructions: string } } }
+      const question = body.questions.q.instructions.includes('old_rule') ? 'lifts' : 'standing'
+      asked.push({ question, state: body.state, auth: e.init?.headers?.Authorization })
+      const p = answer(question, body.state)
+      const text = JSON.stringify({ model: 'jev-1', answers: { q: { type: 'noul', noul: p } }, usage: { input_tokens: 1, output_tokens: 1 } })
+      return { value: { status: 200, ok: true, headers: {}, text } }
+    })
+    return asked
+  }
+  const JEV_ON = { OM_JEV: '1', TYPESAFE_API_KEY: 'ts-key' }
+
+  test('with Jev on, a standing rule of the user\'s the Observer left out becomes a correction quoting it; a one-time go-ahead does not', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on, { env: JEV_ON })
+    const seen = pi(on, { reply: () => '<observations>\n* 🟡 User approved the paid runs\n</observations>' })
+    const asked = jev(on, (q, state) => (state.sentence?.includes('spending') ? 0.95 : 0.1))
+
+    const said = 'Yes go ahead with the paid runs. Keep the spending under $40 for the whole project.'
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn(said, 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+
+    expect(correctionsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "Keep the spending under $40 for the whole project."')
+    expect(asked).toEqual([
+      { question: 'standing', state: { sentence: 'Yes go ahead with the paid runs.', message: said }, auth: 'Bearer ts-key' },
+      { question: 'standing', state: { sentence: 'Keep the spending under $40 for the whole project.', message: said }, auth: 'Bearer ts-key' },
+    ])
+    expect(seen.logs).toContain('Jev: a standing rule in rows 0-3 the Observer did not list; kept as a correction: "🔴 User: \\"Keep the spending under $40 for the whole project.\\""')
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
+    expect(stats.counts['observer.compaction.jev.calls']).toBe(2)
+    expect(stats.counts['observer.compaction.jev.promoted']).toBe(1)
+  })
+
+  test('with Jev on, a sentence a correction already quotes is not asked about', async ($, on) => {
+    mock.clock(on)
+    world(on, { env: JEV_ON })
+    pi(on, { reply: () => '<corrections>\n* 🔴 User: "Never push to main."\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>' })
+    const asked = jev(on, () => 0.99)
+
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('Never push to main.', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+
+    expect(correctionsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "Never push to main."')
+    expect(asked).toEqual([])
+  })
+
+  test('with Jev on, a correction that only approves one action replaces no constraint and is kept as 🟡', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on, { env: JEV_ON })
+    pi(on, {
+      reply: constraining({
+        setup: { quote: 'Never push to the default branch' },
+        approve: { quote: 'push and close the issues', replaces: 'Never push' },
+      }),
+    })
+    const asked = jev(on, (q) => (q === 'lifts' ? 0.1 : 0.2))
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('setup\nNever push to the default branch', 'r', CHUNK), at(22, 14, 0))
+    await clock.settle()
+    await runTurn($, turn('approve\npush and close the issues', 'r', CHUNK), at(22, 14, 5))
+    await clock.settle()
+    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 8))
+    await clock.settle()
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(correctionsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:00 User: "Never push to the default branch"')
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('* 🟡 2026-09-22 14:05 User: "push and close the issues"')
+    expect(asked.filter((a) => a.question === 'lifts').map((a) => a.state)).toEqual([{ old_rule: '"Never push to the default branch"', new_message: '"push and close the issues"' }])
+  })
+
+  test('with Jev on, a correction the user meant as a change of the rule still replaces it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on, { env: JEV_ON })
+    pi(on, {
+      reply: constraining({
+        setup: { quote: 'Use pnpm, never npm' },
+        reverse: { quote: 'Use npm after all, pnpm breaks the lockfile', replaces: 'Use pnpm' },
+      }),
+    })
+    jev(on, (q) => (q === 'lifts' ? 0.9 : 0.2))
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('setup\nUse pnpm, never npm', 'r', CHUNK), at(22, 14, 0))
+    await clock.settle()
+    await runTurn($, turn('reverse\nUse npm after all, pnpm breaks the lockfile', 'r', CHUNK), at(22, 14, 5))
+    await clock.settle()
+    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 8))
+    await clock.settle()
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(correctionsIn(result.messages?.[0]?.text)).toBe(
+      '* 🔴 2026-09-22 14:05 User: "Use npm after all, pnpm breaks the lockfile" (this replaces the earlier constraint 2026-09-22 14:00 User: "Use pnpm, never npm")',
+    )
+  })
+
+  test('Jev is off without OM_JEV=1', async ($, on) => {
+    mock.clock(on)
+    world(on, { env: { TYPESAFE_API_KEY: 'ts-key' } })
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    const asked = jev(on, () => 0.99)
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('Keep the spending under $40 from now on.', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+    expect(correctionsIn(result.messages?.[0]?.text)).toBeUndefined()
+    expect(asked).toEqual([])
+  })
+
+  test('a failing Jev leaves the Observer\'s corrections as they are', async ($, on) => {
+    mock.clock(on)
+    world(on, { env: JEV_ON })
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    on('http.fetch', () => ({ value: { status: 500, ok: false, headers: {}, text: 'down' } }))
+    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('Keep the spending under $40 from now on.', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
+    expect(correctionsIn(result.messages?.[0]?.text)).toBeUndefined()
+  })
+
   test("a 🔴 correction whose quote runs over several lines stays one line; after its closing quote an unmarked line is its own 🟡 line", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)

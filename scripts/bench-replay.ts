@@ -118,6 +118,7 @@ import type { Options } from './cli'
 const HERE = resolve(import.meta.dir, '..')
 const OUT_ROOT = `${mainCheckout()}/.scratch/om-replay`
 const CACHE = `${OUT_ROOT}/luna-cache`
+const JEV_CACHE = `${OUT_ROOT}/jev-cache`
 const OLD_CACHE = `${mainCheckout()}/.scratch/om-vcc/luna-cache`
 const TRANSCRIPTS = ['om-orchestration', 'om-v04', 'firstmate-11']
 // Transcripts whose content (memories, questions, answers, excerpts) never leaves this machine: aggregate numbers only.
@@ -240,6 +241,8 @@ async function om(o: Options) {
   const reflectorCache = str(o, 'reflector-cache')
   if (reflectorCache) mkdirSync(reflectorCache, { recursive: true })
   const env: Record<string, string> = { HOME: process.env.HOME ?? '/root', OM_NO_PRUNE: '1', OM_STATS_DIR: `${out}/stats` }
+  // OM_JEV=1 in the bench's environment turns Jev on in the replayed plugin (its key with it; a plugin without Jev ignores both).
+  if (process.env.OM_JEV === '1') Object.assign(env, { OM_JEV: '1', TYPESAFE_API_KEY: process.env.TYPESAFE_API_KEY ?? '' })
 
   // The engine: a hand-built `$`, a virtual clock, and pi calls that land after a fixed virtual latency.
   let now = t.events[0]?.at ?? 0
@@ -248,6 +251,9 @@ async function om(o: Options) {
   const store = new Map<string, string>()
   const logs: { at: number; text: string; to?: string }[] = []
   let timers = 0
+  let fetching = 0 // Jev calls in flight
+  const jevCalls: { hash: string; hit: boolean }[] = []
+  let jevMisses = 0
   type Pending = { due: number; result: Promise<PiResult>; resolve: (v: PiResult) => void }
   const pending: Pending[] = []
   const calls: Call[] = []
@@ -339,8 +345,12 @@ async function om(o: Options) {
       after: (ms: number, fn: () => void) => {
         // after(0) is OM's way off the hook's path: counted, so a drain waits for it. The stats file's write delay
         // runs on real time and is flushed at the end.
+        // A Jev call in flight holds them back, so a live call never loses to its own timeout (askNoul's).
         if (ms > 0) {
-          const h = setTimeout(fn, 10)
+          let h = setTimeout(function fire() {
+            if (fetching) h = setTimeout(fire, 10)
+            else fn()
+          }, 10)
           return { cancel: () => clearTimeout(h) }
         }
         timers++
@@ -395,6 +405,35 @@ async function om(o: Options) {
       },
       spawn: () => {
         throw new Error('the replay spawns nothing')
+      },
+    },
+    // Jev (hooks/jev.ts) alone, cached like pi's replies in JEV_CACHE by sha256(url + body), the key left out.
+    http: {
+      fetch: async (url: string, init: { body?: string; headers?: Record<string, string> } = {}) => {
+        if (!url.startsWith('https://api.typesafe.ai/')) throw new Error(`the replay fetches Jev alone, not ${url}`)
+        const hash = createHash('sha256').update(url).update('\0').update(init.body ?? '').digest('hex')
+        const file = `${JEV_CACHE}/${hash}.json`
+        jevCalls.push({ hash, hit: existsSync(file) })
+        if (existsSync(file)) return JSON.parse(readFileSync(file, 'utf8')).response
+        if (piMode !== 'live') {
+          jevMisses++
+          throw new Error(`${piMode}: no cached Jev reply for ${hash}`)
+        }
+        timers++
+        fetching++
+        try {
+          const r = await fetch(url, { method: 'POST', headers: init.headers, body: init.body })
+          const response = { status: r.status, ok: r.ok, headers: {}, text: await r.text() }
+          if (r.ok) {
+            mkdirSync(JEV_CACHE, { recursive: true })
+            writeFileSync(`${file}.${process.pid}`, JSON.stringify({ url, body: init.body, response, at: new Date().toISOString() }))
+            renameSync(`${file}.${process.pid}`, file)
+          }
+          return response
+        } finally {
+          fetching--
+          timers--
+        }
       },
     },
     ui: { invalidate: () => {} },
@@ -526,6 +565,7 @@ async function om(o: Options) {
       cost: +sum((c) => c.cost).toFixed(5),
     },
     fallbacks,
+    ...(jevCalls.length ? { jev: { calls: jevCalls.length, cacheHits: jevCalls.filter((c) => c.hit).length, misses: jevMisses } } : {}),
     wallMs: Math.round(performance.now() - wall0),
   }
   writeFileSync(`${out}/summary.json`, JSON.stringify(summary, null, 1))
@@ -533,6 +573,8 @@ async function om(o: Options) {
   reflections.forEach((r, i) => writeFileSync(`${out}/reflection-${i + 1}.json`, JSON.stringify(r, null, 1)))
   writeFileSync(`${out}/log.txt`, logs.map((l) => `${new Date(l.at).toISOString()} ${l.to ?? ''} ${l.text}`).join('\n'))
   console.log(`[${name}] ${JSON.stringify(summary)}`)
+  // A Jev miss outside live mode answered as a failure: the replay is not the plugin's, so it fails.
+  if (jevMisses) fail(`[${name}] ${jevMisses} Jev calls had no cached reply (--pi ${piMode}): record them with --pi live`)
   // The stats file's delayed write (`clock.after` with a delay) runs on a real timer the plugin may leave armed.
   process.exit(0)
 }

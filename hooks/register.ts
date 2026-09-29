@@ -20,6 +20,8 @@ import {
 } from './prompts'
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
+import { JEV_ENDPOINT, JEV_MODEL, JEV_TIMEOUT_MS, LIFTS, STANDING } from './jev'
+import type { Noul } from './jev'
 import { registerPrune } from './prune'
 import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
@@ -1048,6 +1050,115 @@ function unsaid<T extends { line: string }>(entries: readonly T[], replies: read
   })
 }
 
+// The key when Jev is on, else undefined.
+async function jevKey($: EngineInterface) {
+  const [on, key] = await Promise.all([$.env.get('OM_JEV').catch(() => null), $.env.get('TYPESAFE_API_KEY').catch(() => null)])
+  return on === '1' && key?.trim() ? key.trim() : undefined
+}
+
+// `question`'s answer over `state`: the probability of true, or undefined on a failure, a timeout or a reply out of
+// contract.
+async function askNoul($: EngineInterface, key: string, state: Record<string, unknown>, question: Noul): Promise<number | undefined> {
+  let timer: { cancel: () => void } | undefined
+  const timeout = new Promise<undefined>((resolve) => void (timer = $.clock.after(JEV_TIMEOUT_MS, () => resolve(undefined))))
+  const call = $.http
+    .fetch(JEV_ENDPOINT, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: JEV_MODEL, state, questions: { q: question } }),
+    })
+    .then(
+      (res) => {
+        if (!res.ok) return undefined
+        const p = (JSON.parse(res.text) as { answers?: { q?: { type?: string; noul?: unknown } } }).answers?.q
+        return p?.type === 'noul' && typeof p.noul === 'number' && p.noul >= 0 && p.noul <= 1 ? p.noul : undefined
+      },
+      () => undefined,
+    )
+    .catch(() => undefined)
+  try {
+    return await Promise.race([call, timeout])
+  } finally {
+    timer?.cancel()
+  }
+}
+
+// Jev's second opinion on the Observer's corrections (hooks/jev.ts), when on. A correction that replaces a constraint
+// keeps doing so only when Jev finds the user lifted or changed that rule; one that only approves an action is moved to
+// the observations as 🟡, as an ungrounded one is. A sentence of the user's in the chunk that Jev finds sets a standing
+// rule, held by no correction or constraint in force, becomes a correction quoting it (JEV_PROMOTED at most, the
+// likeliest). Off, or where Jev fails, the Observer's corrections stand as they are.
+const JEV_LIFTS = 0.5
+const JEV_STANDING = 0.85
+const JEV_SENTENCES = 24 // the latest sentences of the chunk asked about
+const JEV_PROMOTED = 3
+const JEV_MESSAGE_CHARS = 800
+async function jevCheck($: EngineInterface, v: View, from: number, to: number, corrections: readonly string[], constraints: readonly string[], phase: Call['phase']) {
+  const key = await jevKey($)
+  if (!key) return { corrections: [...corrections], moved: [] as string[] }
+  const quoteOf = (line: string) => keyOf(line).replace(REPLACES, '').replace(/^User:\s*/, '')
+  let asked = 0
+  let failed = 0
+  const ask = async (state: Record<string, unknown>, q: typeof STANDING) => {
+    asked++
+    const p = await askNoul($, key, state, q)
+    if (p === undefined) failed++
+    return p
+  }
+
+  // Each replacing correction, asked against the rules it names.
+  const lifted = await Promise.all(
+    corrections.map(async (c) => {
+      const ids = new Set(c.match(REPLACES)?.[1]!.match(/k[0-9a-f]+/gi)?.map((id) => id.toLowerCase()))
+      const old = constraints.filter((k) => ids.has(constraintId(k))).map(quoteOf)
+      if (!old.length) return true
+      const p = await ask({ old_rule: old.join('\n'), new_message: quoteOf(c) }, LIFTS)
+      return p === undefined || p >= JEV_LIFTS
+    }),
+  )
+  const kept = corrections.filter((_, i) => lifted[i])
+  const moved = corrections.filter((_, i) => !lifted[i]).map((c) => `🟡${baseOf(c).replace(REPLACES, '').slice('🔴'.length)}`)
+
+  // The user's sentences in the chunk, each with its message and time, that no kept correction or constraint quotes.
+  const held = [...kept, ...constraints].map((l) => normSaid(quoteOf(l)))
+  const sentences: { sentence: string; message: string; at?: number }[] = []
+  for (let i = from; i < to; i++) {
+    const m = v.messages[i]!
+    if (m.role !== 'user' || isSummary(m) || m.toolResults?.length) continue
+    const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+    if (!text || NOT_SAID.test(text)) continue
+    for (const raw of text.split(/(?<=[.!?])\s+|\n+/)) {
+      const sentence = raw.trim().replace(/"/g, "'")
+      if (sentence.length < 8 || sentence.length > 300 || sentence.split(/\s+/).length < 3) continue
+      if (held.some((h) => h.includes(normSaid(sentence)))) continue
+      sentences.push({ sentence, message: text.slice(0, JEV_MESSAGE_CHARS), at: v.at[i] })
+    }
+  }
+  const asking = sentences.slice(-JEV_SENTENCES)
+  const standing = await Promise.all(asking.map((s) => ask({ sentence: s.sentence, message: s.message }, STANDING)))
+  const promoted = asking
+    .map((s, i) => ({ ...s, p: standing[i] ?? 0, i }))
+    .filter((s) => s.p >= JEV_STANDING)
+    .sort((a, b) => b.p - a.p)
+    .slice(0, JEV_PROMOTED)
+    .sort((a, b) => a.i - b.i)
+    .map((s) => `🔴 ${s.at === undefined ? '' : `${stamp(s.at)} `}User: "${s.sentence}"`)
+
+  for (const l of moved) log($, `Jev: a correction in the observer reply for rows ${from}-${to} only approves an action; kept as 🟡: ${JSON.stringify(l.slice(0, 160))}`)
+  for (const l of promoted) log($, `Jev: a standing rule in rows ${from}-${to} the Observer did not list; kept as a correction: ${JSON.stringify(l.slice(0, 160))}`)
+  void $.session.id().then(
+    (id) =>
+      record(statsIo($), id, (s) => {
+        count(s, `observer.${phase}.jev.calls`, asked)
+        if (failed) count(s, `observer.${phase}.jev.failed`, failed)
+        if (moved.length) count(s, `observer.${phase}.jev.unlifted`, moved.length)
+        if (promoted.length) count(s, `observer.${phase}.jev.promoted`, promoted.length)
+      }),
+    () => {},
+  )
+  return { corrections: [...kept, ...promoted], moved }
+}
+
 // One chunk, read alone: the Observer never sees the observations so far.
 async function observe($: EngineInterface, v: View, from: number, to: number, phase: Call['phase'], { constraints, state }: Before): Promise<Chunk> {
   const chunk = serialize(v, from, to)
@@ -1091,6 +1202,9 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
     if (kept!.startsWith('🔴')) corrections.push(kept!)
     else moved.push(baseOf(kept!).replace(REPLACES, ''))
   }
+  const jev = await jevCheck($, v, from, to, corrections, constraints, phase)
+  corrections.splice(0, corrections.length, ...jev.corrections)
+  moved.push(...jev.moved)
   const lines = carryClauses(v, from, to, groundRed([...parseLines(observed, bounds, !bounds, note), ...moved].map((l) => splitSource(l).line), said, demote))
   if (demoted.length) {
     for (const l of demoted) log($, `a 🔴 line in the observer reply for rows ${from}-${to} is not in the user's messages; kept as 🟡: ${JSON.stringify(l.slice(0, 160))}`)
