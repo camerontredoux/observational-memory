@@ -46,16 +46,19 @@ function world(
   const stored: Record<string, unknown> = { ...entries }
   const logs: string[] = []
   const screen: string[] = []
+  const reads: string[] = []
   const bytes = () => Object.entries(stored).reduce((n, [k, v]) => n + k.length + JSON.stringify(v).length, 0)
-  on('store.get', ($, e) => ({ value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
+  on('store.get', ($, e) => (reads.push(e.key), { value: stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key])) }))
   on('store.set', ($, e) => {
     if (o.setFails) throw new Error('EACCES')
     const was = stored[e.key]
     stored[e.key] = JSON.parse(JSON.stringify(e.value))
-    if (bytes() <= 4 * 1024 * 1024) return { value: undefined }
+    const would = bytes()
+    if (would <= 4 * 1024 * 1024) return { value: undefined }
     if (was === undefined) delete stored[e.key]
     else stored[e.key] = was
-    throw new Error(`observational-memory: $.store.set: the store would be ${bytes()} characters, over the 4194304 limit`)
+    // The engine's refusal in its wording, as a deny: a hook that throws is skipped, and the plugin would see core's instead.
+    return { deny: `observational-memory: $.store.set: the store would be ${would} characters, over the 4194304 limit` }
   })
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
   on('store.keys', () => {
@@ -69,7 +72,7 @@ function world(
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   // Starts a session and lets the background pruner run to its end.
   const start = async ($: Engine) => (await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false }), await clock.settle())
-  return { clock, stored, logs, screen, start, files, run }
+  return { clock, stored, reads, logs, screen, start, files, run }
 }
 
 describe('register', () => {
@@ -83,12 +86,12 @@ describe('register', () => {
   })
 
   test("a subagent's keys belong to its session: pruned with an old one, kept with the current one and under the cap", async ($, on) => {
-    const big = 'y'.repeat(1_500_000)
+    const big = 'y'.repeat(1_200_000) // two of them keep the store under 60% of its cap: the daily run drops no more
     const w = world(on, { ...session('old', NOW - 31 * DAY), ...session('old/agent-1', NOW - 31 * DAY), ...session('a', NOW - DAY, big), ...session('session-1/agent-2', NOW - 40 * DAY, big) })
     on('skill.prompt', ($, e) => ({ text: e.text }))
     await w.start($)
     expect(w.logs).toEqual(['pruned 1 session(s) untouched for 30 days: old (6 keys)'])
-    await $.skill.prompt({ skill: 'huge', text: big })
+    await $.skill.prompt({ skill: 'huge', text: 'y'.repeat(2_000_000) })
     expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:session-1/agent-2'])
     expect(w.logs[1]).toMatch(/^pruned 1 session\(s\) to fit the store under its size cap: a \(3 keys, ~\d+ KiB\)$/)
   })
@@ -117,15 +120,39 @@ describe('register', () => {
     expect(w.stored['ledger:s']).toBeDefined()
   })
 
-  test('a write over the cap drops the oldest other sessions until it fits, then succeeds', async ($, on) => {
+  test('a write over the cap drops the oldest other sessions one at a time until it fits, then succeeds, sizing none it keeps', async ($, on) => {
     const big = 'y'.repeat(900_000)
+    const huge = 'y'.repeat(1_600_000) // fits once two of the sessions have gone, not one
     const w = world(on, { ...session('a', NOW - 3 * DAY, big), ...session('b', NOW - 2 * DAY, big), ...session('c', NOW - DAY, big), ...session('session-1', NOW, big) })
     on('skill.prompt', ($, e) => ({ text: e.text }))
-    await $.skill.prompt({ skill: 'huge', text: big })
+    await $.skill.prompt({ skill: 'huge', text: huge })
     expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:c', 'ledger:session-1'])
-    expect(w.stored['skills:session-1']).toEqual([{ skill: 'huge', text: big, at: NOW }])
+    expect(w.stored['skills:session-1']).toEqual([{ skill: 'huge', text: huge, at: NOW }])
     expect(w.logs).toHaveLength(1)
-    expect(w.logs[0]).toMatch(/^pruned 2 session\(s\) to fit the store under its size cap: a, b \(6 keys, ~\d+ KiB\)$/)
+    expect(w.logs[0]).toMatch(/^pruned 2 session\(s\) to fit the store under its size cap: a, b \(6 keys, ~175\d KiB\)$/)
+    expect(w.reads.filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:a', 'ledger:b']) // read only as they are deleted
+  })
+
+  test('the daily run then drops the oldest sessions until the store is under 60% of its cap, but the current one, a running one and one with no time', async ($, on) => {
+    const big = 'y'.repeat(650_000)
+    const w = world(
+      on,
+      { ...session('session-1', NOW - 9 * DAY, big), ...session('idle', NOW - 5 * DAY, big), ...session('a', NOW - 3 * DAY, big), ...session('b', NOW - 2 * DAY, big), ...session('c', NOW - DAY, big), 'transcript:fresh': big },
+      true,
+      ['idle'],
+    )
+    await w.start($)
+    expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:') || k.startsWith('transcript:')).sort()).toEqual(['ledger:idle', 'ledger:session-1', 'transcript:fresh'])
+    expect(w.stored['seen:fresh']).toBe(NOW) // stamped now, so the newest
+    expect(w.logs).toEqual([expect.stringMatching(/^pruned 3 session\(s\) to keep the store under 60% of its size cap: a, b, c \(9 keys, ~190\d KiB\)$/)])
+  })
+
+  test('the daily run drops nothing more once the store is under 60% of its cap', async ($, on) => {
+    const big = 'y'.repeat(800_000)
+    const w = world(on, { ...session('a', NOW - 3 * DAY, big), ...session('b', NOW - 2 * DAY, big), ...session('c', NOW - DAY, big) })
+    await w.start($)
+    expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:'))).toEqual(['ledger:a', 'ledger:b', 'ledger:c'])
+    expect(w.logs).toEqual([])
   })
 
   test('a failing pruner is logged and the session starts', async ($, on) => {
