@@ -217,18 +217,22 @@ function locked<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 const estimateTokens = (text: string) => Math.ceil(text.length / 4)
+// The regex source that finds a note written with a count of 0 (its first 0), whatever its count: each note's regex
+// is built from the function that writes the note, so the two cannot drift apart.
+const noteSource = (note: string) => note.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('0', '\\d+')
+const truncationNote = (tokens: number) => `\n... [truncated ~${tokens} tokens]`
 const truncate = (text: string, maxTokens: number) =>
-  text.length <= maxTokens * 4 ? text : `${text.slice(0, maxTokens * 4)}\n... [truncated ~${estimateTokens(text) - maxTokens} tokens]`
-const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
+  text.length <= maxTokens * 4 ? text : `${text.slice(0, maxTokens * 4)}${truncationNote(estimateTokens(text) - maxTokens)}`
+const TRUNCATED = new RegExp(`${noteSource(truncationNote(0))}$`)
 // What truncate leaves of a text given no room: its note alone.
-const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
+const isStub = (text: string) => text.search(TRUNCATED) === 0
 // An oversized command result or brief, bounded at both ends: a final error or test summary, or a brief's reporting
 // and acceptance rules, usually sits at the start or the end, never only in the middle. The omission is marked
 // explicitly, never silently dropped; om_recall can still find the full `what` in the transcript. The tail starts at
 // a line boundary so its first line is whole.
 const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
 // The marker excerpt leaves in a brief it cut (see capUserMessages).
-const BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/
+const BRIEF_CUT = new RegExp(noteSource(omissionMarker(0, 'message')))
 function excerpt(text: string, maxTokens: number, what: 'result' | 'message' | 'input' = 'result') {
   if (text.length <= maxTokens * 4) return text
   const room = maxTokens * 4
@@ -276,7 +280,7 @@ function maskTail(rows: readonly SessionMessage[]) {
     })
     .toReversed()
 }
-const MASKED = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/
+const MASKED = new RegExp(noteSource(omissionMarker(0, 'result')))
 const isWrapper = (m: SessionMessage) => isPrompt(m) && INJECTED_WRAPPER.test(m.text.trim())
 // An injected wrapper row in the raw tail (a task notification, hook feedback) that a newer one repeats keeps its
 // first line and the lines no newer one has, then names the whole row by its hash for unmask.
@@ -326,7 +330,8 @@ function unmask(rows: readonly SessionMessage[], history: readonly SessionMessag
       return m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m
     })
 }
-const INPUT_MASKED = /\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full input\] \.\.\./
+// Found in a call's input as JSON, where the marker's newlines are escaped: the marker without them.
+const INPUT_MASKED = new RegExp(noteSource(omissionMarker(0, 'input').trim()))
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })

@@ -3579,6 +3579,54 @@ describe('register', () => {
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
+  test('an older tool input and result the raw tail cut read whole again after the compaction', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+    const script = `cat <<'EOF' > notes.txt\n${'a heredoc line\n'.repeat(300)}EOF`
+    const output = `BEGIN build\n${'compiled module\n'.repeat(300)}END: build passed`
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle()
+    await runTurn(
+      $,
+      [
+        { role: 'user', text: 'build', toolUses: [] },
+        { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't-build', tool: 'Bash', input: { command: script } }] },
+        { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't-build', text: output, isError: false }] },
+        { role: 'assistant', text: 'built', toolUses: [] },
+      ],
+      at(22, 15, 10),
+    )
+    // Three newer calls and results, so the build's are past the ones the raw tail keeps whole.
+    await runTurn($, turn('p', 'p'), at(22, 15, 20))
+    await runTurn($, turn('q', 'q'), at(22, 15, 30))
+    await runTurn($, turn('r', 'r'), at(22, 15, 40))
+    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    const call = first.messages!.flatMap((m) => m.toolUses).find((u) => u.tool_use_id === 't-build')
+    const result = first.messages!.flatMap((m) => m.toolResults ?? []).find((r) => r.tool_use_id === 't-build')
+    expect(String(call?.input.command)).toContain('om_recall can retrieve the full input')
+    expect(result?.text).toContain('om_recall can retrieve the full result')
+    expect(seen.prompts.join('\n')).not.toContain('compiled module') // not observed yet
+
+    history.push(...first.messages!)
+    const memory = first.messages![0]!
+    await runTurn($, turn('c', 'c', CHUNK), at(22, 16, 0))
+    await runTurn($, turn('d', 'd', 8_000), at(22, 16, 30))
+    await clock.settle()
+    const observed = seen.prompts.length
+    await $.session.compact({ trigger: 'auto', messages: history.slice(history.indexOf(memory)) })
+
+    // The Observer read the call and its result whole, and the next compaction matched the history with no Observer call.
+    expect(seen.prompts.join('\n')).toContain(JSON.stringify({ command: script }))
+    expect(seen.prompts.join('\n')).toContain(output)
+    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+  })
+
   // A compaction writes its kept tail back in the context's order, so the history then holds a parallel block
   // grouped. The background ledger and the next compaction must read it in the same order, or the watermark over
   // it looks changed and the whole backlog is observed on the spot (a firstmate session, upgraded mid-way to 0.4.5).
