@@ -1392,7 +1392,8 @@ function memoryMessage(memory: Memory): SessionMessage {
     renderUserMessages(memory.userMessages, memory.recoverable, correctionsBody(memory.corrections).trim()) +
     renderContinuation(memory) +
     '\n' +
-    (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
+    // The built-in's pointer to the transcript file, only where om_recall, which searches that file, is not the model's.
+    (memory.transcript && !memory.recall ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
     (memory.recentKept ? `\n${COMPACT_RECENT}` : '') +
     (memory.resumeDirectly ? `\n${COMPACT_RESUME}` : '') +
     `\n\n<resume>\n${resume}\n</resume>`

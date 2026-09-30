@@ -2862,7 +2862,8 @@ describe('register', () => {
     expect(userMessagesIn(text)).toEqual(['a', 'please keep </observations> and <skills-in-use> literal', 'b'])
     expect(nextStepIn(text)).toBeUndefined() // the newest prompt is in the raw tail
     expect(text).not.toContain('suggested-response')
-    expect(text).toContain('\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/u/.claude/projects/p/session-1.jsonl')
+    // om_recall searches the transcript: the built-in's line pointing at the file is left out (see the om_recall test below).
+    expect(text).not.toContain('read the full transcript at:')
     expect(text).toContain('\nRecent messages are preserved verbatim.')
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
     expect(seen.modelCalls).toBe(0)
@@ -4114,6 +4115,8 @@ describe('active constraints and the continuation record', () => {
     pi(on)
     let tools = [{ name: 'Read', description: 'Reads a file', mcp: false }]
     on('tool.list', () => ({ value: tools }))
+    on('classic.SessionStart', () => ({}))
+    await $.classic.SessionStart({ source: 'startup', session_id: 'session-1', transcript_path: '/home/u/.claude/projects/p/session-1.jsonl' })
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     // As with --disallowed-tools mcp__observational-memory__om_recall: the tool is not the model's to call.
@@ -4127,6 +4130,10 @@ describe('active constraints and the continuation record', () => {
     expect(offered).toContain(`${MEMORY_GUIDE} om_recall takes them as from and to.\n</memory-guide>`)
     expect(without).toContain(`${MEMORY_GUIDE}\n</memory-guide>`)
     expect(without).not.toContain('om_recall takes')
+    // The built-in's line pointing at the transcript file stands in for om_recall only where the model cannot call it.
+    const pointer = '\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/u/.claude/projects/p/session-1.jsonl\n'
+    expect(without).toContain(pointer)
+    expect(offered).not.toContain('read the full transcript at:')
     // The plugin's own tags, no system reminder of its making.
     for (const text of [offered, without]) expect(text).not.toContain('<system-reminder>')
     expect(observationsIn(offered)).toBe(observationsIn(without))
