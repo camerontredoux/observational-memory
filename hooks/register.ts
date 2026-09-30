@@ -156,7 +156,7 @@ type Memory = {
   nextStep?: string // the user's latest request, verbatim
   environment?: string // the working directory and git state at compaction (see environmentOf)
   failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
-  brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
+  brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran
   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
   transcript?: string
   recoverable: boolean // the session's transcript is known: om_recall can find what the memory leaves out
@@ -178,9 +178,6 @@ let lock: Promise<unknown> = Promise.resolve()
 const reflecting = new Set<string>()
 // Per loop, the Reflector input that last failed at every attempt: the same input is not sent again.
 const failedInput = new Map<string, string>()
-// OM_BRIEF=always: every compaction's memory message carries the session brief of all the rows it compacted, not
-// only where the floor runs. Off by default: on replayed questions it made no difference while the Observer worked.
-const briefAlways = ($: EngineInterface) => $.env.get('OM_BRIEF').then((v) => v === 'always', () => false)
 const sinceScheduled = new Map<string, { rows: number; tail: string[]; tokens: number }>() // the history the last step saw (its length and newest rows' hashes), and its growth since a pass
 const waiting = new Map<string, { loop: Loop; stamp: string }>() // loops a pass left short of a slot, first in line when one frees
 const backoff = new Map<string, { failures: number; until: number }>() // loops whose last background call failed
@@ -2034,13 +2031,12 @@ export const register: Register = (on) => {
     }
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
-    const [sessionId, started, usage, recall, always, environment] = await Promise.all([
+    const [sessionId, started, usage, recall, environment] = await Promise.all([
       $.session.id(),
       $.clock.now(),
       $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
       // Not the model's with --disallowed-tools, or when its registration failed; assumed so when the host cannot tell.
       $.tool.list().then((tools) => tools.some((t) => t.name === RECALL_TOOL_NAME), () => true),
-      briefAlways($),
       environmentOf($),
     ])
     const loop = loopOf(sessionId, e.agentId)
@@ -2167,9 +2163,9 @@ export const register: Register = (on) => {
       const attempt = async (cut: number, floor: boolean) => {
         const tail = messages.slice(cut)
         // The brief carried from the memory message, with the rows leaving context merged in: those the floor
-        // compiles, or with OM_BRIEF=always every one. A brief is carried even where the Observer's memory stands again:
-        // it holds rows the Observer never observed, which no observation covers.
-        const from = always ? base : floor ? observed : cut
+        // compiles. A brief is carried even where the Observer's memory stands again: it holds rows the Observer never
+        // observed, which no observation covers.
+        const from = floor ? observed : cut
         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
         dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
         const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))

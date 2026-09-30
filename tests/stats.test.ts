@@ -157,7 +157,7 @@ describe('stats', () => {
     const s = emptyStats('a', T0)
     addCompaction(s, { trigger: 'auto', fellBack: false, floor: true, ms: 40, rowsBriefed: 30, briefTokens: 900, memoryTokens: 1_200, observations: 0 }, T0)
     addCompaction(s, { trigger: 'manual', fellBack: false, floor: true, ms: 30, rowsBriefed: 12, briefTokens: 500 }, T0)
-    addCompaction(s, { trigger: 'auto', fellBack: false, ms: 20, briefTokens: 700 }, T0) // OM_BRIEF=always: a brief, no floor
+    addCompaction(s, { trigger: 'auto', fellBack: false, ms: 20, briefTokens: 700 }, T0) // a carried brief, no floor
     expect(s.counts).toEqual({ 'compaction.auto.floor': 1, 'compaction.manual.floor': 1 })
     expect(s.metrics['compaction.auto.rowsBriefed']).toMatchObject({ count: 1, sum: 30 })
     expect(s.metrics['compaction.auto.briefTokens']).toMatchObject({ count: 2, sum: 1_600 })

@@ -398,7 +398,7 @@ describe('run validity', () => {
     // The floor's stats are no fallback; a built-in run given the floor's message had the plugin loaded.
     expect(scoreRun(s, 'om', run(s, () => FLOOR_SUMMARY('x'), answered), { memoryUsd: 0, memoryCalls: 0, reflections: 0, fellBack: 0, floor: 1, failures: 0 }).valid).toBe(true)
     expect(scoreRun(s, 'builtin', run(s, () => FLOOR_SUMMARY('x'), answered)).invalid.join()).toMatch(/plugin/)
-    // A memory with a brief that is no floor's (OM_BRIEF=always) is the observational path.
+    // A memory with a brief that is no floor's (one carried from an earlier floor) is the observational path.
     expect(scoreRun(s, 'om', run(s, () => OM_SUMMARY('x').replace('<all-user-messages>', '<session-brief>\n> Compiled by code\n</session-brief>\n\n<all-user-messages>'), answered)).compactions[0]!.path).toBe('observational')
   })
 

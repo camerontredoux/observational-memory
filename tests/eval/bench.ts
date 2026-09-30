@@ -425,7 +425,7 @@ export type RunMeta = {
   /** The plugin checkout the version label named, and its commit (`-dirty` when it had uncommitted changes). */
   pluginRoot?: string
   pluginCommit?: string
-  /** `always`: the session ran with OM_BRIEF=always (a variant under its own version label). */
+  /** `always`: the session ran with OM_BRIEF=always (a variant under its own version label), a flag since removed. */
   brief?: 'always'
   /** What the budget admitted the run under. */
   admission?: { budgetUsd: number; spentUsd: number; reserveUsd: number }

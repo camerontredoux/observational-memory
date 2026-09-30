@@ -4237,25 +4237,7 @@ describe('the floor', () => {
     expect(briefIn(third.messages![0]!.text)).toBe(briefed!.slice(FLOOR_NOTE.length + 1))
   })
 
-  test('with OM_BRIEF=always every compaction carries the brief of all the rows it compacts beside the observations', async ($, on) => {
-    const clock = mock.clock(on)
-    const { files } = world(on, { env: { OM_BRIEF: 'always' } })
-    pi(on)
-    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)]
-
-    const result = await $.session.compact({ trigger: 'manual', messages })
-    await clock.advance(5_000)
-
-    const text = result.messages![0]!.text
-    expect(observationsIn(text)).toContain('User: "a"')
-    expect(briefIn(text)).toBe([NOTE, '[Brief Transcript]', '- said: a'].join('\n')) // rows [0, 3): the cut at the watermark
-    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
-    expect(stats.counts['compaction.manual.floor']).toBeUndefined()
-    expect(stats.metrics['compaction.manual.briefTokens']!.sum).toBeGreaterThan(0)
-    expect(stats.metrics['compaction.manual.rowsBriefed']).toBeUndefined()
-  })
-
-  test('OM_BRIEF is off by default: an observed memory has no session brief', async ($, on) => {
+  test('an observed memory has no session brief', async ($, on) => {
     mock.clock(on)
     world(on)
     pi(on)
