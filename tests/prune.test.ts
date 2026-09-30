@@ -254,6 +254,13 @@ describe('register', () => {
     expect(w.stored['skills:session-1']).toEqual([{ skill: 'huge', text: big, at: NOW }])
   })
 
+  test('the daily run deletes the legacy fork: and buffer: keys, whatever their session', async ($, on) => {
+    const w = world(on, { 'fork:a': { at: 1 }, 'buffer:session-1': [], 'buffer:b/agent-1': [], forkX: 1, 'other:fork:a': 1, ...session('recent', NOW - DAY) })
+    await w.start($)
+    expect(Object.keys(w.stored).sort()).toEqual(['forkX', 'ledger:recent', 'live:recent', 'other:fork:a', 'prune:last', 'times:recent'])
+    expect(w.logs).toEqual(['deleted 3 legacy fork: and buffer: key(s)'])
+  })
+
   test('keys with no colon are not sessions', async ($, on) => {
     const w = world(on, { ledgerX: 1, ...session('old', NOW - 60 * DAY) })
     await w.start($)

@@ -14,6 +14,8 @@ const PRUNE_TO = 0.6 // the daily run drops the oldest sessions until the store 
 export const KINDS = ['ledger', 'times', 'live', 'skills', 'turns', 'transcript', 'seen', 'goal'] as const
 export const key = (kind: (typeof KINDS)[number], id: string) => `${kind}:${id}`
 const LAST_RUN = 'prune:last' // outside KINDS: shared by every process, never pruned
+// Kinds v0.3 and v0.4 stored and nothing reads now: the daily run deletes their keys, whatever their session.
+const LEGACY = /^(fork|buffer):/
 // The engine's refusal of a write that would take the whole file over its cap.
 const CAP_ERROR = /the store would be \d+ characters, over the \d+ limit/
 
@@ -119,11 +121,14 @@ async function drop(
   return dropped
 }
 
-// Drops every session untouched for PRUNE_AFTER_DAYS, then the oldest until the store is under PRUNE_TO of its cap,
-// but the current one and those still running; one with no time is stamped now and kept.
+// Deletes the legacy keys, then drops every session untouched for PRUNE_AFTER_DAYS, then the oldest until the store
+// is under PRUNE_TO of its cap, but the current one and those still running; one with no time is stamped now and kept.
 async function prune($: EngineInterface, current: string) {
   const now = await $.clock.now()
   const old = (at: number | undefined) => at !== undefined && now - at > PRUNE_AFTER_DAYS * DAY
+  const legacy = (await $.store.keys()).filter((k) => LEGACY.test(k))
+  for (const k of legacy) await $.store.delete(k)
+  if (legacy.length) $.ui.log(`deleted ${legacy.length} legacy fork: and buffer: key(s)`, { to: 'debug' })
   const scanned = await sessions($, true)
   const all = scanned.filter((s) => s.id !== current)
   for (const s of all.filter((s) => s.at === undefined)) await $.store.set(key('seen', s.id), now)
