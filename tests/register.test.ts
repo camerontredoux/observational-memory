@@ -3690,6 +3690,35 @@ describe('register', () => {
     expect(stats.metrics['compaction.notPersistent.rowsKept']!.sum).toBe(2 * kept)
   })
 
+  test('a context that differs from the history under the watermark only in a tool result keeps the ledger, checked against the history', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, files, stored } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await clock.settle()
+    const observed = seen.prompts.length
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(ledger.watermark.to).toBeGreaterThan(2)
+    // The context alone reads a's result, under the watermark, differently: the history still holds it whole.
+    const context = [...history]
+    context[2] = { ...history[2]!, toolResults: [{ tool_use_id: 't-a', text: '[Old tool result content cleared]', isError: false }] }
+    const result = await $.session.compact({ trigger: 'auto', messages: context })
+    await clock.advance(5_000)
+
+    expect(seen.prompts).toHaveLength(observed)
+    expect(seen.logs.filter((l) => l.includes('restarting the ledger'))).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('cut at the background watermark with no Observer call'))).toHaveLength(1)
+    expect(observationsIn(result.messages?.[0]?.text)?.replace(/ \(source .*\)$/gm, '')).toBe(ledger.entries.map((e) => `* ${e.line}`).join('\n'))
+    expect(result.messages?.slice(1)).toEqual(context.slice(ledger.watermark.to))
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
+    expect(stats.counts['compaction.notPersistent.rows.result-result']).toBe(1)
+    expect(stats.metrics['compaction.notPersistent.rowsKept']!.sum).toBe(ledger.watermark.to)
+  })
+
   test('stats: background calls and a compaction land in the session file, and om_stats and /om-stats report them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)

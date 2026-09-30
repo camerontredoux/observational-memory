@@ -1969,18 +1969,33 @@ const kindOf = (m: SessionMessage) =>
     ? m.toolUses.length ? 'call' : 'reply'
     : m.toolResults?.length ? 'result' : isMemory(m) ? 'memory' : isSummary(m) ? 'summary' : typed(m, []) === undefined ? 'injected' : 'prompt'
 
+// The context's first row that differs from the history's at `offset`, and where it reads the same in the history
+// nearby, if anywhere: a row one side lacks shifts it.
+function firstDiffering(messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
+  const differs = (m: SessionMessage, i: number) => rowHash(m) !== rowHash(rows[offset + i]!)
+  const i = offset < 0 ? -1 : messages.findIndex(differs)
+  const near = (k: number) =>
+    Array.from({ length: 2 * ALIGN_ROWS + 1 }, (_, d) => k + d - ALIGN_ROWS).find((j) => j !== k && rows[j] && rowHash(rows[j]) === rowHash(messages[i]!))
+  return { differs, i, seen: offset < 0 ? undefined : near(offset + i) }
+}
+
+// Whether a context that does not match its history still lines up with it row for row at `offset`: its first
+// differing row reads as no history row nearby (`changed`), and every differing row has the same role, tool calls and
+// tool results as the history's row there, so the two cut between the same rows.
+function linesUp(messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
+  if (offset < 0) return false
+  const { differs, seen } = firstDiffering(messages, rows, offset)
+  const ids = (m: SessionMessage) => [...m.toolUses.map((u) => u.tool_use_id), '|', ...(m.toolResults ?? []).map((r) => r.tool_use_id)].join()
+  return seen === undefined && messages.every((m, i) => !differs(m, i) || (m.role === rows[offset + i]!.role && ids(m) === ids(rows[offset + i]!)))
+}
+
 // Why a compaction's context is not the tail of its loop's history, by shape alone (no content): logged, and counted
 // in the stats by trigger, by how the first differing row differs (`short`: the context is longer than the history;
 // `extra`: it reads as a later history row, so the history holds rows the context lacks; `missing`: an earlier one;
 // `changed`: none nearby) and by the two rows' kinds, with how far from the end it sits and the observed rows kept.
 function notPersistent($: EngineInterface, sessionId: string, trigger: string, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number, kept: number) {
   const shape = (m: SessionMessage) => `${m.role}, ${rowText(m).length} chars, ${m.toolUses.length} tool uses, ${m.toolResults?.length ?? 0} tool results`
-  const differs = (m: SessionMessage, i: number) => rowHash(m) !== rowHash(rows[offset + i]!)
-  const i = offset < 0 ? -1 : messages.findIndex(differs)
-  // Where the first differing row reads the same in the history nearby, if anywhere: a row one side lacks shifts it.
-  const near = (k: number) =>
-    Array.from({ length: 2 * ALIGN_ROWS + 1 }, (_, d) => k + d - ALIGN_ROWS).find((j) => j !== k && rows[j] && rowHash(rows[j]) === rowHash(messages[i]!))
-  const seen = offset < 0 ? undefined : near(offset + i)
+  const { differs, i, seen } = firstDiffering(messages, rows, offset)
   const differing = offset < 0 ? messages.length : messages.filter(differs).length
   log(
     $,
@@ -2054,9 +2069,12 @@ export const register: Register = (on) => {
     const order = callOrder(live)
     const messages = order.map((i) => live[i]!)
     const { offset, rows, persistent } = history ? align(messages, history) : { offset: -messages.length, rows: [], persistent: false }
-    // Unmatched, the rows are still timed and the ledger still stands up to the first row that differs, by content:
-    // `reconcile` checks the rows under the watermark by hash and finds each chunk where its rows read the same.
-    const v = view(messages, await loadMarks($, loop.key), persistent ? offset : undefined)
+    // Unmatched but lined up row for row (see linesUp), the ledger is checked against the history's rows, which it was
+    // built from, and observed, timed and cut over them; only the raw tail is the context's. Otherwise unmatched, it is
+    // checked against the context: one row under the watermark that differs restarts it (see `reconcile`), and each
+    // chunk past the watermark is found where its rows read the same.
+    const lined = history !== undefined && !persistent && linesUp(messages, rows, offset)
+    const v = view(lined ? rows.slice(offset, offset + messages.length) : messages, await loadMarks($, loop.key), persistent || lined ? offset : undefined)
     const base = v.base
     const initial = await locked(() => loadLedger($, loop.key, v))
     if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)

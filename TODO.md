@@ -53,8 +53,12 @@ still fail it sometimes: 43 of 82 in session `40c779b6`, mostly subagents. On 20
 24.4 s. Its compactions that matched took about 0.2 s.
 
 The cause is not known. The current guess is task notifications injected into the context (`queued_command`
-attachments). Since v1.4.1 (`62ee8ee`) a mismatch keeps the background notes up to the first differing row, and
-`notPersistent` in `hooks/register.ts` counts how the two differ: `compaction.notPersistent.<trigger>`, the shape
+attachments). A context that still lines up with the history row for row keeps all the background notes: the
+ledger is checked against the history's rows, and only the raw tail comes from the context. It lines up when the
+first differing row reads as no history row nearby and each differing row has the same role, tool calls and tool
+results as the history's row there (`linesUp` in `hooks/register.ts`). Any other mismatch keeps the notes only when
+every differing row is past the watermark; one under it restarts the ledger from the memory message. `notPersistent`
+in `hooks/register.ts` counts how the two differ: `compaction.notPersistent.<trigger>`, the shape
 (`extra`, `missing`, `changed`, `short`), `compaction.notPersistent.rows.<context kind>-<history kind>`, and the
 `fromEnd`, `differing` and `rowsKept` metrics.
 
