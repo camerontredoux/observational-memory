@@ -235,8 +235,8 @@ export const BRIEF_REF_NOTE = '> The reference in parentheses at the end of a li
 // leaves in place of the conversation and how to resume from it, told before any compaction happens. It is the same
 // text for the whole session, as the section is cached.
 export const COMPACTION_BRIEFING =
-  'When this session is compacted, one memory message replaces the earlier conversation, and the most recent messages stay as they were. ' +
-  'Its <memory-guide> says how to read it and its <resume> how to go on. After a compaction, continue the work where it stood; do not restart it.'
+  'When this session is compacted, one memory message replaces the earlier conversation, and the most recent messages stay. ' +
+  'Where it has a <memory-guide> and <resume>, they say how to read it and how to go on. After a compaction, continue the work where it stood; do not restart it.'
 
 // The Session line's writer (register.ts writeSession): a separate small call, in the background, so the Observer's
 // prompt and inputs stay as they are.

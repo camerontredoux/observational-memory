@@ -4324,6 +4324,10 @@ describe('the handoff', () => {
     const words = COMPACTION_BRIEFING.split(/\s+/).length
     expect(words).toBeLessThanOrEqual(60)
     for (const said of ['<memory-guide>', '<resume>', 'most recent messages', 'do not restart']) expect(COMPACTION_BRIEFING).toContain(said)
+    // Not that the recent messages are unchanged: their long tool results are cut to head and tail. A fallback to the
+    // built-in compaction writes no guide or resume.
+    expect(COMPACTION_BRIEFING).not.toContain('as they were')
+    expect(COMPACTION_BRIEFING).toContain('Where it has a <memory-guide> and <resume>')
   })
 
   test("the Observer's next steps and what the user was told are rendered in the record, and the reminder sends the model to them", async ($, on) => {
