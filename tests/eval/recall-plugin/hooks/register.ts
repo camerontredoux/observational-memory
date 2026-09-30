@@ -55,19 +55,16 @@ export const register: Register = (on) => {
           "shown: a summary that does not show a tool's full output is not evidence that the output is lost. Use it too " +
           "whenever the summary lacks a detail you need: exact text, a tool's output, a quote, what happened when. It " +
           "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
-          'what compaction removed from context, the earlier files a moved session continued from, optionally its ' +
+          'what compaction removed from context and the transcripts this session was resumed or moved from, optionally its ' +
           'subagents. Search first: its excerpts, the best lines of each ' +
           'matching block, usually answer, and it names query terms that occur nowhere, so do not search again to confirm an ' +
           'absence. Read a block only when its excerpt is not enough, and only the lines you need. Outline only to orient, ' +
-          'one page. Stop as soon as you have the answer. search (a query alone): words, all of which must appear (failing ' +
-          'that, blocks holding some, rarest first), "quoted phrases" or /regex/. read (a ref alone, like a79f045b:2133): a block, a page of lines ' +
-          'at a time. outline (neither): a line per message or tool call, for a from/to range. files: the files the session ' +
-          'read, edited or wrote, each with the blocks that touched it; a query narrows them by path.',
+          'one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', maxLength: 500, description: 'Words, "quoted phrases" or /regex/flags to find, e.g. a file name, an error, a marker; with files, part of a path' },
-            mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query, read with a ref alone, else outline' },
+            query: { type: 'string', maxLength: 500, description: 'Words, all of which must appear (failing that, blocks holding some, rarest first), "quoted phrases" or /regex/flags to find, e.g. a file name, an error, a marker; with files, part of a path' },
+            mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query; read with a ref alone, like a79f045b:2133: a block, a page of lines at a time; else outline: a line per message or tool call. files: the files the session read, edited or wrote, each with the blocks that touched it' },
             ref: { type: 'string', description: 'A block reference from a search or outline, to read; a subagent reference, to outline its transcript' },
             lines: { type: 'string', description: 'Lines of the block to read, e.g. "1-200" or "201-" (read)' },
             before: { type: 'number', description: 'Blocks before the read one to show too, at most 5 (read)' },
