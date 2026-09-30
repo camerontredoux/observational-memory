@@ -24,6 +24,8 @@ export type LunaCall = {
   ms: number
   input?: number
   output?: number
+  cacheRead?: number // input tokens pi's provider read from its prompt cache, apart from `input`
+  cacheWrite?: number
   cost?: number
   chunkTokens?: number
 }
@@ -90,6 +92,8 @@ export function addLuna(s: SessionStats, c: LunaCall, at: number) {
   add(s, `${key}.ms`, c.ms, at)
   add(s, `${key}.in`, c.input, at)
   add(s, `${key}.out`, c.output, at)
+  add(s, `${key}.cacheRead`, c.cacheRead, at)
+  add(s, `${key}.cacheWrite`, c.cacheWrite, at)
   add(s, `${key}.cost`, c.cost, at)
   add(s, `${key}.chunkTokens`, c.chunkTokens, at)
 }

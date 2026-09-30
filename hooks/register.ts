@@ -913,7 +913,7 @@ type PiMessage = {
   content?: { type: string; text?: string }[]
   stopReason?: string
   errorMessage?: string
-  usage?: { input?: number; output?: number; cost?: { total?: number } }
+  usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } }
 }
 
 // The last assistant message pi's `--mode json` printed, one event per line.
@@ -982,7 +982,7 @@ async function complete($: EngineInterface, role: string, system: string, prompt
   if (message.stopReason !== 'stop')
     throw await fail(new Error(`pi exited 0, stopReason ${message.stopReason ?? 'none'}: ${truncate(message.errorMessage ?? '', 50)}`))
   const u = message.usage
-  await note({ input: u?.input, output: u?.output, cost: u?.cost?.total })
+  await note({ input: u?.input, output: u?.output, cacheRead: u?.cacheRead, cacheWrite: u?.cacheWrite, cost: u?.cost?.total })
   log(
     $,
     `Luna ${role}: ${u?.input ?? '?'} in, ${u?.output ?? '?'} out, $${(u?.cost?.total ?? 0).toFixed(4)}, ` +
