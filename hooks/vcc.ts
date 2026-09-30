@@ -66,7 +66,8 @@ const sanitize = (text: string) =>
 const oneLine = (text: string) => sanitize(text).replace(/\s+/g, ' ').trim()
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`)
 
-// Rows in call order, each tool call joined to its result; typed prompts kept as markers for where a turn closes.
+// Rows in call order, each tool call joined to its result; every user row that is not a tool result (a typed prompt,
+// or an injected one such as a task notification; not a bare system reminder) kept as a marker for where a turn closes.
 function normalize(rows: readonly SessionMessage[], at: readonly (number | undefined)[], refOf?: RefOf): Block[] {
   const blocks: Block[] = []
   const calls = new Map<string, Extract<Block, { kind: 'tool' }>>()

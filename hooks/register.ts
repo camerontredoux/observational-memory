@@ -10,7 +10,6 @@ import {
   MEMORY_GUIDE_RECALL,
   MEMORY_GUIDE_SOURCES,
   MEMORY_HEADER,
-  MEMORY_MARK,
   MEMORY_RECALL,
   MEMORY_RESUME,
   MEMORY_RESUME_END,
@@ -22,7 +21,7 @@ import {
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
-import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
+import { INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallInput, RecallIo, TranscriptCache } from './recall'
 import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
@@ -161,7 +160,7 @@ type Memory = {
   nextStep?: string // the user's latest request, verbatim
   environment?: string // the working directory and git state at compaction (see environmentOf)
   failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
-  brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran, or with OM_BRIEF=always
+  brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran
   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
   transcript?: string
   recoverable: boolean // the session's transcript is known: om_recall can find what the memory leaves out
@@ -184,9 +183,6 @@ let lock: Promise<unknown> = Promise.resolve()
 const reflecting = new Set<string>()
 // Per loop, the Reflector input that last failed at every attempt: the same input is not sent again.
 const failedInput = new Map<string, string>()
-// OM_BRIEF=always: every compaction's memory message carries the session brief of all the rows it compacted, not
-// only where the floor runs. Off by default: on replayed questions it made no difference while the Observer worked.
-const briefAlways = ($: EngineInterface) => $.env.get('OM_BRIEF').then((v) => v === 'always', () => false)
 const sinceScheduled = new Map<string, { rows: number; tail: string[]; tokens: number }>() // the history the last step saw (its length and newest rows' hashes), and its growth since a pass
 const waiting = new Map<string, { loop: Loop; stamp: string }>() // loops a pass left short of a slot, first in line when one frees
 const backoff = new Map<string, { failures: number; until: number }>() // loops whose last background call failed
@@ -232,18 +228,22 @@ function locked<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 const estimateTokens = (text: string) => Math.ceil(text.length / 4)
+// The regex source that finds a note written with a count of 0 (its first 0), whatever its count: each note's regex
+// is built from the function that writes the note, so the two cannot drift apart.
+const noteSource = (note: string) => note.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('0', '\\d+')
+const truncationNote = (tokens: number) => `\n... [truncated ~${tokens} tokens]`
 const truncate = (text: string, maxTokens: number) =>
-  text.length <= maxTokens * 4 ? text : `${text.slice(0, maxTokens * 4)}\n... [truncated ~${estimateTokens(text) - maxTokens} tokens]`
-const TRUNCATED = /\n\.\.\. \[truncated ~\d+ tokens\]$/
+  text.length <= maxTokens * 4 ? text : `${text.slice(0, maxTokens * 4)}${truncationNote(estimateTokens(text) - maxTokens)}`
+const TRUNCATED = new RegExp(`${noteSource(truncationNote(0))}$`)
 // What truncate leaves of a text given no room: its note alone.
-const isStub = (text: string) => /^\n\.\.\. \[truncated ~\d+ tokens\]$/.test(text)
+const isStub = (text: string) => text.search(TRUNCATED) === 0
 // An oversized command result or brief, bounded at both ends: a final error or test summary, or a brief's reporting
 // and acceptance rules, usually sits at the start or the end, never only in the middle. The omission is marked
 // explicitly, never silently dropped; om_recall can still find the full `what` in the transcript. The tail starts at
 // a line boundary so its first line is whole.
 const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
 // The marker excerpt leaves in a brief it cut (see capUserMessages).
-const BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/
+const BRIEF_CUT = new RegExp(noteSource(omissionMarker(0, 'message')))
 function excerpt(text: string, maxTokens: number, what: 'result' | 'message' | 'input' = 'result') {
   if (text.length <= maxTokens * 4) return text
   const room = maxTokens * 4
@@ -291,7 +291,7 @@ function maskTail(rows: readonly SessionMessage[]) {
     })
     .toReversed()
 }
-const MASKED = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n/
+const MASKED = new RegExp(noteSource(omissionMarker(0, 'result')))
 const isWrapper = (m: SessionMessage) => isPrompt(m) && INJECTED_WRAPPER.test(m.text.trim())
 // An injected wrapper row in the raw tail (a task notification, hook feedback) that a newer one repeats keeps its
 // first line and the lines no newer one has, then names the whole row by its hash for unmask.
@@ -341,7 +341,8 @@ function unmask(rows: readonly SessionMessage[], history: readonly SessionMessag
       return m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m
     })
 }
-const INPUT_MASKED = /\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full input\] \.\.\./
+// Found in a call's input as JSON, where the marker's newlines are escaped: the marker without them.
+const INPUT_MASKED = new RegExp(noteSource(omissionMarker(0, 'input').trim()))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
 // A subagent's lines go to the debug log only: the main chat shows the main conversation's.
@@ -419,10 +420,8 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
   }
   return { offset: best?.offset ?? end, rows: best?.rows ?? [...history], persistent: false }
 }
-// A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it. Every version's
-// header starts with MEMORY_MARK.
-const isMemory = (m: SessionMessage | undefined) =>
-  m?.role === 'user' && (m.text.startsWith(MEMORY_MARK) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`))
+// A memory message of any version, told as recall.ts's `isMemoryText` tells one.
+const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && isMemoryText(m.text)
 const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
 const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
@@ -431,14 +430,11 @@ const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.lengt
 // reminder, a named wrapper, an image note with no text) or skill text. A system reminder a hook appended to a prompt
 // is cut from it. A prompt typed after pasted images keeps their markers, as sent. `SessionMessage` carries no origin field (no host metadata
 // for a user prompt's source reaches this hook, unlike `prompt.submit`'s or `session.receive`'s own `origin`), so a
-// genuine structured prompt is told from an injected one by name, using recall.ts's `INJECTED_WRAPPER` and
-// `IMAGE_MARKERS` so the two modules agree on what counts as typed.
+// genuine structured prompt is told from an injected one by name, by recall.ts's `typedText`, so the two modules
+// agree on what counts as typed.
 function typed(m: SessionMessage, skills: readonly Skill[]) {
-  if (!isPrompt(m) || isMemory(m) || isSummary(m)) return undefined
-  const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-  const said = text.replace(IMAGE_MARKERS, '')
-  if (!said || INJECTED_WRAPPER.test(said)) return undefined
-  return skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
+  const text = isPrompt(m) && !isMemory(m) && !isSummary(m) ? typedText(m.text) : undefined
+  return text === undefined || skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
 }
 
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -2200,13 +2196,12 @@ export const register: Register = (on) => {
     }
     const main = e.agentId === undefined
     const installs = e.trigger !== 'precompute'
-    const [sessionId, started, usage, recall, always, environment] = await Promise.all([
+    const [sessionId, started, usage, recall, environment] = await Promise.all([
       $.session.id(),
       $.clock.now(),
       $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
       // Not the model's with --disallowed-tools, or when its registration failed; assumed so when the host cannot tell.
       $.tool.list().then((tools) => tools.some((t) => t.name === RECALL_TOOL_NAME), () => true),
-      briefAlways($),
       environmentOf($),
     ])
     const loop = loopOf(sessionId, e.agentId)
@@ -2365,9 +2360,9 @@ export const register: Register = (on) => {
       const attempt = async (cut: number, floor: boolean) => {
         const tail = messages.slice(cut)
         // The brief carried from the memory message, with the rows leaving context merged in: those the floor
-        // compiles, or with OM_BRIEF=always every one. A brief is carried even where the Observer's memory stands again:
-        // it holds rows the Observer never observed, which no observation covers.
-        const from = always ? base : floor ? observed : cut
+        // compiles. A brief is carried even where the Observer's memory stands again: it holds rows the Observer never
+        // observed, which no observation covers.
+        const from = floor ? observed : cut
         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
         dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
         const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))

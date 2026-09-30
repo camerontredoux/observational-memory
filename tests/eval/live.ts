@@ -48,11 +48,6 @@ export type PlanInput = {
   settleMs: number
   /** How long `herdr agent start` waits for Claude Code to be ready. */
   startTimeoutMs: number
-  /**
-   * `always`: the session runs with OM_BRIEF=always, so every observational compaction's memory also carries the
-   * code-compiled session brief (hooks/register.ts). Off unless given; only under a version label of its own.
-   */
-  brief?: 'always'
 }
 
 export type PlanStep =
@@ -62,7 +57,7 @@ export type PlanStep =
   | { kind: 'grow'; argv: string[]; purpose: string; prompt: string; max: number; settleMs: number }
 
 /** The session's `--settings` file. */
-export type Settings = { env: { CLAUDE_CODE_PLUGIN_DIRS: string; OM_STATS_DIR: string; OM_BRIEF?: 'always' }; permissions: { allow: string[] } }
+export type Settings = { env: { CLAUDE_CODE_PLUGIN_DIRS: string; OM_STATS_DIR: string }; permissions: { allow: string[] } }
 
 export type Plan = {
   input: PlanInput
@@ -95,9 +90,6 @@ export function runIdOf(config: Configuration, version: string, scenario: string
 export function planRun(input: PlanInput): Plan {
   const { config, scenario: s, pluginRoot } = input
   const runId = runIdOf(config, input.version, s.id, input.run)
-  if (input.brief && (input.version === 'old' || input.version === 'new'))
-    throw new Error(`--brief ${input.brief}: give the variant a version label of its own (such as new-brief), so its runs never mix with ${input.version}'s`)
-  if (input.brief && !usesObservationalCompaction(config)) throw new Error(`--brief ${input.brief}: ${config} has no observational compaction to carry the brief`)
   const runDir = `${input.benchRoot.replace(/\/$/, '')}/${runId}`
   const projectDir = `${runDir}/project`
   const settingsPath = `${runDir}/settings.json`
@@ -105,7 +97,7 @@ export function planRun(input: PlanInput): Plan {
   const recallDir = `${runDir}/recall-plugin`
   const expectedPlugin = config === 'builtin' ? undefined : config === 'builtin+recall' ? recallDir : pluginRoot.replace(/\/$/, '')
   const settings: Settings = {
-    env: { CLAUDE_CODE_PLUGIN_DIRS: expectedPlugin ?? '', OM_STATS_DIR: statsDir, ...(input.brief ? { OM_BRIEF: input.brief } : {}) },
+    env: { CLAUDE_CODE_PLUGIN_DIRS: expectedPlugin ?? '', OM_STATS_DIR: statsDir },
     permissions: { allow: ['Read', 'Glob', 'Grep', 'Write', 'Edit', ...s.commands.map((c) => `Bash(${c})`), ...(recallAvailable(config) ? [RECALL_TOOL] : [])] },
   }
   const claudeArgs = [
@@ -176,7 +168,7 @@ export function describePlan(plan: Plan): string {
       ? 'no observational-memory plugin (built-in compaction)'
       : input.config === 'builtin+recall'
         ? `observational-memory from ${plan.expectedPlugin}: the recall-only eval plugin (om_recall alone, built-in compaction), with the recall of ${input.pluginRoot}`
-        : `observational-memory from ${plan.expectedPlugin} (observational compaction${input.brief ? `, with OM_BRIEF=${input.brief}: every memory message carries the session brief` : ''})`
+        : `observational-memory from ${plan.expectedPlugin} (observational compaction)`
   const out = [
     `Run ${plan.runId}: configuration ${input.config}, plugin version ${input.version}, scenario ${input.scenario.id}, session ${input.sessionId}`,
     `Sandbox: ${plan.runDir}`,

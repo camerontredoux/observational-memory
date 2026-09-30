@@ -85,21 +85,6 @@ describe('the live run plan', () => {
     for (const i of compacts) expect(plan.steps[i - 1]).toEqual({ kind: 'settle', ms: 30_000, purpose: expect.any(String) })
   })
 
-  test('OM_BRIEF=always reaches the session only as its own labelled variant of an observational configuration', () => {
-    // Off by default: no configuration's settings carry the switch.
-    for (const config of CONFIGURATIONS) expect('OM_BRIEF' in planRun(input(config)).settings.env).toBe(false)
-    const plan = planRun(input('om+recall', { version: 'new-brief', brief: 'always' }))
-    expect(plan.settings.env.OM_BRIEF).toBe('always')
-    expect(plan.runId).toBe('repeated-compaction.om-recall.new-brief.r2')
-    expect(plan.files[plan.settingsPath]).toContain('"OM_BRIEF": "always"')
-    expect(describePlan(plan)).toContain('OM_BRIEF=always')
-    // Its results never mix with old or new: the switch needs a label of its own.
-    expect(() => planRun(input('om', { brief: 'always' }))).toThrow(/label/)
-    expect(() => planRun(input('om', { version: 'old', brief: 'always' }))).toThrow(/label/)
-    // Built-in compaction has no memory message for the brief to go in.
-    expect(() => planRun(input('builtin+recall', { version: 'new-brief', brief: 'always' }))).toThrow(/observational/)
-  })
-
   test('the dry run shows every command, every prompt and what the session should have loaded', () => {
     const plan = planRun(input('om'))
     const text = describePlan(plan)
