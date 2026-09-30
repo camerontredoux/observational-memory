@@ -1620,9 +1620,11 @@ function schedule($: EngineInterface, loop: Loop, stamp: string) {
     const held = backoff.get(loop.key)
     if (held && (await $.clock.now()) < held.until) return
     const v = await liveView($, loop)
-    const ledger = await loadLedger($, loop.key, v)
+    const stored = (await $.store.get(ledgerKey(loop.key))) as Ledger | undefined
+    const ledger = reconcile($, stored, v)
     if (!isLive(loop, stamp)) return
-    await $.store.set(ledgerKey(loop.key), ledger)
+    // Written only when reconciling changed it: each write rewrites the whole store.
+    if (JSON.stringify(ledger) !== JSON.stringify(stored)) await $.store.set(ledgerKey(loop.key), ledger)
     if (!isLive(loop, stamp)) return
     const mine = running.filter((j) => j.loop.key === loop.key && j.stamp === stamp) // an ended life's calls observe nothing
     const covered: Range[] = [ledger.watermark, ...ledger.chunks, ...mine.flatMap((j) => locate(v, j.range, ledger.watermark.to) ?? [])]
@@ -1958,9 +1960,15 @@ function noteRecall($: EngineInterface, sessionId: string, result: string, fromF
   return result
 }
 
-async function noteTranscript($: EngineInterface, e: { session_id: string; transcript_path: string }) {
-  if (!e.transcript_path) return
-  await $.store.set(transcriptKey(e.session_id), e.transcript_path).catch((error) => log($, `could not record the transcript path (${errorText(error)})`))
+// The transcript path this process last recorded per session: a turn's end records it again only when it changed.
+const notedTranscripts = new Map<string, string>()
+
+async function noteTranscript($: EngineInterface, e: { session_id: string; transcript_path: string }, ifChanged = false) {
+  if (!e.transcript_path || (ifChanged && notedTranscripts.get(e.session_id) === e.transcript_path)) return
+  await $.store.set(transcriptKey(e.session_id), e.transcript_path).then(
+    () => void notedTranscripts.set(e.session_id, e.transcript_path),
+    (error) => log($, `could not record the transcript path (${errorText(error)})`),
+  )
 }
 
 // What a row is, by shape alone, for the mismatch counts.
@@ -2412,7 +2420,7 @@ export const register: Register = (on) => {
     await noteTranscript($, e)
     return next(e)
   })
-  on('classic.Stop', async ($, e, next) => (await noteTranscript($, e), next(e)))
+  on('classic.Stop', async ($, e, next) => (await noteTranscript($, e, true), next(e)))
 
   // Subagents raise no turn.start, so each is the main conversation's prompt.
   on('turn.start', async ($, e, next) => {
