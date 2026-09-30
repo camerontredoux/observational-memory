@@ -9,7 +9,9 @@ import { brief } from './stats'
 const PRUNE_AFTER_DAYS = 30
 const DAY = 24 * 60 * 60 * 1000
 const STORE_CAP = 4 * 1024 * 1024
-const KINDS = ['ledger', 'times', 'live', 'skills', 'turns', 'transcript', 'seen', 'goal']
+// Every kind of session key: register.ts builds its keys with `key`, so a kind it stores is one this prunes.
+export const KINDS = ['ledger', 'times', 'live', 'skills', 'turns', 'transcript', 'seen', 'goal'] as const
+export const key = (kind: (typeof KINDS)[number], id: string) => `${kind}:${id}`
 const LAST_RUN = 'prune:last' // outside KINDS: shared by every process, never pruned
 // The engine's refusal of a write that would take the whole file over its cap.
 const CAP_ERROR = /the store would be \d+ characters, over the \d+ limit/
@@ -19,10 +21,10 @@ type Session = { id: string; keys: string[]; at?: number; bytes: number }
 // The session a key belongs to, or none: a subagent's keys, `<kind>:<session>/<agent>`, go with its session.
 function sessionOf(key: string) {
   const at = key.indexOf(':')
-  return at < 1 || !KINDS.includes(key.slice(0, at)) ? undefined : { kind: key.slice(0, at), id: key.slice(at + 1).split('/')[0]! }
+  return at < 1 || !(KINDS as readonly string[]).includes(key.slice(0, at)) ? undefined : { kind: key.slice(0, at), id: key.slice(at + 1).split('/')[0]! }
 }
 
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+export const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 const size = (value: unknown) => JSON.stringify(value)?.length ?? 0
 const valid = (t: unknown) => (typeof t === 'number' && Number.isFinite(t) && t > 0 ? [t] : [])
 // A session's last activity from its `times:` or `seen:` value; a malformed mark counts for nothing.
@@ -111,7 +113,7 @@ async function prune($: EngineInterface, current: string) {
   const now = await $.clock.now()
   const old = (at: number | undefined) => at !== undefined && now - at > PRUNE_AFTER_DAYS * DAY
   const all = (await sessions($, false)).filter((s) => s.id !== current)
-  for (const s of all.filter((s) => s.at === undefined)) await $.store.set(`seen:${s.id}`, now)
+  for (const s of all.filter((s) => s.at === undefined)) await $.store.set(key('seen', s.id), now)
   const candidates = all.filter((s) => old(s.at))
   if (!candidates.length) return
   const live = await liveSessions($)
