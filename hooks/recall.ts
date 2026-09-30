@@ -72,22 +72,25 @@ type Block = {
 type Thread = { tag: string; label: string; blocks: Block[]; path?: string; loaded: boolean }
 type Corpus = { main: Thread; files: string[]; subagents: Thread[]; live: boolean; note?: string; load: (t: Thread) => Promise<void>; now: () => Promise<number> }
 
-// A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it.
-const isMemoryText = (text: string) => text.startsWith(MEMORY_MARK) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`)
+// A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it. Shared with
+// register.ts's `isMemory`.
+export const isMemoryText = (text: string) => text.startsWith(MEMORY_MARK) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`)
 // Known wrappers the host or another session delivers into context, not any text that merely starts with a tag (a
-// real user message may itself start with one). Shared with register.ts's `typed`, so a row counts as a genuine
-// prompt or an injected one the same way in compaction and in recall. Add a name here only once it is confirmed
-// injected (a tag the installed host itself emits to wrap content that is not a prompt addressed to the assistant,
-// whoever authored it: `<user-memory-input>` wraps the user's own `#` memory note, not a request to act on).
+// real user message may itself start with one). Read by `typedText`, which register.ts's `typed` shares, so a row
+// counts as a genuine prompt or an injected one the same way in compaction and in recall. Add a name here only once
+// it is confirmed injected (a tag the installed host itself emits to wrap content that is not a prompt addressed to
+// the assistant, whoever authored it: `<user-memory-input>` wraps the user's own `#` memory note, not a request to
+// act on).
 // `mcp-resource-update` and `mcp-polling-update` carry attributes (`server=`, `uri=`, ...) before their closing
 // `>`, so the tag alone is optionally followed by an attribute list, for every name here.
 export const INJECTED_WRAPPER =
   /^<(?:task-notification|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args|fork-boilerplate|bash-stdout|bash-input|bash-stderr|cross-session-message|teammate-message|user-memory-input|mcp-resource-update|mcp-polling-update|channel)(?:\s[^>]*)?>/
 // The markers the host puts before a prompt for the images pasted into it (`[Image #10]`), or alone in an image note
-// (`[Image: source: /tmp/….png]`). Shared with register.ts's `typed`.
-export const IMAGE_MARKERS = /^(?:\s*\[Image(?: #\d+|: [^\]\n]*)\])+\s*/
+// (`[Image: source: /tmp/….png]`).
+const IMAGE_MARKERS = /^(?:\s*\[Image(?: #\d+|: [^\]\n]*)\])+\s*/
 // What the user typed: not an injected block (a system reminder, a named wrapper, an image note with no text).
-function typedText(text: string) {
+// Shared with register.ts's `typed`.
+export function typedText(text: string) {
   const t = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
   const said = t.replace(IMAGE_MARKERS, '')
   return !said || INJECTED_WRAPPER.test(said) ? undefined : t

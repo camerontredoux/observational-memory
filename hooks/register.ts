@@ -9,7 +9,6 @@ import {
   MEMORY_GUIDE,
   MEMORY_GUIDE_RECALL,
   MEMORY_HEADER,
-  MEMORY_MARK,
   MEMORY_RECALL,
   MEMORY_RESUME,
   MEMORY_RESUME_END,
@@ -21,7 +20,7 @@ import {
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
-import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
+import { INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallInput, RecallIo } from './recall'
 import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
@@ -406,10 +405,8 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
   }
   return { offset: best?.offset ?? end, rows: best?.rows ?? [...history], persistent: false }
 }
-// A v0.4.1 memory message starts with the header; later ones with the built-in wrapper before it. Every version's
-// header starts with MEMORY_MARK.
-const isMemory = (m: SessionMessage | undefined) =>
-  m?.role === 'user' && (m.text.startsWith(MEMORY_MARK) || m.text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`))
+// A memory message of any version, told as recall.ts's `isMemoryText` tells one.
+const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && isMemoryText(m.text)
 const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
 const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
@@ -418,14 +415,11 @@ const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.lengt
 // reminder, a named wrapper, an image note with no text) or skill text. A system reminder a hook appended to a prompt
 // is cut from it. A prompt typed after pasted images keeps their markers, as sent. `SessionMessage` carries no origin field (no host metadata
 // for a user prompt's source reaches this hook, unlike `prompt.submit`'s or `session.receive`'s own `origin`), so a
-// genuine structured prompt is told from an injected one by name, using recall.ts's `INJECTED_WRAPPER` and
-// `IMAGE_MARKERS` so the two modules agree on what counts as typed.
+// genuine structured prompt is told from an injected one by name, by recall.ts's `typedText`, so the two modules
+// agree on what counts as typed.
 function typed(m: SessionMessage, skills: readonly Skill[]) {
-  if (!isPrompt(m) || isMemory(m) || isSummary(m)) return undefined
-  const text = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-  const said = text.replace(IMAGE_MARKERS, '')
-  if (!said || INJECTED_WRAPPER.test(said)) return undefined
-  return skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
+  const text = isPrompt(m) && !isMemory(m) && !isSummary(m) ? typedText(m.text) : undefined
+  return text === undefined || skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
 }
 
 const pad = (n: number) => String(n).padStart(2, '0')
