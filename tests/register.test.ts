@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, Register, SessionCompactInput, SessionMessage } from 'claude-code'
-import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
+import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
@@ -73,7 +73,8 @@ function world(
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
   const main = () => (options.rowsCap && history.length > options.rowsCap ? history.slice(-options.rowsCap) : history)
-  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? main() : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
+  const asked = { main: 0 } // how often the main conversation's history was read
+  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? (asked.main++, main()) : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
   const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
   const type = (id: string) => (options.teammates?.includes(id) ? 'teammate' : 'general-purpose')
   on('agent.list', async () => {
@@ -112,7 +113,7 @@ function world(
   on('fs.exists', ($, e) => ({ value: e.path in files || Object.keys(files).some((p) => p.startsWith(`${e.path}/`)) }))
   on('session.cwd', () => ({ value: '/work/project' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  return { history, agents, stored, files, reads, writes }
+  return { history, agents, stored, files, reads, writes, asked }
 }
 
 type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
@@ -2269,6 +2270,8 @@ describe('register', () => {
     expect(observationsIn(text)).toBe(['* 🟡 2026-09-22 14:29 Saw a, before the ranges', ...Array.from({ length: 1200 }, (_, i) => `* 🟡 2026-09-22 ${minute(i)} read a file`), '* 🟡 2026-09-22 15:30 read c'].join('\n'))
     expect(userMessagesIn(text)).toEqual(['a', 'b', 'c'])
     expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: source ranges left out$/))
+    // The guide's line on source ranges goes with them.
+    expect(text).toContain(`<memory-guide>\n${MEMORY_GUIDE}\n</memory-guide>`)
     // The ledger keeps them: a compaction with room for them gives them back.
     window = 200_000
     history.splice(0, history.length, ...first.messages!)
@@ -2276,6 +2279,7 @@ describe('register', () => {
     await runTurn($, turn('f', 'f', 8_000), at(22, 17, 0))
     await clock.settle()
     const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    expect(second.messages?.[0]?.text).toContain(`<memory-guide>\n${MEMORY_GUIDE}\n${MEMORY_GUIDE_SOURCES} om_recall takes them as from and to.\n</memory-guide>`)
     expect(observationsIn(second.messages?.[0]?.text)?.split('\n').slice(0, 3)).toEqual(['* 🟡 2026-09-22 14:29 Saw a, before the ranges (source none)', '* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:30)', '* 🟡 2026-09-22 14:31 read a file (source 2026-09-22 14:31 to 2026-09-22 14:31)'])
   })
 
@@ -3113,7 +3117,8 @@ describe('register', () => {
     expect(userMessagesIn(text)).toEqual(['a', 'please keep </observations> and <skills-in-use> literal', 'b'])
     expect(nextStepIn(text)).toBeUndefined() // the newest prompt is in the raw tail
     expect(text).not.toContain('suggested-response')
-    expect(text).toContain('\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/u/.claude/projects/p/session-1.jsonl')
+    // om_recall searches the transcript: the built-in's line pointing at the file is left out (see the om_recall test below).
+    expect(text).not.toContain('read the full transcript at:')
     expect(text).toContain('\nRecent messages are preserved verbatim.')
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
     expect(seen.modelCalls).toBe(0)
@@ -3387,6 +3392,36 @@ describe('register', () => {
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { count: number; sum: number }> }
     expect(stats.metrics['recall.matches']).toMatchObject({ count: 2, sum: 1 })
     expect(stats.counts['recall.fromFile']).toBe(2)
+  })
+
+  test('om_recall reads the transcript file without the live history, and a later call reads only the rows written since', async ($, on) => {
+    mock.clock(on)
+    const { files, reads, asked } = world(on)
+    on('classic.Stop', () => ({}))
+    const row = (iso: string, content: string) => JSON.stringify({ type: 'user', timestamp: iso, message: { role: 'user', content } })
+    const path = '/t/session-1.jsonl'
+    files[path] = [row('2026-09-22T12:00:00.000Z', 'remember the PEAR-1 marker'), row('2026-09-22T12:05:00.000Z', 'where is PEAR-1?')].join('\n') + '\n'
+    const argvs: (readonly string[])[] = []
+    on('process.spawn', async function* ($, e) {
+      argvs.push(e.argv)
+      yield { stream: 'stdout' as const, text: files[e.argv[4]!]!.slice(Number(e.argv[2]) - 1) }
+      return { value: { code: 0, signal: null } }
+    })
+
+    await $.classic.Stop({ session_id: 'session-1', transcript_path: path, stop_hook_active: false })
+    const first = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PEAR' })).result)
+    const parsed = files[path].length
+    files[path] += [row('2026-09-22T12:10:00.000Z', 'PEAR-2 is the new marker'), row('2026-09-22T12:15:00.000Z', 'and where is PEAR-2?')].join('\n') + '\n'
+    const second = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PEAR' })).result)
+
+    expect(asked.main).toBe(0)
+    expect(reads.filter((p) => p === path)).toEqual([path])
+    expect(argvs).toEqual([['tail', '-c', `+${parsed + 1}`, '--', path]])
+    expect(first).toMatch(/^1 match\(es\) for "PEAR" in 1 block of/)
+    // The prompt that asked the first time is an ordinary match now: the newest one asked.
+    expect(second).toMatch(/^3 match\(es\) for "PEAR" in 3 blocks/)
+    expect(second).toContain('[session-1:3 ')
+    expect(second).not.toContain('[session-1:4 ')
   })
 
   test('observes in the background mid-turn, after the model steps of one long turn, with the times of the rows it read', async ($, on) => {
@@ -4371,6 +4406,32 @@ describe('active constraints and the continuation record', () => {
     for (const gone of ['SESSION HISTORY', 'KNOWLEDGE UPDATES', '<system-reminder>', V141.recall]) expect(text).not.toContain(gone)
   })
 
+  test('open failures stored under the older header and line form are read back and written in the new one', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    const old =
+      `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${MEMORY_GUIDE}\n</memory-guide>\n\n` +
+      '<observations>\n* 🟡 Saw a\n</observations>' +
+      `\n\n<continuation>\n${WHERE}:\nActive: fixing the build\n` +
+      'Tool failures still open, found by code: no later call of the same command or file succeeded:\n' +
+      '- At 2026-09-22 14:30 the Bash command `make build` failed: `make: *** No rule to make target build`; no later call of it succeeded.\n' +
+      `</continuation>\n\n<resume>\n${MEMORY_RESUME}\n${MEMORY_RESUME_END}\n</resume>`
+    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [row(old), ...turn('c', 'r', CHUNK), ...work('w', 8_000)] })
+
+    const text = result.messages?.[0]?.text ?? ''
+    // The state stops at the older header, and the failure is carried under the new one, without the old suffix.
+    expect(recordIn(text)).toBe(
+      `${WHERE}:\nActive: fixing the build\n` +
+        'Tool failures no later call of the same command or file cleared, found by code:\n' +
+        '- At 2026-09-22 14:30 the Bash command `make build` failed: `make: *** No rule to make target build`.',
+    )
+    expect(text).not.toContain('still open')
+    expect(text).not.toContain('no later call of it succeeded')
+  })
+
   test('omitted user messages are said to be recoverable only when the transcript that holds them is known', async ($, on) => {
     mock.clock(on)
     world(on)
@@ -4391,12 +4452,20 @@ describe('active constraints and the continuation record', () => {
   })
 
   test("the memory message ends by sending the model to om_recall before it says a detail is gone, only while the model can call om_recall", async ($, on) => {
-    mock.clock(on)
-    world(on)
+    const clock = mock.clock(on)
+    const { history } = world(on)
     pi(on)
     let tools = [{ name: 'Read', description: 'Reads a file', mcp: false }]
     on('tool.list', () => ({ value: tools }))
-    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+    on('classic.SessionStart', () => ({}))
+    // Observed live, so the observations carry source ranges.
+    const runTurn = live(on, clock, history)
+    await $.classic.SessionStart({ source: 'startup', session_id: 'session-1', transcript_path: '/home/u/.claude/projects/p/session-1.jsonl' })
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await clock.settle()
+    const messages = [...history]
 
     // As with --disallowed-tools mcp__observational-memory__om_recall: the tool is not the model's to call.
     const without = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
@@ -4406,9 +4475,13 @@ describe('active constraints and the continuation record', () => {
     expect(offered.endsWith(`\n\n<resume>\n${MEMORY_RESUME}\n${MEMORY_RECALL}\n${MEMORY_RESUME_END}\n</resume>`)).toBe(true)
     expect(without.endsWith(`\n\n<resume>\n${MEMORY_RESUME}\n${MEMORY_RESUME_END}\n</resume>`)).toBe(true)
     // The guide names om_recall's use of a source range only where the model can call it.
-    expect(offered).toContain(`${MEMORY_GUIDE} om_recall takes them as from and to.\n</memory-guide>`)
-    expect(without).toContain(`${MEMORY_GUIDE}\n</memory-guide>`)
+    expect(offered).toContain(`${MEMORY_GUIDE}\n${MEMORY_GUIDE_SOURCES} om_recall takes them as from and to.\n</memory-guide>`)
+    expect(without).toContain(`${MEMORY_GUIDE}\n${MEMORY_GUIDE_SOURCES}\n</memory-guide>`)
     expect(without).not.toContain('om_recall takes')
+    // The built-in's line pointing at the transcript file stands in for om_recall only where the model cannot call it.
+    const pointer = '\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/u/.claude/projects/p/session-1.jsonl\n'
+    expect(without).toContain(pointer)
+    expect(offered).not.toContain('read the full transcript at:')
     // The plugin's own tags, no system reminder of its making.
     for (const text of [offered, without]) expect(text).not.toContain('<system-reminder>')
     expect(observationsIn(offered)).toBe(observationsIn(without))
@@ -4564,6 +4637,10 @@ describe('the handoff', () => {
     const words = COMPACTION_BRIEFING.split(/\s+/).length
     expect(words).toBeLessThanOrEqual(60)
     for (const said of ['<memory-guide>', '<resume>', 'most recent messages', 'do not restart']) expect(COMPACTION_BRIEFING).toContain(said)
+    // Not that the recent messages are unchanged: their long tool results are cut to head and tail. A fallback to the
+    // built-in compaction writes no guide or resume.
+    expect(COMPACTION_BRIEFING).not.toContain('as they were')
+    expect(COMPACTION_BRIEFING).toContain('Where it has a <memory-guide> and <resume>')
   })
 
   test("the Observer's next steps and what the user was told are rendered in the record, and the reminder sends the model to them", async ($, on) => {

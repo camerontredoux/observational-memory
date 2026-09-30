@@ -37,6 +37,9 @@ export type RecallIo = {
   // The name, among `names` in `dir`, of the file that says the session `id` continued it.
   continuing: (dir: string, names: readonly string[], id: string) => Promise<string | undefined>
   now: () => Promise<number> // milliseconds since the epoch
+  // For a TranscriptCache: a file's size in bytes and its mtime, and its text from a byte offset on.
+  stat?: (path: string) => Promise<{ size: number; mtime: number }>
+  readFrom?: (path: string, offset: number) => Promise<string>
 }
 export type RecallInput = {
   query?: unknown
@@ -204,20 +207,27 @@ function addParts(ref: string, parts: readonly Part[], seen: Seen, out: Block[])
   })
 }
 
+// Where the parse of a file stands, for parsing on from there: the line it is on, whether that line's row was parsed
+// before its newline was written, and whether the rows after a compaction boundary are still copies.
+type At = { line: number; open: boolean; copying: boolean }
+
 // One transcript file's user and assistant rows as blocks. A row a newer file copied from an older one (the same
-// uuid) is read once, from the older file; so are the messages a compaction writes again after its boundary.
-function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean) {
+// uuid) is read once, from the older file; so are the messages a compaction writes again after its boundary. `used`
+// is how much of `text` was parsed for good: through its last newline, and a last row already whole.
+function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean, from: At = { line: 0, open: false, copying: false }) {
   const blocks: Block[] = []
   let continuedIn: string | undefined
-  let copying = false
+  let copying = from.copying
+  let last = false
   const lines = text.split('\n')
-  for (let n = 0; n < lines.length; n++) {
+  for (let n = from.open ? 1 : 0; n < lines.length; n++) {
     let r: Row
     try {
       r = JSON.parse(lines[n]!) as Row
     } catch {
       continue // a line still being written
     }
+    if (n === lines.length - 1) last = true
     if (r.type === 'continued-in' && r.continuedInSessionId) continuedIn = r.continuedInSessionId
     if (r.type === 'system' && r.subtype === 'compact_boundary') {
       copying = true
@@ -253,15 +263,18 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean) {
       else if (p.type.endsWith('tool_result'))
         made.push({ b: { ...base, kind: 'result', text: resultText(p.content), ...(p.is_error ? { error: true } : {}) }, resultOf: p.tool_use_id })
     }
-    addParts(`${tag}:${n + 1}`, made, seen, blocks)
+    addParts(`${tag}:${from.line + n + 1}`, made, seen, blocks)
   }
-  return { blocks, continuedIn }
+  const cut = text.lastIndexOf('\n') + 1
+  const at: At = { line: from.line + lines.length - 1, open: last || (from.open && cut === 0), copying }
+  return { blocks, continuedIn, used: last ? text.length : cut, at }
 }
 
 // The newest prompt is the one that asked: search never answers with it, whole, at message scope (every part of its
 // row, not only the part that decided it was the asking one, so a structured prompt's other text parts are excluded
-// too).
+// too). A cached parse's mark from an earlier call goes first.
 function markAsking(blocks: readonly Block[]) {
+  for (const b of blocks) if (b.asking) delete b.asking
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i]!
     if (b.kind !== 'user' || b.meta || typedText(b.text) === undefined) continue
@@ -310,42 +323,84 @@ async function chainOf(io: RecallIo, path: string) {
   return { dir, names, files, truncated, unreadableLink, discoveryFailed }
 }
 
+// What om_recall keeps between its calls (loadTranscript's `cache`): the chain's files as parsed so far, and the
+// blocks and state they share. Rows are only ever appended, and a file continued in another no longer grows: each
+// file but the newest is taken as parsed while its size and mtime hold, and the newest is parsed on from the byte
+// its last whole row ended at, as it has grown by this very call's row.
+type Parsed = At & { path: string; size: number; mtime: number; offset: number; continuedIn?: string }
+export type TranscriptCache = { parsed?: { files: Parsed[]; seen: Seen; blocks: Block[] } }
+const utf8Bytes = (text: string) => new TextEncoder().encode(text).length
+
+// Whether the cached parse still stands: the chain starts with its files, those it found after them still listed,
+// each file but its newest unchanged and the newest no shorter than what was parsed of it.
+async function reusable(io: RecallIo, cached: NonNullable<TranscriptCache['parsed']>, files: readonly string[], names: readonly string[]) {
+  const listed = (p: Parsed, k: number) => (k < files.length ? p.path === files[k] : names.includes(p.path.slice(p.path.lastIndexOf('/') + 1)))
+  if (!cached.files.every(listed)) return false
+  const now = await Promise.all(cached.files.map((p) => io.stat!(p.path).catch(() => undefined)))
+  const newest = cached.files.length - 1
+  return cached.files.every((p, k) => {
+    const s = now[k]
+    return !!s && (k < newest ? s.size === p.size && s.mtime === p.mtime : s.size >= Math.max(p.size, p.offset))
+  })
+}
+
 // The session's whole transcript from its newest file: the files before it, and after it when it was continued.
-export async function loadTranscript(io: RecallIo, path: string, options: { asking?: boolean } = {}): Promise<Corpus> {
+export async function loadTranscript(io: RecallIo, path: string, options: { asking?: boolean; cache?: TranscriptCache } = {}): Promise<Corpus> {
+  // Taken while this call parses on from it: a call beside this one parses afresh rather than into the same state.
+  const cache = io.stat && io.readFrom ? options.cache : undefined
+  const cached = cache?.parsed
+  if (cache) delete cache.parsed
   const { dir, names, files, truncated: backTruncated, unreadableLink: backLinkUnreadable, discoveryFailed } = await chainOf(io, path)
   const pathIndex = files.indexOf(path) // stable: only files after it are ever appended below
-  const seen = newSeen()
-  const blocks: Block[] = []
+  const kept = cached && (await reusable(io, cached, files, names)) ? cached : undefined
+  const seen = kept?.seen ?? newSeen()
+  const blocks: Block[] = kept?.blocks ?? []
+  const record: Parsed[] = []
+  let cacheable = !!cache
   const unread = new Set<number>()
   let forwardTruncated = false
   let forwardUnreadable = false
   let backContentUnreadable = false
   for (let i = 0; i < files.length; i++) {
     const tag = tagFor(stem(files[i]!))
-    let text: string
-    try {
-      text = await io.read(files[i]!)
-    } catch (error) {
-      if (files[i] === path) throw error // the file the caller asked for: let it fall back to the live history, as before
-      if (i < pathIndex) {
-        // an older predecessor, not the requested file or anything after it: note the gap and keep reading forward
-        backContentUnreadable = true
-        unread.add(i)
-        continue
+    const prior = kept?.files[i]
+    let continuedIn = prior?.continuedIn
+    if (prior && i < kept!.files.length - 1) record.push(prior) // parsed before, and unchanged since
+    else {
+      const stat = cache && (await io.stat!(files[i]!).catch(() => undefined))
+      if (!stat) cacheable = false
+      let text: string
+      try {
+        text = prior ? await io.readFrom!(files[i]!, prior.offset) : await io.read(files[i]!)
+      } catch (error) {
+        if (files[i] === path) throw error // the file the caller asked for: let it fall back to the live history, as before
+        cacheable = false
+        if (i < pathIndex) {
+          // an older predecessor, not the requested file or anything after it: note the gap and keep reading forward
+          backContentUnreadable = true
+          unread.add(i)
+          continue
+        }
+        files.length = i // only the files actually read are counted
+        forwardUnreadable = true
+        break
       }
-      files.length = i // only the files actually read are counted
-      forwardUnreadable = true
-      break
+      const parsed = parseFile(tag, text, seen, false, prior)
+      blocks.push(...parsed.blocks)
+      continuedIn = parsed.continuedIn ?? continuedIn
+      if (stat) {
+        const offset = (prior?.offset ?? 0) + utf8Bytes(text.slice(0, parsed.used))
+        record.push({ ...parsed.at, path: files[i]!, size: stat.size, mtime: stat.mtime, offset, ...(continuedIn ? { continuedIn } : {}) })
+      }
     }
-    const parsed = parseFile(tag, text, seen, false)
-    blocks.push(...parsed.blocks)
-    const next = parsed.continuedIn && `${parsed.continuedIn}.jsonl`
+    const next = continuedIn && `${continuedIn}.jsonl`
     if (i === files.length - 1 && next && names.includes(next) && !files.includes(`${dir}/${next}`)) {
       if (files.length < CHAIN_MAX_FILES) files.push(`${dir}/${next}`)
       else forwardTruncated = true
     }
   }
   if (unread.size) files.splice(0, files.length, ...files.filter((_, i) => !unread.has(i)))
+  if (cache && cacheable) cache.parsed = { files: record, seen, blocks }
   if (options.asking) markAsking(blocks)
   // Each file's subagents: `<id>/subagents/agent-<agent id>.jsonl`, with a `.meta.json` naming the call that started it.
   const subagents: Thread[] = []
@@ -370,7 +425,8 @@ export async function loadTranscript(io: RecallIo, path: string, options: { aski
     (backLinkUnreadable || backContentUnreadable || forwardUnreadable) && `a chain file could not be read, leaving a gap in coverage`,
   ].filter((s): s is string => !!s)
   return {
-    main: { tag: 'main', label: 'session', blocks, loaded: true },
+    // A copy of the cached blocks, which the next call appends to.
+    main: { tag: 'main', label: 'session', blocks: cache ? [...blocks] : blocks, loaded: true },
     files: files.map((f) => tagFor(stem(f))),
     subagents,
     live: false,

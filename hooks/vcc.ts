@@ -829,10 +829,11 @@ export function openFailures(prev: readonly OpenFailure[], rows: readonly Sessio
 export function renderFailure(f: OpenFailure) {
   const when = f.at === undefined ? 'At an unknown time' : `At ${day(f.at)} ${hhmm(f.at)}`
   const what = f.tool === 'Bash' ? `the Bash command \`${tick(f.target)}\`` : f.target ? `the ${f.tool} call on \`${tick(f.target)}\`` : `a ${f.tool} call`
-  return `- ${when} ${what} ${f.policy ? 'was blocked' : 'failed'}: \`${tick(f.error)}\`; no later call of it succeeded.`
+  return `- ${when} ${what} ${f.policy ? 'was blocked' : 'failed'}: \`${tick(f.error)}\`.`
 }
+// Also the older form, ending "; no later call of it succeeded.", which a stored memory message may hold.
 const FAILURE_LINE =
-  /^- At (?:an unknown time|(\d{4}-\d\d-\d\d) (\d\d:\d\d)) (?:the Bash command `([^`]*)`|the (\S+) call on `([^`]*)`|a (\S+) call) (failed|was blocked): `([^`]*)`; no later call of it succeeded\.$/
+  /^- At (?:an unknown time|(\d{4}-\d\d-\d\d) (\d\d:\d\d)) (?:the Bash command `([^`]*)`|the (\S+) call on `([^`]*)`|a (\S+) call) (failed|was blocked): `([^`]*)`(?:; no later call of it succeeded)?\.$/
 /** The open failures renderFailure's lines give back. */
 export function parseFailures(body: string): OpenFailure[] {
   return body.split('\n').flatMap((l) => {

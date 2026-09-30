@@ -8,6 +8,7 @@ import {
   FLOOR_NOTE,
   MEMORY_GUIDE,
   MEMORY_GUIDE_RECALL,
+  MEMORY_GUIDE_SOURCES,
   MEMORY_HEADER,
   MEMORY_MARK,
   MEMORY_RECALL,
@@ -22,7 +23,7 @@ import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, du
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
-import type { RecallInput, RecallIo } from './recall'
+import type { RecallInput, RecallIo, TranscriptCache } from './recall'
 import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
 
@@ -1305,7 +1306,8 @@ const CONTINUATION = '\n\n<continuation>\n'
 // The environment, read afresh at each compaction, sits between them and is never read back as the state.
 const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
 const ENVIRONMENT = 'Environment at compaction, read from git by code, not by a model'
-const FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded'
+const FAILURES = 'Tool failures no later call of the same command or file cleared, found by code'
+const OLD_FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded' // read back only
 const LATEST = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
 const SESSION_LABEL = 'Session: '
 function renderContinuation(memory: Memory) {
@@ -1322,19 +1324,19 @@ function parseContinuation(text: string, from: number) {
   const start = text.indexOf(CONTINUATION, from)
   if (start < 0) return undefined
   const body = text.slice(start + CONTINUATION.length)
-  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${OLD_FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
   const all = body.slice(0, end.length ? Math.min(...end) : 0).split('\n')
   const lines = all[0]?.startsWith(WHERE) ? all.slice(1) : all
   const session = lines[0]?.startsWith(SESSION_LABEL) ? lines[0].slice(SESSION_LABEL.length).trim() || undefined : undefined
   return { state: lines.slice(session === undefined ? 0 : 1).join('\n').trim() || undefined, session }
 }
 
-// The open failures a record lists, read from `from` on, past the user's text.
+// The open failures a record lists, read from `from` on, past the user's text, under either header.
 function failuresOf(text: string, from: number) {
   const record = text.indexOf(CONTINUATION, from)
-  const start = record < 0 ? -1 : text.indexOf(`\n${FAILURES}:\n`, record)
-  if (start < 0) return []
-  const body = text.slice(start + FAILURES.length + 3)
+  const header = record < 0 ? undefined : [FAILURES, OLD_FAILURES].find((h) => text.includes(`\n${h}:\n`, record))
+  if (header === undefined) return []
+  const body = text.slice(text.indexOf(`\n${header}:\n`, record) + header.length + 3)
   const end = [`\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
   return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
 }
@@ -1433,7 +1435,9 @@ const SESSION_BRIEF_END = '\n</session-brief>'
 // sends it there), so they are the last thing read before the messages. A guide line never starts with a tag, so
 // parseMemory reads no section from it.
 function memoryMessage(memory: Memory): SessionMessage {
-  const guide = `${MEMORY_GUIDE}${memory.recall ? MEMORY_GUIDE_RECALL : ''}`
+  // The source-range line only where the observations have one: over the budget they are left out.
+  const sources = memory.observations.includes('(source ') ? `\n${MEMORY_GUIDE_SOURCES}${memory.recall ? MEMORY_GUIDE_RECALL : ''}` : ''
+  const guide = `${MEMORY_GUIDE}${sources}`
   const resume = [MEMORY_RESUME, memory.recall ? MEMORY_RECALL : '', MEMORY_RESUME_END].filter(Boolean).join('\n')
   const text =
     `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${guide}\n</memory-guide>\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
@@ -1443,7 +1447,8 @@ function memoryMessage(memory: Memory): SessionMessage {
     renderUserMessages(memory.userMessages, memory.recoverable, correctionsBody(memory.corrections).trim()) +
     renderContinuation(memory) +
     '\n' +
-    (memory.transcript ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
+    // The built-in's pointer to the transcript file, only where om_recall, which searches that file, is not the model's.
+    (memory.transcript && !memory.recall ? `\n${COMPACT_TRANSCRIPT}${memory.transcript}` : '') +
     (memory.recentKept ? `\n${COMPACT_RECENT}` : '') +
     (memory.resumeDirectly ? `\n${COMPACT_RESUME}` : '') +
     `\n\n<resume>\n${resume}\n</resume>`
@@ -2060,18 +2065,16 @@ function skillsInUse($: EngineInterface, skills: readonly Skill[], tail: readonl
   return kept
 }
 
-// What om_recall reads files with. `$.fs.read` refuses a file over 4 MiB, which a long transcript is: `cat` reads it.
+// What om_recall reads files with. `$.fs.read` refuses a file over 4 MiB, which a long transcript is: `cat` reads it,
+// and `tail` the part of a file past what was parsed of it.
 const recallIo = ($: EngineInterface): RecallIo => ({
   read: async (path) => {
     const size = await $.fs.stat(path).then((s) => s.size, () => undefined)
     if (size !== undefined && size < 4 * 1024 * 1024) return String(await $.fs.read(path))
-    const cat = $.process.spawn({ argv: ['cat', '--', path] })
-    let text = ''
-    let error = ''
-    for await (const c of cat) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
-    if ((await cat.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
-    return text
+    return output($, ['cat', '--', path], path)
   },
+  stat: (path) => $.fs.stat(path).then((s) => ({ size: s.size, mtime: s.mtimeMs })),
+  readFrom: (path, offset) => output($, ['tail', '-c', `+${offset + 1}`, '--', path], path),
   list: async (dir) => ((await $.fs.exists(dir)) ? (await $.fs.list(dir)).map((f) => f.name) : []),
   // A file's `continued-in` row, written as JSON by Claude Code: quoted inside a message, its quotes are escaped.
   continuing: async (dir, names, id) => {
@@ -2082,6 +2085,17 @@ const recallIo = ($: EngineInterface): RecallIo => ({
   },
   now: () => $.clock.now(),
 })
+// What a command reading `path` prints, or its error when it fails.
+async function output($: EngineInterface, argv: string[], path: string) {
+  const run = $.process.spawn({ argv })
+  let text = ''
+  let error = ''
+  for await (const c of run) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
+  if ((await run.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
+  return text
+}
+// Each session's transcript as om_recall last parsed it, parsed on from there by its next call.
+const transcripts = new Map<string, TranscriptCache>()
 
 function noteRecall($: EngineInterface, sessionId: string, result: string, fromFile: boolean) {
   record(statsIo($), sessionId, (s, at) => addRecall(s, Number(result.match(/^(\d+) match/)?.[1] ?? 0), fromFile, at))
@@ -2513,19 +2527,16 @@ export const register: Register = (on) => {
           "shown: a summary that does not show a tool's full output is not evidence that the output is lost. Use it too " +
           "whenever the summary lacks a detail you need: exact text, a tool's output, a quote, what happened when. It " +
           "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
-          'what compaction removed from context, the earlier files a moved session continued from, optionally its ' +
+          'what compaction removed from context and the transcripts this session was resumed or moved from, optionally its ' +
           'subagents. Search first: its excerpts, the best lines of each ' +
           'matching block, usually answer, and it names query terms that occur nowhere, so do not search again to confirm an ' +
           'absence. Read a block only when its excerpt is not enough, and only the lines you need. Outline only to orient, ' +
-          'one page. Stop as soon as you have the answer. search (a query alone): words, all of which must appear (failing ' +
-          'that, blocks holding some, rarest first), "quoted phrases" or /regex/. read (a ref alone, like a79f045b:2133): a block, a page of lines ' +
-          'at a time. outline (neither): a line per message or tool call, for a from/to range. files: the files the session ' +
-          'read, edited or wrote, each with the blocks that touched it; a query narrows them by path.',
+          'one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', maxLength: 500, description: 'Words, "quoted phrases" or /regex/flags to find, e.g. a file name, an error, a marker; with files, part of a path' },
-            mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query, read with a ref alone, else outline' },
+            query: { type: 'string', maxLength: 500, description: 'Words, all of which must appear (failing that, blocks holding some, rarest first), "quoted phrases" or /regex/flags to find, e.g. a file name, an error, a marker; with files, part of a path' },
+            mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query; read with a ref alone, like a79f045b:2133: a block, a page of lines at a time; else outline: a line per message or tool call. files: the files the session read, edited or wrote, each with the blocks that touched it' },
             ref: { type: 'string', description: 'A block reference from a search or outline, to read; a subagent reference, to outline its transcript' },
             lines: { type: 'string', description: 'Lines of the block to read, e.g. "1-200" or "201-" (read)' },
             before: { type: 'number', description: 'Blocks before the read one to show too, at most 5 (read)' },
@@ -2569,17 +2580,20 @@ export const register: Register = (on) => {
   // The transcript file and those it continued from hold the whole session, compactions and --resume included; the
   // live history stands in when no file is known or readable.
   on('tool.call', { tool: 'mcp__observational-memory__om_recall' }, async ($, e) => {
-    const [rows, sessionId] = await Promise.all([$.session.messages(), $.session.id()])
+    const sessionId = await $.session.id()
     const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
     let corpus: Awaited<ReturnType<typeof loadTranscript>> | undefined
     if (path) {
+      const cache = transcripts.get(sessionId) ?? {}
+      transcripts.set(sessionId, cache)
       try {
-        corpus = await loadTranscript(recallIo($), path, { asking: true })
+        corpus = await loadTranscript(recallIo($), path, { asking: true, cache })
       } catch (error) {
         log($, `could not read the transcript for om_recall (${errorText(error)}); searching the live history`)
       }
     }
     const fromFile = !!corpus?.main.blocks.length
+    const rows = fromFile ? [] : await $.session.messages()
     const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, loopOf(sessionId)), 0).at, rows.length >= ROWS_CAP, () => $.clock.now()), e)
     return { result: noteRecall($, sessionId, found.text, fromFile) }
   })
@@ -2644,6 +2658,7 @@ export const register: Register = (on) => {
     const cleared = e.reason === 'clear'
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
+    transcripts.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     await flushHeld($) // and so does the held times' timer
     const kinds = cleared ? KINDS.map((kind) => key(kind, e.sessionId)) : []

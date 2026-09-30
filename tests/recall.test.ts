@@ -3,7 +3,7 @@ import { MEMORY_HEADER } from '../hooks/prompts'
 import { legacyRecall } from './eval/legacy-recall'
 import { liveTranscript, loadTranscript, parseInput, recall, refsOf } from '../hooks/recall'
 import type { SessionMessage } from 'claude-code'
-import type { RecallInput, RecallIo } from '../hooks/recall'
+import type { RecallInput, RecallIo, TranscriptCache } from '../hooks/recall'
 
 const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
 const NEW = 'bbbbbbbb-2222-4222-8222-222222222222'
@@ -161,6 +161,72 @@ describe('recall', () => {
     const corpus = await loadTranscript(io, `${DIR}/${NEW}.jsonl`, { asking: true })
     expect(corpus.files).toEqual(['bbbbbbbb'])
     expect(corpus.note).toMatch(/discover|list/)
+  })
+
+  // memoryIo with what a TranscriptCache needs: a file's size in UTF-8 bytes and an mtime `touch` moves, and its
+  // bytes from an offset on, each such read recorded in `from`.
+  function cachingIo(files: Record<string, string>) {
+    const mtimes: Record<string, number> = {}
+    const from: [string, number][] = []
+    const bytes = (p: string) => {
+      if (!(p in files)) throw new Error(`ENOENT: ${p}`)
+      return new TextEncoder().encode(files[p])
+    }
+    return Object.assign(memoryIo(files), {
+      from,
+      touch: (p: string) => void (mtimes[p] = (mtimes[p] ?? 0) + 1),
+      stat: async (p: string) => ({ size: bytes(p).length, mtime: mtimes[p] ?? 0 }),
+      readFrom: async (p: string, offset: number) => (from.push([p, offset]), new TextDecoder().decode(bytes(p).slice(offset))),
+    })
+  }
+  // What a corpus's main thread reads as, to compare a cached parse with a fresh one.
+  const digest = (c: Awaited<ReturnType<typeof loadTranscript>>) => c.main.blocks.map((b) => [b.ref, b.kind, b.text, !!b.asking, b.pair?.ref ?? ''])
+  const fresh = async (files: Record<string, string>, path: string) => digest(await loadTranscript(memoryIo({ ...files }), path, { asking: true }))
+
+  test('a cached transcript is parsed on from the byte it stopped at, and reads as a fresh parse does', async () => {
+    const path = `${DIR}/${NEW}.jsonl`
+    const files = { [`${DIR}/${OLD}.jsonl`]: oldFile, [path]: newFile } // newFile ends on a whole row, no newline yet
+    const io = cachingIo(files)
+    const cache: TranscriptCache = {}
+    const first = await loadTranscript(io, path, { asking: true, cache })
+    const blocks = first.main.blocks.length
+    const checked = [{ type: 'text', text: 'Café ☕ checked 🥝' }, { type: 'tool_use', id: 'k1', name: 'Bash', input: { command: 'ls' } }]
+    const steps = [
+      // a call, then a compaction: its boundary and memory message
+      `\n${msg('assistant', 12, checked)}\n${JSON.stringify({ type: 'system', subtype: 'compact_boundary', uuid: 'b-2' })}\n${msg('user', 13, `${MEMORY_HEADER}\n\n<observations>\n* 🟡 checked\n</observations>`)}\n`,
+      // the compaction's copy of the call, cut off mid-row
+      msg('assistant', 13, checked).slice(0, 40),
+      // the rest of it, the call's result and a new prompt
+      `${msg('assistant', 13, checked).slice(40)}\n${msg('user', 14, [{ type: 'tool_result', tool_use_id: 'k1', content: 'a.txt' }])}\n${msg('user', 15, 'and now?')}\n`,
+    ]
+    for (const step of steps) {
+      files[path] += step
+      const corpus = await loadTranscript(io, path, { asking: true, cache })
+      expect(digest(corpus)).toEqual(await fresh(files, path))
+    }
+
+    expect(io.reads).toEqual([`${DIR}/${OLD}.jsonl`, path]) // each read whole once, by the first call
+    const bytes = (text: string) => new TextEncoder().encode(text).length
+    expect(io.from).toEqual([
+      [path, bytes(newFile)],
+      [path, bytes(newFile + steps[0])],
+      [path, bytes(newFile + steps[0])], // the cut-off row was left for the next call
+    ])
+    expect(first.main.blocks.length).toBe(blocks)
+  })
+
+  test('a cached predecessor that changed is parsed again', async () => {
+    const path = `${DIR}/${NEW}.jsonl`
+    const files = { [`${DIR}/${OLD}.jsonl`]: oldFile, [path]: `${newFile}\n` }
+    const io = cachingIo(files)
+    const cache: TranscriptCache = {}
+    await loadTranscript(io, path, { asking: true, cache })
+    await loadTranscript(io, path, { asking: true, cache })
+    expect(io.reads).toEqual([`${DIR}/${OLD}.jsonl`, path])
+    io.touch(`${DIR}/${OLD}.jsonl`)
+    const corpus = await loadTranscript(io, path, { asking: true, cache })
+    expect(io.reads).toEqual([`${DIR}/${OLD}.jsonl`, path, `${DIR}/${OLD}.jsonl`, path])
+    expect(digest(corpus)).toEqual(await fresh(files, path))
   })
 
   test('a query alone searches, as before; a ref alone reads; nothing outlines', async () => {

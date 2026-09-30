@@ -313,6 +313,9 @@ describe('vcc', () => {
     expect(failures).toHaveLength(OPEN_FAILURES_MAX)
     expect(failures.at(-1)!.target).toBe(`make t${OPEN_FAILURES_MAX + 2}`)
     expect(parseFailures(failures.map(renderFailure).join('\n'))).toEqual(failures)
+    expect(renderFailure(failures[0]!)).toMatch(/failed: `make: \*\*\* No rule to make target t\d+`\.$/)
+    // The older form, as a stored memory message holds it, reads back the same.
+    expect(parseFailures(failures.map((f) => renderFailure(f).replace(/\.$/, '; no later call of it succeeded.')).join('\n'))).toEqual(failures)
   })
 
   test('open failures: a lookup that found its path missing is carried until a later call names the file; other failed lookups are not', () => {
