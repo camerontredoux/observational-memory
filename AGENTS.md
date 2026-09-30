@@ -27,7 +27,7 @@ A Claude Code function-hooks plugin that replaces compaction with observational 
 
 ### Releases
 
-A user-visible change bumps `version` in `.claude-plugin/plugin.json`. The commit subject is `observational-memory vX.Y.Z: <change>`. When the change adds or changes behaviour, update the `description` in `plugin.json` and in `hooks/hooks.json`.
+A user-visible change bumps `version` in `.claude-plugin/plugin.json`. The commit subject is `observational-memory vX.Y.Z: <change>`. Keep the `description` in `plugin.json` a short summary of the plugin. The `description` in `hooks/hooks.json` lists the behaviour per hook event, one short clause each, without constants. When a change adds or changes what a hook does, update its clause there.
 
 Known issues that are not tracked on GitHub live in `TODO.md`.
 
