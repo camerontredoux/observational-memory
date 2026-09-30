@@ -1512,7 +1512,73 @@ function dropLoop($: EngineInterface, key: string) {
   return locked(() => Promise.all(LOOP_KEYS.map((k) => $.store.delete(k(key)))))
 }
 
-const loadMarks = async ($: EngineInterface, sessionId: string) => ((await $.store.get(timesKey(sessionId))) as Mark[] | undefined) ?? []
+// Times and turn starts are held here, by store key, for the loop's life they belong to, and written
+// MARKS_WRITE_DELAY_MS after they change, at a turn's end, before a compaction or a pass reads them, and at the
+// session's end: every model step of every loop marks a time, and each store write rewrites the whole file. `synced`:
+// the value as last read from the store or written to it, when the key was there. A hot reload loses what was not
+// written yet: those rows take the time of the row before (see view).
+const MARKS_WRITE_DELAY_MS = 2_000
+type Held = { value: unknown[]; synced?: unknown[]; loop: Loop; stamp: string; dirty: boolean }
+const heldMarks = new Map<string, Held>()
+let heldWrite: { cancel: () => void } | undefined
+
+// A held value, else the store's, held from then on while the loop's life lasts.
+async function readHeld<T extends unknown[]>($: EngineInterface, key: string, loop: Loop): Promise<T | undefined> {
+  const stamp = stampOf(loop)
+  const h = heldMarks.get(key)
+  if (h && isLive(h.loop, h.stamp)) return h.value as T
+  const value = (await $.store.get(key)) as T | undefined
+  const now = heldMarks.get(key)
+  if (now && isLive(now.loop, now.stamp)) return now.value as T // held meanwhile
+  if (isLive(loop, stamp)) heldMarks.set(key, { value: value ?? [], synced: value, loop, stamp, dirty: false })
+  return value
+}
+
+// Holds a new value and schedules its write. Nothing once the loop's life has ended.
+function hold($: EngineInterface, key: string, value: unknown[], loop: Loop, stamp: string) {
+  if (!isLive(loop, stamp)) return
+  const h = heldMarks.get(key)
+  if (h?.stamp === stamp) Object.assign(h, { value, dirty: true })
+  else heldMarks.set(key, { value, loop, stamp, dirty: true })
+  heldWrite ??= $.clock.after(MARKS_WRITE_DELAY_MS, () => void flushHeld($))
+}
+
+// Writes what is held and not yet written; never throws, and what failed stays held for the next write. An ended
+// life's values go unwritten. A key gone from the store since it was read or written was deleted by another
+// process's prune: what it held is not brought back, only what was marked since, and later reads see it gone.
+async function flushHeld($: EngineInterface) {
+  heldWrite?.cancel()
+  heldWrite = undefined
+  for (const [key, h] of heldMarks) if (!isLive(h.loop, h.stamp)) heldMarks.delete(key)
+  const synced = [...heldMarks].filter(([, h]) => h.synced)
+  const due = [...heldMarks].filter(([, h]) => h.dirty)
+  if (!synced.length && !due.length) return
+  for (const [, h] of due) h.dirty = false
+  let n = 0
+  try {
+    const present = new Set(synced.length ? await $.store.keys() : [])
+    for (const [key, h] of synced) {
+      if (present.has(key) || heldMarks.get(key) !== h) continue
+      const gone = new Set(h.synced)
+      h.value = h.value.filter((x) => !gone.has(x))
+      h.synced = undefined
+      if (!h.value.length) heldMarks.delete(key)
+    }
+    for (; n < due.length; n++) {
+      const [key, h] = due[n]!
+      if (heldMarks.get(key) !== h || !isLive(h.loop, h.stamp)) continue
+      const value = h.value
+      await $.store.set(key, value)
+      h.synced = value
+    }
+  } catch (error) {
+    for (const [, h] of due.slice(n)) h.dirty = true
+    log($, `could not record the times (${errorText(error)})`)
+  }
+}
+
+const loadMarks = async ($: EngineInterface, loop: Loop) => (await readHeld<Mark[]>($, timesKey(loop.key), loop)) ?? []
+const loadTurns = async ($: EngineInterface, sessionId: string) => (await readHeld<number[]>($, turnsKey(sessionId), loopOf(sessionId))) ?? []
 const loadLedger = async ($: EngineInterface, sessionId: string, v: View) =>
   reconcile($, (await $.store.get(ledgerKey(sessionId))) as Ledger | undefined, v)
 
@@ -1554,7 +1620,8 @@ function liveStart(rows: readonly SessionMessage[]) {
 }
 
 async function liveView($: EngineInterface, loop: Loop) {
-  const [rows, marks] = await Promise.all([loopHistory($, loop), loadMarks($, loop.key)])
+  await flushHeld($)
+  const [rows, marks] = await Promise.all([loopHistory($, loop), loadMarks($, loop)])
   const offset = liveStart(rows)
   return view(inCallOrder(rows.slice(offset)), marks, offset)
 }
@@ -1571,9 +1638,9 @@ async function markTime($: EngineInterface, onlyPrompt: boolean, loop: Loop, sta
   const hashes = !last || last.stamp !== stamp || rows.length < last.rows ? new Set(rows.map(rowHash)) : undefined
   markedRows.set(loop.key, { rows: rows.length, stamp })
   const i = rows.length - 1
-  const marks = (await loadMarks($, loop.key)).filter((k) => k.i !== i && (!hashes || hashes.has(k.hash)))
+  const marks = (await loadMarks($, loop)).filter((k) => k.i !== i && (!hashes || hashes.has(k.hash)))
   if (i >= 0 && (!onlyPrompt || isPrompt(rows[i]!))) marks.push({ i, hash: rowHash(rows[i]!), at: now })
-  if (isLive(loop, stamp)) await $.store.set(timesKey(loop.key), marks.slice(-MAX_MARKS))
+  hold($, timesKey(loop.key), marks.slice(-MAX_MARKS), loop, stamp)
   return rows
 }
 
@@ -1586,8 +1653,9 @@ async function current($: EngineInterface, agentId?: string) {
 
 async function markTurn($: EngineInterface) {
   const [sessionId, now] = await Promise.all([$.session.id(), $.clock.now()])
-  const turns = ((await $.store.get(turnsKey(sessionId))) as number[] | undefined) ?? []
-  await $.store.set(turnsKey(sessionId), [...turns, now].slice(-SKILLS_WHOLE_TURNS))
+  const loop = loopOf(sessionId)
+  const stamp = stampOf(loop)
+  hold($, turnsKey(sessionId), [...(await loadTurns($, sessionId)), now].slice(-SKILLS_WHOLE_TURNS), loop, stamp)
 }
 
 // Where the rows a step saw end in the history now: where they ended, else, once the history reads as its newest
@@ -2062,6 +2130,7 @@ export const register: Register = (on) => {
     const loop = loopOf(sessionId, e.agentId)
     const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
     markedRows.delete(loop.key) // its next mark checks the marks against the rows
+    await flushHeld($)
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
     // the session cannot read, or a context that does not match) is compacted with no stored state.
     const history = await loopHistory($, loop).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
@@ -2072,7 +2141,7 @@ export const register: Register = (on) => {
     const { offset, rows, persistent } = history ? align(messages, history) : { offset: -messages.length, rows: [], persistent: false }
     // Unmatched, the rows are still timed and the ledger still stands up to the first row that differs, by content:
     // `reconcile` checks the rows under the watermark by hash and finds each chunk where its rows read the same.
-    const v = view(messages, await loadMarks($, loop.key), persistent ? offset : undefined)
+    const v = view(messages, await loadMarks($, loop), persistent ? offset : undefined)
     const base = v.base
     const initial = await locked(() => loadLedger($, loop.key, v))
     if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)
@@ -2120,7 +2189,7 @@ export const register: Register = (on) => {
     // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
     const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
     const goal = main ? (((await $.store.get(goalKey(sessionId))) as Goal | undefined)?.line ?? priorMemory?.session) : undefined
-    const turns = main ? (((await $.store.get(turnsKey(sessionId))) as number[] | undefined) ?? []) : undefined
+    const turns = main ? await loadTurns($, sessionId) : undefined
     const known = mergeSkills(prior, recorded)
     // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
     const prompts = messages.flatMap((m, i) => {
@@ -2406,7 +2475,7 @@ export const register: Register = (on) => {
       }
     }
     const fromFile = !!corpus?.main.blocks.length
-    const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, sessionId), 0).at, rows.length >= ROWS_CAP, () => $.clock.now()), e)
+    const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, loopOf(sessionId)), 0).at, rows.length >= ROWS_CAP, () => $.clock.now()), e)
     return { result: noteRecall($, sessionId, found.text, fromFile) }
   })
 
@@ -2456,7 +2525,7 @@ export const register: Register = (on) => {
       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
       const { loop, stamp } = await current($, e.agentId)
       if (e.agentId !== undefined && !teammate) await dropLoop($, loop.key)
-      else await markTime($, false, loop, stamp).then(() => schedule($, loop, stamp))
+      else await markTime($, false, loop, stamp).then(() => flushHeld($)).then(() => schedule($, loop, stamp))
     } catch (error) {
       log($, errorText(error))
     }
@@ -2471,6 +2540,7 @@ export const register: Register = (on) => {
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
+    await flushHeld($) // and so does the held times' timer
     const kinds = cleared ? [ledgerKey, timesKey, liveKey, skillsKey, turnsKey, transcriptKey, seenKey, goalKey] : []
     await locked(async () => {
       const subagents = (await $.store.keys()).filter((k) => LOOP_KEYS.some((kind) => k.startsWith(kind(`${e.sessionId}/`))))

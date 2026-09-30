@@ -2790,6 +2790,44 @@ describe('register', () => {
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1/mate-1', 'times:session-1/mate-1'])
   })
 
+  test("the steps' times and the turn's start are held and written together a moment later, at once at the turn's end, and a prune by another process stays done", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored, writes } = world(on)
+    pi(on)
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+    const times = () => (stored['times:session-1'] as { i: number; at: number }[]).map((k) => [k.i, k.at])
+    await clock.set(at(23, 9, 0))
+    history.push({ role: 'user', text: 'brief', toolUses: [] })
+    await $.turn.start({ text: 'brief', turnId: 't' })
+    for (let n = 0; n < 3; n++) {
+      history.push(...call(n, 100))
+      await step($, 't', n, history.length)
+      await clock.settle()
+    }
+    expect(writes.filter((k) => k.startsWith('times:') || k.startsWith('turns:'))).toEqual([])
+
+    await clock.advance(2_000)
+    expect(writes.filter((k) => k.startsWith('times:') || k.startsWith('turns:')).sort()).toEqual(['times:session-1', 'turns:session-1'])
+    expect(times()).toEqual([0, 2, 4, 6].map((i) => [i, at(23, 9, 0)]))
+    expect(stored['turns:session-1']).toEqual([at(23, 9, 0)])
+
+    history.push({ role: 'assistant', text: 'done', toolUses: [] })
+    await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })
+    expect(times().map(([i]) => i)).toEqual([0, 2, 4, 6, 7])
+
+    // Another process's prune deleted the session's keys: what they held is not written back, only what came since.
+    delete stored['times:session-1']
+    delete stored['turns:session-1']
+    await clock.set(at(23, 9, 5))
+    history.push({ role: 'user', text: 'next', toolUses: [] })
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await clock.advance(2_000)
+    expect(times()).toEqual([[8, at(23, 9, 5)]])
+    expect(stored['turns:session-1']).toEqual([at(23, 9, 5)])
+  })
+
   test('a scheduling pass that changes nothing in the ledger does not write it again', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored, writes } = world(on)
