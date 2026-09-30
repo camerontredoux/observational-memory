@@ -20,7 +20,7 @@ import {
 } from './prompts'
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
-import { registerPrune } from './prune'
+import { errorText, key, KINDS, registerPrune } from './prune'
 import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
 import type { RecallInput, RecallIo } from './recall'
 import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
@@ -341,7 +341,6 @@ function unmask(rows: readonly SessionMessage[], history: readonly SessionMessag
     })
 }
 const INPUT_MASKED = /\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full input\] \.\.\./
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 // `log` writes the debug log only; `show` puts a short line on screen too. The engine prefixes the plugin's name.
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
 // A subagent's lines go to the debug log only: the main chat shows the main conversation's.
@@ -1544,14 +1543,13 @@ function reconcile($: EngineInterface, stored: Ledger | undefined, v: View): Led
 }
 
 const loopOf = (sessionId: string, agentId?: string): Loop => ({ sessionId, agentId, key: agentId === undefined ? sessionId : `${sessionId}/${agentId}` })
-const ledgerKey = (sessionId: string) => `ledger:${sessionId}`
-const timesKey = (sessionId: string) => `times:${sessionId}`
-const liveKey = (sessionId: string) => `live:${sessionId}`
-const skillsKey = (sessionId: string) => `skills:${sessionId}`
-const turnsKey = (sessionId: string) => `turns:${sessionId}` // the main loop's newest turn starts
-const transcriptKey = (sessionId: string) => `transcript:${sessionId}`
-const seenKey = (sessionId: string) => `seen:${sessionId}` // the pruner's stamp
-const goalKey = (sessionId: string) => `goal:${sessionId}` // the Session line (see writeSession)
+const ledgerKey = (sessionId: string) => key('ledger', sessionId)
+const timesKey = (sessionId: string) => key('times', sessionId)
+const liveKey = (sessionId: string) => key('live', sessionId)
+const skillsKey = (sessionId: string) => key('skills', sessionId)
+const turnsKey = (sessionId: string) => key('turns', sessionId) // the main loop's newest turn starts
+const transcriptKey = (sessionId: string) => key('transcript', sessionId)
+const goalKey = (sessionId: string) => key('goal', sessionId) // the Session line (see writeSession)
 
 // The kinds a subagent's loop keeps: dropped when it finishes.
 const LOOP_KEYS = [ledgerKey, timesKey, liveKey]
@@ -2648,10 +2646,10 @@ export const register: Register = (on) => {
     if (cleared) end(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     await flushHeld($) // and so does the held times' timer
-    const kinds = cleared ? [ledgerKey, timesKey, liveKey, skillsKey, turnsKey, transcriptKey, seenKey, goalKey] : []
+    const kinds = cleared ? KINDS.map((kind) => key(kind, e.sessionId)) : []
     await locked(async () => {
       const subagents = (await $.store.keys()).filter((k) => LOOP_KEYS.some((kind) => k.startsWith(kind(`${e.sessionId}/`))))
-      await Promise.all([...subagents, ...kinds.map((kind) => kind(e.sessionId))].map((key) => $.store.delete(key)))
+      await Promise.all([...subagents, ...kinds].map((key) => $.store.delete(key)))
     }).catch((error) => log($, `could not drop the ended session's state (${errorText(error)})`))
     return next(e)
   })
