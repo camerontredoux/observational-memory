@@ -437,12 +437,13 @@ const minute = (ms: number) => Math.floor(ms / 60_000) // a time read back from 
 
 // Each row's time: its own mark, a mark on a row that reads the same (a compaction's copy), or the row before's.
 function view(messages: readonly SessionMessage[], marks: readonly Mark[], offset?: number): View {
-  const hashes = messages.map(rowHash)
+  const texts = messages.map(rowText) // each row's text built once, for its hash and its tokens
+  const hashes = messages.map((m, i) => hash(`${m.role}\n${texts[i]}`))
   const byIndex = new Map(offset === undefined ? [] : marks.filter((k) => hashes[k.i - offset] === k.hash).map((k) => [k.i - offset, k.at]))
   const byHash = new Map(marks.map((k) => [k.hash, k.at]))
   const at: (number | undefined)[] = []
   for (let i = 0; i < messages.length; i++) at.push(byIndex.get(i) ?? byHash.get(hashes[i]!) ?? at[i - 1])
-  return { messages, hashes, tokens: messages.map((m) => estimateTokens(rowText(m))), at, base: isMemory(messages[0]) ? 1 : 0 }
+  return { messages, hashes, tokens: texts.map((t) => estimateTokens(t)), at, base: isMemory(messages[0]) ? 1 : 0 }
 }
 
 const tokensBetween = (v: View, from: number, to: number) => v.tokens.slice(from, to).reduce((n, t) => n + t, 0)
@@ -1558,13 +1559,19 @@ async function liveView($: EngineInterface, loop: Loop) {
   return view(inCallOrder(rows.slice(offset)), marks, offset)
 }
 
+// Per loop, the history's length at its last mark, in that life: the marks are checked against the rows only once the
+// history got shorter or a compaction ran (which forgets the loop's entry).
+const markedRows = new Map<string, { rows: number; stamp: string }>()
+
 // Records the time against the newest row: the prompt at turn.start, a tool result at each step, the answer at
 // turn.complete. Nothing once the loop has ended.
 async function markTime($: EngineInterface, onlyPrompt: boolean, loop: Loop, stamp: string) {
   const [rows, now] = await Promise.all([historyOf($, loop.agentId), $.clock.now()])
-  const hashes = new Set(rows.map(rowHash))
+  const last = markedRows.get(loop.key)
+  const hashes = !last || last.stamp !== stamp || rows.length < last.rows ? new Set(rows.map(rowHash)) : undefined
+  markedRows.set(loop.key, { rows: rows.length, stamp })
   const i = rows.length - 1
-  const marks = (await loadMarks($, loop.key)).filter((k) => k.i !== i && hashes.has(k.hash))
+  const marks = (await loadMarks($, loop.key)).filter((k) => k.i !== i && (!hashes || hashes.has(k.hash)))
   if (i >= 0 && (!onlyPrompt || isPrompt(rows[i]!))) marks.push({ i, hash: rowHash(rows[i]!), at: now })
   if (isLive(loop, stamp)) await $.store.set(timesKey(loop.key), marks.slice(-MAX_MARKS))
   return rows
@@ -2054,6 +2061,7 @@ export const register: Register = (on) => {
     ])
     const loop = loopOf(sessionId, e.agentId)
     const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
+    markedRows.delete(loop.key) // its next mark checks the marks against the rows
     // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
     // the session cannot read, or a context that does not match) is compacted with no stored state.
     const history = await loopHistory($, loop).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
