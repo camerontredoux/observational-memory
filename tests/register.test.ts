@@ -4090,6 +4090,32 @@ describe('active constraints and the continuation record', () => {
     for (const gone of ['SESSION HISTORY', 'KNOWLEDGE UPDATES', '<system-reminder>', V141.recall]) expect(text).not.toContain(gone)
   })
 
+  test('open failures stored under the older header and line form are read back and written in the new one', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    const old =
+      `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${MEMORY_GUIDE}\n</memory-guide>\n\n` +
+      '<observations>\n* 🟡 Saw a\n</observations>' +
+      `\n\n<continuation>\n${WHERE}:\nActive: fixing the build\n` +
+      'Tool failures still open, found by code: no later call of the same command or file succeeded:\n' +
+      '- At 2026-09-22 14:30 the Bash command `make build` failed: `make: *** No rule to make target build`; no later call of it succeeded.\n' +
+      `</continuation>\n\n<resume>\n${MEMORY_RESUME}\n${MEMORY_RESUME_END}\n</resume>`
+    const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+
+    const result = await $.session.compact({ trigger: 'auto', messages: [row(old), ...turn('c', 'r', CHUNK), ...work('w', 8_000)] })
+
+    const text = result.messages?.[0]?.text ?? ''
+    // The state stops at the older header, and the failure is carried under the new one, without the old suffix.
+    expect(recordIn(text)).toBe(
+      `${WHERE}:\nActive: fixing the build\n` +
+        'Tool failures no later call of the same command or file cleared, found by code:\n' +
+        '- At 2026-09-22 14:30 the Bash command `make build` failed: `make: *** No rule to make target build`.',
+    )
+    expect(text).not.toContain('still open')
+    expect(text).not.toContain('no later call of it succeeded')
+  })
+
   test('omitted user messages are said to be recoverable only when the transcript that holds them is known', async ($, on) => {
     mock.clock(on)
     world(on)

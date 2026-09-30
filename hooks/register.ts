@@ -1257,7 +1257,8 @@ const CONTINUATION = '\n\n<continuation>\n'
 // The environment, read afresh at each compaction, sits between them and is never read back as the state.
 const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
 const ENVIRONMENT = 'Environment at compaction, read from git by code, not by a model'
-const FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded'
+const FAILURES = 'Tool failures no later call of the same command or file cleared, found by code'
+const OLD_FAILURES = 'Tool failures still open, found by code: no later call of the same command or file succeeded' // read back only
 const LATEST = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
 const SESSION_LABEL = 'Session: '
 function renderContinuation(memory: Memory) {
@@ -1274,19 +1275,19 @@ function parseContinuation(text: string, from: number) {
   const start = text.indexOf(CONTINUATION, from)
   if (start < 0) return undefined
   const body = text.slice(start + CONTINUATION.length)
-  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
+  const end = [`\n${ENVIRONMENT}:\n`, `\n${FAILURES}:\n`, `\n${OLD_FAILURES}:\n`, `\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
   const all = body.slice(0, end.length ? Math.min(...end) : 0).split('\n')
   const lines = all[0]?.startsWith(WHERE) ? all.slice(1) : all
   const session = lines[0]?.startsWith(SESSION_LABEL) ? lines[0].slice(SESSION_LABEL.length).trim() || undefined : undefined
   return { state: lines.slice(session === undefined ? 0 : 1).join('\n').trim() || undefined, session }
 }
 
-// The open failures a record lists, read from `from` on, past the user's text.
+// The open failures a record lists, read from `from` on, past the user's text, under either header.
 function failuresOf(text: string, from: number) {
   const record = text.indexOf(CONTINUATION, from)
-  const start = record < 0 ? -1 : text.indexOf(`\n${FAILURES}:\n`, record)
-  if (start < 0) return []
-  const body = text.slice(start + FAILURES.length + 3)
+  const header = record < 0 ? undefined : [FAILURES, OLD_FAILURES].find((h) => text.includes(`\n${h}:\n`, record))
+  if (header === undefined) return []
+  const body = text.slice(text.indexOf(`\n${header}:\n`, record) + header.length + 3)
   const end = [`\n${LATEST} (`, '\n</continuation>'].map((m) => `\n${body}`.indexOf(m)).filter((i) => i >= 0)
   return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
 }
