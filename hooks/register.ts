@@ -72,6 +72,9 @@ const TAIL_RESULT_MAX_TOKENS = 250
 const TAIL_WHOLE_INPUTS = 3
 const TAIL_INPUT_MAX_TOKENS = 500
 const OBSERVER_TIMEOUT_MS = 120_000 // a ~10k-token chunk takes Luna about 15 s
+const OBSERVER_CALL_MS = 15_000 // what a call typically takes: a chunk failed at compaction with less time left is not retried
+// Observation at compaction, calls in flight waited on included, ends by this: the rows still unobserved stay raw.
+const COMPACTION_DEADLINE_MS = 30_000
 const REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens of output, in the background
 const MAX_MARKS = 4_000
 const STAMP_SLACK_MS = 60_000
@@ -169,7 +172,8 @@ type Memory = {
 type Loop = { sessionId: string; agentId?: string; key: string }
 // `stamp`: the loop's life the job was scheduled in (see stampOf); one that has ended since lands discarded.
 // `before`: what its Observer is shown beside its rows (see beforeRows).
-type Job = { loop: Loop; range: Range; stamp: string; before: Before }
+// `landed`: settles once its chunk landed (true) or did not, so a compaction can wait on it.
+type Job = { loop: Loop; range: Range; stamp: string; before: Before; landed: Promise<boolean> }
 type Bounds = { lo: number; hi: number; latest: number } | undefined
 
 // Background Observer calls in flight, a slot each until its call returns: one whose loop ended still holds a pi
@@ -1398,6 +1402,9 @@ function withOmitted(brief: UserMessage, dropped: readonly UserMessage[]): UserM
 const OVER_BUDGET = 'the compacted context is over its budget'
 // A context that is the memory message alone: nothing for the floor to compile either.
 const MEMORY_ALONE = 'nothing to compact after the memory message'
+const DEADLINE_PASSED = `the compaction's ${COMPACTION_DEADLINE_MS / 1000}s deadline passed`
+// The person interrupted, a hook above settled first or the hook's budget ran out: its memory never enters the context.
+const ABANDONED = 'the compaction was abandoned'
 const overLimit = (what: string, tokens: number, limit: number) => `${what}: ~${tokens} tokens, ~${limit} allowed`
 
 // A memory with its skills as lines and its user messages the brief alone, the rest counted.
@@ -1686,10 +1693,11 @@ function schedule($: EngineInterface, loop: Loop, stamp: string) {
       if (from >= next) break
       const to = chunkEnd(v, from, next, next === limit)
       if (to === undefined) break
-      const job: Job = { loop, range: range(v, from, to), stamp, before: beforeRows(ledger, from) }
+      let done!: (landed: boolean) => void
+      const job: Job = { loop, range: range(v, from, to), stamp, before: beforeRows(ledger, from), landed: new Promise((r) => (done = r)) }
       running.push(job)
       covered.push(job.range)
-      $.clock.after(0, () => void runJob($, job, v))
+      $.clock.after(0, () => void runJob($, job, v, done))
     }
     if (slots > 0) waiting.delete(loop.key)
     else waiting.set(loop.key, { loop, stamp })
@@ -1699,7 +1707,7 @@ function schedule($: EngineInterface, loop: Loop, stamp: string) {
 // One Observer call, its slot held until it returns. A job whose loop ended before it began makes no call; one whose
 // loop ended while it ran, or while its landing read the history and the ledger, lands discarded; its pi call is
 // killed when the loop ends.
-async function runJob($: EngineInterface, job: Job, v: View) {
+async function runJob($: EngineInterface, job: Job, v: View, done: (landed: boolean) => void) {
   const { loop, stamp } = job
   const { sessionId } = loop
   let chunk: Chunk | undefined
@@ -1740,6 +1748,7 @@ async function runJob($: EngineInterface, job: Job, v: View) {
       )
     return !!at
   }).catch((error) => (log($, errorText(error)), false))
+  done(landed)
   if (landed) backoff.delete(loop.key)
   else if (!chunk && isLive(loop, stamp)) await backOff($, loop, stamp)
   // The slot it held goes to a loop waiting for one first, whether this chunk landed or not.
@@ -2116,33 +2125,60 @@ export const register: Register = (on) => {
     const chunks: Chunk[] = []
     const failures: { rows: number; why: string }[] = [] // shown once the compaction stands: a fallback says so instead
     let sync = { calls: 0, ms: 0 }
+    let deadlineHit = false
     const start = tailStart(v, base)
     if (!fits(initial.watermark.to) && start > initial.watermark.to) {
+      // The loop's background calls in flight cover their rows: they are waited on, not made again.
+      const inFlight = running.flatMap((job) => {
+        const at = job.loop.key === loop.key && job.stamp === life ? locate(v, job.range, initial.watermark.to) : undefined
+        return at ? [{ job, at }] : []
+      })
       const gaps: [number, number][] = []
       let from = initial.watermark.to
-      for (const c of [...initial.chunks, { from: start, to: start }].sort((a, b) => a.from - b.from)) {
+      for (const c of [...initial.chunks, ...inFlight.map((f) => f.at), { from: start, to: start }].sort((a, b) => a.from - b.from)) {
         for (let to; from < Math.min(c.from, start); from = to) gaps.push([from, (to = chunkEnd(v, from, Math.min(c.from, start), false)!)])
         from = Math.max(from, c.to)
       }
+      // Every call, and the wait on those in flight, ends by the deadline or when the compaction is abandoned: the
+      // calls still running are killed, and their rows left unobserved as a failed chunk's.
+      const deadline = new AbortController()
+      const signal = AbortSignal.any([deadline.signal, next.signal])
+      const stopped = signal.aborted ? Promise.resolve(undefined) : new Promise<undefined>((r) => signal.addEventListener('abort', () => r(undefined), { once: true }))
       // A chunk that failed fast (a bad reply, a pi error) is observed again once: a chunk left raw holds back every
-      // chunk after it. A timeout is not, as it would hold the compaction for another timeout.
+      // chunk after it. A timeout is not, as it would hold the compaction for another timeout; nor is one with less
+      // time left than a call takes, nor an unreadable history's, which gets one round of calls.
       let retries = 0
       const once = (from: number, to: number) => {
         const before = beforeRows(initial, from)
-        return observe($, v, from, to, 'compaction', before).catch((error) => {
-          if (failureClass(errorText(error)) === 'timeout') throw error
+        return observe($, v, from, to, 'compaction', before, signal).catch(async (error) => {
+          if (!history || signal.aborted || failureClass(errorText(error)) === 'timeout') throw error
+          if ((await $.clock.now()) - syncStarted > COMPACTION_DEADLINE_MS - OBSERVER_CALL_MS) throw error
           retries++
           log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
-          return observe($, v, from, to, 'compaction', before)
+          return observe($, v, from, to, 'compaction', before, signal)
         })
       }
+      const syncStarted = await $.clock.now()
       if (!isLive(loop, life)) throw new LoopEnded()
-      const settled = await Promise.allSettled(gaps.map(([from, to]) => once(from, to)))
-      sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - started }
+      const timer = $.clock.after(COMPACTION_DEADLINE_MS, () => deadline.abort(new Error(DEADLINE_PASSED)))
+      const [settled, waited] = await Promise.all([
+        Promise.allSettled(gaps.map(([from, to]) => once(from, to))),
+        Promise.all(inFlight.map((f) => Promise.race([f.job.landed, stopped]))),
+      ])
+      timer.cancel()
+      deadlineHit = deadline.signal.aborted
+      sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - syncStarted }
       settled.forEach((r, i) => {
         if (r.status === 'fulfilled') return void (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length))
         log($, `observation of rows ${gaps[i]![0]}-${gaps[i]![1]} at compaction failed (${errorText(r.reason)}); left unobserved`)
         failures.push({ rows: gaps[i]![1] - gaps[i]![0], why: reason(r.reason, OBSERVER_TIMEOUT_MS) })
+      })
+      // A background call that failed says so itself; one still running is cut off here, its rows left unobserved.
+      waited.forEach((landed, i) => {
+        if (landed !== undefined) return
+        const { at } = inFlight[i]!
+        log($, `background observation of rows ${at.from}-${at.to} was still running at compaction (${errorText(signal.reason)}); left unobserved`)
+        failures.push({ rows: at.to - at.from, why: reason(signal.reason, OBSERVER_TIMEOUT_MS) })
       })
     }
     const priorMemory = base ? parseMemory(messages[0]!) : undefined
@@ -2284,8 +2320,11 @@ export const register: Register = (on) => {
     // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
     // message that stands; once installed, the watermark restarts after the memory message, and the chunks past
     // it are found again there. One that does not stand leaves the chunks committed, not installed.
+    // An abandoned compaction's memory never enters the context: its chunks are stored committed, not installed.
     const settle = async (l: Ledger) => {
       const ledger = commit({ ...l, chunks: [...l.chunks, ...chunks] }, v)
+      // The rows this compaction's own chunks committed: not one left waiting behind a gap, nor one landed before it.
+      const observedNow = chunks.reduce((n, c) => n + (c.from >= l.watermark.to && c.to <= ledger.watermark.to ? c.to - c.from : 0), 0)
       const stores = persistent && ledger.watermark.to > base && isLive(loop, life) // under the lock, as a loop's end deletes
       let built
       try {
@@ -2294,15 +2333,16 @@ export const register: Register = (on) => {
         if (stores && chunks.length) await $.store.set(ledgerKey(loop.key), ledger)
         throw error
       }
-      if (stores && !installs) await $.store.set(ledgerKey(loop.key), ledger)
+      const abandoned = next.signal.aborted
+      if (stores && (!installs || abandoned)) await $.store.set(ledgerKey(loop.key), ledger)
+      if (abandoned) throw new Error(ABANDONED)
       if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
-      return built
+      return { ...built, observedNow }
     }
-    const { ledger, cut, memory, message, floor, briefed } = await locked(async () => settle(await loadLedger($, loop.key, v)))
+    const { ledger, cut, memory, message, floor, briefed, observedNow } = await locked(async () => settle(await loadLedger($, loop.key, v)))
     // Failed rows the floor compiled into the brief are not kept.
     for (const f of failures) show($, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
     const kept = new Set(order.slice(cut))
-    const observedNow = chunks.reduce((n, c) => n + c.to - c.from, 0)
     const observed = ledger.watermark.to
     // Why the floor ran, as `build` found it.
     const why = observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : 'nothing was observed yet'
@@ -2331,6 +2371,8 @@ export const register: Register = (on) => {
       syncMs: sync.ms,
       rowsObservedNow: observedNow,
       rowsObservedBefore: observed - base - observedNow,
+      ...(deadlineHit ? { deadlineHit } : {}),
+      ...(history ? {} : { unreadable: true }), // a history the session cannot read: a workflow agent's, a fork's
       ...(briefed ? { rowsBriefed: briefed } : {}),
       memoryTokens: estimateTokens(message.text),
       ...(memory.brief ? { briefTokens } : {}),
@@ -2346,6 +2388,7 @@ export const register: Register = (on) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
+    if (next.error.message === ABANDONED) return log($, `${ABANDONED}; its chunks are kept, not installed`), { skip: `observational-memory: ${ABANDONED}` }
     log($, `${next.error.message}; using the built-in compaction`)
     const message = next.error.message ?? ''
     const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'

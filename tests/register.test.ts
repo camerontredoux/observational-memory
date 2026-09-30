@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
+import type { On, ProcessRunResult, Register, SessionCompactInput, SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
@@ -874,6 +874,79 @@ describe('register', () => {
     expect(failures.length).toBeGreaterThan(0)
     expect(seen.prompts.length - before).toBe(failures.length)
     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
+  })
+
+  test('observation at compaction ends by its deadline: a call still running is killed and its rows briefed, and a chunk waiting behind it is not counted as observed', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    const { gate } = gates()
+    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+
+    const compacting = $.session.compact({ trigger: 'manual', messages })
+    await clock.advance(29_999)
+    expect([seen.prompts.length, seen.inFlight]).toEqual([2, 1]) // rows 3-7 answered, rows 0-3 held
+    await clock.advance(1)
+    const result = await compacting
+
+    expect(seen.stopped).toBe(1)
+    expect(seen.logs).toContain("observation of rows 0-3 at compaction failed (the compaction's 30s deadline passed); left unobserved")
+    expect(seen.logs.at(-1)).toMatch(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, /)
+    expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
+    expect(seen.screen).toEqual([
+      "Observation failed (the compaction's 30s deadline passed) and put 3 messages in the session brief",
+      'Compacted in 30.0 s · memory 0 notes · 7 messages in a brief compiled by code (the Observer failed)',
+    ])
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!)
+    expect(stats.counts['compaction.manual.deadlineHit']).toBe(1)
+    expect([stats.metrics['compaction.manual.rowsObservedNow'].sum, stats.metrics['compaction.manual.rowsObservedBefore'].sum]).toEqual([0, 0])
+    expect(stats.metrics['compaction.manual.syncMs'].sum).toBe(30_000)
+  })
+
+  test('at compaction, a chunk that fails with less time left than a call takes is not observed again', async ($, on) => {
+    const clock = mock.clock(on)
+    world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined), fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+
+    const compacting = $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+    await clock.advance(16_000)
+    open(1)
+    await compacting
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
+    expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (pi exited 1: Error: network down); left unobserved')
+  })
+
+  test('compaction waits for a background call in flight over rows it must observe instead of making the call again', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const { gate, open } = gates()
+    const seen = pi(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle() // [0, 3) observed
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 1))
+    await clock.settle() // [3, 7) in flight, held
+    history.push(...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK), ...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000))
+    const compacting = $.session.compact({ trigger: 'manual', messages: [...history] })
+    await clock.advance(10_000)
+    const calls = seen.prompts.length
+    expect(seen.inFlight).toBe(1)
+    open(2)
+    const result = await compacting
+
+    expect(seen.prompts).toHaveLength(calls)
+    expect(seen.prompts.filter((p) => p.includes(']: b\n'))).toHaveLength(1)
+    expect(seen.logs).toContain('observed rows 3-7 in the background, 1 observations; watermark 7, 0 chunk(s) waiting on a gap')
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "b"')
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "g"')
+    expect(seen.logs.filter((l) => l.includes('deadline'))).toEqual([])
+    expect(seen.screen.at(-1)).toMatch(/^Compacted in 10.0 s · observed \d+ messages on the spot · memory \d+ notes$/)
   })
 
   test('a background pi call still running at its timeout on the clock is killed, and a later pass retries its chunk', async ($, on) => {
@@ -1972,6 +2045,22 @@ describe('register', () => {
     expect(seen.logs).toContain('Compacted subagent in 0 ms · observed 3 messages on the spot · memory 1 note')
   })
 
+  test("an unreadable subagent history gets one round of Observer calls, a failed chunk briefed rather than observed again, and is counted", async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on, { unreadable: ['agent-1'] })
+    const seen = pi(on, { fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+
+    const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
+    expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!)
+    expect(stats.counts['compaction.subagent.unreadable']).toBe(1)
+    expect(stats.counts['compaction.subagent.floor']).toBe(1)
+  })
+
   test("a subagent's budget takes the smallest window, not the main model's million", async ($, on) => {
     mock.clock(on)
     world(on, { unreadable: ['agent-1'] })
@@ -2235,6 +2324,42 @@ describe('register', () => {
     expect([ledger.watermark.to, ledger.entries.length, ledger.anchor]).toEqual([7, 2_000, undefined])
   })
 
+  // A hook above that settles a second after it passes the compaction on, abandoning the rest of the chain.
+  const settlesFirst = { name: 'settles-first', tier: 'prepend' as const, register: ((on) => {
+    on('session.compact', async ($, e, next) => {
+      void next(e).catch(() => {})
+      await $.clock.sleep(1_000)
+      return { messages: [{ role: 'user' as const, text: 'summary from above', toolUses: [] }] }
+    })
+  }) satisfies Register }
+  test('a compaction abandoned while it observes kills its calls and stores the chunks that landed committed, not installed', { plugins: [settlesFirst] }, async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored, files } = world(on)
+    const { gate } = gates()
+    const seen = pi(on, { hold: (n) => (n === 3 ? gate(3) : undefined) })
+    const runTurn = live(on, clock, history)
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle() // [0, 3) observed
+    history.push(...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK), ...turn('g', 'g', 8_000))
+
+    const compacting = $.session.compact({ trigger: 'manual', messages: [...history] })
+    await clock.advance(1_000)
+    const result = await compacting
+    await clock.settle()
+
+    expect(result.messages?.map((m) => m.text)).toEqual(['summary from above'])
+    expect(seen.stopped).toBe(1)
+    const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
+    expect([ledger.watermark.to, ledger.anchor]).toEqual([expect.any(Number), undefined])
+    expect(ledger.watermark.to).toBeGreaterThan(3) // the chunk after the watermark landed; the held one did not
+    expect(ledger.entries.map((e) => e.line)).toContain('🔴 2026-09-22 15:00 User: "b"')
+    expect(seen.logs).toContain('observation of rows 11-15 at compaction failed (settles-first settled the call); left unobserved')
+    expect(seen.logs.filter((l) => l.startsWith('Compacted') || l.startsWith('observed'))).toEqual([expect.stringMatching(/^observed rows 0-3 in the background/)])
+    await clock.advance(5_000)
+    expect(JSON.parse(files['/stats/session-1.json'] ?? '{"metrics":{}}').metrics['compaction.manual.ms']).toBeUndefined()
+  })
+
   test('a memory whose constraints are within their cap but push it over its budget keeps them all: the floor briefs the raw tail instead', async ($, on) => {
     mock.clock(on)
     const { history, stored } = world(on)
@@ -2454,7 +2579,7 @@ describe('register', () => {
     let context = () => [...rows]
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, 0) + (n + 1) * 10_000) // the held call stays within its timeout
+        await clock.set(at(23, 9, 0) + (n + 1) * 10_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
         rows.push(...agentCall('one', n, 16_000))
         await step($, 's', n, rows.length, 'agent-1')
         await clock.settle()
@@ -2463,7 +2588,11 @@ describe('register', () => {
 
     await run(0, 10)
     expect([seen.inFlight, seen.prompts[0]]).toEqual([1, expect.stringContaining('/src/one-0.ts')]) // the first chunk, held
-    const first = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: context() })
+    // Compaction waits on the held call until its deadline, then leaves its rows unobserved.
+    const compacting = $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: context() })
+    await clock.advance(30_000)
+    const first = await compacting
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^background observation of rows \d+-\d+ was still running at compaction \(the compaction's 30s deadline passed\); left unobserved$/))
     expect(builtin).toBe(0)
     expect(briefIn(first.messages![0]!.text)).toStartWith(FLOOR_NOTE)
     rows.push(...first.messages!)
@@ -2485,7 +2614,7 @@ describe('register', () => {
     expect(observed).toContain('one-10')
     expect(observed).not.toMatch(/\bone-0\b/) // the chunk the brief took
     expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual([
-      expect.stringMatching(/^Compacted subagent in 0 ms · memory 0 notes · \d+ messages in a brief compiled by code \(the Observer failed\)$/),
+      expect.stringMatching(/^Compacted subagent in 30.0 s · memory 0 notes · \d+ messages in a brief compiled by code \(the Observer failed\)$/),
       expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/),
     ])
     await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
@@ -2504,7 +2633,7 @@ describe('register', () => {
     on('session.compact', () => (builtin++, { messages: [SUMMARY] }))
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, 0) + (n + 1) * 10_000) // the held call stays within its timeout
+        await clock.set(at(23, 9, 0) + (n + 1) * 10_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
         history.push(...agentCall('main', n, 16_000))
         await step($, 't', n + 1, history.length)
         await clock.settle()
@@ -2516,7 +2645,9 @@ describe('register', () => {
 
     await run(0, 10)
     expect([seen.inFlight, seen.prompts[0]]).toEqual([1, expect.stringContaining('/src/main-0.ts')]) // the first chunk, held
-    const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    const compacting = $.session.compact({ trigger: 'auto', messages: [...history] })
+    await clock.advance(30_000) // the deadline, the held call still in flight
+    const first = await compacting
     expect(builtin).toBe(0)
     expect(briefIn(first.messages![0]!.text)).toStartWith(FLOOR_NOTE)
     // The main history is the compaction's result from here on; it grows past its old length before the next.
