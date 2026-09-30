@@ -351,14 +351,15 @@ function world(on: On, sessionId: string | (() => string)) {
 // git, which reads the environment at compaction, as outside a repository.
 function pi(on: On) {
   const seen = { prompts: [] as string[], logs: [] as string[] }
-  on('process.run', ($, e): { value: ProcessRunResult } => {
-    if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } }
-    const prompt = e.init?.stdin ?? ''
+  on('process.run', (): { value: ProcessRunResult } => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } }))
+  on('process.spawn', async function* ($, e, next) {
+    if (e.argv[0] !== 'pi') return yield* next(e)
+    const prompt = e.input ?? ''
     seen.prompts.push(prompt)
     const text = `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>`
     const event = { role: 'assistant', content: [{ type: 'text', text }], api: 'openai-codex-responses', provider: 'openai-codex', model: 'gpt-5.6-luna', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: 'stop', timestamp: 0 }
-    const stdout = [{ type: 'message_start', message: { ...event, content: [] } }, { type: 'message_end', message: event }, { type: 'turn_end', message: event, toolResults: [] }].map((e) => JSON.stringify(e)).join('\n')
-    return { value: { exitCode: 0, stdout, stderr: '' } }
+    yield { stream: 'stdout' as const, text: [{ type: 'message_start', message: { ...event, content: [] } }, { type: 'message_end', message: event }, { type: 'turn_end', message: event, toolResults: [] }].map((e) => JSON.stringify(e)).join('\n') }
+    return { value: { code: 0, signal: null } }
   })
   on('model.complete', () => ({ value: { isAnswered: false, reason: 'empty-reply', usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }))
   on('ui.log', ($, e) => ((e.to === 'debug' ? seen.logs : []).push(e.text), { value: undefined }))

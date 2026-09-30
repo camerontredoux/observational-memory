@@ -24,6 +24,8 @@ export type LunaCall = {
   ms: number
   input?: number
   output?: number
+  cacheRead?: number // input tokens pi's provider read from its prompt cache, apart from `input`
+  cacheWrite?: number
   cost?: number
   chunkTokens?: number
 }
@@ -43,6 +45,8 @@ export type Compaction = {
   rowsBriefed?: number // rows the floor compiled into the session brief, the Observer not having observed them
   briefTokens?: number
   observations?: number
+  deadlineHit?: boolean // observation at compaction was cut off at its deadline
+  unreadable?: boolean // the loop's history could not be read: its whole context was observed on the spot
 }
 export type Reflection = { ms: number; tokensBefore: number; tokensAfter: number; level: number }
 
@@ -90,6 +94,8 @@ export function addLuna(s: SessionStats, c: LunaCall, at: number) {
   add(s, `${key}.ms`, c.ms, at)
   add(s, `${key}.in`, c.input, at)
   add(s, `${key}.out`, c.output, at)
+  add(s, `${key}.cacheRead`, c.cacheRead, at)
+  add(s, `${key}.cacheWrite`, c.cacheWrite, at)
   add(s, `${key}.cost`, c.cost, at)
   add(s, `${key}.chunkTokens`, c.chunkTokens, at)
 }
@@ -98,6 +104,8 @@ export function addCompaction(s: SessionStats, c: Compaction, at: number) {
   const key = `compaction.${c.trigger}`
   if (c.fellBack) count(s, `${key}.fellBack`)
   if (c.floor) count(s, `${key}.floor`)
+  if (c.deadlineHit) count(s, `${key}.deadlineHit`)
+  if (c.unreadable) count(s, `${key}.unreadable`)
   add(s, `${key}.ms`, c.ms, at)
   add(s, `${key}.tokensBefore`, c.tokensBefore, at)
   add(s, `${key}.tokensAfter`, c.tokensAfter, at)
