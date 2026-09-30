@@ -23,7 +23,7 @@ import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, du
 import type { Io, LunaCall } from './stats'
 import { registerPrune } from './prune'
 import { IMAGE_MARKERS, INJECTED_WRAPPER, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS } from './recall'
-import type { RecallInput, RecallIo } from './recall'
+import type { RecallInput, RecallIo, TranscriptCache } from './recall'
 import { compileBrief, mergeBriefs, openFailures, parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
 
@@ -1935,18 +1935,16 @@ function skillsInUse($: EngineInterface, skills: readonly Skill[], tail: readonl
   return kept
 }
 
-// What om_recall reads files with. `$.fs.read` refuses a file over 4 MiB, which a long transcript is: `cat` reads it.
+// What om_recall reads files with. `$.fs.read` refuses a file over 4 MiB, which a long transcript is: `cat` reads it,
+// and `tail` the part of a file past what was parsed of it.
 const recallIo = ($: EngineInterface): RecallIo => ({
   read: async (path) => {
     const size = await $.fs.stat(path).then((s) => s.size, () => undefined)
     if (size !== undefined && size < 4 * 1024 * 1024) return String(await $.fs.read(path))
-    const cat = $.process.spawn({ argv: ['cat', '--', path] })
-    let text = ''
-    let error = ''
-    for await (const c of cat) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
-    if ((await cat.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
-    return text
+    return output($, ['cat', '--', path], path)
   },
+  stat: (path) => $.fs.stat(path).then((s) => ({ size: s.size, mtime: s.mtimeMs })),
+  readFrom: (path, offset) => output($, ['tail', '-c', `+${offset + 1}`, '--', path], path),
   list: async (dir) => ((await $.fs.exists(dir)) ? (await $.fs.list(dir)).map((f) => f.name) : []),
   // A file's `continued-in` row, written as JSON by Claude Code: quoted inside a message, its quotes are escaped.
   continuing: async (dir, names, id) => {
@@ -1957,6 +1955,17 @@ const recallIo = ($: EngineInterface): RecallIo => ({
   },
   now: () => $.clock.now(),
 })
+// What a command reading `path` prints, or its error when it fails.
+async function output($: EngineInterface, argv: string[], path: string) {
+  const run = $.process.spawn({ argv })
+  let text = ''
+  let error = ''
+  for await (const c of run) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
+  if ((await run.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
+  return text
+}
+// Each session's transcript as om_recall last parsed it, parsed on from there by its next call.
+const transcripts = new Map<string, TranscriptCache>()
 
 function noteRecall($: EngineInterface, sessionId: string, result: string, fromFile: boolean) {
   record(statsIo($), sessionId, (s, at) => addRecall(s, Number(result.match(/^(\d+) match/)?.[1] ?? 0), fromFile, at))
@@ -2381,17 +2390,20 @@ export const register: Register = (on) => {
   // The transcript file and those it continued from hold the whole session, compactions and --resume included; the
   // live history stands in when no file is known or readable.
   on('tool.call', { tool: 'mcp__observational-memory__om_recall' }, async ($, e) => {
-    const [rows, sessionId] = await Promise.all([$.session.messages(), $.session.id()])
+    const sessionId = await $.session.id()
     const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
     let corpus: Awaited<ReturnType<typeof loadTranscript>> | undefined
     if (path) {
+      const cache = transcripts.get(sessionId) ?? {}
+      transcripts.set(sessionId, cache)
       try {
-        corpus = await loadTranscript(recallIo($), path, { asking: true })
+        corpus = await loadTranscript(recallIo($), path, { asking: true, cache })
       } catch (error) {
         log($, `could not read the transcript for om_recall (${errorText(error)}); searching the live history`)
       }
     }
     const fromFile = !!corpus?.main.blocks.length
+    const rows = fromFile ? [] : await $.session.messages()
     const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, sessionId), 0).at, rows.length >= ROWS_CAP, () => $.clock.now()), e)
     return { result: noteRecall($, sessionId, found.text, fromFile) }
   })
@@ -2456,6 +2468,7 @@ export const register: Register = (on) => {
     const cleared = e.reason === 'clear'
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
+    transcripts.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     const kinds = cleared ? [ledgerKey, timesKey, liveKey, skillsKey, turnsKey, transcriptKey, seenKey, goalKey] : []
     await locked(async () => {

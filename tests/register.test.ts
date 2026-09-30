@@ -73,7 +73,8 @@ function world(
   const history: SessionMessage[] = []
   const agents: Record<string, SessionMessage[]> = {}
   const main = () => (options.rowsCap && history.length > options.rowsCap ? history.slice(-options.rowsCap) : history)
-  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? main() : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
+  const asked = { main: 0 } // how often the main conversation's history was read
+  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? (asked.main++, main()) : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
   const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
   const type = (id: string) => (options.teammates?.includes(id) ? 'teammate' : 'general-purpose')
   on('agent.list', async () => {
@@ -111,7 +112,7 @@ function world(
   on('fs.exists', ($, e) => ({ value: e.path in files || Object.keys(files).some((p) => p.startsWith(`${e.path}/`)) }))
   on('session.cwd', () => ({ value: '/work/project' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  return { history, agents, stored, files, reads }
+  return { history, agents, stored, files, reads, asked }
 }
 
 type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
@@ -3140,6 +3141,36 @@ describe('register', () => {
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { count: number; sum: number }> }
     expect(stats.metrics['recall.matches']).toMatchObject({ count: 2, sum: 1 })
     expect(stats.counts['recall.fromFile']).toBe(2)
+  })
+
+  test('om_recall reads the transcript file without the live history, and a later call reads only the rows written since', async ($, on) => {
+    mock.clock(on)
+    const { files, reads, asked } = world(on)
+    on('classic.Stop', () => ({}))
+    const row = (iso: string, content: string) => JSON.stringify({ type: 'user', timestamp: iso, message: { role: 'user', content } })
+    const path = '/t/session-1.jsonl'
+    files[path] = [row('2026-09-22T12:00:00.000Z', 'remember the PEAR-1 marker'), row('2026-09-22T12:05:00.000Z', 'where is PEAR-1?')].join('\n') + '\n'
+    const argvs: (readonly string[])[] = []
+    on('process.spawn', async function* ($, e) {
+      argvs.push(e.argv)
+      yield { stream: 'stdout' as const, text: files[e.argv[4]!]!.slice(Number(e.argv[2]) - 1) }
+      return { value: { code: 0, signal: null } }
+    })
+
+    await $.classic.Stop({ session_id: 'session-1', transcript_path: path, stop_hook_active: false })
+    const first = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PEAR' })).result)
+    const parsed = files[path].length
+    files[path] += [row('2026-09-22T12:10:00.000Z', 'PEAR-2 is the new marker'), row('2026-09-22T12:15:00.000Z', 'and where is PEAR-2?')].join('\n') + '\n'
+    const second = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PEAR' })).result)
+
+    expect(asked.main).toBe(0)
+    expect(reads.filter((p) => p === path)).toEqual([path])
+    expect(argvs).toEqual([['tail', '-c', `+${parsed + 1}`, '--', path]])
+    expect(first).toMatch(/^1 match\(es\) for "PEAR" in 1 block of/)
+    // The prompt that asked the first time is an ordinary match now: the newest one asked.
+    expect(second).toMatch(/^3 match\(es\) for "PEAR" in 3 blocks/)
+    expect(second).toContain('[session-1:3 ')
+    expect(second).not.toContain('[session-1:4 ')
   })
 
   test('observes in the background mid-turn, after the model steps of one long turn, with the times of the rows it read', async ($, on) => {
