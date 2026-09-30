@@ -88,7 +88,8 @@ function world(
     await options.holdGet?.(e.key)
     return { value }
   })
-  on('store.set', ($, e) => ((stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
+  const writes: string[] = [] // the keys written, in order
+  on('store.set', ($, e) => (writes.push(e.key), (stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
   // The stats files, in memory under OM_STATS_DIR.
   const files: Record<string, string> = {}
@@ -111,7 +112,7 @@ function world(
   on('fs.exists', ($, e) => ({ value: e.path in files || Object.keys(files).some((p) => p.startsWith(`${e.path}/`)) }))
   on('session.cwd', () => ({ value: '/work/project' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  return { history, agents, stored, files, reads }
+  return { history, agents, stored, files, reads, writes }
 }
 
 type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
@@ -2970,6 +2971,73 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(1)
     expect(Object.keys(stored).sort()).toEqual(['ledger:session-1/mate-1', 'times:session-1/mate-1'])
+  })
+
+  test("the steps' times and the turn's start are held and written together a moment later, at once at the turn's end, and a prune by another process stays done", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored, writes } = world(on)
+    pi(on)
+    const step = steps(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+    const times = () => (stored['times:session-1'] as { i: number; at: number }[]).map((k) => [k.i, k.at])
+    await clock.set(at(23, 9, 0))
+    history.push({ role: 'user', text: 'brief', toolUses: [] })
+    await $.turn.start({ text: 'brief', turnId: 't' })
+    for (let n = 0; n < 3; n++) {
+      history.push(...call(n, 100))
+      await step($, 't', n, history.length)
+      await clock.settle()
+    }
+    expect(writes.filter((k) => k.startsWith('times:') || k.startsWith('turns:'))).toEqual([])
+
+    await clock.advance(2_000)
+    expect(writes.filter((k) => k.startsWith('times:') || k.startsWith('turns:')).sort()).toEqual(['times:session-1', 'turns:session-1'])
+    expect(times()).toEqual([0, 2, 4, 6].map((i) => [i, at(23, 9, 0)]))
+    expect(stored['turns:session-1']).toEqual([at(23, 9, 0)])
+
+    history.push({ role: 'assistant', text: 'done', toolUses: [] })
+    await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })
+    expect(times().map(([i]) => i)).toEqual([0, 2, 4, 6, 7])
+
+    // Another process's prune deleted the session's keys: what they held is not written back, only what came since.
+    delete stored['times:session-1']
+    delete stored['turns:session-1']
+    await clock.set(at(23, 9, 5))
+    history.push({ role: 'user', text: 'next', toolUses: [] })
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await clock.advance(2_000)
+    expect(times()).toEqual([[8, at(23, 9, 5)]])
+    expect(stored['turns:session-1']).toEqual([at(23, 9, 5)])
+  })
+
+  test('a scheduling pass that changes nothing in the ledger does not write it again', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored, writes } = world(on)
+    pi(on)
+    const runTurn = live(on, clock, history)
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0))
+    await clock.settle()
+    const ledger = stored['ledger:session-1'] as Ledger
+    expect(ledger.entries.length).toBeGreaterThan(0)
+
+    writes.length = 0
+    await runTurn($, turn('c', 'c'), at(23, 9, 5))
+    await clock.settle()
+    expect(writes).not.toContain('ledger:session-1')
+    expect(stored['ledger:session-1']).toEqual(ledger)
+  })
+
+  test("a turn's end records the transcript path only when it changed", async ($, on) => {
+    const { stored, writes } = world(on)
+    on('classic.Stop', () => ({}))
+    const stop = (path: string) => $.classic.Stop({ session_id: 'session-1', transcript_path: path, stop_hook_active: false })
+    await stop('/t/session-1.jsonl')
+    await stop('/t/session-1.jsonl')
+    expect(writes.filter((k) => k.startsWith('transcript:'))).toEqual(['transcript:session-1'])
+    await stop('/t/other.jsonl')
+    expect(writes.filter((k) => k.startsWith('transcript:'))).toEqual(['transcript:session-1', 'transcript:session-1'])
+    expect(stored['transcript:session-1']).toBe('/t/other.jsonl')
   })
 
   test('a genuine prompt that happens to start with a tag is told apart from a named injected wrapper by name, not by shape', async ($, on) => {
