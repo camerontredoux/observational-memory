@@ -115,14 +115,15 @@ function world(
 }
 
 type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
-type PiCall = { argv: readonly string[]; cwd?: string; timeoutMs?: number }
+type PiCall = { argv: readonly string[]; cwd?: string }
 
 // git outside a repository, as the plugin's environment read meets it by default.
 const NOT_A_REPO: ProcessRunResult = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
 
-// pi on the host, as `$.process.run` runs it: it observes by naming the prompts of its chunk, each at the time
+// pi on the host, as `$.process.spawn` runs it: it observes by naming the prompts of its chunk, each at the time
 // its block shows; the reflector answers `reflect(n, prompt)` for its nth call, by default a reflection near its target. `hold` delays the nth call's answer, `fail`
-// answers it with a failed run instead. git is answered by `git`, else as outside a repository, and is no pi call.
+// answers it with a failed run instead; `stopped` counts the calls killed before they answered. git, through
+// `$.process.run`, is answered by `git`, else as outside a repository, and is no pi call.
 // `$.model.complete` is counted, and answers nothing.
 function pi(
   on: On,
@@ -135,26 +136,48 @@ function pi(
     session?: (prompt: string) => string | ProcessRunResult
   } = {},
 ) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[] }
+  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[] }
   let reflections = 0
-  on('process.run', async ($, e) => {
-    if (e.argv[0] === 'git') return seen.git.push(e.argv), { value: options.git?.(e.argv) ?? NOT_A_REPO }
-    const prompt = e.init?.stdin ?? ''
-    if (e.argv[e.argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT) {
+  on('process.run', ($, e) => {
+    if (e.argv[0] !== 'git') return { value: { exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` } }
+    return seen.git.push(e.argv), { value: options.git?.(e.argv) ?? NOT_A_REPO }
+  })
+  // What pi prints comes in pieces, the middle of a line ending one, as a child writes it. A call killed while held
+  // stops holding at once.
+  on('process.spawn', async function* ($, e, next) {
+    if (e.argv[0] !== 'pi') return yield* next(e)
+    const killed = new Promise<never>((_, reject) => next.signal.addEventListener('abort', () => reject(next.signal.reason), { once: true }))
+    killed.catch(() => {})
+    let answered = false
+    try {
+      const r = await answer(e.argv, e.cwd, e.input ?? '', killed)
+      answered = true
+      const half = Math.floor(r.stdout.length / 2)
+      for (const [stream, text] of [['stdout', r.stdout.slice(0, half)], ['stdout', r.stdout.slice(half)], ['stderr', r.stderr]] as const) if (text) yield { stream, text }
+      return { value: { code: r.exitCode, signal: null } }
+    } finally {
+      if (!answered) seen.stopped++
+    }
+  })
+  async function answer(argv: readonly string[], cwd: string | undefined, prompt: string, killed: Promise<never>): Promise<ProcessRunResult> {
+    if (argv[argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT) {
       seen.sessions.push(prompt)
       const r = options.session?.(prompt) ?? 'Session: the test goal'
-      return { value: typeof r === 'string' ? { exitCode: 0, stdout: piOutput(prompt, r), stderr: '' } : r }
+      return typeof r === 'string' ? { exitCode: 0, stdout: piOutput(prompt, r), stderr: '' } : r
     }
     seen.prompts.push(prompt)
-    seen.systems.push(e.argv[e.argv.indexOf('--system-prompt') + 1] ?? '')
-    seen.calls.push({ argv: e.argv, cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
+    seen.systems.push(argv[argv.indexOf('--system-prompt') + 1] ?? '')
+    seen.calls.push({ argv, cwd })
     const n = seen.prompts.length
     seen.inFlight++
     seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight)
-    await options.hold?.(n, prompt)
-    seen.inFlight--
+    try {
+      await Promise.race([options.hold?.(n, prompt), killed])
+    } finally {
+      seen.inFlight--
+    }
     const failed = options.fail?.(n, prompt)
-    if (failed) return { value: failed }
+    if (failed) return failed
     let text: string
     if (prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
       reflections++
@@ -164,8 +187,8 @@ function pi(
         options.reply?.(prompt) ??
         `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
         `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
-    return { value: { exitCode: 0, stdout: piOutput(prompt, text), stderr: '' } }
-  })
+    return { exitCode: 0, stdout: piOutput(prompt, text), stderr: '' }
+  }
   on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
   on('ui.log', ($, e) => ((e.to === 'debug' ? seen.logs : seen.screen).push(e.text), { value: undefined }))
   return seen
@@ -347,7 +370,7 @@ describe('register', () => {
     expect(seen.prompts[1]).toContain('[User]: b')
     expect(seen.prompts[1]).not.toContain('User: "a"') // a pure mapper: no observations so far
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
-    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS], cwd: '/tmp', timeoutMs: 120_000 })
+    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS], cwd: '/tmp' })
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s')
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
@@ -853,6 +876,28 @@ describe('register', () => {
     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
   })
 
+  test('a background pi call still running at its timeout on the clock is killed, and a later pass retries its chunk', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const { gate } = gates()
+    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 14, 31))
+    await clock.settle()
+    expect(seen.inFlight).toBe(1) // since turn a ended, a minute ago
+    await clock.advance(59_000)
+    expect([seen.inFlight, seen.stopped]).toEqual([1, 0])
+    await clock.advance(1_000)
+
+    expect([seen.inFlight, seen.stopped]).toEqual([0, 1])
+    expect(seen.logs).toContain('background observation of rows 0-3 failed (pi timed out after 120000 ms); it will be retried')
+    await clock.advance(60_000)
+    expect(seen.prompts).toHaveLength(2)
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^observed rows 0-3 in the background/))
+  })
+
   test('a failed pi call in the background leaves its chunk unobserved, logged once, and a later pass retries it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
@@ -1020,7 +1065,7 @@ describe('register', () => {
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
     await clock.settle() // [0, 4) observed
-    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 1)) // within the held call's timeout
     await clock.settle() // [4, 8) in flight, held
     expect(seen.prompts).toHaveLength(2)
     const messages = [...history]
@@ -1052,17 +1097,17 @@ describe('register', () => {
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
     const seen = pi(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(100 + n) : undefined),
-      reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🔴 2026-09-22 15:00 User: "b"\n</observations>`),
+      reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🔴 2026-09-22 14:39 User: "b"\n</observations>`),
       reflect: (n, prompt) => (n === 1 ? big : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module')),
     })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 14, 39)) // within the held reflection's timeout
     await clock.settle() // chunk a's 4000 entries start a reflection, held; chunk b lands meanwhile
     const reflectAt = seen.prompts.findIndex((p) => p.startsWith('## OBSERVATIONS')) + 1
     expect(reflectAt).toBeGreaterThan(0)
-    expect((stored['ledger:session-1'] as Ledger).entries.at(-1)?.line).toBe('🔴 2026-09-22 15:00 User: "b"')
+    expect((stored['ledger:session-1'] as Ledger).entries.at(-1)?.line).toBe('🔴 2026-09-22 14:39 User: "b"')
     open(100 + reflectAt)
     await clock.settle()
     open(100 + seen.prompts.length)
@@ -1081,11 +1126,11 @@ describe('register', () => {
     expect(reflections[0]).not.toContain('User: "b"')
     expect(seen.systems.at(-1)).toContain('reflection agent for a coding assistant')
     const entries = (stored['ledger:session-1'] as Ledger).entries
-    expect(seen.screen).toContain(`Condensed memory in 30m 0s · 4,001 → ${entries.length.toLocaleString('en-US')} notes`)
+    expect(seen.screen).toContain(`Condensed memory in 9m 0s · 4,001 → ${entries.length.toLocaleString('en-US')} notes`)
     expect(seen.calls.at(-1)!.argv).toEqual([...PI_ARGV, seen.systems.at(-1), ...PI_FLAGS])
     expect(entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
       '🟡 2026-09-22 14:30 Explored the auth module',
-      '🔴 2026-09-22 15:00 User: "b"',
+      '🔴 2026-09-22 14:39 User: "b"',
     ])
     // The snapshot as the Reflector read it, the newest left out: each line with its source range.
     const line = '* 🟡 2026-09-22 14:30 read a file with a long name (source 2026-09-22 14:30 to 2026-09-22 14:31)'
@@ -1956,7 +2001,7 @@ describe('register', () => {
     agents['agent-2'] = [{ role: 'user', text: 'second brief', toolUses: [] }]
 
     for (let n = 0; n < 10; n++) {
-      await clock.set(at(23, 9, n + 1))
+      await clock.set(at(23, 9, 0) + (n + 1) * 10_000) // the held calls stay within their timeout
       history.push(...agentCall('main', n, 16_000))
       await step($, 't', n, history.length)
       agents['agent-1'].push(...agentCall('one', n, 16_000))
@@ -2409,7 +2454,7 @@ describe('register', () => {
     let context = () => [...rows]
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, n + 1))
+        await clock.set(at(23, 9, 0) + (n + 1) * 10_000) // the held call stays within its timeout
         rows.push(...agentCall('one', n, 16_000))
         await step($, 's', n, rows.length, 'agent-1')
         await clock.settle()
@@ -2459,7 +2504,7 @@ describe('register', () => {
     on('session.compact', () => (builtin++, { messages: [SUMMARY] }))
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, n + 1))
+        await clock.set(at(23, 9, 0) + (n + 1) * 10_000) // the held call stays within its timeout
         history.push(...agentCall('main', n, 16_000))
         await step($, 't', n + 1, history.length)
         await clock.settle()
@@ -2535,7 +2580,7 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(2)
   })
 
-  test("a finished subagent's keys are dropped, a chunk landing after it is discarded, and session end sweeps any left", async ($, on) => {
+  test("a finished subagent's keys are dropped, its calls in flight are stopped, and session end sweeps any left", async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
@@ -2546,21 +2591,25 @@ describe('register', () => {
     await clock.settle()
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
     for (let n = 0; n < 10; n++) {
-      await clock.set(at(23, 10, n))
+      await clock.set(at(23, 10, 0) + n * 10_000) // the held calls stay within their timeout
       agents['agent-1'].push(...agentCall('one', n, 16_000))
       await step($, 's', n, agents['agent-1'].length, 'agent-1')
       await clock.settle()
     }
     expect(stored['ledger:session-1/agent-1']).toBeDefined()
-    expect(seen.inFlight).toBeGreaterThan(0)
+    const held = seen.inFlight
+    expect(held).toBeGreaterThan(0)
 
     await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    await clock.settle()
+    expect([seen.inFlight, seen.stopped]).toEqual([0, held]) // killed with their loop, not left to run
     expect(Object.keys(stored).filter((k) => k.includes('/'))).toEqual([])
     for (let n = 2; n <= 10; n++) open(n)
     await clock.settle()
 
     expect(Object.keys(stored).filter((k) => k.includes('/'))).toEqual([])
-    expect(seen.logs).toContain('a background chunk landed after its loop ended; discarded')
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^background observation of rows \d+-\d+ stopped: /))
+    expect(seen.logs).not.toContainEqual(expect.stringMatching(/will be retried$/))
     expect((stored['ledger:session-1'] as Ledger).entries.length).toBeGreaterThan(0) // the main conversation's stays
 
     // A subagent that never finished (killed, or the process died) leaves keys the session's end sweeps.
@@ -2645,7 +2694,7 @@ describe('register', () => {
     expect(seen.logs).toContain('a reflection outlived its loop; discarded')
   })
 
-  test("a finished subagent's calls hold their slots until they return, then a waiting main loop and sibling subagent are observed", async ($, on) => {
+  test("a finished subagent's calls are stopped, and their slots go to a waiting main loop and sibling subagent", async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
@@ -2660,15 +2709,18 @@ describe('register', () => {
     await step($, 's', 0, agents['agent-1'].length, 'agent-1')
     await clock.settle()
     expect(seen.inFlight).toBe(4)
-    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 30)) // no slot: main waits
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0)) // no slot: main waits
     await step($, 's2', 0, agents['agent-2'].length, 'agent-2') // and so does the sibling
     await clock.settle()
+    expect(seen.prompts).toHaveLength(4)
 
     await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
-    await runTurn($, turn('c', 'c', 8_000), at(23, 9, 40)) // main's pass after the subagent ends: still no slot
     await clock.settle()
-    expect(seen.prompts).toHaveLength(4)
-    for (let n = 1; n <= 4; n++) open(n)
+    expect(seen.stopped).toBe(4)
+    expect(seen.prompts.length).toBeGreaterThan(4) // the freed slots went to the loops waiting on them
+    for (let n = 5; n <= seen.prompts.length; n++) open(n)
+    await clock.settle()
+    await runTurn($, turn('c', 'c', 8_000), at(23, 9, 1))
     await clock.settle()
     for (let n = 5; n <= seen.prompts.length; n++) open(n)
     await clock.settle()
@@ -3152,7 +3204,7 @@ describe('register', () => {
 
     // Each step resolves with the first Observer call still held: nothing waits on it.
     for (let n = 0; n < 8; n++) {
-      await clock.set(at(23, 9, n + 1))
+      await clock.set(at(23, 9, 0) + (n + 1) * 14_000) // the held call stays within its timeout
       history.push(...call(n, 16_000))
       await step($, 't', n + 1, history.length)
       await clock.settle()
@@ -3172,7 +3224,7 @@ describe('register', () => {
       'Observed 7 messages · +1 note · memory 2 notes',
     ])
     // The rows' times come from the steps that brought them, not only the prompt's.
-    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 09:03 Read a file', '🟡 2026-09-23 09:06 Read a file'])
+    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 09:00 Read a file', '🟡 2026-09-23 09:01 Read a file'])
   })
 
   test('past the 4096 rows the history reads as, a long turn still observes in the background mid-turn', async ($, on) => {
@@ -3443,7 +3495,7 @@ describe('register', () => {
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 14, 31)) // within the held call's timeout
     await clock.settle() // [0, 4) in flight, held
     history.splice(0, history.length, ...turn('z', 'z', CHUNK), ...turn('b', 'b', 8_000)) // rewound
     open(1)

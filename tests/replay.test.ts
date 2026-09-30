@@ -191,15 +191,17 @@ describe('the om chain through hooks/register.ts', () => {
     })
     on('skill.prompt', ($, e) => ({ text: e.text }))
     const observed: string[][] = []
-    on('process.run', ($, e) => {
-      if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } } // outside a repository
-      const prompt = e.init?.stdin ?? ''
+    on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } })) // git, outside a repository
+    on('process.spawn', async function* ($, e, next) {
+      if (e.argv[0] !== 'pi') return yield* next(e)
+      const prompt = e.input ?? ''
       const session = e.argv[e.argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT // the Session line's writer
       const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
       if (!session) observed.push(words)
       const text = session ? 'Session: replay goal' : `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
       const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage: { input: 1, output: 1, cost: { total: 0 } } }
-      return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'message_end', message }), stderr: '' } }
+      yield { stream: 'stdout' as const, text: JSON.stringify({ type: 'message_end', message }) }
+      return { value: { code: 0, signal: null } }
     })
 
     const inputs: string[][] = []
