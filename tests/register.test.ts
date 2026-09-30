@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, SessionCompactInput, SessionMessage } from 'claude-code'
-import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
+import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
@@ -2134,6 +2134,8 @@ describe('register', () => {
     expect(observationsIn(text)).toBe(['* 🟡 2026-09-22 14:29 Saw a, before the ranges', ...Array.from({ length: 1200 }, (_, i) => `* 🟡 2026-09-22 ${minute(i)} read a file`), '* 🟡 2026-09-22 15:30 read c'].join('\n'))
     expect(userMessagesIn(text)).toEqual(['a', 'b', 'c'])
     expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: source ranges left out$/))
+    // The guide's line on source ranges goes with them.
+    expect(text).toContain(`<memory-guide>\n${MEMORY_GUIDE}\n</memory-guide>`)
     // The ledger keeps them: a compaction with room for them gives them back.
     window = 200_000
     history.splice(0, history.length, ...first.messages!)
@@ -2141,6 +2143,7 @@ describe('register', () => {
     await runTurn($, turn('f', 'f', 8_000), at(22, 17, 0))
     await clock.settle()
     const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    expect(second.messages?.[0]?.text).toContain(`<memory-guide>\n${MEMORY_GUIDE}\n${MEMORY_GUIDE_SOURCES} om_recall takes them as from and to.\n</memory-guide>`)
     expect(observationsIn(second.messages?.[0]?.text)?.split('\n').slice(0, 3)).toEqual(['* 🟡 2026-09-22 14:29 Saw a, before the ranges (source none)', '* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:30)', '* 🟡 2026-09-22 14:31 read a file (source 2026-09-22 14:31 to 2026-09-22 14:31)'])
   })
 
@@ -4136,14 +4139,20 @@ describe('active constraints and the continuation record', () => {
   })
 
   test("the memory message ends by sending the model to om_recall before it says a detail is gone, only while the model can call om_recall", async ($, on) => {
-    mock.clock(on)
-    world(on)
+    const clock = mock.clock(on)
+    const { history } = world(on)
     pi(on)
     let tools = [{ name: 'Read', description: 'Reads a file', mcp: false }]
     on('tool.list', () => ({ value: tools }))
     on('classic.SessionStart', () => ({}))
+    // Observed live, so the observations carry source ranges.
+    const runTurn = live(on, clock, history)
     await $.classic.SessionStart({ source: 'startup', session_id: 'session-1', transcript_path: '/home/u/.claude/projects/p/session-1.jsonl' })
-    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 30))
+    await clock.settle()
+    const messages = [...history]
 
     // As with --disallowed-tools mcp__observational-memory__om_recall: the tool is not the model's to call.
     const without = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
@@ -4153,8 +4162,8 @@ describe('active constraints and the continuation record', () => {
     expect(offered.endsWith(`\n\n<resume>\n${MEMORY_RESUME}\n${MEMORY_RECALL}\n${MEMORY_RESUME_END}\n</resume>`)).toBe(true)
     expect(without.endsWith(`\n\n<resume>\n${MEMORY_RESUME}\n${MEMORY_RESUME_END}\n</resume>`)).toBe(true)
     // The guide names om_recall's use of a source range only where the model can call it.
-    expect(offered).toContain(`${MEMORY_GUIDE} om_recall takes them as from and to.\n</memory-guide>`)
-    expect(without).toContain(`${MEMORY_GUIDE}\n</memory-guide>`)
+    expect(offered).toContain(`${MEMORY_GUIDE}\n${MEMORY_GUIDE_SOURCES} om_recall takes them as from and to.\n</memory-guide>`)
+    expect(without).toContain(`${MEMORY_GUIDE}\n${MEMORY_GUIDE_SOURCES}\n</memory-guide>`)
     expect(without).not.toContain('om_recall takes')
     // The built-in's line pointing at the transcript file stands in for om_recall only where the model cannot call it.
     const pointer = '\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/u/.claude/projects/p/session-1.jsonl\n'

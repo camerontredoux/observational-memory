@@ -8,6 +8,7 @@ import {
   FLOOR_NOTE,
   MEMORY_GUIDE,
   MEMORY_GUIDE_RECALL,
+  MEMORY_GUIDE_SOURCES,
   MEMORY_HEADER,
   MEMORY_MARK,
   MEMORY_RECALL,
@@ -1383,7 +1384,9 @@ const SESSION_BRIEF_END = '\n</session-brief>'
 // sends it there), so they are the last thing read before the messages. A guide line never starts with a tag, so
 // parseMemory reads no section from it.
 function memoryMessage(memory: Memory): SessionMessage {
-  const guide = `${MEMORY_GUIDE}${memory.recall ? MEMORY_GUIDE_RECALL : ''}`
+  // The source-range line only where the observations have one: over the budget they are left out.
+  const sources = memory.observations.includes('(source ') ? `\n${MEMORY_GUIDE_SOURCES}${memory.recall ? MEMORY_GUIDE_RECALL : ''}` : ''
+  const guide = `${MEMORY_GUIDE}${sources}`
   const resume = [MEMORY_RESUME, memory.recall ? MEMORY_RECALL : '', MEMORY_RESUME_END].filter(Boolean).join('\n')
   const text =
     `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${guide}\n</memory-guide>\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
