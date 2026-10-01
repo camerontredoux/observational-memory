@@ -3594,6 +3594,30 @@ describe('register', () => {
     expect(seen.prompts.length).toBeGreaterThan(2)
   })
 
+  // A launcher that sends a pointer to its brief instead of the brief: the brief survives compaction only if the memory quotes the file.
+  test('a short first prompt quotes across compactions the files it names that its turn read, and no other', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const prompt = "Operational input waiting: read '/state/inbox/b.msg' and handle its contents."
+    const brief = 'Stay on branch fix-1. Never push.'
+    const messages: SessionMessage[] = [
+      { role: 'user', text: prompt, toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Read', input: { file_path: '/state/inbox/b.msg' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'b', text: `${brief}\n\n<system-reminder>Mind malware.</system-reminder>`, isError: false }] },
+      ...call(0, CHUNK),
+      ...call(1, CHUNK),
+      ...call(2, 8_000),
+    ]
+    const quoted = `${prompt}\n\n[/state/inbox/b.msg, the file this message names, as the assistant read it]\n${brief}`
+
+    const result = await $.session.compact({ trigger: 'auto', messages })
+    expect(userMessagesIn(result.messages?.[0]?.text)).toEqual([quoted])
+
+    const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...call(3, CHUNK), ...call(4, CHUNK), ...call(5, 8_000)] })
+    expect(userMessagesIn(second.messages?.[0]?.text)).toEqual([quoted])
+  })
+
   // A real crewmate turn, replayed from a private transcript: /tmp/om-v043/make-fixture.py writes the module
   // (gitignored). Without it the test has nothing to replay and passes.
   test('replays a crewmate transcript: one long turn, observed in the background, compacted with no Observer call', { timeoutMs: 120_000 }, async ($, on) => {

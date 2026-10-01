@@ -394,6 +394,25 @@ function typed(m: SessionMessage, skills: readonly Skill[]) {
   return text === undefined || skills.some((s) => s.text.trim() && text.includes(s.text.trim())) ? undefined : text
 }
 
+// The session's first prompt, when it is short enough to be a pointer ("read <file> and handle it", as a launcher
+// sends a crewmate its brief), with the text of each file it names that `turn`, the rows before the next prompt,
+// read: the file is then the brief, and the memory message quotes it with the prompt across compactions. Each file
+// is labelled, so its text is not taken for the user's words.
+const POINTER_MAX_TOKENS = 500
+function withFilesRead(prompt: string, turn: readonly SessionMessage[]) {
+  if (estimateTokens(prompt) > POINTER_MAX_TOKENS) return prompt
+  const results = new Map(turn.flatMap((m) => (m.toolResults ?? []).map((r) => [r.tool_use_id, r] as const)))
+  const files = turn.flatMap((m) =>
+    m.toolUses.flatMap((u) => {
+      const path = u.input.file_path
+      const r = results.get(u.tool_use_id)
+      if (u.tool !== 'Read' || typeof path !== 'string' || !prompt.includes(path) || !r || r.isError) return []
+      return [`\n\n[${path}, the file this message names, as the assistant read it]\n${r.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()}`]
+    }),
+  )
+  return prompt + files.join('')
+}
+
 const minute = (ms: number) => Math.floor(ms / 60_000) // a time read back from its stamp compares by the minute
 
 // Each row's time: its own mark, a mark on a row that reads the same (a compaction's copy), or the row before's.
@@ -1833,6 +1852,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     const text = i < base ? undefined : typed(m, known)
     return text === undefined ? [] : [{ i, message: stamped(i, text) }]
   })
+  if (!base && prompts[0]?.i === 0) prompts[0].message.text = withFilesRead(prompts[0].message.text, messages.slice(1, prompts[1]?.i))
   // The reply ending each turn: the last assistant text before the next prompt, from rows past the memory message.
   const replyRows = prompts.flatMap((p, k) => {
     const lo = k ? prompts[k - 1]!.i : base - 1
