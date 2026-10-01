@@ -1,0 +1,246 @@
+SUMMARY: hooks/register.ts carries most of the plugin's code (2,477 lines), and about 1,040 of those lines never touch $: the memory-page codec, the handling of Observer and Reflector replies, and 
+the raw-tail shaping. Those three could be their own modules and tested directly, instead of only through the ~29 s engine-level suite. Recent churn is concentrated in two places, the 283-line 
+session.compact closure and the codec. Several concepts are copied across modules and have started to diverge: the typed-prompt rule, the store key list, the om_recall registration copied into the 
+eval plugin, and small time/token/clip helpers. The 5.4k characters of manifest description prose is rewritten on nearly every release, nothing in the repo reads it, and it already claims the memory 
+carries /compact instructions, which the code sends to built-in compaction instead.
+
+=== D1 [high] register.ts carries about 1,040 lines of pure code in three separate concepts, and tests can only reach them through the whole mocked engine
+EVIDENCE: hooks/register.ts:220-330 (tail shaping: `function excerpt(`, `function maskTail(`, `function dedupWrappers(`, `function unmask(`); :364-902 and :986-1051 (rows, timeline and 
+Observer/Reflector reply handling: `function view(`, `function parseLines(`, `function applyConstraints(`, `function boundPins(`, `function grounded(`, `function carryClauses(`); :1112-1440 (memory 
+page codec: `function memoryMessage(memory: Memory): SessionMessage`, `function parseMemory(message: SessionMessage)`). An awk scan for `$.`/`($` over these ranges finds no engine call; the only hit 
+is noteUnmarked at :897. register.ts:2027 `export const register: Register` is the file's only export, and tests/register.test.ts:1-5 imports nothing else from it.
+IMPACT: The codec's round trip (parseMemory(memoryMessage(m))), constraint replacement and grounding can only be tested by driving a full compaction. The 146 register tests take 28.6 s of the suite's 
+29.6 s (about 196 ms each), while vcc's 22 pure tests take 86 ms (about 4 ms each). Locality is poor where change is frequent: over the last 25 commits to register.ts, 26 of 181 hunks landed in the 
+codec (Memory 8, parseMemory 5, memoryMessage 5, withOmitted 4, unstamp 4) and 52 inside register(). A reader has to page through 2,477 lines to change one format.
+SUGGESTION: Move them into three $-free modules, the way vcc.ts and recall.ts are built: hooks/memory.ts (the Memory type, render/parse of every section, older-version reading, capUserMessages, 
+capReplies, briefer), hooks/notes.ts (sectionsOf, parseLines, constraints, boundPins, grounding, carryClauses, unsaid, sources), and hooks/tail.ts (excerpt, maskTail, dedupWrappers, unmask). 
+register.ts keeps the loops, the store, pi and the hooks. Add direct tests at each new interface, for example a round-trip test for the codec, and cut the matching engine-level tests down to a few 
+that check the wiring.
+ESSENCE: Nothing about what runs changes: the Observer, the Reflector and the watermark cut stay in register.ts, and compaction still makes no model call. Only where the pure code lives changes, and 
+the $ rule holds because none of it touches $.
+PRIOR: None found. git log has no split of register.ts. The only similar move is a8363a1, which took legacyRecall out of recall.ts. TODO.md and docs/plans do not raise it.
+VERDICT: partly / medium
+REASON: The core claim holds. An awk scan of register.ts:220-1440 finds engine use only in log/show/statsIo (:333-360), noteUnmarked (:897), complete/environmentOf/noteObservations (:926-981) and 
+observe (:1052). Those are exactly the stretches the finding leaves out, so its four ranges add up to ~1,045 pure lines. register.ts:2027 `export const register` is the only export, and 
+register.test.ts:1-5 imports nothing from hooks/register. The pure code already takes callbacks where it needs I/O (parseLines' `unmarked`, groundRed's `demoted`), so extracting it would not break 
+the AGENTS.md $ rule. The churn numbers check out: over the last 25 commits there are 181 default-context hunks, 52 of them inside register(). Some details are wrong. There are 156 register tests, 
+not 146. They sum to 29.5 s, but 7.3 s of that is two replays of local fixtures (6.2 s crewmate, 1.1 s firstmate), and the median test takes 101 ms. Moving code out does not speed up those tests 
+unless engine tests are deleted. The ranges also cover the ledger-view machinery (view, align, locate, tailStart, floorCuts, chunkEnd, serialize, :439-528), and the suggested three-module map leaves 
+it unplaced. Cutting engine-level tests down to 'a few that check the wiring' deletes regression checks, which the testing conventions say needs the user's approval and a named reason per test. No 
+prior art found.
+CORRECTION: Extract one module first: the memory-page codec (Memory, memoryMessage/parseMemory and their section renderers and parsers, capUserMessages, capReplies, briefer). It has the clearest 
+interface and a natural round-trip test. Place the view/ledger helpers deliberately rather than leaving them implicit, and split notes and tail only if the codec move pays off (the conventions say to 
+use as few files as possible). Keep the existing engine tests. Add the round-trip test beside them instead of deleting coverage.
+
+=== D2 [medium] The session.compact handler is one 283-line closure with nested builders, repeated expressions and four store reads awaited one after another
+EVIDENCE: hooks/register.ts:2029 `on('session.compact', async ($, e, next) => {` runs to :2311. Nested inside it: `const compile = async (from, to)` :2146, `const build = async (ledger, kept)` :2165, 
+which holds `attempt` :2168, `shown` :2208 and `stands` :2228, then `settle` :2241. State is shared through mutable `let corpus`/`let dirs` (:2144-2145), `let sources = true` (:2207) and `let sync` 
+(:2072). The same line appears twice: `dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME')...` at :2154 and :2175. So does `{ ...(v.at[i] === undefined ? {} : { at: 
+stamp(v.at[i]!) }), text }` at :2112 and :2119. Sequential reads: `await $.store.get(skillsKey(...))` :2105, `goalKey` :2106, `turnsKey` :2107 and `transcriptKey` :2127, all after the Promise.all at 
+:2038.
+IMPACT: Most of the churn lands here: 52 of the 181 hunks in the last 25 commits to register.ts fell inside register(). The budget arithmetic (:2134-2140, covering limit, overhead, budget and 
+density) and the cut order (:2214-2225) cannot be tested alone. Four store reads that do not depend on each other are awaited one at a time on compaction's critical path, where two or three of them 
+could run in parallel. The duplicated `dirs` line means a fix to the cwd/HOME fallback has to be made twice.
+SUGGESTION: Split the handler into named stages at module level: gather (one Promise.all covering session id, usage, tools, environment and the four store keys), observeGaps(v, ledger, start), a pure 
+planBudget(usage, main, v) that returns {budget, density}, a pure buildMemory(inputs, compile) that tries the watermark and then the floor cuts, and install/record. Hoist `dirs` into a single lazy 
+helper, and use one `stamped(i, text)` helper for prompts and replies.
+ESSENCE: The watermark cut, the floor that compiles the session brief and the fallback to built-in compaction all stay as they are. The stages only name the steps and make them testable, and the cut 
+still makes no model call.
+PRIOR: None found for the structure. docs/plans/compaction-ideas.md:294 cites line numbers inside this handler (the OVER_CAP cliff) for other purposes.
+VERDICT: partly / low
+REASON: Several facts hold. The handler spans register.ts:2029-2308 (the .catch ends at :2308, not :2311). The `dirs ??= Promise.all([$.session.cwd()...` line appears at both :2154 and :2175. The `{ 
+...(v.at[i] === undefined ? {} : { at: stamp(...) }), text }` expression appears at :2112 and :2119. Budget and density are computed inline at :2134-2140, and the cut order at :2214-2225. The store 
+reads at :2105-2107 and :2127 are awaited one after another. The impact is overstated in two places. First, churn: I recounted the same 25 commits. 41 of 181 hunks fall in the compact handler and 11 
+elsewhere in register(), so about 23% is in the handler and 71% is outside register(). That is about twice the file's average hunk density, but it is not 'most of the churn'. Second, latency: $.store 
+is the plugin's local JSON file through the host (claude-code.d.ts:2910-2923). Three of the four reads run only on the main loop. They follow environmentOf's git calls and any on-the-spot 
+observation, so they add a few host round trips to a path that TODO.md measures at ~0.2 s for a matched compaction. The suggestion's single Promise.all cannot include the store keys directly, because 
+each key needs sessionId from that same Promise.all. Moving `build` to module level would mean passing ~20 captured values (messages, v, base, priorMemory, prompts, replyRows, typedSoFar, goal, 
+recorded, turns, environment, transcript, recall, budget, density, tailTokens, compile...) through a large inputs object.
+CORRECTION: Keep the cheap, clear wins: a pure planBudget(usage, main, totalTokens) returning {budget, density} with a direct test, one lazy dirs() helper, and one stamped(i, text) helper. Optionally 
+chain the four reads off $.session.id() so they overlap. Describe the latency gain as a few host round trips, not a critical-path cost. Leave build/attempt as closures unless the codec extraction 
+(D1) shrinks what they capture.
+
+=== D3 [medium] The store key schema is spelled out in three places across two files, and missing one leaves keys that are never pruned
+EVIDENCE: hooks/register.ts:1495-1502 has one function per key (`const goalKey = (sessionId: string) => `goal:${sessionId}``), :1505 `const LOOP_KEYS = [ledgerKey, timesKey, liveKey]`, and :2458 
+`const kinds = cleared ? [ledgerKey, timesKey, liveKey, skillsKey, turnsKey, transcriptKey, seenKey, goalKey] : []`. hooks/prune.ts:12 has `const KINDS = ['ledger', 'times', 'live', 'skills', 
+'turns', 'transcript', 'seen', 'goal']`, and :114 writes the literal `$.store.set(`seen:${s.id}`, now)`. prune.ts:19-22 `sessionOf` returns undefined for a kind that is not in KINDS. Commit 181f0ca 
+(v1.5.0) had to add `goal` in all three places.
+IMPACT: Each new kind of per-session state takes three edits in two files. If prune.ts:12 is missed, that kind is never pruned and never counted by the store-cap fallback. The store is one shared 
+JSON file capped at 4 MiB (prune.ts:4, `STORE_CAP = 4 * 1024 * 1024`), so a missed kind leaks until the cap forces writes to fail.
+SUGGESTION: Add a small $-free hooks/keys.ts that exports `KINDS`, `key(kind, id)` and `LOOP_KINDS`. register.ts derives its key functions and the /clear list from it (`KINDS.map((k) => key(k, 
+id))`), and prune.ts imports KINDS and `key('seen', id)`.
+ESSENCE: This touches only storage bookkeeping. Observation, reflection and compaction are unchanged.
+PRIOR: TODO.md:30-36 covers non-atomic store writes, which is a different problem. The v1.5.0 commit 181f0ca shows the three edits. No existing note proposes a single schema.
+VERDICT: confirmed / low
+REASON: Verified. register.ts:1495-1502 has one key function per kind, and :1505 defines `LOOP_KEYS = [ledgerKey, timesKey, liveKey]`. The /clear list at :2458 names all eight kinds. prune.ts:12 has 
+`KINDS = ['ledger', ..., 'goal']`, and :114 writes the literal `seen:${s.id}`. sessionOf (prune.ts:20-23) ignores any kind not in KINDS, so such keys are never pruned and never counted by the cap 
+fallback (:146-158). seenKey appears in register.ts only in the /clear list. `git show 181f0ca` shows `goal` added in all three places. tests/prune.test.ts does not check that register's kinds match 
+KINDS, so a missed edit would pass the tests. No prior art proposes a single schema (TODO.md's store item is about atomicity). The risk is real but has not happened yet, and it is a slow leak, so low 
+severity.
+CORRECTION: The suggestion works. A smaller version needs no new file: export KINDS (and a key(kind, id) helper) from prune.ts, which register.ts already imports (register.ts:23), then derive the 
+/clear list from it and use key('seen', id) at prune.ts:114.
+
+=== D4 [medium] Three modules each decide what counts as a typed prompt: two by copying the code, one by a looser rule
+EVIDENCE: hooks/register.ts:423-429 `function typed(m, skills)` repeats recall.ts:90-94 `function typedText(text)` line for line: `.replace(/<\system-reminder>[\s\S]*?<\/system-reminder>/g, 
+'').trim()`, then `said = text.replace(IMAGE_MARKERS, '')`, then `!said || INJECTED_WRAPPER.test(said)`. register.ts:411-412 `isMemory` repeats recall.ts:76 `isMemoryText`. The comments at 
+register.ts:421-422 say the constants are shared "so the two modules agree on what counts as typed", but the function itself is copied. vcc.ts:80 uses a third, looser rule: `if 
+(!m.toolResults?.length && m.text.replace(/<\system-reminder>...` pushes a `kind: 'user'` block for injected wrappers too, and vcc.ts:560 `if (!next || next.b.kind === 'user') r.score += 14` treats 
+such a block as the end of a turn.
+IMPACT: A fix has to be made in two places, and it already was once: docs/plans/ideas/code-only.md:27 describes the image-prompt bug that had to be fixed in both `typed()` and `typedText()`. In the 
+brief, a task notification or hook-feedback row gives the assistant line before it a +14 closing-turn bonus that <all-user-messages> and om_recall would never grant.
+SUGGESTION: Export `typedText` and `isMemoryText` from recall.ts, or from a small shared rows module. Reduce register's `typed` to `isPrompt(m) && !isMemory(m) && !isSummary(m) ? typedText(m.text)` 
+plus the skills filter, and have vcc's normalize use `typedText(m.text) !== undefined` for its user blocks.
+ESSENCE: No change to what is observed or compacted, except that the brief's turn boundaries would match the rest of the plugin.
+PRIOR: docs/plans/ideas/code-only.md:27-30 (the double fix for the image prompt). No existing note proposes merging the functions.
+VERDICT: partly / low
+REASON: The duplication is real. register.ts:423-429 `typed` repeats recall.ts:90-94 `typedText` line for line (the system-reminder strip, the IMAGE_MARKERS strip, the `!said || 
+INJECTED_WRAPPER.test(said)` check), and register.ts:411-412 isMemory repeats recall.ts:76 isMemoryText. docs/plans/ideas/code-only.md:27-30 (C1) records a bug that had to be fixed in both functions. 
+The vcc half is not a clear bug. vcc.ts:80 does push a `kind: 'user'` block for any non-tool-result user row, injected wrappers included, even though the comment at :69 says 'typed prompts'. But that 
+block is used only as a turn-closure marker (:560 +14, and filtered out at :582). A task notification or local-command row is injected after the assistant has stopped, so the answer before it did end 
+a turn, and the +14 there is arguably right. Comparing it with <all-user-messages> and om_recall mixes different purposes. Switching vcc to typedText would change brief ranking and would need a 
+replay or bench to justify it.
+CORRECTION: Export typedText and isMemoryText from recall.ts and reduce register's typed to `isPrompt(m) && !isMemory(m) && !isSummary(m) ? typedText(m.text)` plus the skills filter. Leave vcc's 
+turn-closure rule alone, or fix only its comment to say it marks any user row that is not a tool result. Change the vcc rule only with a measurement.
+
+=== D5 [medium] The eval-only builtin+recall plugin keeps a hand-synced copy of om_recall's registration because that registration is buried in register()
+EVIDENCE: tests/eval/recall-plugin/hooks/register.ts:1-5: "Kept in step with hooks/register.ts's `session.start` registration (tests/register.test.ts checks they register the same om_recall), its 
+`tool.call` handler, and its om_recall `tool.describe` and `classic.SessionStart` handlers". That 109-line file repeats the ~1,500-character tool description and schema from register.ts:2318-2349, 
+recallIo from register.ts:1934-1954, noteTranscript, and the tool.describe and classic hooks from register.ts:2403-2415. The copies already differ: the eval copy uses `rows.map(() => undefined)` for 
+times and a literal `rows.length >= 4096` in place of ROWS_CAP. prune.ts shows that a module can register its own hooks: register.ts:2028 `registerPrune(on)`, and prune.ts:134-137 `export function 
+registerPrune(on: On) { on('session.start', ...) }`, whose handlers receive their own `$`.
+IMPACT: About 100 duplicated lines, plus parity tests (tests/register.test.ts:220-222 recallOnlyHooks, :1804, :1833) that exist only to catch drift. Every change to om_recall's description or schema 
+needs two edits.
+SUGGESTION: Move om_recall's hooks (tool registration, tool.call, tool.describe, classic.SessionStart/Stop, recallIo, noteTranscript) into a `registerRecall(on, { timesOf?, onResult? })` in a new 
+hooks/recall-hooks.ts, following the registerPrune pattern. hooks/register.ts calls it and passes marks and stats. The eval plugin becomes `export const register = (on) => registerRecall(on)`, and 
+scripts/bench-live.ts copies that module next to recall.ts and prompts.ts.
+ESSENCE: om_recall behaves the same in production. Only the eval harness drops its copy.
+PRIOR: None found. The eval plugin's header documents the keep-in-step duty but proposes no fix.
+VERDICT: partly / low
+REASON: The duplication is real. tests/eval/recall-plugin/hooks/register.ts (109 lines) repeats register.ts:2317-2349's description and schema, recallIo (:1934-1954), noteTranscript (:1961-1964), 
+tool.describe and the classic hooks (:2403-2415). Parity tests exist at register.test.ts:218-222 and :1795-1805. The differences it names (times `rows.map(() => undefined)`, literal 4096, 
+`brief(error)` vs `error.trim()`) are real, but the times one is deliberate: the eval plugin has no marks. The suggested fix conflicts with how the harness is built, though. 
+tests/eval/live.ts:115-121 assembles builtin+recall from the current checkout's recall-plugin plus only the version-under-test's hooks/recall.ts and hooks/prompts.ts (pluginRoot is any version, such 
+as `old`). A version from before the split has no recall-hooks.ts, so moving registration there breaks builtin+recall runs against older versions and baselines unless the eval keeps a fallback. It 
+would also change which om_recall description builtin+recall measures, from the checkout's to each version's, which affects comparability with docs/bench. recallIo uses stats' `brief` and 
+production's tool.call needs view/loadMarks/noteRecall, so the extracted module needs callbacks or needs stats.ts copied too.
+CORRECTION: If done, registerRecall must take timesOf/onResult/clip callbacks, and bench-live must copy recall-hooks.ts only when the version has it, keeping the current copy as the fallback for 
+older versions. Given the parity tests already catch drift, the payoff is two edits saved per description change. That is low value against the harness complexity.
+
+=== D6 [medium] The manifest descriptions are about 5.4k characters of mechanism narrative that nothing reads, that every release rewrites, and that already make a false claim
+EVIDENCE: The .claude-plugin/plugin.json description is 3,765 chars (about 940 tokens); the hooks/hooks.json description is 1,652 chars. rg over hooks/, tests/ and scripts/ finds no code that reads 
+either one. Of 35 commits to plugin.json, 21 rewrote the description; all 18 commits to hooks.json did, and it grew from 100 chars at 7bcb413. AGENTS.md (Releases) requires updating both. The text 
+repeats constants that can drift: "up to four at once" (register.ts:41 `MAX_PARALLEL = 4`), "about nine lines a chunk" (:65 `OBSERVER_TOKENS_PER_LINE = 1_100`), "up to five of the assistant's own 
+sentences" (:986 `CARRIED_CLAUSES = 5`). One claim is false in both files: plugin.json lists "...and the instructions given to /compact" and hooks.json "...with the git state, and the /compact 
+instructions", but register.ts:2032-2034 `if (e.instructions?.trim()) { show($, 'Compaction instructions given. Using built-in compaction'...); return delegateToBuiltin(...) }` means the memory never 
+carries them. The delegation (540d032) landed before the v1.0.0 description (5c2f030) added the claim.
+IMPACT: Each behaviour change costs a two-file prose edit. The long single-sentence descriptions are hard to read in the /plugin UI, and they already contradict the code on /compact instructions.
+SUGGESTION: Cut plugin.json to one or two plain sentences about what the user gets (background observation, compaction with no model call, om_recall, om_stats). Make hooks.json one short clause per 
+hook event, with no constants. Put the mechanism narrative in a README or AGENTS.md section that is edited only when the architecture changes, and drop the AGENTS.md rule to update both descriptions 
+for every behaviour change. Remove the /compact-instructions claim now.
+ESSENCE: This is documentation only. It removes a false statement, and the plugin's behaviour is unchanged.
+PRIOR: None found. AGENTS.md's release rule is what creates the churn.
+VERDICT: partly / low
+REASON: The false claim is confirmed. plugin.json says '...never on compaction's path, and the instructions given to /compact', and hooks.json says '...with the git state, and the /compact 
+instructions'. But register.ts:2032-2034 sends any compaction with instructions straight to delegateToBuiltin, so the memory never carries them. 540d032 (09-23) added the delegation before 5c2f030 
+(v1.0.0, 09-24) added the claim. The other numbers are right: descriptions of 3,765 and 1,652 chars; 21 of 35 plugin.json commits and 18 of 18 hooks.json commits rewrote the description; the repeated 
+constants match MAX_PARALLEL=4 (:41), OBSERVER_TOKENS_PER_LINE=1100 (:65) and CARRIED_CLAUSES=5 (:986). 'Nothing reads' is overstated. No repo code reads the descriptions, but the host shows them in 
+/plugin and plugin validate. The rest of the suggestion (cut to two sentences, drop the AGENTS.md rule) overrides an explicit project release rule (AGENTS.md, Releases). That is a proposal for the 
+user to decide, not a defect.
+CORRECTION: Fix now: remove the /compact-instructions claim from both manifests, or say instead that explicit /compact instructions hand the compaction to the built-in compactor. Bring shortening the 
+descriptions and relaxing the AGENTS.md release rule to the user as a proposal. Do not treat either as a defect.
+
+=== D7 [low] Small text, time and token helpers are redefined in each module, and the chars/4 rule appears 15 times, which makes the TODO density fix hard to do in one place
+EVIDENCE: Token estimate: register.ts:220 `const estimateTokens = (text: string) => Math.ceil(text.length / 4)`, vcc.ts:632 `const tokens = (text: string) => Math.ceil(text.length / 4)`, plus 10 
+inline `* 4`/`/ 4` in register.ts (e.g. :222, :234, :259, :564, :654, :1210, :1304, :1793) and 3 in vcc.ts (e.g. :628 `TRANSCRIPT_FRESH_TOKENS * 4`). Local time stamp: register.ts:431-435 
+`pad`/`stamp`, recall.ts:95-104 `pad`/`day`/`clock`/`stamp`, vcc.ts:435-442 `hhmm`/`day`; only stats.ts:189 and :402 print UTC. Plural and grouping: register.ts:336 `plural`, recall.ts:109-110 
+`grouped` (toLocaleString) and `plural`, stats.ts:171 `grouped` (regex) and :219 `plural`. Clipping: register.ts:646 `cap`, vcc.ts:67 `clip`, recall.ts:105 `oneLine`, stats.ts:174 `brief`. Error 
+text: register.ts:331 and prune.ts:25 `errorText`.
+IMPACT: TODO.md:3-11 says the chars/4 estimate runs about 2x low on dense text and that the scheduling thresholds still use the plain estimate. With the ratio written into 15 places across two 
+modules, applying a density correction consistently means an audit of each one. om_stats prints UTC while memory and om_recall print local time, so the same event shows two different clock times.
+SUGGESTION: Add a $-free hooks/text.ts with `estimateTokens`, `charsFor(tokens)`, `stamp`/`day`/`clock`, `plural`/`grouped`, `clip` and `errorText`, import it everywhere, and replace the inline `* 4` 
+with `charsFor`. Decide on local or UTC once for stats.
+ESSENCE: No behaviour change. The helpers keep their current outputs, apart from any time-zone decision for stats.
+PRIOR: TODO.md:3-11 (token estimates run low on dense text) is the fix this seam would make local. No existing note on the duplication.
+VERDICT: partly / low
+REASON: The helpers are duplicated. There are 11 chars/4 sites in register.ts (:220, :222 twice, :234, :235, :259, :564, :654, :1210, :1304, :1793) and 3 in vcc.ts (:628, :632, :662). pad/stamp 
+appear at register.ts:431-435, recall.ts:95-104 and vcc.ts:435-442, and errorText at register.ts:331 and prune.ts:25. The main argument does not hold, though. The TODO.md:3-11 fix is about the 
+scheduling thresholds (CHUNK_TOKENS, KEEP_RAW_TOKENS, RAW_MAX_TOKENS), and all of them go through view().tokens → estimateTokens in one place (register.ts:445, tokensBetween :448). The inline `* 4`s 
+are output caps (truncate, excerpt, cue and handoff budgets) that a density correction does not need to change. The helpers also differ. register's cap, vcc's clip (trimEnd), recall's oneLine 
+(collapses whitespace) and stats' brief (60 chars) behave differently. recall's grouped uses toLocaleString, while stats' uses a regex with rounding. Merging them changes output. stats prints UTC 
+with an explicit 'UTC' label (stats.ts:201, :245, :402), so the times are labeled, not ambiguous. A new text.ts for one-line helpers cuts against the conventions' 'as few files as possible'.
+CORRECTION: If anything, reuse existing exports where the behaviour really is identical (for example, register.ts importing errorText from one place) and leave the differing clip helpers alone. Drop 
+the density justification: the TODO fix lives in view().tokens/estimateTokens alone.
+
+=== D8 [low] 'Brief' names three different things in register.ts, and BRIEF_MAX_TOKENS has two meanings and two values
+EVIDENCE: register.ts:88 `const BRIEF_MAX_TOKENS = 8_000` caps the session's first user message ("The session's first message, the standing brief", :1294), and :1303 `const briefMax = 
+BRIEF_MAX_TOKENS` is a needless alias. vcc.ts:13 `export const BRIEF_MAX_TOKENS = 3_000 // the whole section, a hard cap` caps the code-compiled session brief. register.ts:21 also imports stats' 
+`brief` (stats.ts:174 `export const brief = (text: string) => (text.length > 60 ? ...` , a 60-char error clip) and uses it at :346, :1942 and :2352. register.ts:1360 `function briefer(memory)` 
+shortens skills and user messages and has nothing to do with the session brief; `BRIEF_CUT` at :232 is also about the first message.
+IMPACT: A maintainer searching for the session brief's cap finds two constants with the same name and different values. `briefer` and `BRIEF_CUT` point to the wrong concept, which matters in the file 
+that also handles the vcc brief (`memory.brief`, renderBrief).
+SUGGESTION: Keep 'session brief' for vcc's Brief only. Rename the first-message concept (for example FIRST_MESSAGE_MAX_TOKENS, FIRST_CUT, `shortened()` in place of `briefer`), rename stats' `brief` 
+to `clipLine`, and drop the `briefMax` alias.
+ESSENCE: These are renames only, with no behaviour change.
+PRIOR: None found. No CONTEXT.md glossary exists (docs/agents/domain.md points to one).
+VERDICT: confirmed / low
+REASON: Verified. register.ts:88 `BRIEF_MAX_TOKENS = 8_000` caps the first user message (comment :1294 'the standing brief'), and :1303 `const briefMax = BRIEF_MAX_TOKENS` is a no-op alias. vcc.ts:13 
+exports a different `BRIEF_MAX_TOKENS = 3_000` for the session brief. BRIEF_CUT (:232, 'a brief it cut (see capUserMessages)') and briefer (:1360, 'user messages the brief alone') both use 'brief' 
+for the first message. register.ts also imports stats' `brief` (stats.ts:174, a 60-char clip) and uses it at :346, :1942, :2352 and :2374. prompts.ts uses 'brief' only for the session brief 
+(:221-231), so register.ts is the odd one out. No CONTEXT.md exists, as the finding says. These are renames only, with no behaviour change.
+CORRECTION: 
+
+=== D9 [low] Scaffolding for the rejected BM25 experiment stays in the test suite, with a copy of recall's ranking that must be kept in step
+EVIDENCE: tests/eval/ranking.ts:4-5: "`current` copies `search`'s gate, weights and sort, and `excerpt`'s `whole` and `best`, so it must be kept in step with `hooks/recall.ts`; 
+`tests/ranking.test.ts` checks it against `recall()` itself." Commit 9007d3b says "The current ranking stays; BM25 stays rejected. hooks/recall.ts is unchanged." The pieces are tests/eval/ranking.ts 
+(128 lines), tests/ranking.test.ts (42) and scripts/bench-bm25.ts (262).
+IMPACT: 432 lines are maintained for a closed experiment, and any change to om_recall's search ranking fails tests/ranking.test.ts until someone updates the copy.
+SUGGESTION: Delete the three files and point docs/bench/README.md at commit 9007d3b and docs/bench/2026-09-25-bm25.md for anyone who wants to rerun it. tests/eval/legacy-recall.ts is different: it is 
+a deliberately frozen baseline and should stay.
+ESSENCE: Test and benchmark scaffolding only. The plugin is untouched.
+PRIOR: docs/bench/2026-09-25-bm25.md and commit 9007d3b record the rejection. No note proposes removing the scaffolding.
+VERDICT: partly / low
+REASON: The facts hold. tests/eval/ranking.ts:4-5 says the copy must be kept in step with recall.ts. The three files total 128+42+262=432 lines. 9007d3b and docs/plans/om-direction.md:24 reject BM25. 
+The impact is overstated. ranking.ts has not been touched since 9007d3b, even though four later commits changed recall.ts (b3ad3db, 6d79e2a, 8003175, d32157b), so keeping it in step has cost nothing 
+so far. The 3 tests run in 25 ms. A ranking change is also exactly when someone would want to rerun the comparison. The harness is kept on purpose: docs/bench/2026-09-25-bm25.md:126-134 has a 'How to 
+rerun' section with the commands, and the finding's priorArt misses that. Deleting it is defensible, since issue #20 is closed and the rejection is recorded, but the rerun docs must change with it, 
+and deleting tests should get the user's OK under the testing conventions.
+CORRECTION: Deletion is optional cleanup, not dead code that is costing anything. If removed, rewrite the 'How to rerun' section of docs/bench/2026-09-25-bm25.md to point at `git checkout 9007d3b`, 
+and note om-direction.md:24 as the recorded decision.
+
+=== D10 [low] The omission-marker format is written once and then re-encoded in three separate regexes
+EVIDENCE: register.ts:230 `const omissionMarker = (tokens, what) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n``, then three hand-written copies: :232 
+`BRIEF_CUT = /\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full message\] \.\.\.\n/`, :280 `MASKED = /...full result\] \.\.\.\n/` and :330 `INPUT_MASKED = /\.\.\. \[~\d+ tokens omitted; 
+om_recall can retrieve the full input\] \.\.\./`. The same pattern exists for truncate at :222 and its readers `TRUNCATED` (:223) and `isStub` (:225). prompts.ts:20 also quotes the marker to the 
+Observer.
+IMPACT: The marker is about 20 tokens for each cut result or input in the raw tail. Anyone who shortens it to save tokens has to edit four literals. A missed one silently stops unmask (:310, :320) 
+from restoring rows, and the restored rows are what the history comparison and the Observer see.
+SUGGESTION: Build each regex from the same source, for example `const markerRe = (what: string) => new RegExp(escape(omissionMarker(0, what)).replace('0', '\\d+'))`, or keep the literals next to 
+omissionMarker with a single test that feeds excerpt output into all three.
+ESSENCE: No behaviour change. It only protects the raw-tail and unmask path that compaction relies on.
+PRIOR: None found.
+VERDICT: confirmed / low
+REASON: Verified. omissionMarker (register.ts:230) builds `\n... [~N tokens omitted; om_recall can retrieve the full ${what}] ...\n`. BRIEF_CUT (:232), MASKED (:280) and INPUT_MASKED (:330) re-encode 
+it by hand, and truncate (:222) has the same split with TRUNCATED (:223) and isStub (:225). unmask relies on MASKED (:310) and INPUT_MASKED (:319-320). The marker is ~70 chars, so ~18 tokens per cut, 
+as stated. One refinement: tests already pin the result and message formats (register.test.ts:415, :2954, :3003), so a missed edit there would fail tests. INPUT_MASKED has no test pin, so the input 
+marker is the one that could drift silently.
+CORRECTION: 
+
+=== D11 [low] The OM_BRIEF=always evaluation flag stays in the production compaction path after showing no gain
+EVIDENCE: register.ts:182-184: "OM_BRIEF=always: every compaction's memory message carries the session brief of all the rows it compacted... Off by default: on replayed questions it made no 
+difference while the Observer worked." `const briefAlways = ($) => $.env.get('OM_BRIEF')...`, read on every compaction at :2044 and used at :2173 `const from = always ? base : floor ? observed : 
+cut`. docs/bench/README.md:111-125: "The always-on brief showed no gain here".
+IMPACT: One env read on every compaction, an extra branch in the floor logic, and plumbing in tests/eval/live.ts (4 refs), tests/bench-live.test.ts (5), tests/register.test.ts (3) and 
+scripts/bench-live.ts, all for a variant the benchmarks rejected.
+SUGGESTION: Remove the flag and the `always` branch (the brief is compiled only for the floor), and drop the related bench-live options and tests. If the #13 replay measurement is still wanted, run 
+it from a branch.
+ESSENCE: The default path is unchanged. The code-compiled brief still stands in where the observations do not cover enough.
+PRIOR: docs/bench/README.md:111-125 (v120-brief showed no gain; the note defers to the #13 replay). No recorded decision to remove it.
+VERDICT: partly / low
+REASON: The flag is as described. register.ts:182-184 defines briefAlways, it is read at :2044 inside the first Promise.all, and it is used at :2173 `const from = always ? base : floor ? observed : 
+cut`. There are plumbing and tests in tests/eval/live.ts:52-55, :65, :108, :179, tests/bench-live.test.ts:88-100, register.test.ts:4192 and :4210, and scripts/bench-live.ts:43 and :118-119. Two 
+corrections. First, the priorArt misses docs/plans/om-direction.md:23, which lists 'Always-on brief. No measured gain.' under Rejected. That is a recorded decision, and it strengthens the case for 
+removal. Second, the env read runs in parallel inside the existing Promise.all, so it adds no latency. The real cost is a branch plus ~2 register tests, 1 bench-live test and the --brief option. One 
+weak reason to keep it: docs/plans/ideas/outside.md:44 (X5 cliff, parked) builds on the flag ('as OM_BRIEF=always already compiles it').
+CORRECTION: Remove the flag, the `always` branch, --brief and their tests, citing om-direction.md:23 as the decision. Note in outside.md X5 that the cliff arm would need its own switch. Drop the 
+latency claim, because the read is parallel.
+

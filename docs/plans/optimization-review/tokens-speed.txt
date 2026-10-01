@@ -1,0 +1,177 @@
+SUMMARY: The most important finding: the plugin keeps its live working state in $.store, which is one pretty-printed 5.3 MB JSON file shared by every Claude Code process. The file is at 96% of its 4 
+MiB cap, and every get or set reads, parses, stringifies and rewrites the whole file (measured about 14 ms per get and 38 ms per set). The cost lands on the paths that matter: every prompt waits on 
+two read-modify-write cycles, every model step rewrites the file, and the prune that runs when a write hits the cap reads every key one at a time, about 34 s. On the token side, prompt_cache_key is 
+random for each pi process, so Reflector retries re-send about 29k uncached tokens (6 cache hits in 72 retries in the bench cache). The compacted memory also prints the newest user request twice, 
+which efficiency.md E4 deliberately leaves alone. Standing costs in the main conversation are small: COMPACTION_BRIEFING is about 69 tokens and is cached, and the fixed memory boilerplate is about 
+600 tokens.
+
+=== T1 [high] Every prompt waits on two whole-store read-modify-writes and a hash of the full history, and Stop rewrites the same transcript path every turn
+EVIDENCE: hooks/register.ts:2418-2426 turn.start runs `await markTime($, true, loop, stamp)` and then `await markTurn($)`, both before `return next(e)`. register.ts:1564-1569 markTime: 
+`historyOf(...)` (full $.session.messages()), `new Set(rows.map(rowHash))`, `loadMarks` (store.get) and `$.store.set(timesKey(...))`. register.ts:1582-1583 markTurn: `$.store.get(turnsKey...)` then 
+`$.store.set(turnsKey...)`. register.ts:2415 `on('classic.Stop', async ($, e, next) => (await noteTranscript($, e), next(e)))`, and 1961-1963 noteTranscript does `await 
+$.store.set(transcriptKey(e.session_id), e.transcript_path)` every turn with no check for a change. register.ts:2443 turn.complete awaits `markTime(...).then(() => schedule(...))` before returning. 
+By contrast, register.ts:2432 turn.step already defers its work: `$.clock.after(0, () => void onStep(...))`.
+IMPACT: The prompt path costs 2 gets and 2 sets. Measured on a copy of the 5.3 MB store, that is about 2×14 + 2×38 ≈ 104 ms of host work. On top of that: an IPC copy of up to 4,096 rows (4.8M chars 
+on a real 19.5 MB transcript) and about 15 ms of FNV hashing over them (measured). This adds roughly 120 ms before each model request starts. Stop adds about 38 ms and one full-file rewrite per turn 
+to store a value that almost never changes (701 transcript: keys are in the store). If the write that trips the store cap is one of these, the prompt also waits for the T3 prune (tens of seconds).
+SUGGESTION: Handle turn.start the way turn.step is handled: read `now` synchronously in the hook, then run markTime and markTurn inside `$.clock.after(0, …)`, passing that `now`. The prompt row is 
+still the newest row, because the model has not answered yet. Keep the last noted transcript path in a module Map and skip the set when it is unchanged. Also defer turn.complete's markTime+schedule. 
+None of these results is needed before the request.
+ESSENCE: Timestamps, turn starts and the transcript path are still recorded for every turn, and the background observation schedule does not change. Only the ordering relative to the model request 
+changes.
+PRIOR: none found. TODO.md 'Store writes are not atomic across processes' covers correctness, not latency. docs/plans/ideas/efficiency.md covers tokens only.
+VERDICT: refuted / low
+REASON: The awaits are real: register.ts:2418-2426 awaits markTime and markTurn before next(e), and markTime/markTurn do the gets and sets at 1564-1569 and 1582-1583. But the premise that the model 
+request waits on them is false. In the host (/usr/bin/claude, 2.1.286), Snr() puts turn.start on a serial turn-event tail and returns the turnId synchronously: 
+`e.turnEvents.enqueue("turn.start",()=>T.turn.start({text:g,turnId:h})...)`. The interactive caller then runs `Wo=Snr(...);Bo=await this._runImpl(...)` without awaiting it, and I found no code that 
+awaits the turn's `started` promise before a request. The d.ts also marks turn.start as observe-only ('a different return changes nothing'). So nothing adds ~120 ms before the request, and deferring 
+turn.start with clock.after would gain nothing. turn.step has to defer (2432) because it wraps the request itself. turn.complete's markTime+schedule (2443) only holds later events in the same tail 
+(for example the next turn.start's hooks), never a request. What does hold up is minor: noteTranscript (1961-1963) calls `$.store.set(transcriptKey(...), e.transcript_path)` on every classic.Stop 
+without checking for a change. That is one needless whole-file rewrite per turn (~35 ms, 5.3 MB), and it belongs in T2.
+CORRECTION: Drop the prompt-path latency claim. Keep one line under T2: skip the Stop-time transcript write when the path is unchanged (a module Map). Priority is low: it is 1 of ~30 whole-file 
+rewrites per turn.
+
+=== T2 [high] Every model step rewrites the whole 5.3 MB store to save one timestamp, and each scheduling pass adds about 5 more whole-file reads
+EVIDENCE: register.ts:1599-1602 onStep calls `markTime($, false, loop, stamp)` on every step, which does 1 store.get and 1 store.set of `times:` (1567-1569). A due step (every STEP_SCHEDULE_TOKENS = 
+5k tokens, register.ts:46) runs `Promise.all([schedule($, loop, stamp), writeSession($, loop, stamp)])` (1610). schedule: liveView → loopHistory `$.store.get(liveKey…)` plus `loadMarks`, then 
+`loadLedger` (store.get) and `$.store.set(ledgerKey…)` (1622-1625). writeSession: `$.store.get(ledgerKey…), $.store.get(goalKey…)` (1713), and liveView again once due (1716-1718). stats.ts:318-320 
+already shows the alternative: `The sessions this process has touched, each loaded once and written after a pause`, with `WRITE_DELAY_MS = 2_000`. Host store ops: each one parses and re-serializes 
+the whole file (confirmed in the host binary). The file is 5.3 MB pretty-printed, 4.04M chars compact.
+IMPACT: Counting call sites for a 20-step turn with about 4 due passes and 2 landed chunks gives roughly 55 gets and 30 sets. At the measured per-op cost that is about 0.8 s + 1.1 s ≈ 2 s of host 
+work per turn, and 30 × 5.3 MB ≈ 160 MB of disk writes per turn. All of it runs through the file lock shared with every other Claude Code session. If the host parses on its main thread, it stalls the 
+UI in 14-38 ms slices. It also widens the lost-update window that TODO.md describes. Times values are up to 43 KB (900 marks), and 455 times: keys total 799 KiB.
+SUGGESTION: Keep a per-process, per-loop cache of the keys this process owns: times, turns, goal, and ledger reads. Load each key once, update it in memory, and write behind after a short delay (the 
+stats.ts pattern), flushing at turn.complete, before compaction reads, and at session.end. Ledger writes that land observations can stay write-through, since resume needs them. Losing unflushed marks 
+after a crash costs only timestamps, because view() falls back to the previous row's time (register.ts:444 `byIndex.get(i) ?? byHash.get(hashes[i]!) ?? at[i - 1]`).
+ESSENCE: Background observation after each turn and during long turns runs unchanged. The ledger and watermark are still persisted for compaction and resume. Only the durability of per-step 
+timestamps is relaxed, by a few seconds.
+PRIOR: none found for cost. TODO.md:30-36 records the cross-process non-atomicity, which fewer writes reduce.
+VERDICT: confirmed / high
+REASON: onStep (1599-1602) runs markTime on every step, which does one get and one set of `times:` (1567-1569). A due pass then adds schedule (1618-1625): 3 gets (live, times, ledger) and a ledger 
+set that happens on every pass, even when reconcile changed nothing. writeSession (1713) adds 2 gets and then usually returns at 1715. In the host, each op is serialized per plugin and does all of 
+its work on the main thread. A get does readFile + JSON.parse + utimes. A set does proper-lockfile (cross-process) + read + parse + `b(a).length` + `b(r,null,2)` + write. So every get parses the 
+whole file and every set re-serializes it twice and rewrites it. I measured this on a copy of the 5,307,016-byte store: about 12.5 ms per get and 35 ms per set, before the lock and the atomic rename. 
+Counting call sites for a 20-step turn gives roughly 55-60 gets and 30 sets: about 0.7 s + 1.1 s of main-thread work and about 160 MB of writes per turn, under the file lock the other running 
+sessions also take (12 are listed in ~/.claude/sessions). The fallback claim holds: view() at 444 falls back to `at[i - 1]`, so losing unflushed marks costs only timestamps. The stats.ts:318-320 
+write-behind pattern exists as cited. No prior art covers the cost: TODO.md:30-36 covers atomicity only.
+CORRECTION: Minor additions to the suggestion. schedule's `$.store.set(ledgerKey…)` at 1622 can be skipped when reconcile returns an unchanged ledger, even without a cache. The write-behind cache 
+must flush on hot reload and on session.end. It also must not bring back keys that another process's prune has deleted, since TODO.md:30-36 already records that race.
+
+=== T3 [high] A write that hits the store cap triggers a prune that reads ~2,400 keys one by one, each read parsing the whole file (≈34 s), inline on that write
+EVIDENCE: hooks/prune.ts:141-146 `on('store.set', …) try { return await next(e) } catch … const all = await sessions($, true)`. prune.ts:38-45 sessions(): `for (const key of await $.store.keys())` … 
+`const value = await $.store.get(key)`, one get per key when withSizes is set. prune.ts:155 prunes only down to `STORE_CAP * 0.75`. drop() (81-96) then runs store.keys(), gets, liveSessions() and one 
+delete per key for each dropped session. The store now holds 2,393 session keys (ledger 450, times 455, transcript 701, turns 379, seen 280, goal 63, skills 44, live 21) and is 4,041,863 of 4,194,304 
+chars, 96% of the cap. Compaction waits on the same global lock that schedule's ledger write holds (register.ts:1618, 2061, 2255).
+IMPACT: About 2,393 × 14.1 ms ≈ 34 s just to size the keys. Freeing about 1 MB at about 9 KB per session then means around 100 drops at a few hundred ms each (keys, gets, a registry read, 4-5 deletes 
+at 38 ms each). That is roughly a minute in total, estimated from the measured per-op costs. Because the design prunes only to 75% and lets the store grow back, this recurs. The current headroom is 
+about 150k chars. If the tripping write is turn.start's times write, the user's prompt waits. If it is a schedule() ledger write, compaction queues behind it and loses its claim of instant compaction 
+with no model call on its path.
+SUGGESTION: Enforce the size budget in the daily background prune, which already reads times and seen off-path: when the store is over about 70%, drop the oldest non-running sessions down to about 
+50%. Then cap errors become rare. In the store.set handler, stop sizing every value. Order sessions by `at` using only the times and seen reads, delete the oldest non-running session, retry the 
+write, and repeat until it fits. Also add the dead `fork:` (67 keys) and `buffer:` keys, which KINDS never prunes, to the daily sweep.
+ESSENCE: Pruning still protects running sessions and the current one, and the ledger and watermark of live sessions stay intact. The expensive scan simply moves off the write path and out of the 
+queue compaction waits on.
+PRIOR: prune.ts header and TODO.md:30-36 cover atomicity only. No doc measures the cost of the cap path.
+VERDICT: confirmed / high
+REASON: prune.ts:141-146 catches the cap error inside the store.set chain and calls sessions($, true). With withSizes set, that function does one `$.store.get(key)` for every KINDS key (37-45), and 
+each get parses the whole file in the host. The store now holds 2,399 KINDS keys and 4,088,933 of 4,194,304 chars (97.5%, ~105k chars of headroom; the reviewer measured 4,041,863, so it has grown 
+~47k since). Sizing alone costs about 2,399 × 12.5 ms ≈ 30 s. I replayed the cap logic on a copy (oldest first, down to 0.75 × cap): 121 sessions and 390 keys go. Each delete in drop (95) is a locked 
+read, parse and pretty rewrite, so that is about 15 s and ~2 GB of disk writes, plus a keys(), 1-2 gets and a liveSessions() scan per session. That is about 50 s in all, as estimated. The daily prune 
+cannot help yet: it drops only sessions untouched for 30 days (112), and the oldest session in the store is from 2026-09-23. So the cap path will be the first to run, and soon. If the write that 
+trips the cap is the ledger write in schedule (1622) or in runJob's landing (1678), both inside `locked` (214-218), compaction's `locked` calls at 2061 and 2255 queue behind it. fork: (67 keys) and 
+buffer: keys are outside KINDS (prune.ts:12) and are never pruned. No doc measures this.
+CORRECTION: Sizes: about 121 sessions and 390 deletes rather than ~100 drops. The sizing costs ~30 s and the deletes add ~15 s and ~2 GB of rewrites. Headroom is now ~105k chars. The cap test in 
+prune.test.ts:93/128 asserts the '~N KiB' log, so either keep a size estimate (for example from the times/seen reads and key lengths) or update those tests.
+
+=== T4 [medium] Each pi process sends a random prompt_cache_key, so Reflector retries re-send ~29k uncached tokens; the plugin drops cacheRead, so nobody sees it
+EVIDENCE: register.ts:37-38 `PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', …]`, and `PI_ISOLATION = [… '--no-session', …]` passes no session id. In the pi bundle (chunk-3YAHQSW6.js), 
+`if(parsed.noSession…) return SessionManager.inMemory(cwd, parsed.sessionId!==void 0?{id:parsed.sessionId}:void 0)` and `this.sessionId=options?.id??createSessionId()`. In the codex provider, 
+`prompt_cache_key:cacheSessionId` with `cacheSessionId = options?.sessionId`. register.ts:1832-1838: each Reflector attempt resends `reflectionPrompt(input, …)`, and prompts.ts:177 puts the 
+observations first, so retries share the whole prefix. register.ts:907 `usage?: { input?: number; output?: number; cost?: … }` has no cacheRead, and pi's `input` excludes cached tokens. Bench reply 
+cache (~/.cache/om-bench-compact/luna-cache): the Reflector made 234 calls, including 72 retries over identical observations; only 6 hit the cache, and each retry averaged 29,165 uncached input 
+tokens. The Observer had 5,019 of 5,990 calls with hits, averaging only 1,940 cached tokens against its ~3.3k-token system prompt.
+IMPACT: About 72 × 29k ≈ 2.1M uncached Reflector input tokens in the bench corpus that could have been served from cache. Cached input is typically billed at about 10% and prefills faster, so 
+reflections would also finish sooner. Real sessions average 13,396 uncached input tokens per Observer call against a 10,638-token chunk estimate (2,439 calls in the local om stats), which is 
+consistent with the system prompt often missing the cache. The missing cacheRead field means this cannot be checked from om_stats.
+SUGGESTION: Add a stable, valid id per role to the pi argv, e.g. `--session-id om-observer`, `om-reflector` and `om-session`. pi accepts `--session-id` together with `--no-session` and keeps the 
+session in memory. That id becomes a constant prompt_cache_key, so requests route to the same cache. Add `cacheRead` and `cacheWrite` to PiMessage.usage and to the Luna stats, so the hit rate can be 
+measured before and after.
+ESSENCE: Same models, same prompts, same inputs and outputs. Only the cache routing key and the accounting change, so the Observer and Reflector behave identically in the background.
+PRIOR: none found: rg for prompt_cache, cacheRead or 'cache key' in docs/ and TODO.md finds only tests/eval/pi.ts, which maps cacheRead for bench transcripts, and the bench's reply cache keyed by 
+argv.
+VERDICT: partly / medium
+REASON: The facts check out in the pi bundle. With --no-session, pi uses `SessionManager.inMemory(cwd, parsed.sessionId!==void 0?{id:parsed.sessionId}:void 0)`, and otherwise a uuidv7 per process. 
+The codex provider sends `prompt_cache_key` from options.sessionId. validateSessionIdFlags rejects only --session, --continue and --resume, so `--session-id om-observer` passes assertValidSessionId 
+together with --no-session. register.ts:37-38 passes no id, and PiMessage.usage at 907 has no cacheRead. I recounted the bench reply cache: Reflector 234 calls, 162 distinct observation blocks, 72 
+retries, 6 with hits, 29,165 uncached input tokens per retry on average. Observer 6,236 calls, 5,019 with hits (the finding says 5,990 calls). OBSERVER_SYSTEM_PROMPT is 13,239 chars (~3.3k tokens). 
+But the priorArt field is wrong. docs/plans/om-direction.md:27 already says 'prompt caching never hit (pi's cache key is a fresh session id per call)' and 'Worth retrying only with a stable cache 
+key'. The impact is also mostly a bench cost: live reflections are rare (REFLECT_AT_TOKENS 40k), and the Observer already hits ~80% of the time. Also, the codex provider sends the same id as the 
+`session-id` and `x-client-request-id` headers (buildSSEHeaders). One constant id for every concurrent call in every process would make those headers identical across unrelated requests.
+CORRECTION: Cite om-direction.md:27 as prior art. The new parts are the concrete --session-id fix and the Reflector-retry numbers. Use a stable id scoped to one unit of work rather than one global id 
+per role. Examples: `om-reflect-<loop>-<seq>`, so a reflection's retries share a key, and `om-obs-<sessionId>` for the Observer's system-prompt prefix. Add cacheRead and cacheWrite to PiMessage.usage 
+and to the Luna stats first, so the live gain can be measured before and after.
+
+=== T5 [medium] The newest user request is printed whole twice in every memory message where it left context (up to 2k tokens each time)
+EVIDENCE: register.ts:1173: renderUserMessages replaces a message with QUOTED only when `i < messages.length - 1 && …`, so the newest is always written `\n${m.text}\n`. register.ts:1268-1269: 
+renderContinuation adds `${LATEST} (${latest.length} chars):\n${latest}` with `latest = truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)`. register.ts:2190: `nextStep: … typedSoFar.at(-1)!.text` when 
+the newest prompt is before the cut. Caps: register.ts:93 `NEXT_STEP_MAX_TOKENS = 2_000` and :109 `NEWEST_RESERVE_TOKENS = 2_000`. This session's own compacted memory has the 4,491-character request 
+in full in <all-user-messages> and again under 'The user's latest request…' in <continuation>.
+IMPACT: min(prompt length, 2k) tokens duplicated per compaction whenever the newest prompt was compacted away. That happens on long agentic turns and in every workflow or subagent session whose task 
+is a long prompt. Here it was about 1,120 tokens, about 5% of the 21.3k-token average main-corpus context. The duplicate also repeats at every later cut until a new prompt arrives.
+SUGGESTION: When nextStep is set and equals the newest message, write that entry in <all-user-messages> as `* User @ HH:MM (N chars): quoted in the continuation below`, the same mechanism as QUOTED 
+for corrections. In parseUserMessages, recover its text from the LATEST block by its length header. The exact wording then appears once, in the continuation, right before <resume>, which is where the 
+continuation needs it.
+ESSENCE: This is a pure context-assembly change with no model call. The watermark cut and the Observer and Reflector are untouched, and the verbatim wording is kept once.
+PRIOR: docs/plans/ideas/efficiency.md E4 (user-dedup) explicitly keeps this duplicate: 'The newest prompt is never replaced, because the continuation quotes it for its exact wording.' The new reason: 
+the continuation's copy alone keeps that wording, so the second full copy adds nothing. It can be tested at E4's no-model tier.
+VERDICT: partly / low
+REASON: The duplicate is real. renderUserMessages (1173) writes the newest message whole: the QUOTED exemption requires `i < messages.length - 1`. renderContinuation (1268-1269) quotes 
+`truncate(memory.nextStep, NEXT_STEP_MAX_TOKENS)` again. At the next cut with no new prompt, nextStep is taken from the prior memory's messages again (2125, 2190), so the duplicate carries forward. 
+But the scope is overstated. nextStep is only set when `typedSoFar.length > 1` (2190), and the comment at 2187-2188 explains why: a session whose only prompt is its brief never gets a latest-request 
+quote. So workflow and subagent sessions with one long task prompt are not duplicated. It happens only when a later prompt has left context, as in mid-turn cuts of long agentic turns. The two copies 
+also have different caps. The all-user-messages copy keeps up to max(3k − brief, 2k) tokens (capUserMessages 1306, 1318), while the continuation copy is cut at 2k. A pointer is only lossless when the 
+continuation copy is not truncated. docs/plans/ideas/efficiency.md:59 (E4) chose to keep the newest prompt, and tests at register.test.ts:3820 and :3954 cover this layout.
+CORRECTION: Limit the claim to sessions with two or more typed prompts where the newest has left context. Replace the all-user-messages entry with the pointer only when nextStep equals that message 
+and fits within NEXT_STEP_MAX_TOKENS, so the continuation copy is whole. Screen it with E4's no-model tier before adopting it, since E4 deliberately kept the newest prompt.
+
+=== T6 [medium] Each scheduling pass fetches and hashes the whole history up to three times
+EVIDENCE: register.ts:1564-1565 markTime: `historyOf(...)` then `new Set(rows.map(rowHash))`. On a due step, schedule → liveView (1555-1558) → loopHistory `historyOf` again (1543) → unmask, which 
+walks the whole history and runs `JSON.stringify(u.input)` twice per tool call (318-320), then view() → `messages.map(rowHash)` plus `messages.map((m) => estimateTokens(rowText(m)))`, building 
+rowText twice per row (440, 445). writeSession runs in the same Promise.all (1610) and calls liveView a third time (1716). rowHash = FNV over `rowText`, which JSON-stringifies every input (365-373).
+IMPACT: Measured on a real 19.5 MB transcript (4,096 rows, 4.8M chars): one full hash pass takes about 15 ms. A due step therefore costs about 3 × (IPC of the full history + 15 ms) plus two unmask 
+passes, roughly 60-100 ms of CPU. It repeats every 5k tokens of new history in every running loop, including subagents, and recurs on the compaction path through liveView.
+SUGGESTION: Within one pass, fetch the history once and share it: markTime returns rows, which onStep hands to schedule and writeSession, or build a per-pass View once and share that. In view(), 
+compute rowText once per row and derive both the hash and the token count from it. Filter marks by row hash only when the history got shorter or a compaction happened, not on every step.
+ESSENCE: The observation schedule, chunk boundaries and ledger reconciliation stay the same. The same data is simply computed once per pass.
+PRIOR: none found
+VERDICT: partly / low
+REASON: The duplication is real. markTime (1564-1565) fetches the history and hashes every row on every step, not only on due passes. On a due pass, schedule's liveView (1555-1558) goes through 
+loopHistory (1542-1545) for a second fetch plus unmask. unmask walks the whole history and stringifies each tool input twice (318-320). view() builds rowText twice per row (440 for the hash, 445 for 
+tokens). Two details are off. First, writeSession calls liveView only after its seq check (1713-1716), which usually returns first. So the typical count is 2 fetches per due pass, and 3 only when a 
+Session line is due, every 20 observations. Second, view() hashes the live slice from liveStart on, not the whole history. I measured FNV on 4.8M chars at 6-10 ms, so the 15 ms figure with rowText is 
+plausible. All of this runs deferred via clock.after (2432), so it costs host main-thread CPU, not the request path. There is also a correctness caution about sharing markTime's rows with schedule. 
+schedule reads its view inside `locked` (1618-1621) so that reconcile and the ledger write match the latest history. Rows fetched before the lock wait can be staler than a chunk that landed in 
+between (runJob 1671-1679), and would then be reconciled against an older view.
+CORRECTION: Say instead: 'fetches the history 2 times per due pass (3 when a Session line is due) and hashes every row on every step'. Compute rowText once per row in view() and filter marks only 
+when the history shrank. Both are safe. If rows are shared, fetch them once inside the lock, or check that their length and last hash still match inside the lock before use. Don't hand pre-lock rows 
+to schedule.
+
+=== T7 [low] om_recall fetches the full live history it does not use, and re-reads and re-parses the whole transcript chain on every call
+EVIDENCE: register.ts:2382 `const [rows, sessionId] = await Promise.all([$.session.messages(), $.session.id()])`, but rows are used only in the fallback branch at 2393 (`fromFile ? corpus! : 
+liveTranscript(rows, …)`). register.ts:2387 calls `loadTranscript(recallIo($), path, { asking: true })` on every call. recall.ts:314-347 reads and parses every chain file on each call. recallIo.read 
+spawns `cat` for files of 4 MiB or more (register.ts:1937-1943).
+IMPACT: Measured with Bun on a 19.5 MB transcript: about 105 ms to load and parse (2,630 blocks) plus about 25 ms per search. The engine path adds the streamed cat and a full-history IPC copy (up to 
+4.8M chars) on every call. A typical recall after compaction runs a search and then a read, so the same file is parsed 2-3 times while the model waits on the tool.
+SUGGESTION: Call $.session.messages() only when the file is unavailable. Cache the parsed corpus per process, keyed by each chain file's path, size and mtime, and re-run markAsking on a copy of the 
+flags for each call.
+ESSENCE: om_recall answers the same queries over the same transcript. Background observation and compaction are untouched.
+PRIOR: none found
+VERDICT: partly / low
+REASON: This is confirmed at register.ts:2382: `Promise.all([$.session.messages(), $.session.id()])`, and `rows` is used only in the fallback at 2393. loadTranscript runs on every call (2387), and 
+recall.ts:314-347 re-lists, re-reads and re-parses every chain file each time, with recallIo spawning `cat` for files of 4 MiB or more (1937-1943). So skipping messages() unless the file is 
+unavailable is a clean win. The caching suggestion would rarely hit. Claude Code appends every row to the current transcript as it is produced, including this call's tool_use and the previous call's 
+result, so the current file's size and mtime change between any two om_recall calls. loadTranscript with `{ asking: true }` depends on that fresh content, because markAsking marks the calling block. 
+A cache keyed by path, size and mtime therefore misses on the current file almost every time and helps only immutable predecessor files in a resume chain.
+CORRECTION: Keep the lazy messages() fix. For the parse, cache the parsed blocks of immutable predecessor files by path, size and mtime. For the current file, parse incrementally from the last byte 
+offset, re-parsing only appended lines, and then re-run markAsking. A cache keyed by size and mtime alone would not help.
+

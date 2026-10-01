@@ -1,0 +1,174 @@
+SUMMARY: The plugin mostly uses the function-hooks API correctly. `claude plugin validate` passes, hooks/*.ts type-check cleanly against 2.1.285, turn.step delegates with `return yield* next(e)`, and 
+background work is started through `$.clock.after`, as the reference asks. The serious problems are elsewhere. The compaction hook never reads next.signal, so an interrupted compaction still installs 
+its ledger and leaves pi running. The single shared store is at 97% of its 4 MiB cap and is rewritten whole (5.3 MB) on every model request, and the 30-day prune removes nothing, so pruning runs 
+inside whichever write hits the cap. Pi runs through the uncancellable, 4 MiB-capped $.process.run where $.process.spawn would fix cancellation and the cap together. No new API in 2.1.285 fixes the 
+duplicated tail, the missing summary marker or cross-process atomicity; $.state is session-scoped only.
+
+=== A1 [high] session.compact never reads next.signal: an abandoned compaction still marks its memory as installed and leaves its pi processes running
+EVIDENCE: rg -n 'signal' hooks/*.ts finds nothing. hooks/register.ts:2093 `const settled = await Promise.allSettled(gaps.map(([from, to]) => once(from, to)))`: one pi call per ~10k-token gap, with no 
+MAX_PARALLEL cap, each allowed 120 s plus one retry. register.ts:2252 `if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(built.memory.observations), watermark: 
+{ from: 1, to: 1, ...`. register.ts:1477-1482 reconcile: `stored.anchor !== anchor ? 'a different memory message leads the context' ... return fresh(v, stored.seq)`. claude-code.d.ts 
+(2.1.285):5986-5990 next.signal `Aborts when the call this dispatch belongs to is abandoned: the user interrupted, a hook above settled first, or this hook ran out of budget. Anything the hook 
+started (timers, requests) should stop on it.` reference.md:117-120 says the same: `anything started for the dispatch should stop on it`.
+IMPACT: If the user presses Esc while a compaction is observing gaps synchronously (up to 120 s per chunk), the pi children keep running. The hook also still writes the ledger as installed: the 
+anchor of a memory that never entered the context, and a reset watermark. On the next pass reconcile sees a different anchor and restarts the ledger from the old memory message. Every observation 
+made since the previous compaction is dropped, and the background observer pays about one Luna call per 10k tokens to observe them again. A compaction that fires before it catches up puts those calls 
+back on the critical path. The declarations do not promise that the engine rejects later `$` calls after an abandonment, so nothing here prevents the write.
+SUGGESTION: In settle, check `next.signal.aborted` before the writes at register.ts:2248-2252. When it is set, store the ledger with its new chunks committed but not installed (the `stores && 
+!installs` branch) and throw. Pass the signal down through observe() to complete(), so pi runs under $.process.spawn, which kills the child when next.signal aborts (see A2). Cap the synchronous gaps 
+at MAX_PARALLEL like the background path. Optionally, stage the anchor/watermark reset and commit it only on classic.SessionStart with source 'compact', which the plugin already hooks, or on 
+classic.PostCompact (types:7117-7124).
+ESSENCE: The watermark cut and the synchronous fallback are unchanged. The only difference is that an abandoned compaction no longer overwrites the background ledger, so the background observations 
+survive for the next cut and it stays model-free.
+PRIOR: None found. docs/plans/results/1627-saiddup.md and 0128-supersede.md discuss ledger loss for precompute and non-persistent compactions, which the `installs`/`persistent` flags already handle. 
+Nothing covers an abandoned dispatch, and TODO.md has no entry.
+VERDICT: partly / medium
+REASON: The core claim is true. rg for signal/AbortController/aborted in hooks/ finds only a comment at register.ts:924, so session.compact never reads next.signal. In settle (register.ts:2244-2253), 
+once build succeeds the code writes `{ ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, ...} }` with no check that the compaction still stands. After that, reconcile 
+(register.ts:1473-1482) sees `stored.anchor !== anchor`, and `fresh(v, stored.seq)` rebuilds the ledger from the old memory message, so every entry committed since the previous compaction is lost. 
+The 2.1.285 declarations (bundled-skills/2.1.285/.../types/claude-code.d.ts:5986-5991) and reference.md:117-120 say work should stop on the signal, and nothing says later $ calls are rejected. No 
+prior art in TODO.md or docs/plans (rg for abandon/interrupt/next.signal). Two corrections. (1) It happens less often than the finding implies. Only persistent compactions write the ledger (`stores = 
+persistent && ...`, register.ts:2246). A normal watermark cut takes 0.1-0.5 s with no Observer call (docs/plans/compaction-ideas.md:510), so there is almost no time to press Esc. The real window is a 
+persistent compaction whose background observation fell behind and which is observing gaps on the spot. Whether the engine still accepts the store.set after abandonment is not verified. That makes it 
+medium, not high. (2) The suggestion to cap the synchronous gaps at MAX_PARALLEL goes against a documented choice. The comment at register.ts:2067-2069 says gaps are observed 'all at once' to keep 
+the critical path short, and a cap of 4 would roughly double compaction time whenever there are more than 4 gaps.
+CORRECTION: In settle, check next.signal.aborted before the writes at register.ts:2248-2252. When it is set, store the ledger with the new chunks committed but not installed (the `stores && 
+!installs` write), then throw, so the 'Compacted' toast, the stats record and maybeReflect are skipped too. Optionally pass the signal down to complete() once it runs under $.process.spawn (A2). Drop 
+the MAX_PARALLEL cap on the synchronous gaps.
+
+=== B1 [high] Store is at 97% of the 4 MiB cap: the 30-day prune removes nothing, so pruning happens inside the store.set that hits the cap, one whole-file rewrite per deleted key
+EVIDENCE: prune.ts:9 `const PRUNE_AFTER_DAYS = 30`. prune.ts:141-163 store.set hook: on a cap error, `sessions($, true)` reads every value (prune.ts:44 `const value = await $.store.get(key)`) and 
+drop() runs per session. drop() calls $.store.keys() and liveSessions() (prune.ts:60-64 reads every ~/.claude/sessions/*.json and /proc) for each session, then prune.ts:95 `for (const key of keys) 
+await $.store.delete(key)`. claude-code.d.ts:3124: writes reject for `a store over 4 MiB of JSON text in all`. register.ts:2471-2473 skill.prompt stores the full `r.text` per session. Measured on the 
+live store file: 4,078,734 of 4,194,304 bytes (97.2%) across 738 sessions, oldest activity 2026-09-23 (7 days ago). A simulated cap-prune drops 139 sessions and 464 keys. Serializing and writing the 
+store costs 12.2 ms per set.
+IMPACT: No session is 30 days old, so the daily prune is inert. Whichever write crosses the cap next pays the whole prune inline: a turn.step mark, or the compaction's install write at 
+register.ts:2252, which puts it on the compaction path. That prune is about 2,468 store.get calls, 139 × (keys() + 12 session-file reads + /proc checks), and 464 sequential deletes that each rewrite 
+the ~5 MB file, about 5.7 s of rewrites alone. Pruning to 75% leaves about 1 MB of headroom, under 2 days at the observed ~0.58 MB/day, so this repeats. Measured waste: skill texts total 518,551 
+chars in 70 entries but only 33 are unique, so ~271 KB (6.5% of the cap) is duplicated. 68 legacy fork:/buffer: keys (48.6 KB) fall outside KINDS (prune.ts:12) and are never pruned. 282 of 702 
+transcript: keys belong to sessions with no ledger.
+SUGGESTION: Make the daily background prune (already started from session.start) size-aware: after the age rule, drop the oldest non-live sessions until the store is under ~50-60% of the cap, off any 
+write path. Keep the store.set hook only as a last resort. Delete the legacy fork:/buffer: keys once. Store each skill text once under a content hash, or drop the text once it is older than 
+SKILLS_WHOLE_TURNS. Longer term, move per-session bulk (ledger 2.49 MB plus skills 0.51 MB, 74% of the bytes) to one file per session under the plugin data dir via $.fs, as stats.ts already does. 
+That removes the shared cap and also narrows TODO's cross-process lost-write window, since only the owning process writes a session's file.
+ESSENCE: The ledger, skills and times keep the same content and the same readers. Only where and when stale sessions are removed changes, and it moves off compaction's path.
+PRIOR: a32e129 (30-day prune plus prune-at-cap) and 73d70ba (fail-closed liveness) built this machinery. TODO.md:30-36 covers only atomicity. Nothing notes that the cap is reached within a week, or 
+the cost of the inline path.
+VERDICT: confirmed / medium
+REASON: I re-measured a copy of ~/.claude/plugins/store/observational-memory_inline-8aabd6f3acbe.json: 2,473 keys, 4,123,376 characters of compact JSON (98.3% of 4,194,304; CAP_ERROR at prune.ts:15 
+counts characters), so about 71k characters are left. The file on disk is 5.35 MB, pretty-printed, and its mtime changed every few seconds while I worked, so each set rewrites the whole file. The 
+oldest session activity is 7.8 days old, so the 30-day rule (prune.ts:9, 112) matches nothing. A cap prune simulated from prune.ts:146-158, ignoring liveness, drops 132 sessions and 434 keys. drop() 
+does a store.keys() plus liveSessions() for each session (prune.ts:87, 94) and deletes keys one at a time (prune.ts:95). A pretty-printed stringify plus write of this store takes 14.2 ms in bun, so 
+the deletes alone take about 6 s. Skill texts: 70 stored, 33 unique, 266 KB duplicated. There are 68 fork:/buffer: keys (48.6 KB) outside KINDS (prune.ts:12); the current code no longer writes them, 
+as they date from v0.3/v0.4. 282 of 703 transcript: keys belong to sessions with no ledger. skillsInUse (register.ts:1916-1922) uses an older skill's text only for its token count in a log line, so 
+dropping texts older than SKILLS_WHOLE_TURNS is safe. Prior art (a32e129, 73d70ba, TODO.md:30-36) covers the mechanism and atomicity, not the cap filling in about a week. Medium rather than high: the 
+cap prune is the designed fallback and it works. The write that crosses the cap is most likely one of the frequent background markTime writes, not the compaction's install write, though that one can 
+land on it or wait for it.
+CORRECTION: 
+
+=== B2 [medium] Every model request rewrites the whole 5.3 MB store, and turn.start blocks the prompt on two more rewrites
+EVIDENCE: register.ts:2431-2433 turn.step `$.clock.after(0, () => void onStep($, e.agentId)...)`. register.ts:1602 onStep `const rows = await markTime($, false, loop, stamp)`. register.ts:1563-1569 
+markTime reads the full history, hashes every row, then `await $.store.set(timesKey(loop.key), marks.slice(-MAX_MARKS))`. register.ts:1625 schedule writes `await $.store.set(ledgerKey(loop.key), 
+ledger)` on every pass, changed or not. register.ts:2418-2426 turn.start awaits markTime (store.set) and markTurn (get plus set) before `return next(e)`. register.ts:1963 and 2415: noteTranscript 
+sets the same path on every classic.Stop. Observed live: the store file (5,318,324 bytes) was rewritten between two consecutive tool calls of this session (mtime 22:06:35.71 to 22:06:39.86, +80 
+bytes). claude-code.d.ts:3137-3142 $.state: `Named values held by the host for the session ... survives a hot reload ... Persist through $.store`.
+IMPACT: Each step of every loop writes about 5.3 MB and costs about 12 ms of serialization on the session's event loop. A 100-step turn writes about 530 MB. Each main turn adds at least 4 more 
+whole-store rewrites: marks and turns at turn.start, the transcript path at classic.Stop, marks plus the ledger at turn.complete. turn.start's two rewrites, plus a full history read (up to 4096 rows) 
+and hash (~9 ms per 8 MB), run before next(e), so they delay every prompt by roughly 25 ms plus the history transfer. Every extra write also widens the cross-process lost-write window that 
+TODO.md:30-36 describes.
+SUGGESTION: Keep marks and turn starts in memory, or in $.state, which is session-scoped and survives a hot reload. Persist them to $.store at turn.complete, before compaction reads them (loadMarks 
+at register.ts:1514), and at session.end. Skip a store.set when the value is unchanged: the transcript path, and schedule's ledger when reconcile changed nothing. Move turn.start's markTime/markTurn 
+into the clock.after(0) it already uses for writeSession.
+ESSENCE: Timestamps and background scheduling on each step are kept. Only how often they are persisted changes, and compaction still reads the same marks.
+PRIOR: None found. docs/plans/compaction-ideas.md I52a (frontier observation at turn.complete) concerns Observer frequency, not store writes. TODO.md:30-36 names the non-atomic store but not the 
+write volume.
+VERDICT: partly / medium
+REASON: The facts are right. turn.step schedules onStep with clock.after(0) (register.ts:2431-2433). onStep calls markTime (1602), which reads the full history, hashes every row and runs store.set 
+(1563-1569) on every model step of the main loop and of each running subagent. schedule writes the ledger on every pass, whether it changed or not (1625). turn.start awaits markTime and markTurn (a 
+get plus a set) before `return next(e)` (2418-2427). noteTranscript sets the same path on every classic.Stop (1963, 2415). The store file is rewritten whole, as mtime changes show, at about 14 ms per 
+write (measured). The sizing needs correcting: the delay before each prompt is about 30 ms plus the history read, which is small next to model latency. The waste is mostly disk volume (about 5.35 MB 
+per step) and about 10 ms of host serialization per step, and a smaller store (B1) shrinks all of it. The suggestion is wrong on one point. It says to persist marks at turn.complete 'before 
+compaction reads them', but auto-compaction and background passes read loadMarks in the middle of a turn (session.compact at register.ts:2059, liveView at 1555). No prior art found.
+CORRECTION: Keep the marks in a per-loop in-memory map (or $.state, to survive a hot reload) that loadMarks reads first, falling back to $.store. Persist it at turn.complete, at session.end and 
+before a compaction. Skip store.set when the value is unchanged: the transcript path, and schedule's ledger when reconcile changed nothing. Update the register tests that list stored keys (for 
+example tests/register.test.ts:1885 and 1989). Shrinking the store (B1) cuts the cost of every remaining write.
+
+=== A2 [medium] pi runs through $.process.run, which cannot be cancelled: after /clear, a subagent's end or a reload, Observer and Reflector calls run to completion and are thrown away
+EVIDENCE: register.ts:932 `$.process.run([...PI, '--system-prompt', system, ...PI_ISOLATION], { cwd: PI_CWD, stdin: prompt, timeoutMs })`. claude-code.d.ts:3268 run's init is `{ cwd, env, stdin, 
+timeoutMs }`, with no signal. claude-code.d.ts:3280-3281 spawn: `The loop is the child's life: leaving it, return() on the stream, next.signal aborting or the module unloading kills the child`. 
+register.ts:1670-1673 runJob: `a background chunk landed after its loop ended; discarded`. register.ts:2455-2456 session.end only calls `end(...)`. register.ts:41 MAX_PARALLEL = 4; register.ts:74-75 
+timeouts of 120 s (observer) and 10 min (reflector). reference.md:62: on reload `the previous environment's timers are dropped`.
+IMPACT: On /clear, when a subagent answers (dropLoop), or when a loop ends, up to 4 Observer calls (≤120 s each, ~10-15k input tokens) and a Reflector call (≤10 min, up to ~20k output tokens) keep 
+running on the user's Luna quota, and their results are discarded. After a hot reload the new module starts with an empty `running` list while the old children continue, so more than MAX_PARALLEL pi 
+processes can overlap.
+SUGGESTION: Implement complete() with $.process.spawn({ argv, cwd, input }). Keep only `message_end` lines as they stream, and enforce the timeout with $.clock. Break the loop when the job's loop is 
+no longer live: have end() fire an AbortController per loop, or check isLive per piece. Inside a dispatch such as compaction, next.signal then kills pi automatically (A1). Module unload also kills 
+the children, which fixes the reload overlap.
+ESSENCE: Same Observer and Reflector calls, same model, same background placement. Only work whose result is already discarded is stopped.
+PRIOR: None found (rg for cancel, process.spawn and next.signal across docs/ and TODO.md). process.spawn is used only for `cat` in recallIo (register.ts:1933-1954).
+VERDICT: confirmed / medium
+REASON: register.ts:932 runs pi through $.process.run with `{ cwd, stdin, timeoutMs }`. ProcessRunInit in 2.1.285 (d.ts:7328-7347) has no signal field. Of the two process calls, only spawn is 
+documented as killed when the loop is left, when next.signal aborts or when the module unloads (d.ts:3280-3282). runJob (register.ts:1655-1675) checks isLive only before and after observe(). end() 
+(register.ts:198-202) and session.end (2453-2465) only bump the life counter. One more effect makes this worse than the finding says: a job leaves `running` only after pi returns (`running = 
+running.filter((j) => j !== job)`, register.ts:1668). After /clear or a subagent's answer, the live loops therefore get fewer than MAX_PARALLEL (4) slots for up to OBSERVER_TIMEOUT_MS (120 s), and 
+`slots = MAX_PARALLEL - running.length` at register.ts:1633 counts the dead jobs. The hot-reload overlap is inferred: the docs do not say what unload does to a process.run child. It is spawn that the 
+docs say is killed on unload. No prior art. The spawn request `{ argv, cwd, env, input }` (d.ts:7415-7436) covers what complete() needs.
+CORRECTION: 
+
+=== A3 [medium] The 4 MiB stdout cap now documented for $.process.run can drop pi's final message_end line on long reflections
+EVIDENCE: register.ts:38 PI_ISOLATION includes `'--mode', 'json'`. register.ts:911-920 piMessage reads only lines starting with `{"type":"message_end"`, with the comment `// a line cut at the output 
+limit`. claude-code.d.ts:3270-3271 `each stream's first 4194304 bytes (isStdoutTruncated, isStderrTruncated say when cut)`; the 2.1.280 copy says nothing about a cap. pi dist/modes/json-event.js: 
+every message_update line carries `usage: event.message.usage`. pi-ai maps each `response.output_text.delta` to one text_delta. register.ts:75 `REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens 
+of output`. `r.isStdoutTruncated` is never read.
+IMPACT: One text-delta line with its usage object is about 274 bytes, so 4 MiB holds about 15,300 deltas. OpenAI streams roughly one delta per token, and low-effort thinking deltas add more. A 
+reflection near its 20k-token target can therefore overflow the cap. message_end is written last, so it is the line cut. complete() then throws `pi exited 0 with no assistant message` after minutes 
+of paid Luna time, and the Reflector retries later with the same input. Observers (at most 1,728 output tokens in the stats) are safe. No reflector.*.out metric appears in the 140 stats files, so 
+this is an estimate, not an observed failure.
+SUGGESTION: Parse message_end from the streamed pieces under $.process.spawn, which has no cap and shares A2's fix. At minimum, check r.isStdoutTruncated and report it as its own failure class, so it 
+is not logged as a model non-answer.
+ESSENCE: The Reflector's prompt, target and placement are unchanged. It simply stops losing finished replies to the transport.
+PRIOR: The comment at register.ts:918 anticipates an output limit, but not that the one line it needs comes last. None in TODO.md or docs/plans.
+VERDICT: refuted / low
+REASON: The premise that a reflection is 'near its 20k-token target' is wrong. The model's target is `REFLECT_TARGET_TOKENS - measure(red)` (register.ts:1814), and measure includes the kept newest 
+lines, up to REFLECT_KEEP_TOKENS = 12k (1790-1802). The Reflector is therefore asked for at most about 8k tokens. I measured the raw pi stdout of all 382 cached Reflector calls under 
+~/.cache/om-bench-compact/luna-cache*. The largest is 2,479,682 bytes (59% of the 4,194,304-byte cap) for 8,257 output tokens, about 300 bytes per token counting the prompt echoes, so the cap is 
+reached only near 14k output tokens. A reply that long is far over target and would be rejected by the target check at register.ts:1845 anyway. The only difference would be that it throws instead of 
+retrying at a stronger level. No live session has a reflector.* metric in any of the 141 stats files. Minor inaccuracy: message_end is not the last line (turn_end, agent_end and agent_settled follow 
+it), though it does come after every delta. Reading r.isStdoutTruncated is a cheap diagnostic but does not fix a real failure.
+CORRECTION: 
+
+=== C1 [low] Repository types are from 2.1.280: the hooks compile cleanly against 2.1.285, but 20 test fakes do not
+EVIDENCE: .claude/types/claude-code.d.ts:1 `// Written by Claude Code 2.1.280.` tsc on a scratch copy with the 2.1.285 declarations: hooks/*.ts has 0 errors; tests have 20 (15 in register.test.ts, 3 
+in eval.test.ts, 1 in prune.test.ts, 1 in replay.test.ts). For example, tests/register.test.ts:887 `missing the following properties from type 'ProcessRunResult': isStdoutTruncated, 
+isStderrTruncated`, and tests/prune.test.ts:35 fs.list entries without `mtimeMs`. reference.md:40-43: `/plugin-types ... is the command a person runs to write the files a mod is typed against`.
+IMPACT: The AGENTS.md type check (`bunx -p typescript tsc -p .`, only fixture errors expected) breaks as soon as someone runs /plugin-types. Meanwhile the checked-in types hide the new truncation 
+flags, which is how A3 went unnoticed.
+SUGGESTION: Run /plugin-types and update the fakes in one shared helper: add isStdoutTruncated/isStderrTruncated to process.run results and mtimeMs to fs.list entries.
+ESSENCE: Type and test changes only.
+PRIOR: None found.
+VERDICT: confirmed / low
+REASON: .claude/types/claude-code.d.ts:1 reads 'Written by Claude Code 2.1.280'. I type-checked a scratch copy with the bundled 2.1.285 declarations: hooks/*.ts gave 0 errors, and tests gained 
+exactly 20 new errors (register.test.ts 15, eval.test.ts 3, prune.test.ts 1, replay.test.ts 1), for example ProcessRunResult missing isStdoutTruncated/isStderrTruncated and fs.list entry shapes. Two 
+notes. The 2.1.280 baseline in this checkout already shows 20 errors inside the local *.local.ts fixture modules, besides the 3 missing-module errors. Claude Code itself is 2.1.286, so /plugin-types 
+would write 2.1.286 declarations, which I could not check. The finding's link to A3 does not hold, since A3 is not a real failure.
+CORRECTION: 
+
+=== D1 [low] None of the 2.1.285 API changes fixes the engine items in TODO.md; the drafted bug report is still unfiled
+EVIDENCE: TODO.md:65-80 (duplicated raw tail, no compact-summary marker, pinned to 2.1.282). claude-code.d.ts:10079-10104 SessionMessage still has only role/text/toolUses/toolResults/handle, with no 
+summary flag. reference.md:108: $.session.append takes `text blocks alone in this release` and `The bottom refuses any other row`. claude-code.d.ts:3137-3142 $.state (ifVersion compare-and-set) is 
+`held by the host for the session ... Persist through $.store`, so it gives no cross-process atomicity. claude-code.d.ts:7117-7124 classic PostCompact carries `compact_summary`, which can confirm 
+that a compaction stood but cannot mark one. register.ts:2295-2298 still strips `handle` from the kept tail.
+IMPACT: The duplicated tail (the user sees the previous answer twice after each auto-compaction), the memory message shown as a long user prompt, and the non-atomic store all remain open. Re-checking 
+them on each release costs time for no gain until the engine changes.
+SUGGESTION: Update TODO.md to say these were re-checked against 2.1.285. File the draft in docs/plans/results/1515-dup-tail.md, extended with two requests: a summary flag or preservedSegment for 
+messages a session.compact hook returns, and $.store compare-and-set (like $.state's ifVersion) for cross-process writes. Use classic.PostCompact or SessionStart(compact) only to confirm an install 
+(A1).
+ESSENCE: No plugin behavior changes.
+PRIOR: TODO.md:30-36 and 65-80, and docs/plans/results/1515-dup-tail.md (Arm C tried keeping handles except on rows with toolResults; that does not fix the duplicate).
+VERDICT: confirmed / low
+REASON: TODO.md:62-78 covers the duplicated raw tail and says 'The bug is not filed yet'. docs/plans/results/1515-dup-tail.md:46-54 holds the unfiled draft, pinned to 2.1.282. In the 2.1.285 
+declarations, SessionMessage (d.ts:10079-10134) still has only role/text/toolUses/toolResults/handle/agentId and no summary flag. Only classic PostCompact carries compact_summary (d.ts:7124). 
+reference.md:108 limits $.session.append to text blocks. $.state (d.ts:3137-3142) is held by the host for the session and says to persist through $.store, so it gives no cross-process compare-and-set 
+on the store. This is process work, not a code change. The running engine is 2.1.286 and the newest local declarations are 2.1.285, so re-check against 2.1.286 before updating TODO.md.
+CORRECTION: 
+

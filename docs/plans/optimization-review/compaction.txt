@@ -1,0 +1,171 @@
+SUMMARY: The compaction core is mostly sound. Ledger work runs under the lock, loop stamps discard work from ended loops, chunks are matched by content hash, the floor catches a failed Observer, and 
+I found no off-by-one or unawaited-promise bug in the handler. The weak point is the promise of no model call on the compaction path, which fails in two places the stats measure. First, when one row 
+of the live context differs from the history anywhere under the watermark, all background notes are thrown away. Second, workflow subagents are never observed in the background at all. Together these 
+make 106 of 162 recent subagent compactions and several auto ones wait 20–74 s on the Observer. Nothing puts a time limit on that wait, and a compaction also repeats Observer calls that background 
+jobs already have in flight. (I could not run /improve-codebase-architecture: the skill blocks model invocation, so the user has to run it. The one structural fix inside this dimension, a single 
+shared function for finding unobserved row ranges, is folded into D4.)
+
+=== C1 [high] One changed row under the watermark discards every note the Observer made in the background, and compaction observes the whole context again on the spot
+EVIDENCE: hooks/register.ts:1476-1484 `stored.anchor !== anchor ? ... : w.from !== v.base || w.to > v.messages.length || range(v, w.from, w.to).hash !== w.hash ? 'the transcript changed under the 
+observations' ...` then `return fresh(v, stored.seq)`. hooks/register.ts:2059 `const v = view(messages, await loadMarks($, loop.key), persistent ? offset : undefined)`: on a mismatch, reconcile 
+checks the ledger against the live context, not against the history it was built from. The comment at hooks/register.ts:2057-2058 says the opposite: `the ledger still stands up to the first row that 
+differs, by content`. hooks/register.ts:2243 `const stores = persistent && ledger.watermark.to > base && isLive(loop, life)`. Stats (~/.claude/plugins/data/observational-memory/stats), each the 
+session's first compaction, auto, main loop: d246d3c3: 5 background chunks (40 notes) had landed; then notPersistent differing=1, fromEnd=116, rowsKept=0; rowsObservedBefore 0, rowsObservedNow 124, 6 
+calls, syncMs 74,177. b58cfeed: 4 chunks landed; differing 1, fromEnd 168, kept 0; 149 rows now, 5 calls, 22,592 ms. b29b5f7a: 4 chunks landed; differing 1, fromEnd 98, kept 0; 107 rows now, 6 calls, 
+20,948 ms. The same shape in subagents: 7c4b6c32 (21.5 s, 22.8 s) and e6b4b426 (about 20 s each). The 5 samples that kept notes (rowsKept 45–188) all had the differing row at fromEnd 3–81 and made 0 
+calls.
+IMPACT: 7 of the 16 mismatch samples since v1.4.1 have exactly this shape: 1 differing row, rowsKept 0. Together they are about 200 s of blocked compaction and about 35 Observer calls on the 
+compaction path. On top of that, the 4–5 background calls per case (about 40–50k chunk tokens) were already paid for and thrown away. Because `stores` is false, the ledger is also never written, so 
+the next pass restarts from the memory message: any constraint that boundPins shortened to an index line (register.ts:702-714) stays shortened for good.
+SUGGESTION: Check the ledger against the history rows it was hashed from, not the live context. When `history` is readable, the shape is `changed` and the lengths match (offset >= 0), run 
+reconcile/commit/build over `rows.slice(offset, offset + messages.length)` and take only the raw tail from `messages`. A more general option: record committed chunk ends in the ledger (commit already 
+walks chunk by chunk at register.ts:1459-1466, so store `{to, seq}` per chunk) so that reconcile can cut back to the last whole chunk before the first differing row instead of calling `fresh(v)`. 
+That is what the comment and TODO.md promise. A rewound transcript (history == context) still restarts, so the test at tests/register.test.ts:1893 is unaffected. Add a test in which one tool-result 
+row under the watermark differs only in the context.
+ESSENCE: Compaction goes back to cutting at the background watermark with no model call. The restart that guards a truly rewound transcript stays, because in that case the history itself no longer 
+matches.
+PRIOR: TODO.md:47-60 lists the mismatch and says the cause is unknown. It also says `Since v1.4.1 (62ee8ee) a mismatch keeps the background notes up to the first differing row`. That is only true 
+when the differing row is past the watermark. The new facts: most mismatches are a single changed result row, and any such row under the watermark wipes the ledger. compaction-ideas.md:516 (I56) 
+found zero-before compactions come from notPersistent, but the restart inside reconcile was left as it was.
+VERDICT: confirmed / high
+REASON: Code: register.ts:1476-1484 compares the whole watermark range with one hash, `range(v, w.from, w.to).hash !== w.hash`, and on a mismatch returns `fresh(v, stored.seq)`. `fresh` (1441-1453) 
+keeps only what the memory message holds. On a first compaction (base 0) that is nothing. At 2059, when the context is not persistent, `v` is built from the live `messages`. Background landings 
+commit their chunks under the watermark right away (runJob 1680, commit 1456-1467), so a changed row anywhere under the watermark throws away every background note. `git log -L` shows reconcile has 
+not changed since 5b441a6. The I56 change (2c34e87) only started calling it for unmatched contexts. Its test at tests/register.test.ts:3658 covers only a difference past the watermark, and no test 
+covers one under it. The comment at 2057-2058 and TODO.md:56 ('keeps the background notes up to the first differing row') overclaim: that holds only past the watermark.
+
+Stats: across the 8 stats files with notPersistent metrics there are 16 samples. 8 of them have differing=1 and rowsKept=0; the reviewer counted 7. All 16 are `changed` result-result. The three 
+main-loop cases are clear-cut. d246d3c3 had 5 background calls landed before the compaction, observing 40 notes; it then made 6 calls in 74.2 s. b58cfeed made 5 calls in 22.7 s and b29b5f7a 6 calls 
+in 21.0 s. In each, the chunk sizes observed on the spot repeat the background ones exactly: d246d3c3 10402/10872/10322/8651, b29b5f7a 10455/12857/11208, b58cfeed 10134/9992/12481. One chunk in each 
+case is +3 tokens, which is the changed row. The same rows were paid for twice. The subagent cases (e6b4b426) are less certain, because some of their background chunks were still in flight when the 
+compaction started.
+
+The secondary effect also holds. With `stores` false (2243) the ledger is not written. The next reconcile sees a new anchor and parses the corrections that boundPins shortened in the rendered message.
+
+The main suggestion is sound: in the `changed` shape with offset >= 0, the history rows line up index for index with `messages`. The rewound-transcript test (1893-1908) makes context == history, so 
+it still restarts. One caveat about the alternative: storing `{to, seq}` per chunk is not enough to cut back. `commit` folds each chunk's corrections (applyConstraints) and currentTask (carry) into 
+the ledger, so cutting back would also need a snapshot of those per chunk. I did not find this in prior art: TODO.md:47-63 and compaction-ideas.md I56 say the cause is unknown and assume the notes 
+are kept.
+CORRECTION: 8 of the 16 mismatch samples have differing=1 and rowsKept=0, not 7. The three main-loop cases (d246d3c3, b58cfeed, b29b5f7a) are the clean evidence. The e6b4b426 subagent cases may 
+partly reflect background chunks still in flight. The comment at 2057-2058 overclaims rather than 'says the opposite'. A cut-back to the last whole chunk would also need per-chunk corrections and 
+currentTask snapshots, not just {to, seq}.
+
+=== D2 [high] Workflow subagents are never observed in the background, so each of their compactions calls the Observer on every row
+EVIDENCE: hooks/register.ts:1598-1601 `A loop no listed agent runs (an engine fork) is left alone.` with `if (agentId !== undefined && !(await $.agent.list()).some((a) => a.id === agentId && a.status 
+=== 'running')) return`. hooks/register.ts:1521-1522 `if (!Array.isArray(rows)) throw new Error(`subagent ${agentId}'s history is unreadable (${rows.deny})`)`. .claude/types/claude-code.d.ts:169-170 
+`A workflow's agents and the engine's own forks (compaction, memory) carry ids no list names.` and :9320 `Not an agent a workflow run filed under the run.` hooks/register.ts:2051 `.catch((error) => 
+void log($, `${errorText(error)}; observing its context on the spot`))`. hooks/register.ts:2294 `if (persistent && installs) void maybeReflect(...)`. Stats for session 28895069 (workflow-heavy, 68 
+workflow JSONL files): 27 subagent compactions, 26 with rowsObservedBefore 0, 146 on-the-spot calls, 2,939 rows observed on the spot, 395.2 s blocked (max 19.9 s), and only 1 notPersistent, so the 
+rest had unreadable histories. Across all stats files: 106 of 162 subagent compactions blocked on the Observer (563 calls, 1,975 s, mean 18.6 s), against 19 of 159 auto compactions.
+IMPACT: About 15–20 s of blocking and 4–7 Observer calls at every workflow-agent compaction. Workflow agents are the largest source of compaction time spent waiting on the Observer. Their ledger is 
+never stored (`stores` needs `persistent`), so the Reflector never runs for them. Their memory grows by each compaction's notes until the budget check falls back to the built-in compactor. Subagent 
+memory already reaches 32.8k tokens in 40c779b6.
+SUGGESTION: When `history` is undefined, do not call the Observer on the compaction path by default. Take the floor: compileBrief over [base, tailStart), which is 0 calls and milliseconds, the same 
+path a failed Observer already takes. Alternatively, allow at most one wave limited by the D3 deadline and brief the rest. Later, workflow agents could be observed in the background from `tool.call` 
+events, which carry their agentId (d.ts:10372 `ToolCallInput = ToolCallEnvelope & AgentLoop`). Count unreadable-history compactions in stats (for example `compaction.subagent.unreadable`) so they 
+stop showing up as unexplained zero-before compactions.
+ESSENCE: Background observation stays as it is wherever the history can be read. The code-compiled brief does the job the essence gives it, standing in where observations do not cover, and no model 
+call runs on the compaction path.
+PRIOR: The behaviour is deliberate since v0.4.10 (57ba343). tests/register.test.ts:1910: `a subagent whose history the session cannot read is observed at compaction from its context alone`. 
+compaction-ideas.md:516 puts subagent blocking down to notPersistent. This finding is a separate cause (only 1 of 26 in 28895069 was notPersistent) and its cost has not been measured before. No doc 
+discusses workflow agents.
+VERDICT: partly / medium
+REASON: The mechanism holds. onStep (1598-1601) returns for any agentId that `$.agent.list()` does not list. historyOf (1521-1522) throws when the history is unreadable, and compaction catches that 
+at 2051 and observes on the spot. The d.ts confirms both halves. At 169-170: 'A workflow's agents and the engine's own forks ... carry ids no list names'. At 9320: 'Not an agent a workflow run filed 
+under the run'. Reflection runs only when `persistent` is true (2294) and the ledger is stored only when `stores` is true (2243), so an unreadable loop's memory is never reflected.
+
+Stats check out. 28895069 has 27 subagent compactions, 26 with 0 rows observed before, 146 calls, 395.2 s blocked, and only 1 notPersistent in total. Its transcript directory holds 15 wf_* workflow 
+dirs and 2 ordinary subagents. Across all files, 106 of 162 subagent compactions blocked (563 calls, 1,975 s), against 19 of 159 auto compactions.
+
+Three corrections. (1) 'Largest source' is not established. Blocked subagent compactions not explained by notPersistent come to about 49 of 106 (28895069: 26, 5fdeae60: 15, 6396851a: 8). 40c779b6 
+alone has 40 blocked subagent compactions that notPersistent does explain. The 32.8k-token subagent memory cited is from 40c779b6 (readable, notPersistent), not from a workflow agent, though the 
+no-reflection growth applies to both. (2) These waits block a background workflow agent, not the user's main loop. (3) Taking the floor by default reverses a deliberate, tested behaviour 
+(tests/register.test.ts:1910 expects the rows observed on the spot). It swaps observations for a brief capped at 3k tokens (vcc.ts:13) over about 150k tokens of context, a quality cost no benchmark 
+measures. `tool.call` events (d.ts:10372) carry only the tool input, not the results or the assistant text, so they cannot rebuild the history for background observation. The 
+`compaction.subagent.unreadable` counter is a clear, cheap win.
+CORRECTION: Keep the facts and the counter. Size it as about half of blocked subagent compactions, in background workflow agents rather than the user's main loop. Prefer the bounded option: at most 
+one wave under a D3-style deadline, with the rest going to the brief. Or measure brief-only quality first before making the floor the default, because the floor-by-default change reverses 
+tests/register.test.ts:1910. Drop the idea of rebuilding history from tool.call events.
+
+=== D3 [medium] No time limit on the Observer calls compaction makes on the spot: a compaction can wait up to about 240 s
+EVIDENCE: hooks/register.ts:74 `const OBSERVER_TIMEOUT_MS = 120_000`. hooks/register.ts:2084-2091 `return observe(...).catch((error) => { if (failureClass(errorText(error)) === 'timeout') throw 
+error; retries++; ... return observe($, v, from, to, 'compaction', before) })`. hooks/register.ts:2094 `const settled = await Promise.allSettled(gaps.map(([from, to]) => once(from, to)))`. 
+hooks/register.ts:2067-2069 `A chunk pi fails on stays raw: the cut is wherever the rest reaches, and with nothing observed at all the floor compiles a brief of the rest`.
+IMPACT: Measured over 128 on-the-spot runs (2,518 s in total): p50 18.7 s, p90 23.2 s, max 74.2 s (d246d3c3). The worst case is a non-timeout failure near 120 s followed by a fresh 120 s retry, about 
+240 s of blocking. With 4–7 calls in parallel, the slowest call sets the wait.
+SUGGESTION: Race the allSettled against a deadline measured from `started` (for example 30 s, about 1.6 times p50). Treat unfinished gaps as failures so the existing floor/failure path briefs them by 
+code. Skip the retry when the remaining time is shorter than a typical call. Late replies can be dropped, since after install they no longer match the transcript anyway. Record 
+`compaction.<trigger>.deadlineHit`.
+ESSENCE: The deadline limits the only model call that can run on the compaction path. The vcc brief covers what did not finish in time, and nothing changes in the background.
+PRIOR: None found for a deadline. docs/plans/ideas/observer.md:36 notes that a timeout is not retried at compaction. compaction-ideas.md:129 records that the user rejected blocking calls of 38–48 s.
+VERDICT: confirmed / medium
+REASON: register.ts:74 sets `OBSERVER_TIMEOUT_MS = 120_000`. Lines 2084-2091 retry a non-timeout failure once with a fresh `observe`, and 2094 awaits `Promise.allSettled` with no overall limit. The 
+worst case is a non-timeout failure near 120 s plus a 120 s retry, about 240 s. That bound is correct but has not been seen: the stats hold no compaction timeouts at all, and 8 
+`observer.compaction.failed.no-observations`, which trigger the retry. My recount over 129 on-the-spot runs (2,537 s) gives p50 18.7 s, p90 23.7 s, max 74.2 s (d246d3c3) and 72.8 s (1b3a95f9). The 
+d246d3c3 wait was one pi call of 74,056 ms (complete() records each call at 929-931), not a retry, so a deadline measured from the start of the observation would have cut it to about 30 s. A 30 s 
+deadline would have cut 5 of the 129 runs. The existing failure and floor path (2067-2069, build 2232-2236) already briefs rows left unobserved, so the suggestion fits the design. No prior art 
+proposes a deadline. docs/plans/ideas/observer.md:36 notes only that a timeout is not retried. One small point: start the deadline just before allSettled, not from `started` (2040), though the setup 
+before it is only about 0.2 s.
+CORRECTION: 
+
+=== D4 [medium] Compaction repeats Observer calls on rows that background jobs are already observing, and ignores MAX_PARALLEL
+EVIDENCE: hooks/register.ts:2077-2079 builds the gaps from `[...initial.chunks, { from: start, to: start }]` only, leaving out running jobs. By contrast, schedule counts them, 
+hooks/register.ts:1627-1628 `const mine = running.filter(...)` / `const covered: Range[] = [ledger.watermark, ...ledger.chunks, ...mine.flatMap(...)]`. hooks/register.ts:1646-1648 `running.push(job) 
+... $.clock.after(0, () => void runJob($, job, v))`: no promise is kept, so there is nothing to await. hooks/register.ts:1700-1701: every landing calls `schedule` for waiting loops, and nothing marks 
+a loop as compacting, so a pass during a compaction can start more duplicates. The on-the-spot `observe` calls never enter `running`.
+IMPACT: In the stats, 15 of 86 on-the-spot compactions overlapped background Observer calls: 25 were in flight at the start and 35 started during the compaction. 21 of those 60 landed nothing, about 
+235k chunk tokens. That is an upper bound, because stats do not record which loop a call belongs to. Each duplicate costs a full call of about 18 s, where waiting for the call already running would 
+take only its remaining time. During a compaction up to 4 background plus 7 on-the-spot pi processes run at once. commit then drops the duplicate (register.ts:1461), so there is no double counting, 
+only waste.
+SUGGESTION: Keep each Job's promise, and have one `gapsOf(ledger, v, running, limit)` used by both schedule and session.compact, so both skip the same covered ranges. At compaction, treat the loop's 
+running ranges as covered and await those promises (within the D3 deadline) alongside the new calls; settle already reloads the ledger, so their landings count. Mark the loop as compacting so 
+schedule() starts nothing for it until settle finishes.
+ESSENCE: The same rows are observed once, by the job that started first. The cut still falls at the committed watermark, and background observation is unchanged.
+PRIOR: None found. TODO.md:37-45 covers chunks run side by side not seeing each other's constraints, not calls repeated on the same rows.
+VERDICT: partly / low
+REASON: The duplicate claim holds in the code. The gaps at 2077-2079 come from `initial.chunks` only. schedule (1627-1628) counts the loop's `running` jobs as covered. Jobs keep no promise 
+(1646-1648, `$.clock.after(0, () => void runJob(...))`). Nothing marks a loop as compacting (no match for 'compacting' apart from a comment at 2130). A landing reschedules the same loop (1700-1701). 
+commit then drops the duplicate (1461). My overlap recount (21 of 129 blocking compactions, 31 calls in flight and 40 started) matches the reviewer's upper bound. It cannot be tied to a loop, and 
+background calls from other loops (subagents stepping during a main compaction) inflate it.
+
+Three corrections. (1) 'Ignores MAX_PARALLEL' is by design. register.ts:41 defines it as 'background Observer calls in flight at once', and 2068 says compaction observes 'all at once' to keep the 
+critical path short. Capping it would add latency. (2) Compaction observes on the spot only when more than RAW_MAX_TOKENS = 40k tokens (register.ts:46) sit past the watermark. With the background 
+healthy that seldom happens, so most overlaps follow C1 restarts or loops the background has fallen far behind. Fixing C1 removes much of this. (3) Background jobs in flight that land after the 
+install are discarded anyway by `locate` (1678-1679). So awaiting them within a deadline is the useful part of the suggestion. The shared `gapsOf` and the compacting flag add state for a small gain.
+CORRECTION: Keep the core: compaction can re-observe rows that a background job for the same loop already has in flight. Drop 'ignores MAX_PARALLEL', which is by design. Size it as a secondary waste, 
+mostly downstream of C1 and loops the background has fallen behind on. The minimal fix: at compaction, treat the loop's in-flight ranges as covered and await those jobs' promises within the D3 
+deadline.
+
+=== S5 [low] The compaction stats count repeated rows as observed on the spot, and include setup time in syncMs
+EVIDENCE: hooks/register.ts:2259 `const observedNow = chunks.reduce((n, c) => n + c.to - c.from, 0)` counts every on-the-spot chunk, including one that commit skipped because a background chunk for 
+the same rows landed first (register.ts:1461 `if (c.from !== watermark.to) continue`). hooks/register.ts:2287 `rowsObservedBefore: observed - base - observedNow`. hooks/register.ts:2095 `sync = { 
+calls: gaps.length + retries, ms: (await $.clock.now()) - started }`, where `started` is read at 2040, before the history read, git status, marks and ledger load.
+IMPACT: rowsObservedBefore is the metric the I56 diagnosis relied on (compaction-ideas.md:516, `every zero-before compaction is a notPersistent one`). When a D4 overlap happens it under-reports 
+background work. syncMs also includes non-Observer setup.
+SUGGESTION: Count observedNow from the rows that actually landed: the watermark before settle compared with the committed ranges that came from `chunks`. Time the sync from just before 
+`Promise.allSettled`.
+ESSENCE: Only the stats change.
+PRIOR: None found.
+VERDICT: confirmed / low
+REASON: register.ts:2259 sums every fulfilled on-the-spot chunk (`chunks.reduce((n, c) => n + c.to - c.from, 0)`), whether or not commit (1461) took it. 2287 then derives `rowsObservedBefore: 
+observed - base - observedNow`, and 2095 times `sync.ms` from `started`, which 2040 reads before the history, ledger and marks loads. The reviewer missed a second case. When an early gap fails and 
+later gaps succeed, the later chunks wait behind the gap (1460) and are never committed, yet they still count in observedNow. That can push rowsObservedBefore below zero, and the screen line (2274) 
+says 'observed N messages on the spot' for rows that went into the brief instead. No negative value appears in the current stats. The syncMs part is real but tiny: compactions with no Observer call 
+take 228-249 ms in total, against about 18.7 s for the calls.
+CORRECTION: 
+
+=== W6 [low] Two constants named BRIEF_MAX_TOKENS mean different things
+EVIDENCE: hooks/vcc.ts:13 `export const BRIEF_MAX_TOKENS = 3_000 // the whole section, a hard cap` (the code-compiled session brief). hooks/register.ts:88 `const BRIEF_MAX_TOKENS = 8_000`, used for 
+the session's first user message: hooks/register.ts:1294 `The session's first message, the standing brief, cut to BRIEF_MAX_TOKENS`.
+IMPACT: Someone reading the floor/brief path sees a 3k and an 8k cap under the same name and cannot tell which one bounds the session brief in the memory message.
+SUGGESTION: Rename the one in register.ts to FIRST_MESSAGE_MAX_TOKENS (or STANDING_BRIEF_MAX_TOKENS) and call it the first message, not a brief, in the comment at 1294.
+ESSENCE: A rename only.
+PRIOR: None found.
+VERDICT: confirmed / low
+REASON: hooks/vcc.ts:13 has `export const BRIEF_MAX_TOKENS = 3_000 // the whole section, a hard cap`, the session brief compiled by code, used at vcc.ts:685 and tested at tests/vcc.test.ts:206. 
+hooks/register.ts:88 has `const BRIEF_MAX_TOKENS = 8_000`, used only at 1303 in capUserMessages for the session's first user message, which the comment at 1294 calls 'the standing brief'. register.ts 
+imports from './vcc' without that name (26-27), so both compile, but a reader sees two caps under one name. The overload goes further than the constant: `briefer`, BRIEF_CUT, 'user messages as the 
+brief' (2214) and prompts.ts:233's 'standing briefing' all use 'brief' for other things. compaction-ideas.md:420 ('The brief keeps its 8k cap') shows the plans use the same ambiguous word. Renaming 
+it to FIRST_MESSAGE_MAX_TOKENS is safe, since the constant is module-local and used once. No CONTEXT.md glossary exists to settle the term.
+CORRECTION: 
+
