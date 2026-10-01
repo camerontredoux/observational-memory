@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, Register, SessionCompactInput, SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
+import { planBudget } from '../hooks/register'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
@@ -2447,6 +2448,31 @@ describe('register', () => {
 
     expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
     expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~30000 allowed; using the built-in compaction$/))
+  })
+
+  test("planBudget: half the room below the session's limit less the overhead, and the raw tail's density from the last measure, never under 1", () => {
+    const usage = (context: object) => ({ startedAt: 0, context, rateLimits: [] }) as never
+    const breakdown = {
+      autoCompactThreshold: 100_000,
+      rawMaxTokens: 200_000,
+      mcpTools: [
+        { name: 'mcp__big__loaded', serverName: 'big', tokens: 10_000, isLoaded: true },
+        { name: 'mcp__big__deferred', serverName: 'big', tokens: 50_000, isLoaded: false },
+      ],
+      memoryFiles: [{ path: '/work/project/CLAUDE.md', type: 'Project', tokens: 6_000 }],
+      agents: [{ agentType: 'explore', source: 'built-in', tokens: 2_000 }],
+      skills: { totalSkills: 3, includedSkills: 3, tokens: 1_000 },
+      slashCommands: { totalCommands: 2, includedCommands: 2, tokens: 1_000 },
+    }
+    // (100k - 20k - 10k loaded - 6k - 2k - 1k - 1k) / 2; a deferred tool is outside the window. (80k - 40k) / 20k.
+    expect(planBudget(usage({ window: 200_000, tokens: 80_000, breakdown }), true, 20_000)).toEqual({ budget: 30_000, density: 2 })
+    // No threshold: the window the breakdown measures against. Fewer tokens measured than estimated scale nothing down.
+    expect(planBudget(usage({ window: 1_000_000, tokens: 30_000, breakdown: { ...breakdown, autoCompactThreshold: undefined } }), true, 20_000)).toEqual({ budget: 80_000, density: 1 })
+    // A subagent's model may have a smaller window than the main model's, and its context is not the one measured.
+    expect(planBudget(usage({ window: 1_000_000, tokens: 900_000 }), false, 20_000)).toEqual({ budget: 90_000, density: 1 })
+    expect(planBudget(usage({ window: 1_000_000 }), true, 20_000)).toEqual({ budget: 490_000, density: 1 })
+    // No usage at all: the smallest window in use.
+    expect(planBudget(undefined, true, 20_000)).toEqual({ budget: 90_000, density: 1 })
   })
 
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {

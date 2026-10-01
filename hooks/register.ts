@@ -1,4 +1,4 @@
-import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
+import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
 import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
@@ -1662,6 +1662,22 @@ async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, nex
   return r
 }
 
+// The compacted context fits half the room the overhead leaves below the point auto-compaction runs at, so the
+// session can work before compacting again. The session's figures are its main model's: a subagent's model may
+// have a smaller window. The overhead grows by what the breakdown lists beside the system prompt and built-in tools.
+// Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's measure,
+// less the overhead, over `totalTokens`, the estimate of the same messages, scales the raw tail's up, never down.
+export function planBudget(usage: SessionUsage | undefined, main: boolean, totalTokens: number) {
+  const breakdown = usage?.context.breakdown
+  const limit = breakdown?.autoCompactThreshold ?? breakdown?.rawMaxTokens ?? usage?.context.window ?? WINDOW_TOKENS
+  const listed = [...(breakdown?.mcpTools.filter((t) => t.isLoaded) ?? []), ...(breakdown?.memoryFiles ?? []), ...(breakdown?.agents ?? []), breakdown?.skills, breakdown?.slashCommands]
+  const overhead = OVERHEAD_TOKENS + listed.reduce((n, l) => n + (l?.tokens ?? 0), 0)
+  const budget = Math.floor(((main ? limit : Math.min(limit, WINDOW_TOKENS)) - overhead) / 2)
+  const measured = main ? usage?.context.tokens : undefined
+  const density = measured === undefined ? 1 : Math.max(1, (measured - overhead) / Math.max(1, totalTokens))
+  return { budget, density }
+}
+
 // The compaction from the ledger: what the session.compact hook runs.
 async function compact($: EngineInterface, e: SessionCompactInput, next: Parameters<Hook<'session.compact'>>[2]): Promise<SessionCompactResult> {
   // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
@@ -1770,47 +1786,44 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const priorMemory = base ? parseMemory(messages[0]!) : undefined
   const prior = priorMemory?.skills ?? []
   // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
-  const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
-  const goal = main ? (((await $.store.get(goalKey(sessionId))) as Goal | undefined)?.line ?? priorMemory?.session) : undefined
-  const turns = main ? await loadTurns($, sessionId) : undefined
+  // A subagent's memory names no file, but om_recall reaches its thread through the session's.
+  const [skills, stored, turns, transcriptPath] = (await Promise.all([
+    main ? $.store.get(skillsKey(sessionId)) : undefined,
+    main ? $.store.get(goalKey(sessionId)) : undefined,
+    main ? loadTurns($, sessionId) : undefined,
+    $.store.get(transcriptKey(sessionId)),
+  ])) as [Skill[] | undefined, Goal | undefined, number[] | undefined, string | undefined]
+  const recorded = skills ?? []
+  const goal = main ? (stored?.line ?? priorMemory?.session) : undefined
+  const transcript = main ? transcriptPath : undefined
   const known = mergeSkills(prior, recorded)
+  // A row of the live context as the memory message quotes it, with the time it was written where that is known.
+  const stamped = (i: number, text: string): UserMessage => ({ ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text })
   // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
   const prompts = messages.flatMap((m, i) => {
     const text = i < base ? undefined : typed(m, known)
-    return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
+    return text === undefined ? [] : [{ i, message: stamped(i, text) }]
   })
   // The reply ending each turn: the last assistant text before the next prompt, from rows past the memory message.
   const replyRows = prompts.flatMap((p, k) => {
     const lo = k ? prompts[k - 1]!.i : base - 1
     for (let j = p.i - 1; j > lo; j--) {
       const m = messages[j]!
-      if (m.role === 'assistant' && m.text.trim()) return [{ i: j, message: { ...(v.at[j] === undefined ? {} : { at: stamp(v.at[j]!) }), text: m.text.trim() } }]
+      if (m.role === 'assistant' && m.text.trim()) return [{ i: j, message: stamped(j, m.text.trim()) }]
     }
     return []
   })
   // An omitted-count line stands for dropped prompts, never for the latest one.
   // A prompt cut to its note alone quotes nothing.
   const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
-  // A subagent's memory names no file, but om_recall reaches its thread through the session's.
-  const transcriptPath = (await $.store.get(transcriptKey(sessionId))) as string | undefined
-  const transcript = main ? transcriptPath : undefined
-  // The compacted context fits half the room the overhead leaves below the point auto-compaction runs at, so the
-  // session can work before compacting again. The session's figures are its main model's: a subagent's model may
-  // have a smaller window. The overhead grows by what the breakdown lists beside the system prompt and built-in tools.
-  // Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's measure,
-  // less the overhead, over the estimate of the same messages scales the raw tail's up, never down.
-  const breakdown = usage?.context.breakdown
-  const limit = breakdown?.autoCompactThreshold ?? breakdown?.rawMaxTokens ?? usage?.context.window ?? WINDOW_TOKENS
-  const listed = [...(breakdown?.mcpTools.filter((t) => t.isLoaded) ?? []), ...(breakdown?.memoryFiles ?? []), ...(breakdown?.agents ?? []), breakdown?.skills, breakdown?.slashCommands]
-  const overhead = OVERHEAD_TOKENS + listed.reduce((n, l) => n + (l?.tokens ?? 0), 0)
-  const budget = Math.floor(((main ? limit : Math.min(limit, WINDOW_TOKENS)) - overhead) / 2)
-  const measured = main ? usage?.context.tokens : undefined
-  const density = measured === undefined ? 1 : Math.max(1, (measured - overhead) / Math.max(1, tokensBetween(v, 0, messages.length)))
+  const { budget, density } = planBudget(usage, main, tokensBetween(v, 0, messages.length))
 
   // Rows [from, to) as the session brief compiles them, each line with its om_recall reference when the model can
-  // read it: the transcript file, the session's directory and home are read once, and only when a brief is compiled.
+  // read it: the transcript file is read once, and only when a brief is compiled. The session's directory and home,
+  // which the brief and the open failures both resolve paths against, are read once, when either first needs them.
   let corpus: Promise<Awaited<ReturnType<typeof loadTranscript>> | undefined> | undefined
-  let dirs: Promise<[string, string | undefined]> | undefined
+  let cwdHome: Promise<[string, string | undefined]> | undefined
+  const dirs = () => (cwdHome ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)]))
   const compile = async (from: number, to: number) => {
     const rows = messages.slice(from, to)
     let refOf
@@ -1819,8 +1832,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
       const c = await corpus
       refOf = c && (await refsOf(c, rows, e.agentId).catch(() => undefined))
     }
-    dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
-    const [cwd, home] = await dirs
+    const [cwd, home] = await dirs()
     return compileBrief(rows, v.at.slice(from, to), cwd, home, refOf)
   }
 
@@ -1840,8 +1852,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
       // observed, which no observation covers.
       const from = floor ? observed : cut
       const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
-      dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
-      const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
+      const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs()))
       let memory: Memory = {
         corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
           estimateTokens(renderCorrections(l)),
