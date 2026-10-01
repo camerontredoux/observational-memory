@@ -22,8 +22,8 @@ Not done:
 
 - 3: skipped. `typed()` (`register.ts:422-428`) reads the stored skill texts to tell a skill's injected text from a user message, so one shared copy needs a change there too.
 - 14: skipped at the user's request.
-- 19: dropped. The pointer replaced the duplicate in 15 of 70 bench compactions and saved about 45 tokens in each, which is not worth a second read path for the latest request. Branch `worktree-wf_1600353f-010-2`.
-- 28: dropped. It saved about 25 tokens per Observer call, and it removed the words that tell the Observer why it gets the constraint list. Branch `worktree-wf_1600353f-010-7`.
+- 19: dropped. The pointer replaced the duplicate in 15 of 70 bench compactions and saved about 45 tokens in each, which is not worth a second read path for the latest request.
+- 28: dropped. It saved about 25 tokens per Observer call, and it removed the words that tell the Observer why it gets the constraint list.
 
 ## Order of work
 
