@@ -54,6 +54,15 @@ describe('the notes pane', () => {
     expect(texts(await draw($, 'a1'))).toContain('🟢 11:00 Subagent searched')
   })
 
+  // The person opens the pane to read the notes while a turn runs, not after it.
+  test('/notes runs at once when typed mid-turn', async ($, on) => {
+    const registered: { name: string; immediate?: true }[] = []
+    on('command.register', ($, e) => (registered.push(e), { value: { command: e.name } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: '/work', surface: null, isInteractive: true })
+    expect(registered.find((c) => c.name === 'notes')?.immediate).toBe(true)
+  })
+
   test('an empty ledger says so', async ($, on) => {
     world(on, {})
     expect(texts(await draw($))[0]).toBe('No observations for this session yet.')

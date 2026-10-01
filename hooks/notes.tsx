@@ -41,10 +41,10 @@ async function poll($: EngineInterface) {
 }
 
 export const registerNotes = (on: On) => {
-  // A pane is for a person: a non-interactive session gets no command.
+  // A pane is for a person: a non-interactive session gets no command. It opens at once mid-turn: the pane only reads the store.
   on('session.start', { isInteractive: true }, async ($, e, next) => {
     await $.command
-      .register({ name: COMMAND, description: 'Show the observations of the transcript in view in a pane' })
+      .register({ name: COMMAND, description: 'Show the observations of the transcript in view in a pane', immediate: true })
       .catch((error) => $.ui.log(`could not register /${COMMAND} (${errorText(error)})`, { to: 'debug' }))
     return next(e)
   })
