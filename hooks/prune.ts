@@ -6,6 +6,9 @@ import { clipLine } from './stats'
 // Every Claude Code process shares that file, so pruning is not atomic across them (see TODO.md). It narrows the
 // window instead: just before deleting a session it lists and reads the session's keys again, its subagents'
 // included, and asks the sessions registry again which sessions run, deleting nothing when that cannot be told.
+//
+// A pruned session is not lost: its keys and values are written to `<config>/plugins/data/observational-memory/archive/`
+// first, one JSON file per session, and a session whose archive cannot be written is not deleted.
 const PRUNE_AFTER_DAYS = 30
 const DAY = 24 * 60 * 60 * 1000
 const STORE_CAP = 4 * 1024 * 1024
@@ -55,10 +58,25 @@ async function sessions($: EngineInterface, withSizes: boolean) {
 
 // The sessions whose process still runs, from the engine's registry: `<config>/sessions/<pid>.json`. Rejects when
 // that cannot be told, so the caller prunes nothing.
-async function liveSessions($: EngineInterface) {
+// The Claude Code config folder, `~/.claude` unless CLAUDE_CONFIG_DIR names another.
+async function configRoot($: EngineInterface) {
   const home = await $.env.get('HOME')
   const root = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? (home ? `${home}/.claude` : undefined)
-  if (!root) throw new Error('no HOME to find the sessions folder')
+  if (!root) throw new Error('no HOME to find the Claude Code config folder')
+  return root
+}
+
+// Writes a session's keys and values to its own file in the archive folder, before they are deleted. A session pruned
+// again after a resume keeps its earlier file: the new one is named with the time too.
+async function archive($: EngineInterface, id: string, values: Record<string, unknown>, why: string) {
+  const dir = `${await configRoot($)}/plugins/data/observational-memory/archive`
+  const now = await $.clock.now()
+  const name = (await $.fs.exists(`${dir}/${id}.json`)) ? `${id}-${now}.json` : `${id}.json`
+  await $.fs.write(`${dir}/${name}`, JSON.stringify({ session: id, prunedAt: new Date(now).toISOString(), why, keys: values }))
+}
+
+async function liveSessions($: EngineInterface) {
+  const root = await configRoot($)
   if (!(await $.fs.exists('/proc/self'))) throw new Error('no /proc to tell which sessions run')
   const dir = `${root}/sessions`
   const live = new Set<string>()
@@ -83,8 +101,8 @@ async function isAlive($: EngineInterface, pid: unknown, procStart: unknown) {
 
 // Deletes each session unless, checked again just before, it is the current one, has a key the scan did not list
 // (a subagent started since), `stale` no longer holds of its newest time across its own and its subagents' keys, or
-// it runs now (resumed since). When which sessions run cannot be told, it stops and rejects, deleting no more. It
-// stops too once `enough` answers true after a deletion. Returns the sessions deleted, sized as they were read.
+// it runs now (resumed since). Each one is archived before its keys are deleted. When which sessions run cannot be
+// told, or an archive cannot be written, it stops and rejects, deleting no more. It stops too once `enough` answers true after a deletion. Returns the sessions deleted, sized as they were read.
 async function drop(
   $: EngineInterface,
   gone: Session[],
@@ -99,13 +117,15 @@ async function drop(
       const keys = (await $.store.keys()).filter((k) => sessionOf(k)?.id === s.id)
       if (keys.some((k) => !s.keys.includes(k))) continue
       const times: number[] = []
+      const values: Record<string, unknown> = {}
       let bytes = 0
       for (const key of keys) {
-        const value = await $.store.get(key)
+        const value = (values[key] = await $.store.get(key))
         bytes += key.length + size(value)
         times.push(...timesOf(sessionOf(key)!.kind, value))
       }
       if (!stale(s, latest(times)) || (await liveSessions($)).has(s.id)) continue
+      await archive($, s.id, values, why)
       for (const key of keys) await $.store.delete(key)
       dropped.push({ ...s, keys, bytes })
       if (await enough()) break

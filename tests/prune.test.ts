@@ -19,7 +19,7 @@ function world(
   keys = true,
   alive: string[] = [],
   env: Record<string, string> = {},
-  o: { listFails?: boolean; setFails?: boolean; id?: () => string; onList?: (n: number) => void } = {},
+  o: { listFails?: boolean; setFails?: boolean; writeFails?: boolean; id?: () => string; onList?: (n: number) => void } = {},
 ) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/u', ...env })
@@ -43,6 +43,11 @@ function world(
     return { value: files[e.path]! }
   })
   on('fs.exists', ($, e) => ({ value: e.path in files || dirs().has(e.path) }))
+  on('fs.write', ($, e) => {
+    if (o.writeFails) throw new Error('ENOSPC') // a hook that throws is skipped: the plugin sees no implementation
+    files[e.path] = e.text
+    return { value: undefined }
+  })
   const stored: Record<string, unknown> = { ...entries }
   const logs: string[] = []
   const screen: string[] = []
@@ -83,6 +88,33 @@ describe('register', () => {
     expect(w.logs).toHaveLength(1)
     expect(w.logs[0]).toMatch(/^pruned 1 session\(s\) untouched for 30 days: old \(3 keys\)$/)
     expect(w.screen).toEqual([])
+  })
+
+  test('each pruned session is archived to its own file first, its subagents with it; a later prune of the same session gets a new file', async ($, on) => {
+    const w = world(on, { ...session('old', NOW - 31 * DAY), ...session('old/agent-1', NOW - 31 * DAY), ...session('recent', NOW - DAY) })
+    await w.start($)
+    const dir = '/home/u/.claude/plugins/data/observational-memory/archive'
+    const archived = JSON.parse(w.files[`${dir}/old.json`]!)
+    expect(archived).toEqual({
+      session: 'old',
+      prunedAt: new Date(NOW).toISOString(),
+      why: 'untouched for 30 days',
+      keys: { ...session('old', NOW - 31 * DAY), ...session('old/agent-1', NOW - 31 * DAY) },
+    })
+    expect(Object.keys(w.files).filter((p) => p.startsWith(dir))).toEqual([`${dir}/old.json`])
+    // Resumed, then untouched for 30 days again: the first archive stays as it was.
+    Object.assign(w.stored, session('old', NOW + DAY), { 'prune:last': NOW - DAY })
+    await w.clock.advance(32 * DAY)
+    await w.start($)
+    expect(JSON.parse(w.files[`${dir}/old.json`]!)).toEqual(archived)
+    expect(JSON.parse(w.files[`${dir}/old-${NOW + 32 * DAY}.json`]!).keys).toEqual(session('old', NOW + DAY))
+  })
+
+  test('a session whose archive cannot be written is not deleted, and nothing after it is', async ($, on) => {
+    const w = world(on, { ...session('a', NOW - 60 * DAY), ...session('b', NOW - 60 * DAY) }, true, [], {}, { writeFails: true })
+    await w.start($)
+    expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:')).sort()).toEqual(['ledger:a', 'ledger:b'])
+    expect(w.logs).toEqual(['could not prune old sessions (no implementation for fs.write)'])
   })
 
   test("a subagent's keys belong to its session: pruned with an old one, kept with the current one and under the cap", async ($, on) => {
