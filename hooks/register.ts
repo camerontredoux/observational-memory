@@ -4,7 +4,7 @@ import { add, addCompaction, clipLine, count, addLuna, addRecall, addReflection,
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { registerNotes } from './notes'
-import { INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
+import { COPY_ID, INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallIo, TranscriptCache } from './recall'
 import { compileBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
@@ -232,6 +232,19 @@ function maskTail(rows: readonly SessionMessage[]) {
     .toReversed()
 }
 const MASKED = new RegExp(noteSource(omissionMarker(0, 'result')))
+// A local slash command's rows (`/compact`, `/effort`): its caveat, its echo and what it printed, all three engine
+// framing. The kept tail leaves them out, as the transcript would draw their copies with no render hook to hide them.
+// An echo with no output after it is a prompt command's (a skill's), whose arguments are the person's request: kept.
+const COMMAND_ROW = /^<(local-command-caveat|command-name|command-message|command-args|local-command-stdout|local-command-stderr)>[^]*?<\/\1>\s*/
+const framing = (m: SessionMessage | undefined, tags: RegExp) => {
+  if (!m || !isPrompt(m) || !tags.test(m.text.trim())) return false
+  let text = m.text.trim()
+  for (let rest = text.replace(COMMAND_ROW, ''); rest !== text; rest = text.replace(COMMAND_ROW, '')) text = rest
+  return !text
+}
+const OUTPUT = /^<(?:local-command-caveat|local-command-std(?:out|err))>/
+const withoutLocalCommands = <M extends SessionMessage>(rows: readonly M[]) =>
+  rows.filter((m, i) => !framing(m, OUTPUT) && !(framing(m, /^<command-name>/) && framing(rows[i + 1], /^<local-command-std(?:out|err)>/)))
 const isWrapper = (m: SessionMessage) => isPrompt(m) && INJECTED_WRAPPER.test(m.text.trim())
 // An injected wrapper row in the raw tail (a task notification, hook feedback) that a newer one repeats keeps its
 // first line and the lines no newer one has, then names the whole row by its hash for unmask.
@@ -257,12 +270,15 @@ function unmask(rows: readonly SessionMessage[], history: readonly SessionMessag
   const whole = new Map<string, string>()
   const wrappers = new Map<string, string>()
   for (const m of history) {
-    for (const r of m.toolResults ?? []) if (r.text.length > (whole.get(r.tool_use_id)?.length ?? -1)) whole.set(r.tool_use_id, r.text)
+    for (const r of m.toolResults ?? []) {
+      const id = originalId(r.tool_use_id)
+      if (r.text.length > (whole.get(id)?.length ?? -1)) whole.set(id, r.text)
+    }
     if (isWrapper(m)) wrappers.set(hash(m.text), m.text)
   }
   const original = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
     const at = r.text.search(MASKED)
-    const w = at < 0 ? undefined : whole.get(r.tool_use_id)
+    const w = at < 0 ? undefined : whole.get(originalId(r.tool_use_id))
     return w && w.length > r.text.length && w.startsWith(r.text.slice(0, at)) ? w : undefined
   }
   const wrapper = (m: SessionMessage) => {
@@ -271,8 +287,8 @@ function unmask(rows: readonly SessionMessage[], history: readonly SessionMessag
     return w && w.startsWith(m.text.slice(0, m.text.indexOf('\n'))) ? w : undefined
   }
   const inputs = new Map<string, Record<string, unknown>>()
-  for (const m of history) for (const u of m.toolUses) if (!INPUT_MASKED.test(JSON.stringify(u.input))) inputs.set(u.tool_use_id, u.input)
-  const input = (u: SessionMessage['toolUses'][number]) => (INPUT_MASKED.test(JSON.stringify(u.input)) ? inputs.get(u.tool_use_id) : undefined)
+  for (const m of history) for (const u of m.toolUses) if (!INPUT_MASKED.test(JSON.stringify(u.input))) inputs.set(originalId(u.tool_use_id), u.input)
+  const input = (u: SessionMessage['toolUses'][number]) => (INPUT_MASKED.test(JSON.stringify(u.input)) ? inputs.get(originalId(u.tool_use_id)) : undefined)
   return rows
     .map((m) => (m.toolUses.some(input) ? { ...m, toolUses: m.toolUses.map((u) => ({ ...u, input: input(u) ?? u.input })) } : m))
     .map((m) => {
@@ -358,6 +374,8 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
 const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && isMemoryText(m.text)
 // What the transcript shows in place of a memory message while the row is collapsed.
 const MEMORY_ROW = 'Compacted into observational memory (ctrl+o to see the full memory)'
+// A row drawn as nothing.
+const NOTHING = { type: 'Box' as const }
 const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
 const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
@@ -1613,7 +1631,7 @@ function firstDiffering(messages: readonly SessionMessage[], rows: readonly Sess
 function linesUp(messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
   if (offset < 0) return false
   const { differs, seen } = firstDiffering(messages, rows, offset)
-  const ids = (m: SessionMessage) => [...m.toolUses.map((u) => u.tool_use_id), '|', ...(m.toolResults ?? []).map((r) => r.tool_use_id)].join()
+  const ids = (m: SessionMessage) => [...m.toolUses.map((u) => originalId(u.tool_use_id)), '|', ...(m.toolResults ?? []).map((r) => originalId(r.tool_use_id))].join()
   return seen === undefined && messages.every((m, i) => !differs(m, i) || (m.role === rows[offset + i]!.role && ids(m) === ids(rows[offset + i]!)))
 }
 
@@ -1729,12 +1747,15 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
   // observed is observed now, in chunks, all at once. A chunk pi fails on stays raw: the cut is wherever the rest
   // reaches, and with nothing observed at all the floor compiles a brief of the rest (see `build`).
+  // A manual compaction with nothing observed since the last one, and less before the raw tail than the whole chunk
+  // the background waits for, observes nothing: the person waits on it, so the floor's brief stands for those rows.
   const chunks: Chunk[] = []
   const failures: { rows: number; why: string }[] = [] // shown once the compaction stands: a fallback says so instead
   let sync = { calls: 0, ms: 0 }
   let deadlineHit = false
   const start = tailStart(v, base)
-  if (!fits(initial.watermark.to) && start > initial.watermark.to) {
+  const briefOnly = main && e.trigger === 'manual' && initial.watermark.to === base && chunkEnd(v, base, start, true) === undefined
+  if (!briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to) {
     // The loop's background calls in flight cover their rows: they are waited on, not made again.
     const inFlight = running.flatMap((job) => {
       const at = job.loop.key === loop.key && job.stamp === life ? locate(v, job.range, initial.watermark.to) : undefined
@@ -1947,7 +1968,8 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const kept = new Set(order.slice(cut))
   const observed = ledger.watermark.to
   // Why the floor ran, as `build` found it.
-  const why = observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : 'nothing was observed yet'
+  const why =
+    observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : briefOnly && start > base ? 'too little to observe yet' : 'nothing was observed yet'
   const briefTokens = memory.brief ? estimateTokens(renderBrief(memory.brief, memory.recall)) : 0
   log(
     $,
@@ -1985,7 +2007,99 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
   // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
   // In the context's own order.
-  return { messages: [message, ...dedupWrappers(maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m)))] }
+  const tail = dedupWrappers(maskTail(withoutLocalCommands(live.filter((_, i) => kept.has(i))).map(({ handle: _, ...m }) => m)))
+  return { messages: [message, ...freshToolIds(tail, started.toString(36))] }
+}
+
+// The kept calls under ids of this compaction's own, a call and its result alike, so the transcript can tell the
+// copies it draws from the originals above the memory message (see copiesAfter). An id a compaction gave before is
+// renamed from its original: originalId reads the original back.
+function freshToolIds(rows: readonly SessionMessage[], tag: string) {
+  const fresh = (id: string) => `${originalId(id)}${COPY_ID}${tag}`
+  return rows.map((m) => ({
+    ...m,
+    toolUses: m.toolUses.map((u) => ({ ...u, tool_use_id: fresh(u.tool_use_id) })),
+    ...(m.toolResults ? { toolResults: m.toolResults.map((r) => ({ ...r, tool_use_id: fresh(r.tool_use_id) })) } : {}),
+  }))
+}
+
+// The tail a compaction keeps is written afresh after the memory message, so the transcript draws it a second time
+// below the rows it already shows. The transcript file tells the copies apart: the compaction writes them in one
+// burst right after the memory row, each stamped within a few milliseconds of the row before it (COPY_STEP_MS), while
+// the next row the session writes comes later, or stamped earlier, as a slash command's own rows are. Rows draw in no fixed order, so the copies are found by id, not by
+// place: a message row or tool group whose row is a copy draws as nothing while collapsed, and so does a single tool
+// row, keyed by the fresh tool_use_id the compaction gave the copy (freshToolIds). Only a compaction since this process started hides
+// its copies: a resumed session may draw the copies without the originals above them. The start comes from the
+// engine's sessions registry, not the module's load: a hot reload of the plugin keeps the process and its transcript.
+// Each memory row's copies, by the id prefix the transcript draws its rows by.
+const copiesOf = new Map<string, Promise<Set<string>>>()
+// The most a copy's timestamp follows the row before it. A compaction of a hundred rows stamps them over 1 ms; the
+// first row after it comes several hundred ms later.
+const COPY_STEP_MS = 50
+const rowId = (requestId: string) => /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}/.exec(requestId)?.[0]
+
+// When the process running this session started, from the engine's registry `<config>/sessions/<pid>.json`: the
+// newest file that names the session, as a resume writes another. Undefined when no file names it.
+async function startedAt($: EngineInterface, sessionId: string) {
+  const home = await $.env.get('HOME')
+  const dir = `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`}/sessions`
+  let newest: number | undefined
+  for (const f of await $.fs.list(dir)) {
+    if (f.kind !== 'file' || !f.name.endsWith('.json')) continue
+    const s = await $.fs.read(`${dir}/${f.name}`).then((t) => JSON.parse(String(t)), () => undefined)
+    if (s?.sessionId === sessionId && typeof s.startedAt === 'number') newest = Math.max(newest ?? 0, s.startedAt)
+  }
+  return newest
+}
+
+// The copies a memory row's compaction wrote; undefined while the transcript does not hold the row yet.
+async function findCopies($: EngineInterface, memory: string) {
+  const sessionId = await $.session.id()
+  const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
+  if (!path) return undefined
+  const lines = (await recallIo($).read(path)).split('\n')
+  const at = lines.findLastIndex((l) => l.includes(`"uuid":"${memory}-`))
+  if (at < 0) return undefined
+  const row = JSON.parse(lines[at]!)
+  const copies = new Set<string>()
+  const started = await startedAt($, sessionId)
+  if (started === undefined || !(Date.parse(row.timestamp) >= started)) return copies
+  let last = Date.parse(row.timestamp)
+  for (const l of lines.slice(at + 1)) {
+    const r = l.trim() ? JSON.parse(l) : undefined
+    if (!r?.uuid) continue // the engine's bookkeeping lines carry no row
+    const time = Date.parse(r.timestamp)
+    if (!(time >= last && time - last <= COPY_STEP_MS)) break
+    last = time
+    copies.add(rowId(r.uuid)!)
+    for (const b of Array.isArray(r.message?.content) ? r.message.content : []) {
+      const id = b.type === 'tool_use' ? b.id : b.type === 'tool_result' ? b.tool_use_id : undefined
+      if (typeof id === 'string' && id.includes(COPY_ID)) copies.add(id)
+    }
+  }
+  return copies
+}
+
+// The copies of every memory row drawn so far; one not yet found in the transcript is looked for again.
+function copiesAfter($: EngineInterface, memory: string) {
+  let found = copiesOf.get(memory)
+  if (!found) {
+    const finding = findCopies($, memory)
+    copiesOf.set(memory, (found = finding.then((c) => c ?? new Set<string>())))
+    finding.then(
+      (c) => (c === undefined ? copiesOf.delete(memory) : c.size && $.ui.invalidate('ui.render')),
+      (error) => (log($, `could not find the compaction's copies (${errorText(error)})`), copiesOf.delete(memory)),
+    )
+  }
+  return found
+}
+
+// A message row by its id's prefix, a tool row by its whole tool_use_id.
+async function isCopy(requestId: string) {
+  const id = requestId.includes(COPY_ID) ? requestId : rowId(requestId)
+  if (!id) return false
+  for (const found of copiesOf.values()) if ((await found.catch(() => undefined))?.has(id)) return true
+  return false
 }
 
 export const register: Register = (on) => {
@@ -2022,9 +2136,20 @@ export const register: Register = (on) => {
 
   // The memory message draws as one line in the transcript, as the built-in summary does; ctrl+o shows it whole.
   // The row alone changes: the model reads the message as written.
-  on('ui.render', { component: 'UserMessage' }, async ($, e, next) =>
-    e.props.isExpanded || !isMemoryText(e.props.text) ? next(e) : next({ ...e, props: { ...e.props, text: MEMORY_ROW } }),
-  )
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    if (isMemoryText(e.props.text)) {
+      const id = rowId(e.requestId)
+      if (id) void copiesAfter($, id)
+      return e.props.isExpanded ? next(e) : next({ ...e, props: { ...e.props, text: MEMORY_ROW } })
+    }
+    return !e.props.isExpanded && (await isCopy(e.requestId)) ? NOTHING : next(e)
+  })
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => (!e.props.isExpanded && (await isCopy(e.requestId)) ? NOTHING : next(e)))
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
+  // A plugin command's output row (`/notes`); a local command's rows are not kept (withoutLocalCommands).
+  on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
 
   on('session.start', async ($, e, next) => {
     await $.tool

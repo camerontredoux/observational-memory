@@ -3,7 +3,16 @@ import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, ProcessRunResult, Register, SessionCompactInput, SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 import { planBudget } from '../hooks/register'
+import { originalId } from '../hooks/recall'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
+
+// A compaction's kept rows under their calls' original ids: it hands them back under fresh ones (freshToolIds).
+const originals = (rows: readonly SessionMessage[] | undefined) =>
+  rows?.map((m) => ({
+    ...m,
+    toolUses: m.toolUses.map((u) => ({ ...u, tool_use_id: originalId(u.tool_use_id) })),
+    ...(m.toolResults ? { toolResults: m.toolResults.map((r) => ({ ...r, tool_use_id: originalId(r.tool_use_id) })) } : {}),
+  }))
 
 // One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
 const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
@@ -372,6 +381,26 @@ const readsIn = (prompt: string) => `<observations>\n* 🟡 Read ${[...prompt.ma
 const readers = (text: string) => new Set([...text.matchAll(/\b(main|one|two)-\d+/g)].map((m) => m[1]))
 
 describe('register', () => {
+  test('the kept calls come back under fresh ids, a call and its result alike, renamed from the original at each compaction', async ($, on) => {
+    const clock = mock.clock(on, { now: at(23, 12, 0) })
+    world(on)
+    pi(on)
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
+
+    const first = await $.session.compact({ trigger: 'manual', messages })
+    await clock.advance(60_000)
+    const second = await $.session.compact({ trigger: 'manual', messages: first.messages! })
+
+    const ids = (rows: readonly SessionMessage[]) => [...rows.flatMap((m) => m.toolUses.map((u) => u.tool_use_id)), ...rows.flatMap((m) => (m.toolResults ?? []).map((r) => r.tool_use_id))]
+    const [call, result] = ids(first.messages!.slice(1))
+    expect(call).toMatch(/^t-c__om\w+$/)
+    expect(result).toBe(call)
+    const [again] = ids(second.messages!.slice(1))
+    expect(again).toMatch(/^t-c__om\w+$/)
+    expect(again).not.toBe(call)
+    expect(originalId(again!)).toBe('t-c')
+  })
+
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
     mock.clock(on, { now: at(23, 12, 0) })
     world(on)
@@ -391,7 +420,7 @@ describe('register', () => {
     expect(seen.calls.map((c) => piSessionOf(c.argv))).toEqual([OBSERVER_SESSION, OBSERVER_SESSION]) // the session's Observer calls share one cache key
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s')
-    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     const text = result.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"') // untimed history: no invented times
     expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
@@ -487,7 +516,7 @@ describe('register', () => {
         '- said: b',
       ].join('\n'),
     )
-    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     expect(seen.logs.slice(-3)).toEqual([
       'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
       'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
@@ -539,7 +568,7 @@ describe('register', () => {
       return `Observation failed (pi exited 1) and kept ${Number(to) - Number(from)} messages in full`
     }))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
-    expect(result.messages?.slice(1)).toEqual(history.slice(3))
+    expect(originals(result.messages?.slice(1))).toEqual(history.slice(3))
     expect(seen.modelCalls).toBe(0)
   })
 
@@ -755,7 +784,7 @@ describe('register', () => {
     expect(seen.logs.filter((l) => l.startsWith('retrying rows') || l.includes('at compaction failed'))).toEqual([])
     expect(seen.screen).toEqual(['Compacted in 0 ms · observed 5 messages on the spot · memory 1 note'])
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "a"')
-    expect(result.messages?.slice(1)).toEqual(messages.slice(5))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(5))
   })
 
   test('an empty <observations> block and corrections alone are valid replies; marker-only and timestamp-only lines are not', async ($, on) => {
@@ -776,7 +805,7 @@ describe('register', () => {
     expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer answered without an <observations> block); left unobserved')
     const text = noReplies(result.messages?.[0]?.text)
     expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n\n</observations>`)
-    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
   })
 
   test('the reply ending each turn that left context is quoted before the observations, carried forward, the newest within its cap', async ($, on) => {
@@ -792,7 +821,7 @@ describe('register', () => {
     const text = first.messages?.[0]?.text ?? ''
     expect(repliesIn(text)).toBe('* You (24 chars):\nFound the bug in a. done\n')
     expect(text.indexOf('<your-replies>')).toBeLessThan(text.indexOf('<observations>'))
-    expect(first.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(originals(first.messages?.slice(1))).toEqual(messages.slice(7))
 
     // Read back from the memory message: the next compaction keeps a's and adds b's (the first row after the memory
     // message), c's and d's, oldest first. d's passes the per-reply cap and is cut to its head and tail.
@@ -849,7 +878,7 @@ describe('register', () => {
     const result = await $.session.compact({ trigger: 'manual', messages })
 
     const text = result.messages?.[0]?.text ?? ''
-    expect(result.messages?.slice(1)).toEqual(messages.slice(-1))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(-1))
     expect(text).toContain('<observations>')
     expect(text).not.toContain('<your-replies>')
   })
@@ -867,7 +896,7 @@ describe('register', () => {
     // Nothing observed: the floor's brief stands for the rows the Observer failed on, not the built-in summary.
     expect(observationsIn(result.messages![0]!.text)).toBe('')
     expect(briefIn(result.messages![0]!.text)).toContain('\n- said: a')
-    expect(result.messages?.slice(1)).toEqual(messages.slice(3))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(3))
     const rejected = seen.logs.filter((l) => l.startsWith('observer reply without observations'))
     expect(rejected).toHaveLength(2) // the call and its retry
     expect(rejected[0]).toBe(`observer reply without observations (${reply.length} chars), began: ${JSON.stringify(reply.slice(0, 500))}`)
@@ -1065,7 +1094,7 @@ describe('register', () => {
     expect(observationsIn(result.messages?.[0]?.text)).toBe(
       ['🔴 2026-09-22 14:30 User said "a"', '🟡 2026-09-22 13:59 Too early', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail (source 2026-09-22 14:00 to 2026-09-22 14:31)'].map((l) => `* ${l}`).join('\n'),
     )
-    expect(result.messages?.slice(1)).toEqual(history.slice(7))
+    expect(originals(result.messages?.slice(1))).toEqual(history.slice(7))
   })
 
   test('keeps at most four Observer calls in flight and schedules the rest as they land', async ($, on) => {
@@ -1164,7 +1193,7 @@ describe('register', () => {
 
     expect(seen.inFlight).toBe(1) // resolved while the held call is still running
     expect(seen.prompts).toHaveLength(2)
-    expect(result.messages?.slice(1)).toEqual(messages.slice(3))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(3))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call, kept 9 raw messages/)
     expect(seen.screen.at(-1)).toBe('Compacted in 0 ms · memory 1 note')
@@ -2051,7 +2080,7 @@ describe('register', () => {
 
     expect(seen.logs).toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "z"') // its rows were never timed
-    expect(result.messages?.slice(1)).toEqual(history.slice(3))
+    expect(originals(result.messages?.slice(1))).toEqual(history.slice(3))
   })
 
   test('a subagent whose history the session cannot read is observed at compaction from its context alone, and its steps store nothing', async ($, on) => {
@@ -2219,7 +2248,7 @@ describe('register', () => {
 
     for (const agentId of [undefined, 'agent-1']) {
       const result = await $.session.compact({ trigger: 'auto', ...(agentId ? { agentId } : {}), messages: [...history] })
-      expect(result.messages?.slice(1)).toEqual(call(1, 36_000))
+      expect(originals(result.messages?.slice(1))).toEqual(call(1, 36_000))
       expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
     }
     expect(seen.prompts).toHaveLength(4)
@@ -2265,7 +2294,7 @@ describe('register', () => {
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
     expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
     expect(nextStepIn(text)).toBe('b')
-    expect(result.messages?.slice(1)).toEqual(messages.slice(7))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: skills kept as lines, user messages as the brief$/))
   })
 
@@ -2523,7 +2552,7 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(calls)
     expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
-    expect(result.messages?.slice(-2)).toEqual(agentCall('one', 7, 36_000))
+    expect(originals(result.messages?.slice(-2))).toEqual(agentCall('one', 7, 36_000))
   })
 
   // What a built-in compaction hands back: its summary, then the newest call and result it keeps, with their handles.
@@ -3833,7 +3862,7 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(observed)
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
     expect(seen.screen.at(-1)).toMatch(/^Compacted in 0 ms · memory \d+ notes?$/)
-    const tail = result.messages!.slice(1)
+    const tail = originals(result.messages!.slice(1))!
     expect(tail).toEqual(context.slice(context.length - tail.length))
     expect(tailKeepsCalls(tail)).toBe(true)
   })
@@ -3857,7 +3886,7 @@ describe('register', () => {
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(seen.prompts).toHaveLength(observed)
     expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
-    const tail = result.messages!.slice(1)
+    const tail = originals(result.messages!.slice(1))!
     expect(tail.slice(-4)).toEqual(block.context)
     expect(tailKeepsCalls(tail)).toBe(true)
   })
@@ -3950,8 +3979,8 @@ describe('register', () => {
     await runTurn($, turn('q', 'q'), at(22, 15, 30))
     await runTurn($, turn('r', 'r'), at(22, 15, 40))
     const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
-    const call = first.messages!.flatMap((m) => m.toolUses).find((u) => u.tool_use_id === 't-build')
-    const result = first.messages!.flatMap((m) => m.toolResults ?? []).find((r) => r.tool_use_id === 't-build')
+    const call = first.messages!.flatMap((m) => m.toolUses).find((u) => originalId(u.tool_use_id) === 't-build')
+    const result = first.messages!.flatMap((m) => m.toolResults ?? []).find((r) => originalId(r.tool_use_id) === 't-build')
     expect(String(call?.input.command)).toContain('om_recall can retrieve the full input')
     expect(result?.text).toContain('om_recall can retrieve the full result')
     expect(seen.prompts.join('\n')).not.toContain('compiled module') // not observed yet
@@ -3988,7 +4017,7 @@ describe('register', () => {
     await clock.settle()
     const first = await $.session.compact({ trigger: 'auto', messages: [...history.slice(0, -block.history.length), ...block.context] })
     const memory = first.messages![0]!
-    expect(first.messages!.slice(-block.context.length)).toEqual(block.context)
+    expect(originals(first.messages!.slice(-block.context.length))).toEqual(block.context)
     history.push(...first.messages!)
     await runTurn($, turn('d', 'd', CHUNK), at(22, 16, 0))
     await runTurn($, turn('e', 'e', CHUNK), at(22, 16, 30))
@@ -4106,7 +4135,7 @@ describe('register', () => {
     expect(seen.logs.filter((l) => l.includes('restarting the ledger'))).toEqual([])
     expect(seen.logs.filter((l) => l.startsWith('cut at the background watermark with no Observer call'))).toHaveLength(1)
     expect(observationsIn(result.messages?.[0]?.text)?.replace(/ \(source .*\)$/gm, '')).toBe(ledger.entries.map((e) => `* ${e.line}`).join('\n'))
-    expect(result.messages?.slice(1)).toEqual(context.slice(ledger.watermark.to))
+    expect(originals(result.messages?.slice(1))).toEqual(context.slice(ledger.watermark.to))
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
     expect(stats.counts['compaction.notPersistent.rows.result-result']).toBe(1)
     expect(stats.metrics['compaction.notPersistent.rowsKept']!.sum).toBe(ledger.watermark.to)
@@ -4613,12 +4642,82 @@ describe('the floor', () => {
     expect(seen.prompts).toEqual([])
     expect(briefIn(result.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
     expect(userMessagesIn(result.messages![0]!.text)).toEqual(['a', 'b'])
-    expect(result.messages?.slice(1)).toEqual(messages.slice(8)) // the newest turn stays raw
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(8)) // the newest turn stays raw
     expect(seen.screen).toEqual([expect.stringMatching(/^Compacted in 0 ms · memory 0 notes · 8 messages in a brief compiled by code \(nothing was observed yet\)$/)])
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
     expect(stats.counts).toEqual({ 'compaction.manual.floor': 1, 'compaction.notPersistent': 1, 'compaction.notPersistent.manual': 1, 'compaction.notPersistent.short': 1 })
     expect(stats.metrics['compaction.manual.rowsBriefed']!.sum).toBe(8)
     expect(stats.metrics['compaction.manual.briefTokens']!.sum).toBeGreaterThan(0)
+  })
+
+  // A manual /compact soon after the last compaction: less than the whole chunk the background waits for lies before
+  // the raw tail, so nothing was observed. The person waits on a manual compaction; an auto one observes as before.
+  const SHORT = [...turn('a', 'a', 16_000), ...turn('b', 'b', 16_000)] // ~4k tokens before the raw tail, which starts at row 3
+
+  test('a manual compaction with less than a chunk unobserved briefs it by code, with no Observer call', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    const seen = pi(on)
+
+    const result = await $.session.compact({ trigger: 'manual', messages: SHORT })
+    await clock.advance(5_000)
+
+    expect(seen.prompts).toEqual([])
+    expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
+    expect(originals(result.messages?.slice(1))).toEqual(SHORT.slice(3))
+    expect(seen.screen).toEqual(['Compacted in 0 ms · memory 0 notes · 3 messages in a brief compiled by code (too little to observe yet)'])
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
+    expect(stats.counts['compaction.manual.floor']).toBe(1)
+    expect(stats.metrics['compaction.manual.syncCalls']!.sum).toBe(0)
+  })
+
+  test("a local slash command's rows stay out of the kept tail; a prompt command's echo, with no output after it, stays", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const user = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
+    const effort = [
+      user('<local-command-caveat>Caveat: the command below was run directly.</local-command-caveat>'),
+      user('<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args></command-args>'),
+      user('<local-command-stdout>Set effort level to high</local-command-stdout>'),
+    ]
+    const skill = user('<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>the parser</command-args>')
+    const messages = [...SHORT.slice(0, 4), ...effort, skill, ...SHORT.slice(4)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(originals(result.messages?.slice(1))).toEqual([SHORT[3]!, skill, ...SHORT.slice(4)])
+  })
+
+  test('an auto compaction with less than a chunk unobserved still observes it on the spot', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+
+    const result = await $.session.compact({ trigger: 'auto', messages: SHORT })
+
+    expect(seen.prompts).toHaveLength(1)
+    expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
+    expect(briefIn(result.messages![0]!.text)).toBeUndefined()
+  })
+
+  test('a manual compaction with background observations since the last one cuts at the watermark, as before', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle() // [0, 4) observed
+    await runTurn($, turn('c', 'c', 100), at(22, 15, 1))
+    const before = seen.prompts.length
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(seen.prompts).toHaveLength(before)
+    expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
+    expect(briefIn(result.messages![0]!.text)).toBeUndefined()
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
   test('a context that is the memory message alone leaves the floor nothing to compile: the built-in compaction runs, saying why', async ($, on) => {
@@ -4965,5 +5064,47 @@ describe('the memory row', () => {
     await draw('fix the build', false)
 
     expect(drawn).toEqual(['Compacted into observational memory (ctrl+o to see the full memory)', memory, 'fix the build'])
+  })
+
+  test('the rows a compaction kept draw once: the copies it wrote after the memory row draw as nothing, the rows after them as written', async ($, on) => {
+    const { stored, files } = world(on)
+    on('ui.render', ($, e) => ({ type: 'Text', children: [String(e.requestId)] }))
+    stored['transcript:session-1'] = '/t/session-1.jsonl'
+    files['/home/u/.claude/sessions/1.json'] = JSON.stringify({ sessionId: 'session-1', startedAt: Date.parse('2026-10-01T07:00:00.000Z') })
+    const memory = `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<observations>\n- 🟡 a note\n</observations>`
+    const row = (uuid: string, timestamp: string, content: unknown) => JSON.stringify({ type: 'user', uuid: `${uuid}-0000-4000-8000-000000000000`, timestamp, message: { content } })
+    // As the engine writes a compaction: its copies over a few milliseconds, then the /compact command's own rows,
+    // stamped when it was typed, and a prompt a second later.
+    files['/t/session-1.jsonl'] = [
+      row('00000000', '2026-10-01T07:09:20.000Z', 'keep going'),
+      row('11111111', '2026-10-01T07:09:32.741Z', memory),
+      row('22222222', '2026-10-01T07:09:32.741Z', 'keep going'),
+      JSON.stringify({ type: 'last-prompt' }),
+      row('33333333', '2026-10-01T07:09:32.742Z', [{ type: 'tool_use', id: 't-c__om1', name: 'Read', input: {} }]),
+      row('44444444', '2026-10-01T07:09:32.742Z', [{ type: 'tool_result', tool_use_id: 't-c__om1', content: 'ok' }]),
+      row('55555555', '2026-10-01T07:09:32.487Z', '<command-name>/compact</command-name>'),
+      row('66666666', '2026-10-01T07:09:33.475Z', 'next prompt'),
+    ].join('\n')
+    const requestId = (uuid: string) => `${uuid}-0000-4000-8000-000000000000`
+    const user = (id: string, text: string) =>
+      $.ui.render({ surface: 'terminal', component: 'UserMessage', requestId: requestId(id), props: { text, origin: { kind: 'unclassified' }, isExpanded: false } })
+    const tool = (id: string) =>
+      $.ui.render({ surface: 'terminal', component: 'ToolUse', requestId: id, props: { tool_use_id: id, tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false } })
+
+    await user('11111111', memory)
+    const drawn = {
+      original: await user('00000000', 'keep going'),
+      copy: await user('22222222', 'keep going'),
+      copiedCall: await tool('t-c__om1'),
+      command: await user('55555555', '<command-name>/compact</command-name>'),
+      next: await user('66666666', 'next prompt'),
+    }
+
+    const nothing = { type: 'Box' }
+    expect(drawn.copy).toEqual(nothing)
+    expect(drawn.copiedCall).toEqual(nothing)
+    expect(drawn.original).not.toEqual(nothing)
+    expect(drawn.command).not.toEqual(nothing)
+    expect(drawn.next).not.toEqual(nothing)
   })
 })

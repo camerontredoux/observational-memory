@@ -248,7 +248,7 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean, fr
       (p: Content) => p.type !== 'thinking' && p.type !== 'redacted_thinking' && !(p.type === 'text' && (!p.text || p.text === '(no content)')),
     )
     if (!parts.length) continue
-    const key = `${r.type}\n${parts.map((p) => p.id ?? p.tool_use_id ?? p.text ?? p.type).join('\n')}`
+    const key = `${r.type}\n${parts.map((p) => { const id = p.id ?? p.tool_use_id; return id ? originalId(id) : (p.text ?? p.type) }).join('\n')}`
     const summary = r.type === 'user' && parts.some((p) => p.type === 'text' && p.text?.startsWith(COMPACT_WRAPPER))
     const memory = parts.some((p) => p.type === 'text' && p.text && isMemoryText(p.text))
     const copy = copying && !summary && !memory && seen.replay.has(key)
@@ -262,9 +262,9 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean, fr
       if (p.type === 'text' && p.text) {
         const kind: Kind = r.type === 'assistant' ? 'assistant' : isMemoryText(p.text) ? 'memory' : summary || r.isCompactSummary ? 'summary' : 'user'
         made.push({ b: { ...base, kind, text: p.text } })
-      } else if (p.type === 'tool_use' || p.type === 'server_tool_use') made.push({ b: callBlock(base, p.name ?? 'tool', p.input, p.id), callId: p.id })
+      } else if (p.type === 'tool_use' || p.type === 'server_tool_use') made.push({ b: callBlock(base, p.name ?? 'tool', p.input, p.id && originalId(p.id)), callId: p.id && originalId(p.id) })
       else if (p.type.endsWith('tool_result'))
-        made.push({ b: { ...base, kind: 'result', text: resultText(p.content), ...(p.is_error ? { error: true } : {}) }, resultOf: p.tool_use_id })
+        made.push({ b: { ...base, kind: 'result', text: resultText(p.content), ...(p.is_error ? { error: true } : {}) }, resultOf: p.tool_use_id && originalId(p.tool_use_id) })
     }
     addParts(`${tag}:${from.line + n + 1}`, made, seen, blocks)
   }
@@ -454,8 +454,8 @@ export function liveTranscript(rows: readonly SessionMessage[], times: readonly 
       const kind: Kind = m.role === 'assistant' ? 'assistant' : isMemoryText(m.text) ? 'memory' : m.text.startsWith(COMPACT_WRAPPER) ? 'summary' : 'user'
       made.push({ b: { ...base, kind, text: m.text } })
     }
-    for (const u of m.toolUses) made.push({ b: callBlock(base, u.tool, u.input, u.tool_use_id), callId: u.tool_use_id })
-    for (const r of m.toolResults ?? []) made.push({ b: { ...base, kind: 'result', text: r.text, ...(r.isError ? { error: true } : {}) }, resultOf: r.tool_use_id })
+    for (const u of m.toolUses) made.push({ b: callBlock(base, u.tool, u.input, originalId(u.tool_use_id)), callId: originalId(u.tool_use_id) })
+    for (const r of m.toolResults ?? []) made.push({ b: { ...base, kind: 'result', text: r.text, ...(r.isError ? { error: true } : {}) }, resultOf: originalId(r.tool_use_id) })
     addParts(`#${i}`, made, seen, blocks)
   })
   markAsking(blocks)
@@ -469,6 +469,11 @@ export function liveTranscript(rows: readonly SessionMessage[], times: readonly 
     now,
   }
 }
+
+// A compaction hands its kept tool calls back under fresh ids, `<id>__om<tag>`, so the transcript can tell the copies
+// it draws from the originals; the part before is the original id, which every lookup and copy check goes by.
+export const COPY_ID = '__om'
+export const originalId = (id: string) => id.split(COPY_ID)[0]!
 
 // The om_recall reference of each row of a compacted span, for the session brief: a tool call by its id, a message
 // by its text (the newest block that reads the same). `agentId` names a subagent's own transcript. None from the live
@@ -484,7 +489,7 @@ export async function refsOf(c: Corpus, rows: readonly SessionMessage[], agentId
     if (b.kind === 'call' && b.callId) calls.set(b.callId, b.ref)
     else if (b.kind === 'user' || b.kind === 'assistant') texts.set(`${b.kind}\n${b.text.trim()}`, b.ref)
   return (row, callId) => {
-    if (callId !== undefined) return calls.get(callId)
+    if (callId !== undefined) return calls.get(originalId(callId))
     const m = rows[row]
     return m && m.text.trim() ? texts.get(`${m.role}\n${m.text.trim()}`) : undefined
   }

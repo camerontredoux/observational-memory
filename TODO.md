@@ -70,13 +70,18 @@ compaction A/B benchmark cannot test this: its replays never produce a mismatch.
 
 After the plugin compacts, Claude Code shows the kept raw tail again, after the compaction notice. Auto-compaction
 fires as a new prompt arrives, so the tail usually holds the previous turn's full answer, and the user sees it twice.
-The memory message also shows as one long user prompt.
 
 The cause is in the engine (2.1.282). When a `session.compact` hook's result stands, the engine gives every returned
 message a new uuid, handle or not, and appends it after the boundary. Built-in compaction keeps the kept rows' uuids
 and records them in the boundary's `preservedSegment`, so nothing shows twice. `SessionMessage` has no field that
-marks the memory message as the compact summary. No plugin-side fix exists. Keeping the handles on all rows brings
-back the resume leak that `e547d11` fixed.
+marks the memory message as the compact summary. Keeping the handles on all rows brings back the resume leak that
+`e547d11` fixed.
+
+Since v1.7.1 the plugin hides the copies on screen instead (`ui.render`). The memory message draws as one line. The
+rows right after it in the transcript, stamped within milliseconds of each other, are the copies, and their message,
+tool group and tool rows draw as nothing. Their tool calls get fresh ids (`<id>__om<tag>`) so the originals stay
+visible. Local slash command rows have no hook that hides them, so the kept tail leaves them out. The engine fix would
+still be better: the copies stay in the transcript file, and a session resumed in another process shows them again.
 
 `docs/plans/results/1515-dup-tail.md` has the live test arms, the evidence and a draft Claude Code bug report. The bug
 is not filed yet. Arm C there (keep `handle` except on rows with `toolResults`) keeps the real assistant rows with
