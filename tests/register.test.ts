@@ -4689,6 +4689,18 @@ describe('the floor', () => {
     expect(originals(result.messages?.slice(1))).toEqual([SHORT[3]!, skill, ...SHORT.slice(4)])
   })
 
+  test('a reply that was thinking alone stays out of the kept tail', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const empty = (text: string): SessionMessage => ({ role: 'assistant', text, toolUses: [] })
+    const messages = [...SHORT.slice(0, 4), empty(''), empty('(no content)'), ...SHORT.slice(4)]
+
+    const result = await $.session.compact({ trigger: 'manual', messages })
+
+    expect(originals(result.messages?.slice(1))).toEqual([SHORT[3]!, ...SHORT.slice(4)])
+  })
+
   test('an auto compaction with less than a chunk unobserved still observes it on the spot', async ($, on) => {
     mock.clock(on)
     world(on)

@@ -245,6 +245,9 @@ const framing = (m: SessionMessage | undefined, tags: RegExp) => {
 const OUTPUT = /^<(?:local-command-caveat|local-command-std(?:out|err))>/
 const withoutLocalCommands = <M extends SessionMessage>(rows: readonly M[]) =>
   rows.filter((m, i) => !framing(m, OUTPUT) && !(framing(m, /^<command-name>/) && framing(rows[i + 1], /^<local-command-std(?:out|err)>/)))
+// A reply that was thinking alone: its copy loses the thinking, and the engine writes it as "(no content)". The kept
+// tail leaves it out.
+const isEmptyReply = (m: SessionMessage) => m.role === 'assistant' && !m.toolUses.length && ['', '(no content)'].includes(m.text.trim())
 const isWrapper = (m: SessionMessage) => isPrompt(m) && INJECTED_WRAPPER.test(m.text.trim())
 // An injected wrapper row in the raw tail (a task notification, hook feedback) that a newer one repeats keeps its
 // first line and the lines no newer one has, then names the whole row by its hash for unmask.
@@ -2007,7 +2010,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
   // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
   // In the context's own order.
-  const tail = dedupWrappers(maskTail(withoutLocalCommands(live.filter((_, i) => kept.has(i))).map(({ handle: _, ...m }) => m)))
+  const tail = dedupWrappers(maskTail(withoutLocalCommands(live.filter((m, i) => kept.has(i) && !isEmptyReply(m))).map(({ handle: _, ...m }) => m)))
   return { messages: [message, ...freshToolIds(tail, started.toString(36))] }
 }
 
