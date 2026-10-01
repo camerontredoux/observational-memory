@@ -108,6 +108,21 @@ Behavior is +0.9, inside the ±2.5 reader noise floor from `2001-grader-noise.md
 
 The report's efficiency verdict is "same" on all three tracks. On the chain, mean context tokens are +2% and model tokens +1%. On the holdout, model tokens are +8%, inside the ±10% band.
 
+## Fresh control
+
+A fresh draw of v1.6.0 settles the identifiers and approvals drops. `bench-compact.ts run --plugin 065b312 --record --samples 3 --jobs 8` reused A's two cached samples and drew a third. In the third sample, the om-v04 replay made 54 fresh Observer calls of 57. The om-orchestration and firstmate-11 replays came from an earlier v1.6.0 draw in `luna-cache-s3`. Raw output is in `~/.claude/scratch/tmp.DcqpGdjq4I/`: `control.md` and `control.json`.
+
+| main corpus, v1.6.0 | sample 1 | sample 2 | sample 3 (fresh) |
+|---|---:|---:|---:|
+| total | 84.8 | 82.9 | 83.5 |
+| identifiers | 59.4 | 57.0 | 50.7 |
+| approvals | 100 | 81.5 | 98.1 |
+
+- **Identifiers.** v1.6.0's own draws go from 50.7 to 59.4. The B samples of item 23 (56.5, 49.8) and item 25 (55.1, 52.7) are in that range. The drop is draw noise.
+- **Approvals.** The 10 items depend on one detail in one om-v04 reply: a note that the `test-1`/`test-2` sessions remain, and the full worktree name `observational-memory-ctx`. v1.6.0 wrote it in 2 of 3 draws. Items 23 and 25 wrote it in 0 of 4 draws. That is one pass or fail per draw, and the split gives p = 0.14 (Fisher's exact test, one-sided). It does not show that either change causes the loss.
+
+Items 23 and 25 landed together in v1.6.4. The combination was not benchmarked: each change was tested alone against v1.6.0.
+
 ## Cost
 
 - B's Observer and Reflector calls: 667 fresh Luna calls (661 Observer, 6 Reflector). They used 6.86M tokens in and 0.41M out, which is $1.89 at the plugin's Luna price.
