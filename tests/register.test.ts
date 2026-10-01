@@ -1430,7 +1430,7 @@ describe('register', () => {
     expect(after.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([api, '🟡 2026-09-22 15:00 User required concise output behind `full`', table])
   })
 
-  test("🔴 lines over their share of the reflection target shorten to om_recall index lines, and still over, the oldest go to the Reflector, which then keeps its target", async ($, on) => {
+  test("🔴 lines over their share of the reflection target shorten to om_recall index lines, and still over, the oldest go to the Reflector, told to keep them as 🟡, which then keeps its target", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const red = (i: number) => `🔴 2026-09-22 14:30 User required that module ${i} keep ${'its public interface and its tests unchanged, '.repeat(8)}always`
@@ -1454,6 +1454,11 @@ describe('register', () => {
     expect(target).toBeGreaterThanOrEqual(2_000)
     expect(prompt).toContain(`* ${red(0)}`) // the oldest, condensed
     expect(prompt).not.toContain(`module 349 keep`)
+    // Its instructions say so: the 🔴 lines it is shown are the user's oldest constraints, not copies to drop.
+    const system = seen.systems[seen.prompts.indexOf(prompt)]!
+    expect(system).toContain('unless the 🔴 lines outgrow their room: then the oldest of them are shown to you with the rest')
+    expect(system).toContain("A 🔴 line you are shown is one of the user's oldest standing constraints, not a copy of one kept elsewhere: condense it as a 🟡 line")
+    expect(system).not.toMatch(/every 🔴 line are kept|🔴 lines are kept apart/)
     const after = (stored['ledger:session-1'] as Ledger).entries
     const pinned = after.filter((e) => e.line.startsWith('🔴'))
     // Shortened: the older 🔴 lines that stay. Whole: the newest, up to REFLECT_KEEP_TOKENS, kept as they were.
