@@ -4950,3 +4950,20 @@ describe('the Session line', () => {
     expect(seen.sessions).toHaveLength(1)
   })
 })
+
+// The memory message is a user message the engine draws as typed: collapsed, its row is one line.
+describe('the memory row', () => {
+  test('a collapsed memory message draws as one line, an expanded one and any other prompt as written', async ($, on) => {
+    const drawn: string[] = []
+    on('ui.render', { component: 'UserMessage' }, ($, e) => (drawn.push(e.props.text), { type: 'Text', children: [e.props.text] }))
+    const draw = (text: string, isExpanded: boolean) =>
+      $.ui.render({ surface: 'terminal', component: 'UserMessage', requestId: 'm1', props: { text, origin: { kind: 'unclassified' }, isExpanded } })
+    const memory = `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<observations>\n- 🟡 a note\n</observations>`
+
+    await draw(memory, false)
+    await draw(memory, true)
+    await draw('fix the build', false)
+
+    expect(drawn).toEqual(['Compacted into observational memory (ctrl+o to see the full memory)', memory, 'fix the build'])
+  })
+})

@@ -355,6 +355,8 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
 }
 // A memory message of any version, told as recall.ts's `isMemoryText` tells one.
 const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && isMemoryText(m.text)
+// What the transcript shows in place of a memory message while the row is collapsed.
+const MEMORY_ROW = 'Compacted into observational memory (ctrl+o to see the full memory)'
 const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
 const isPrompt = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length
 const isCut = (m: SessionMessage) => !(m.role === 'user' && m.toolResults?.length) // no tool result without its call
@@ -2015,6 +2017,12 @@ export const register: Register = (on) => {
     const { text } = await next(e)
     return { text: text ? `${text}\n\n${COMPACTION_BRIEFING}` : `# Context management\n${COMPACTION_BRIEFING}` }
   })
+
+  // The memory message draws as one line in the transcript, as the built-in summary does; ctrl+o shows it whole.
+  // The row alone changes: the model reads the message as written.
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) =>
+    e.props.isExpanded || !isMemoryText(e.props.text) ? next(e) : next({ ...e, props: { ...e.props, text: MEMORY_ROW } }),
+  )
 
   on('session.start', async ($, e, next) => {
     await $.tool
