@@ -3,6 +3,7 @@ import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR
 import { add, addCompaction, clipLine, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
+import { registerNotes } from './notes'
 import { INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallIo, TranscriptCache } from './recall'
 import { compileBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
@@ -1989,6 +1990,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
 
 export const register: Register = (on) => {
   registerPrune(on)
+  registerNotes(on)
   on('session.compact', async ($, e, next) => {
     try {
       return await compact($, e, next)
