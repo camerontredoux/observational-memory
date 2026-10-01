@@ -4378,7 +4378,7 @@ describe('active constraints and the continuation record', () => {
     expect(text).toContain("\nThe user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again (3 chars):\nfix\n</continuation>")
     expect(text).not.toContain("Continue with the user's most recent request")
     expect(text).not.toContain('Pick up the last task')
-    expect(text).toContain("- Do not redo what it lists as completed, even if the user's latest request asked for it.")
+    expect(text).toContain("- Do not redo what it lists as completed, including the request it quotes last.")
     // One record: none of the directives it replaces.
     expect(text).not.toContain('<current-task>')
     expect(text).not.toContain('<optional-next-step>')

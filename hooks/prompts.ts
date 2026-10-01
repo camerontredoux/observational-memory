@@ -211,7 +211,7 @@ export const MEMORY_GUIDE_RECALL = ' om_recall takes them as from and to.'
 // output is not the whole output, and the model is to search before it says a detail is gone.
 export const MEMORY_RESUME = `Continue from the latest message. The messages after this memory are newer: where they differ, they take precedence over it, the continuation record included.
 - Resume the record's active work from its next steps, in order.
-- Do not redo what it lists as completed, even if the user's latest request asked for it.
+- Do not redo what it lists as completed, including the request it quotes last.
 - Do not repeat or contradict what it says you told the user.
 - Do not act on what waits for the user's decision or approval. Ask when the work needs one the user has not given.
 - Its environment was read from git at compaction: check it again before you rely on it.`
