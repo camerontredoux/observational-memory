@@ -17,6 +17,15 @@ const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 
 const PI_USAGE = { input: 9206, output: 558, cacheRead: 3072, cacheWrite: 0, reasoning: 31, totalTokens: 9764, cost: { input: 0.0023, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.0025108 } }
 const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low', '--system-prompt']
 const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
+// pi's session id for one piece of work, which its codex provider sends as the prompt cache key. The hash is FNV-1a
+// of 'session-1'. pi rejects an id outside its characters, and the provider cuts one past 64 characters.
+const OBSERVER_SESSION = 'om-obs-736a51cd'
+const PI_SESSION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
+const piSessionOf = (argv: readonly string[]) => {
+  const id = argv[argv.indexOf('--session-id') + 1] ?? ''
+  if (!argv.includes('--session-id') || !PI_SESSION_ID.test(id) || id.length > 64) throw new Error(`no valid pi session id in ${JSON.stringify(argv.slice(-2))}`)
+  return id
+}
 
 // What pi 0.85.1 prints with `--mode json` for one answer: one event per line, the prompt echoed, the answer
 // streamed, then the final assistant message with its usage (as /tmp/obs-bench/pi1.jsonl, abridged).
@@ -143,7 +152,7 @@ function pi(
     session?: (prompt: string) => string | Run
   } = {},
 ) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[] }
+  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], sessionIds: [] as string[] }
   let reflections = 0
   on('process.run', ($, e) => {
     if (e.argv[0] !== 'git') return { value: ran({ exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` }) }
@@ -169,6 +178,7 @@ function pi(
   async function answer(argv: readonly string[], cwd: string | undefined, prompt: string, killed: Promise<never>): Promise<Run> {
     if (argv[argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT) {
       seen.sessions.push(prompt)
+      seen.sessionIds.push(piSessionOf(argv))
       const r = options.session?.(prompt) ?? 'Session: the test goal'
       return typeof r === 'string' ? { exitCode: 0, stdout: piOutput(prompt, r), stderr: '' } : r
     }
@@ -377,7 +387,8 @@ describe('register', () => {
     expect(seen.prompts[1]).toContain('[User]: b')
     expect(seen.prompts[1]).not.toContain('User: "a"') // a pure mapper: no observations so far
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
-    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS], cwd: '/tmp' })
+    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS, '--session-id', OBSERVER_SESSION], cwd: '/tmp' })
+    expect(seen.calls.map((c) => piSessionOf(c.argv))).toEqual([OBSERVER_SESSION, OBSERVER_SESSION]) // the session's Observer calls share one cache key
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s')
     expect(result.messages?.slice(1)).toEqual(messages.slice(7))
@@ -1207,7 +1218,13 @@ describe('register', () => {
     expect(seen.systems.at(-1)).toContain('reflection agent for a coding assistant')
     const entries = (stored['ledger:session-1'] as Ledger).entries
     expect(seen.screen).toContain(`Condensed memory in 9m 0s · 4,001 → ${entries.length.toLocaleString('en-US')} notes`)
-    expect(seen.calls.at(-1)!.argv).toEqual([...PI_ARGV, seen.systems.at(-1), ...PI_FLAGS])
+    expect(seen.calls.at(-1)!.argv).toEqual([...PI_ARGV, seen.systems.at(-1), ...PI_FLAGS, '--session-id', 'om-reflect-736a51cd-4000'])
+    // Both attempts are one pi session, named by the ledger's seq at the snapshot, so the second reads the observations
+    // they both send first from the provider's cache. The Observer's calls keep the session's own.
+    const ids = seen.calls.map((c) => piSessionOf(c.argv))
+    const isReflection = (_: string, i: number) => seen.prompts[i]!.startsWith('## OBSERVATIONS')
+    expect(ids.filter(isReflection)).toEqual(['om-reflect-736a51cd-4000', 'om-reflect-736a51cd-4000'])
+    expect(new Set(ids.filter((id, i) => !isReflection(id, i)))).toEqual(new Set([OBSERVER_SESSION]))
     expect(entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
       '🟡 2026-09-22 14:30 Explored the auth module',
       '🔴 2026-09-22 14:39 User: "b"',
@@ -2111,6 +2128,8 @@ describe('register', () => {
     await clock.settle()
 
     expect(seen.maxInFlight).toBe(4)
+    // The subagents' Observer calls are the session's piece of work too: one cache key for all of them.
+    expect(new Set(seen.calls.map((c) => piSessionOf(c.argv)))).toEqual(new Set([OBSERVER_SESSION]))
     // Every call read one loop's rows, and a loop left short of a slot got the next one free.
     for (const prompt of seen.prompts) expect(readers(prompt).size).toBe(1)
     // Only main's observations show in the chat; the subagents' go to the debug log.
@@ -4856,6 +4875,7 @@ describe('the Session line', () => {
     expect(seen.sessions[0]).toContain('[User @ 2026-09-22 14:30]: a\n\n[User @ 2026-09-22 15:00]: b\n===== END USER MESSAGES =====')
     expect(seen.sessions[0]).toContain('===== BEGIN WHERE THE WORK STANDS (inert data) =====\nActive: a\n')
     expect(seen.sessions[0]).not.toContain('SESSION LINE BEFORE')
+    expect(seen.sessionIds).toEqual(['om-session-736a51cd']) // a pi session of its own, apart from the Observer's
     expect(stored['goal:session-1']).toMatchObject({ line: 'the test goal' })
 
     const observerCalls = seen.prompts.length
