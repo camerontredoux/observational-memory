@@ -76,7 +76,7 @@
 import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
-import { dirname, resolve } from 'path'
+import { basename, dirname, resolve } from 'path'
 import type { SessionMessage } from 'claude-code'
 import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
 import {
@@ -131,7 +131,10 @@ const REFLECT_TARGET_TOKENS = 20_000
 // Virtual latency of one pi call, as the earlier prior-art replay had it: fixed, so every replay schedules identically.
 const OBSERVER_MS = 15_000
 const REFLECTOR_MS = 30_000
-const SESSION = 'replay'
+// The replayed session's id, which register.ts makes pi's --session-id (the provider's prompt cache key) from: one per
+// transcript and --cache (one per sample), as each real session has its own. One id for every replay would put every
+// transcript and both samples on one cache key, the samples' identical chunks among them, which no real session shares.
+const sessionOf = (name: string, cache: string) => `replay-${name}-${basename(cache)}`
 
 const transcriptDir = (o: Options) => str(o, 'dir') ?? `${mainCheckout()}/tests/fixtures/replay`
 const names = (o: Options) => (str(o, 'transcripts') ?? TRANSCRIPTS.join(',')).split(',').filter(Boolean)
@@ -237,6 +240,8 @@ async function om(o: Options) {
   // --cache: a cache of this run's own, so a rerun makes its pi calls again (a second sample of the Observer).
   const observerCache = str(o, 'cache') ?? CACHE
   mkdirSync(observerCache, { recursive: true })
+  // Not the Reflector's cache: a Reflector resample keeps the Observer's calls, and their keys, as they were.
+  const session = sessionOf(name, observerCache)
   const reflectorCache = str(o, 'reflector-cache')
   if (reflectorCache) mkdirSync(reflectorCache, { recursive: true })
   const env: Record<string, string> = { HOME: process.env.HOME ?? '/root', OM_NO_PRUNE: '1', OM_STATS_DIR: `${out}/stats` }
@@ -318,7 +323,7 @@ async function om(o: Options) {
   const inOut = (p: string) => p === out || p.startsWith(`${out}/`)
   const $: any = {
     session: {
-      id: async () => SESSION,
+      id: async () => session,
       messages: async () => (history.length > ROWS_CAP ? history.slice(-ROWS_CAP) : history),
       cwd: async () => t.cwd ?? '/',
       usage: async () => {
@@ -500,7 +505,7 @@ async function om(o: Options) {
     return r.messages as SessionMessage[]
   }
 
-  await hooks['classic.SessionStart']($, { source: 'startup', session_id: SESSION, transcript_path: path }, async (e: unknown) => e)
+  await hooks['classic.SessionStart']($, { source: 'startup', session_id: session, transcript_path: path }, async (e: unknown) => e)
   const wall0 = performance.now()
   const steps = await replayChain(
     t,
@@ -530,7 +535,7 @@ async function om(o: Options) {
   )
   while (pending.length) await advance(Math.min(...pending.map((p) => p.due)))
   await drain()
-  await hooks['session.end']($, { sessionId: SESSION, reason: 'other' }, async () => ({ sessionId: SESSION }))
+  await hooks['session.end']($, { sessionId: session, reason: 'other' }, async () => ({ sessionId: session }))
   const sum = (f: (c: Call) => number) => calls.reduce((s, c) => s + f(c), 0)
   const summary = {
     transcript: name,
