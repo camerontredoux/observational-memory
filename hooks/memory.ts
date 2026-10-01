@@ -1,6 +1,6 @@
 // The memory message: the page a compaction leaves at the head of the context, rendered from the ledger and read back
 // from the context at the next compaction (memoryMessage, parseMemory), with the cuts that fit its sections to their
-// caps (capUserMessages, capReplies, briefer) and the line, source and constraint formats its sections share with the
+// caps (capUserMessages, capReplies, slimmed) and the line, source and constraint formats its sections share with the
 // Observer's and Reflector's replies. No `$` here: the engine never lets it cross an import.
 import type { SessionMessage } from 'claude-code'
 import {
@@ -21,16 +21,16 @@ import { parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
 
 const REPLIES_MIN_TOKENS = 200 // the assistant's replies section: less room than this quotes none
-// The verbatim user messages section. The brief has a cap of its own. After it, the newest prompts are kept within
-// USER_MESSAGES_MAX_TOKENS; past that, the last three prompts stay whole within USER_RECENT_TOKENS (they are the
-// requests in hand), and every prompt of USER_SHORT_CHARS or fewer (a correction, an approval, a question) within
-// USER_SHORT_TOKENS: long pastes would otherwise fill the section and drop them.
-const BRIEF_MAX_TOKENS = 8_000
+// The verbatim user messages section. The session's first message has a cap of its own. After it, the newest prompts
+// are kept within USER_MESSAGES_MAX_TOKENS; past that, the last three prompts stay whole within USER_RECENT_TOKENS
+// (they are the requests in hand), and every prompt of USER_SHORT_CHARS or fewer (a correction, an approval, a
+// question) within USER_SHORT_TOKENS: long pastes would otherwise fill the section and drop them.
+const FIRST_MESSAGE_MAX_TOKENS = 8_000
 const USER_MESSAGES_MAX_TOKENS = 3_000
 const USER_RECENT_TOKENS = 6_000
 const USER_SHORT_CHARS = 400
 const USER_SHORT_TOKENS = 8_000
-const NEWEST_RESERVE_TOKENS = 2_000 // the least the newest prompt keeps, whatever the brief takes
+const NEWEST_RESERVE_TOKENS = 2_000 // the least the newest prompt keeps, whatever the first message takes
 const NEXT_STEP_MAX_TOKENS = 2_000 // the latest request the continuation record quotes
 const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -77,13 +77,13 @@ export const truncate = (text: string, maxTokens: number) =>
 const TRUNCATED = new RegExp(`${noteSource(truncationNote(0))}$`)
 // What truncate leaves of a text given no room: its note alone.
 export const isStub = (text: string) => text.search(TRUNCATED) === 0
-// An oversized command result or brief, bounded at both ends: a final error or test summary, or a brief's reporting
+// An oversized command result or message, bounded at both ends: a final error or test summary, or a task's reporting
 // and acceptance rules, usually sits at the start or the end, never only in the middle. The omission is marked
 // explicitly, never silently dropped; om_recall can still find the full `what` in the transcript. The tail starts at
 // a line boundary so its first line is whole.
 export const omissionMarker = (tokens: number, what: string) => `\n... [~${tokens} tokens omitted; om_recall can retrieve the full ${what}] ...\n`
-// The marker excerpt leaves in a brief it cut (see capUserMessages).
-const BRIEF_CUT = new RegExp(noteSource(omissionMarker(0, 'message')))
+// The marker excerpt leaves in a message it cut: the first message or a reply (see capUserMessages, cutReply).
+const MESSAGE_CUT = new RegExp(noteSource(omissionMarker(0, 'message')))
 export function excerpt(text: string, maxTokens: number, what: 'result' | 'message' | 'input' = 'result') {
   if (text.length <= maxTokens * 4) return text
   const room = maxTokens * 4
@@ -333,7 +333,7 @@ function parseReplies(text: string) {
 // The newest replies within `max` tokens, oldest first; the newest is cut to fit when it alone passes it.
 const REPLY_MAX_TOKENS = 600 // one reply over this is cut to its head and tail (0: only the section's cap)
 // A reply cut to `max` tokens, unless an earlier compaction cut it so already.
-const cutReply = (text: string, max: number) => (BRIEF_CUT.test(text) && text.replace(BRIEF_CUT, '').length <= max * 4 ? text : excerpt(text, max, 'message'))
+const cutReply = (text: string, max: number) => (MESSAGE_CUT.test(text) && text.replace(MESSAGE_CUT, '').length <= max * 4 ? text : excerpt(text, max, 'message'))
 export function capReplies(replies: readonly UserMessage[], max: number) {
   if (max < REPLIES_MIN_TOKENS) return []
   const kept: UserMessage[] = []
@@ -418,19 +418,18 @@ function failuresOf(text: string, from: number) {
   return parseFailures(body.slice(0, end.length ? Math.min(...end) : 0))
 }
 
-// The session's first message, the standing brief, cut to BRIEF_MAX_TOKENS keeping its head and its tail; then, oldest
-// first with one line counting each run of those dropped between: the newest within what is left of
-// USER_MESSAGES_MAX_TOKENS (at least NEWEST_RESERVE_TOKENS, the newest over it cut, and always kept), the rest of the
-// last three whole within USER_RECENT_TOKENS, and the short ones whole within USER_SHORT_TOKENS.
+// The session's first message, which often sets the whole task, cut to FIRST_MESSAGE_MAX_TOKENS keeping its head and
+// its tail; then, oldest first with one line counting each run of those dropped between: the newest within what is
+// left of USER_MESSAGES_MAX_TOKENS (at least NEWEST_RESERVE_TOKENS, the newest over it cut, and always kept), the rest
+// of the last three whole within USER_RECENT_TOKENS, and the short ones whole within USER_SHORT_TOKENS.
 export function capUserMessages(messages: readonly UserMessage[]) {
   const [first, ...rest] = messages
   if (!first) return []
-  // A brief an earlier compaction cut is kept as it was, with the marker that counts what it lost: cut again, its
-  // count would be lost. A head-only cut is an older plugin version's.
-  const briefMax = BRIEF_MAX_TOKENS
-  const wasCut = [BRIEF_CUT, TRUNCATED].some((cut) => cut.test(first.text) && first.text.replace(cut, '').length <= briefMax * 4)
-  const brief = { ...first, text: wasCut ? first.text : excerpt(first.text, briefMax, 'message') }
-  let left = Math.max(USER_MESSAGES_MAX_TOKENS - estimateTokens(brief.text), NEWEST_RESERVE_TOKENS)
+  // A first message an earlier compaction cut is kept as it was, with the marker that counts what it lost: cut again,
+  // its count would be lost. A head-only cut is an older plugin version's.
+  const wasCut = [MESSAGE_CUT, TRUNCATED].some((cut) => cut.test(first.text) && first.text.replace(cut, '').length <= FIRST_MESSAGE_MAX_TOKENS * 4)
+  const firstKept = { ...first, text: wasCut ? first.text : excerpt(first.text, FIRST_MESSAGE_MAX_TOKENS, 'message') }
+  let left = Math.max(USER_MESSAGES_MAX_TOKENS - estimateTokens(firstKept.text), NEWEST_RESERVE_TOKENS)
   let shortLeft = USER_SHORT_TOKENS
   let recentLeft = USER_RECENT_TOKENS
   const keep = new Map<number, UserMessage>()
@@ -457,8 +456,8 @@ export function capUserMessages(messages: readonly UserMessage[]) {
     if (m.text.length > USER_SHORT_CHARS) longDone = true
     else if (t <= shortLeft) keep.set(i, m), (shortLeft -= t)
   }
-  // In order: the brief, then each kept message, one line counting the messages dropped between.
-  const out: UserMessage[] = [brief]
+  // In order: the first message, then each kept message, one line counting the messages dropped between.
+  const out: UserMessage[] = [firstKept]
   let omitted = 0
   rest.forEach((m, i) => {
     const k = keep.get(i)
@@ -470,16 +469,16 @@ export function capUserMessages(messages: readonly UserMessage[]) {
   return out
 }
 
-// The brief, then one line counting the messages dropped after it.
-function withOmitted(brief: UserMessage, dropped: readonly UserMessage[]): UserMessage[] {
+// The first message, then one line counting the messages dropped after it.
+function withOmitted(first: UserMessage, dropped: readonly UserMessage[]): UserMessage[] {
   const omitted = dropped.reduce((n, m) => n + (m.omitted ?? 1), 0)
-  return [brief, ...(omitted ? [{ text: '', omitted }] : [])]
+  return [first, ...(omitted ? [{ text: '', omitted }] : [])]
 }
 
-// A memory with its skills as lines and its user messages the brief alone, the rest counted.
-export function briefer(memory: Memory): Memory {
-  const [brief, ...rest] = memory.userMessages
-  return { ...memory, skills: memory.skills.map((s) => ({ ...s, text: '' })), userMessages: brief ? withOmitted(brief, rest) : [], replies: [] }
+// A memory with its skills as lines, its user messages the first alone, the rest counted, and no replies.
+export function slimmed(memory: Memory): Memory {
+  const [first, ...rest] = memory.userMessages
+  return { ...memory, skills: memory.skills.map((s) => ({ ...s, text: '' })), userMessages: first ? withOmitted(first, rest) : [], replies: [] }
 }
 
 const renderSkill = (s: Skill) => {

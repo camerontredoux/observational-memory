@@ -179,7 +179,7 @@ export function merge(files: readonly SessionStats[], since?: number) {
 export const grouped = (n: number) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 const num = (n: number) => (Math.abs(n) >= 100 || Number.isInteger(n) ? grouped(n) : n >= 1 ? n.toFixed(1) : n.toFixed(2))
 // A failure's message cut to a short line for the screen.
-export const brief = (text: string) => (text.length > 60 ? `${text.slice(0, 59)}…` : text)
+export const clipLine = (text: string) => (text.length > 60 ? `${text.slice(0, 59)}…` : text)
 export const duration = (ms: number) => {
   if (ms < 1000) return `${Math.round(ms)} ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
@@ -333,7 +333,7 @@ function warn(io: Io, error: unknown) {
   warned = true
   const message = error instanceof Error ? error.message : String(error)
   io.log(`stats not saved (${message}); carrying on without them`)
-  io.show(`Stats failed (${brief(message)}) and will keep retrying quietly`)
+  io.show(`Stats failed (${clipLine(message)}) and will keep retrying quietly`)
 }
 
 export async function statsDir(io: Io) {

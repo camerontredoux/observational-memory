@@ -1,6 +1,6 @@
 import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
-import { add, addCompaction, brief, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
+import { add, addCompaction, clipLine, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
@@ -9,7 +9,7 @@ import { compileBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
   applyConstraints,
   baseOf,
-  briefer,
+  slimmed,
   capReplies,
   capUserMessages,
   constraintId,
@@ -96,8 +96,8 @@ const REPLIES_ROOM_TOKENS = 40_000 // and only within what the compacted context
 const HANDOFF_FIELD_MAX_TOKENS = 500 // each of the continuation record's Next steps and Told the user
 // The Session line leading the continuation record: what the whole session is about, written by its own call in the
 // background at a turn's start (see writeSession), never on compaction's path. Written again once this many
-// observations have landed since the last write; the writer reads the brief and the newest user messages within
-// SESSION_USER_TOKENS, each message after the brief cut to SESSION_MESSAGE_TOKENS.
+// observations have landed since the last write; the writer reads the first message and the newest user messages
+// within SESSION_USER_TOKENS, each message after the first cut to SESSION_MESSAGE_TOKENS.
 const SESSION_EVERY_OBSERVATIONS = 20
 const SESSION_BRIEF_TOKENS = 1_000
 const SESSION_MESSAGE_TOKENS = 300
@@ -296,7 +296,7 @@ function reason(error: unknown, timeoutMs: number) {
   if (kind === 'no-message') return 'no reply from pi'
   if (kind.startsWith('stop-')) return `pi stopped (${kind.slice(5)})`
   if (kind.startsWith('exit-')) return `pi exited ${kind.slice(5)}`
-  return brief(text)
+  return clipLine(text)
 }
 // The calls the stats module makes, spelled here: the engine never lets `$` cross an import.
 const statsIo = ($: EngineInterface): Io => ({
@@ -1332,7 +1332,7 @@ async function writeSession($: EngineInterface, loop: Loop, life: string) {
   const messages = [...(prior?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts]
   const newest = messages.length ? hash(messages.at(-1)!.text) : ''
   if (!messages.length || (goal && goal.newest === newest) || writingGoal.has(loop.key)) return
-  // The brief, then the newest messages within SESSION_USER_TOKENS, each cut, one line counting those left out.
+  // The first message, then the newest messages within SESSION_USER_TOKENS, each cut, one line counting those left out.
   const block = (m: UserMessage, max: number) => `[User${m.at ? ` @ ${m.at}` : ''}]: ${excerpt(m.text, max, 'message')}`
   const [first, ...rest] = messages
   const shown: string[] = []
@@ -1564,7 +1564,7 @@ async function output($: EngineInterface, argv: string[], path: string) {
   let text = ''
   let error = ''
   for await (const c of run) c.stream === 'stdout' ? (text += c.text) : (error += c.text)
-  if ((await run.result).code !== 0) throw new Error(brief(error) || `could not read ${path}`)
+  if ((await run.result).code !== 0) throw new Error(clipLine(error) || `could not read ${path}`)
   return text
 }
 // Each session's transcript as om_recall last parsed it, parsed on from there by its next call.
@@ -1888,9 +1888,9 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
       memory = shown(memory)
       let message = memoryMessage(memory)
       // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
-      // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
+      // compaction), then the skills become lines and the user messages the first alone, which om_recall can still
       // find; the corrections (within their cap), observations and continuation record stay whole.
-      const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(briefer(m))]]
+      const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(slimmed(m))]]
       if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
       const over = contextTokens(message)
       let tokens = over
@@ -2046,7 +2046,7 @@ export const register: Register = (on) => {
       })
       .catch((error) => {
         log($, `could not register ${RECALL_TOOL} (${errorText(error)})`)
-        show($, `Setup failed (${brief(errorText(error))}). ${RECALL_TOOL} is unavailable this session`)
+        show($, `Setup failed (${clipLine(errorText(error))}). ${RECALL_TOOL} is unavailable this session`)
       })
     await Promise.all([
       $.tool.register({
@@ -2068,7 +2068,7 @@ export const register: Register = (on) => {
       $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|<session id>] [full] [7d|<ISO date>]' }),
     ]).catch((error) => {
       log($, `could not register the stats tool and command (${errorText(error)})`)
-      show($, `Setup failed (${brief(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
+      show($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
     })
     return next(e)
   })

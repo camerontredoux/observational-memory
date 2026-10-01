@@ -1,5 +1,5 @@
 import type { EngineInterface, On, SessionStartInput, SessionStartResult } from 'claude-code'
-import { brief } from './stats'
+import { clipLine } from './stats'
 
 // `$.store` is one JSON file capped at 4 MiB, and each session leaves its keys (`<kind>:<sessionId>`) behind.
 //
@@ -157,7 +157,7 @@ async function start($: EngineInterface, e: SessionStartInput, next: (e: Session
     await prune($, await $.session.id())
   })().catch((error) => {
     $.ui.log(`could not prune old sessions (${errorText(error)})`, { to: 'debug' })
-    $.ui.log(`Cleanup failed (${brief(errorText(error))}) and will retry tomorrow`)
+    $.ui.log(`Cleanup failed (${clipLine(errorText(error))}) and will retry tomorrow`)
   })
   return next(e)
 }
