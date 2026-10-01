@@ -2343,6 +2343,8 @@ describe('register', () => {
     const { gate } = gates()
     const seen = pi(on, { hold: (n) => (n === 3 ? gate(3) : undefined) })
     const runTurn = live(on, clock, history)
+    let builtIn = 0
+    on('session.compact', () => (builtIn++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
     await clock.settle() // [0, 3) observed
@@ -2355,6 +2357,9 @@ describe('register', () => {
 
     expect(result.messages?.map((m) => m.text)).toEqual(['summary from above'])
     expect(seen.stopped).toBe(1)
+    // Nor does the built-in compactor run beneath it: a throw after the abandonment would make it.
+    expect(builtIn).toBe(0)
+    expect(seen.logs).toContain('the compaction was abandoned; its chunks are kept, not installed')
     const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
     expect([ledger.watermark.to, ledger.anchor]).toEqual([expect.any(Number), undefined])
     expect(ledger.watermark.to).toBeGreaterThan(3) // the chunk after the watermark landed; the held one did not

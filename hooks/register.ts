@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
+import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 import {
   COMPACT_RECENT,
   COMPACT_RESUME,
@@ -2185,320 +2185,333 @@ async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, nex
   return r
 }
 
+// The compaction from the ledger: what the session.compact hook runs.
+async function compact($: EngineInterface, e: SessionCompactInput, next: Parameters<Hook<'session.compact'>>[2]): Promise<SessionCompactResult> {
+  // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
+  // compactor honors them, background observation cannot. Ordinary compaction stays available without them.
+  if (e.instructions?.trim()) {
+    show($, 'Compaction instructions given. Using built-in compaction', e.agentId)
+    return delegateToBuiltin($, e, next, false)
+  }
+  const main = e.agentId === undefined
+  const installs = e.trigger !== 'precompute'
+  const [sessionId, started, usage, recall, environment] = await Promise.all([
+    $.session.id(),
+    $.clock.now(),
+    $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
+    // Not the model's with --disallowed-tools, or when its registration failed; assumed so when the host cannot tell.
+    $.tool.list().then((tools) => tools.some((t) => t.name === RECALL_TOOL_NAME), () => true),
+    environmentOf($),
+  ])
+  const loop = loopOf(sessionId, e.agentId)
+  const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
+  markedRows.delete(loop.key) // its next mark checks the marks against the rows
+  await flushHeld($)
+  // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
+  // the session cannot read, or a context that does not match) is compacted with no stored state.
+  const history = await loopHistory($, loop).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
+  // The live context with the results an earlier compaction's raw tail cut read whole again, as the history reads them.
+  const live = history ? unmask(e.messages, history) : e.messages
+  const order = callOrder(live)
+  const messages = order.map((i) => live[i]!)
+  const { offset, rows, persistent } = history ? align(messages, history) : { offset: -messages.length, rows: [], persistent: false }
+  // Unmatched but lined up row for row (see linesUp), the ledger is checked against the history's rows, which it was
+  // built from, and observed, timed and cut over them; only the raw tail is the context's. Otherwise unmatched, it is
+  // checked against the context: one row under the watermark that differs restarts it (see `reconcile`), and each
+  // chunk past the watermark is found where its rows read the same.
+  const lined = history !== undefined && !persistent && linesUp(messages, rows, offset)
+  const v = view(lined ? rows.slice(offset, offset + messages.length) : messages, await loadMarks($, loop), persistent || lined ? offset : undefined)
+  const base = v.base
+  const initial = await locked(() => loadLedger($, loop.key, v))
+  if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)
+  const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
+  // What the raw tail from `cut` takes in the compacted context, its old results cut (maskTail).
+  const tailTokens = (cut: number) => maskTail(messages.slice(cut)).reduce((n, m) => n + estimateTokens(rowText(m)), 0)
+
+  // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
+  // observed is observed now, in chunks, all at once. A chunk pi fails on stays raw: the cut is wherever the rest
+  // reaches, and with nothing observed at all the floor compiles a brief of the rest (see `build`).
+  const chunks: Chunk[] = []
+  const failures: { rows: number; why: string }[] = [] // shown once the compaction stands: a fallback says so instead
+  let sync = { calls: 0, ms: 0 }
+  let deadlineHit = false
+  const start = tailStart(v, base)
+  if (!fits(initial.watermark.to) && start > initial.watermark.to) {
+    // The loop's background calls in flight cover their rows: they are waited on, not made again.
+    const inFlight = running.flatMap((job) => {
+      const at = job.loop.key === loop.key && job.stamp === life ? locate(v, job.range, initial.watermark.to) : undefined
+      return at ? [{ job, at }] : []
+    })
+    const gaps: [number, number][] = []
+    let from = initial.watermark.to
+    for (const c of [...initial.chunks, ...inFlight.map((f) => f.at), { from: start, to: start }].sort((a, b) => a.from - b.from)) {
+      for (let to; from < Math.min(c.from, start); from = to) gaps.push([from, (to = chunkEnd(v, from, Math.min(c.from, start), false)!)])
+      from = Math.max(from, c.to)
+    }
+    // Every call, and the wait on those in flight, ends by the deadline or when the compaction is abandoned: the
+    // calls still running are killed, and their rows left unobserved as a failed chunk's.
+    const deadline = new AbortController()
+    const signal = AbortSignal.any([deadline.signal, next.signal])
+    const stopped = signal.aborted ? Promise.resolve(undefined) : new Promise<undefined>((r) => signal.addEventListener('abort', () => r(undefined), { once: true }))
+    // A chunk that failed fast (a bad reply, a pi error) is observed again once: a chunk left raw holds back every
+    // chunk after it. A timeout is not, as it would hold the compaction for another timeout; nor is one with less
+    // time left than a call takes, nor an unreadable history's, which gets one round of calls.
+    let retries = 0
+    const once = (from: number, to: number) => {
+      const before = beforeRows(initial, from)
+      return observe($, v, from, to, 'compaction', before, signal).catch(async (error) => {
+        if (!history || signal.aborted || failureClass(errorText(error)) === 'timeout') throw error
+        if ((await $.clock.now()) - syncStarted > COMPACTION_DEADLINE_MS - OBSERVER_CALL_MS) throw error
+        retries++
+        log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
+        return observe($, v, from, to, 'compaction', before, signal)
+      })
+    }
+    const syncStarted = await $.clock.now()
+    if (!isLive(loop, life)) throw new LoopEnded()
+    const timer = $.clock.after(COMPACTION_DEADLINE_MS, () => deadline.abort(new Error(DEADLINE_PASSED)))
+    const [settled, waited] = await Promise.all([
+      Promise.allSettled(gaps.map(([from, to]) => once(from, to))),
+      Promise.all(inFlight.map((f) => Promise.race([f.job.landed, stopped]))),
+    ])
+    timer.cancel()
+    deadlineHit = deadline.signal.aborted
+    sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - syncStarted }
+    settled.forEach((r, i) => {
+      if (r.status === 'fulfilled') return void (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length))
+      log($, `observation of rows ${gaps[i]![0]}-${gaps[i]![1]} at compaction failed (${errorText(r.reason)}); left unobserved`)
+      failures.push({ rows: gaps[i]![1] - gaps[i]![0], why: reason(r.reason, OBSERVER_TIMEOUT_MS) })
+    })
+    // A background call that failed says so itself; one still running is cut off here, its rows left unobserved.
+    waited.forEach((landed, i) => {
+      if (landed !== undefined) return
+      const { at } = inFlight[i]!
+      log($, `background observation of rows ${at.from}-${at.to} was still running at compaction (${errorText(signal.reason)}); left unobserved`)
+      failures.push({ rows: at.to - at.from, why: reason(signal.reason, OBSERVER_TIMEOUT_MS) })
+    })
+  }
+  const priorMemory = base ? parseMemory(messages[0]!) : undefined
+  const prior = priorMemory?.skills ?? []
+  // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
+  const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
+  const goal = main ? (((await $.store.get(goalKey(sessionId))) as Goal | undefined)?.line ?? priorMemory?.session) : undefined
+  const turns = main ? await loadTurns($, sessionId) : undefined
+  const known = mergeSkills(prior, recorded)
+  // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
+  const prompts = messages.flatMap((m, i) => {
+    const text = i < base ? undefined : typed(m, known)
+    return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
+  })
+  // The reply ending each turn: the last assistant text before the next prompt, from rows past the memory message.
+  const replyRows = prompts.flatMap((p, k) => {
+    const lo = k ? prompts[k - 1]!.i : base - 1
+    for (let j = p.i - 1; j > lo; j--) {
+      const m = messages[j]!
+      if (m.role === 'assistant' && m.text.trim()) return [{ i: j, message: { ...(v.at[j] === undefined ? {} : { at: stamp(v.at[j]!) }), text: m.text.trim() } }]
+    }
+    return []
+  })
+  // An omitted-count line stands for dropped prompts, never for the latest one.
+  // A prompt cut to its note alone quotes nothing.
+  const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
+  // A subagent's memory names no file, but om_recall reaches its thread through the session's.
+  const transcriptPath = (await $.store.get(transcriptKey(sessionId))) as string | undefined
+  const transcript = main ? transcriptPath : undefined
+  // The compacted context fits half the room the overhead leaves below the point auto-compaction runs at, so the
+  // session can work before compacting again. The session's figures are its main model's: a subagent's model may
+  // have a smaller window. The overhead grows by what the breakdown lists beside the system prompt and built-in tools.
+  // Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's measure,
+  // less the overhead, over the estimate of the same messages scales the raw tail's up, never down.
+  const breakdown = usage?.context.breakdown
+  const limit = breakdown?.autoCompactThreshold ?? breakdown?.rawMaxTokens ?? usage?.context.window ?? WINDOW_TOKENS
+  const listed = [...(breakdown?.mcpTools.filter((t) => t.isLoaded) ?? []), ...(breakdown?.memoryFiles ?? []), ...(breakdown?.agents ?? []), breakdown?.skills, breakdown?.slashCommands]
+  const overhead = OVERHEAD_TOKENS + listed.reduce((n, l) => n + (l?.tokens ?? 0), 0)
+  const budget = Math.floor(((main ? limit : Math.min(limit, WINDOW_TOKENS)) - overhead) / 2)
+  const measured = main ? usage?.context.tokens : undefined
+  const density = measured === undefined ? 1 : Math.max(1, (measured - overhead) / Math.max(1, tokensBetween(v, 0, messages.length)))
+
+  // Rows [from, to) as the session brief compiles them, each line with its om_recall reference when the model can
+  // read it: the transcript file, the session's directory and home are read once, and only when a brief is compiled.
+  let corpus: Promise<Awaited<ReturnType<typeof loadTranscript>> | undefined> | undefined
+  let dirs: Promise<[string, string | undefined]> | undefined
+  const compile = async (from: number, to: number) => {
+    const rows = messages.slice(from, to)
+    let refOf
+    if (recall && transcriptPath) {
+      corpus ??= loadTranscript(recallIo($), transcriptPath).catch((error) => void log($, `could not read the transcript for the brief's references (${errorText(error)})`))
+      const c = await corpus
+      refOf = c && (await refsOf(c, rows, e.agentId).catch(() => undefined))
+    }
+    dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
+    const [cwd, home] = await dirs
+    return compileBrief(rows, v.at.slice(from, to), cwd, home, refOf)
+  }
+
+  // The memory message from the ledger once this compaction's chunks commit: cut at the watermark, as observed.
+  // Where that cannot stand (nothing observed, the Observer failed, or over the budget), the floor: the same memory
+  // with the raw tail cut later, the rows between the watermark and the cut compiled by code into the session brief.
+  // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for a context that
+  // is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
+  // `kept`: the ledger is stored with the memory message, so a line the message leaves out (see unsaid) comes back.
+  const build = async (ledger: Ledger, kept: boolean) => {
+    const observed = ledger.watermark.to
+    const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
+    const attempt = async (cut: number, floor: boolean) => {
+      const tail = messages.slice(cut)
+      // The brief carried from the memory message, with the rows leaving context merged in: those the floor
+      // compiles. A brief is carried even where the Observer's memory stands again: it holds rows the Observer never
+      // observed, which no observation covers.
+      const from = floor ? observed : cut
+      const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
+      dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
+      const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
+      let memory: Memory = {
+        corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
+          estimateTokens(renderCorrections(l)),
+        ),
+        observations: renderGrouped(ledger.entries),
+        currentTask: ledger.currentTask,
+        ...(goal ? { session: goal } : {}),
+        ...(covered ? { stateAt: stamp(covered.to) } : {}),
+        skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
+        userMessages: capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)]),
+        // The session's first prompt, a crewmate's whole brief, is quoted above; quoted again as the latest request it
+        // would send the agent back to the top of its brief.
+        // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
+        nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
+        ...(environment ? { environment } : {}),
+        ...(failures.length ? { failures } : {}),
+        ...(brief ? { brief } : {}),
+        ...(floor ? { floor } : {}),
+        transcript,
+        recoverable: transcriptPath !== undefined,
+        recall,
+        recentKept: tail.length > 0,
+        resumeDirectly: e.trigger === 'auto',
+      }
+      // The compacted context: the memory message with its margin, and the raw tail at its density.
+      const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
+      // The replies fill what room is left below REPLIES_ROOM_TOKENS, at most REPLIES_MAX_TOKENS.
+      const room = REPLIES_ROOM_TOKENS - contextTokens(memoryMessage(memory))
+      memory.replies = capReplies([...(priorMemory?.replies ?? []), ...replyRows.filter((r) => r.i < cut).map((r) => r.message)], Math.min(REPLIES_MAX_TOKENS, Math.floor(room / MEMORY_HEADROOM)))
+      // The observations as shown beside the replies: where the ledger keeps every line, one quoting a reply is left out.
+      let sources = true
+      const shown = (m: Memory): Memory => ({ ...m, observations: renderGrouped(kept ? unsaid(ledger.entries, m.replies) : ledger.entries, sources) })
+      memory = shown(memory)
+      let message = memoryMessage(memory)
+      // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
+      // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
+      // find; the corrections (within their cap), observations and continuation record stay whole.
+      const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(briefer(m))]]
+      if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
+      const over = contextTokens(message)
+      let tokens = over
+      const made: string[] = []
+      for (const [what, shorten] of cuts) {
+        if (tokens <= budget) break
+        memory = shorten(memory)
+        message = memoryMessage(memory)
+        tokens = contextTokens(message)
+        made.push(what)
+      }
+      return { ledger, cut, memory, message, tokens, over, made, floor, briefed: floor ? cut - observed : 0 } // rows the Observer had not observed
+    }
+    const stands = (a: Awaited<ReturnType<typeof attempt>>) => {
+      if (a.made.length) log($, `over the ~${budget}-token budget at ~${a.over} tokens: ${a.made.join('; ')}`)
+      return a
+    }
+    let last
+    if (observed > base && (last = await attempt(observed, false)).tokens <= budget) return stands(last)
+    for (const cut of floorCuts(v, observed)) if ((last = await attempt(cut, true)).tokens <= budget) return stands(last)
+    if (!last) throw new Error(MEMORY_ALONE)
+    throw new Error(overLimit(OVER_BUDGET, last.tokens, budget))
+  }
+  // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
+  // message that stands; once installed, the watermark restarts after the memory message, and the chunks past
+  // it are found again there. One that does not stand leaves the chunks committed, not installed.
+  // An abandoned compaction's memory never enters the context: its chunks are stored committed, not installed.
+  const settle = async (l: Ledger) => {
+    const ledger = commit({ ...l, chunks: [...l.chunks, ...chunks] }, v)
+    // The rows this compaction's own chunks committed: not one left waiting behind a gap, nor one landed before it.
+    const observedNow = chunks.reduce((n, c) => n + (c.from >= l.watermark.to && c.to <= ledger.watermark.to ? c.to - c.from : 0), 0)
+    const stores = persistent && ledger.watermark.to > base && isLive(loop, life) // under the lock, as a loop's end deletes
+    let built
+    try {
+      built = await build(ledger, stores && installs)
+    } catch (error) {
+      if (stores && chunks.length) await $.store.set(ledgerKey(loop.key), ledger)
+      throw error
+    }
+    const abandoned = next.signal.aborted
+    if (stores && (!installs || abandoned)) await $.store.set(ledgerKey(loop.key), ledger)
+    if (abandoned) throw new Error(ABANDONED)
+    if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
+    return { ...built, observedNow }
+  }
+  const { ledger, cut, memory, message, floor, briefed, observedNow } = await locked(async () => settle(await loadLedger($, loop.key, v)))
+  // Failed rows the floor compiled into the brief are not kept.
+  for (const f of failures) show($, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
+  const kept = new Set(order.slice(cut))
+  const observed = ledger.watermark.to
+  // Why the floor ran, as `build` found it.
+  const why = observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : 'nothing was observed yet'
+  const briefTokens = memory.brief ? estimateTokens(renderBrief(memory.brief, memory.recall)) : 0
+  log(
+    $,
+    (observedNow ? `observed ${observedNow} rows now, ` : floor ? '' : 'cut at the background watermark with no Observer call, ') +
+      (floor ? `the floor (${why}): ${briefed} rows compiled into the session brief, ` : '') +
+      `kept ${messages.length - cut} raw messages (~${tailTokens(cut)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
+      `${ledger.entries.length} observations, ${memory.skills.length} skill(s)${memory.brief ? `, brief ~${briefTokens} tokens` : ''}`,
+  )
+  show(
+    $,
+    `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
+      `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}` +
+      (floor ? ` · ${plural(briefed, 'message')} in a brief compiled by code (${why})` : ''),
+    e.agentId,
+  )
+  const compaction = {
+    trigger: main ? e.trigger : 'subagent',
+    fellBack: false,
+    floor,
+    tokensBefore: main ? usage?.context.tokens : undefined, // the last response's input: system prompt and tools included
+    estTokensAfter: estimateTokens(message.text) + tailTokens(cut), // messages only
+    syncCalls: sync.calls,
+    syncMs: sync.ms,
+    rowsObservedNow: observedNow,
+    rowsObservedBefore: observed - base - observedNow,
+    ...(deadlineHit ? { deadlineHit } : {}),
+    ...(history ? {} : { unreadable: true }), // a history the session cannot read: a workflow agent's, a fork's
+    ...(briefed ? { rowsBriefed: briefed } : {}),
+    memoryTokens: estimateTokens(message.text),
+    ...(memory.brief ? { briefTokens } : {}),
+    observations: ledger.entries.length,
+  }
+  record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
+  if (persistent && installs) void maybeReflect($, loop, life).catch((error) => log($, errorText(error)))
+  // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
+  // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
+  // In the context's own order.
+  return { messages: [message, ...dedupWrappers(maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m)))] }
+}
+
 export const register: Register = (on) => {
   registerPrune(on)
   on('session.compact', async ($, e, next) => {
-    // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
-    // compactor honors them, background observation cannot. Ordinary compaction stays available without them.
-    if (e.instructions?.trim()) {
-      show($, 'Compaction instructions given. Using built-in compaction', e.agentId)
-      return delegateToBuiltin($, e, next, false)
+    try {
+      return await compact($, e, next)
+    } catch (error) {
+      // Once the compaction is abandoned, a throw would run the hooks beneath, the built-in compactor's model call
+      // among them, for a result the dispatch no longer takes; a return runs nothing.
+      if (!next.signal.aborted) throw error
+      const message = errorText(error)
+      log($, message === ABANDONED ? `${ABANDONED}; its chunks are kept, not installed` : `${message}; the compaction was abandoned, so no built-in compaction either`)
+      return { skip: `observational-memory: ${ABANDONED}` }
     }
-    const main = e.agentId === undefined
-    const installs = e.trigger !== 'precompute'
-    const [sessionId, started, usage, recall, environment] = await Promise.all([
-      $.session.id(),
-      $.clock.now(),
-      $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
-      // Not the model's with --disallowed-tools, or when its registration failed; assumed so when the host cannot tell.
-      $.tool.list().then((tools) => tools.some((t) => t.name === RECALL_TOOL_NAME), () => true),
-      environmentOf($),
-    ])
-    const loop = loopOf(sessionId, e.agentId)
-    const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
-    markedRows.delete(loop.key) // its next mark checks the marks against the rows
-    await flushHeld($)
-    // `e.messages` is the live context: the last rows of the loop's history. Anything else (a subagent's history
-    // the session cannot read, or a context that does not match) is compacted with no stored state.
-    const history = await loopHistory($, loop).catch((error) => void log($, `${errorText(error)}; observing its context on the spot`))
-    // The live context with the results an earlier compaction's raw tail cut read whole again, as the history reads them.
-    const live = history ? unmask(e.messages, history) : e.messages
-    const order = callOrder(live)
-    const messages = order.map((i) => live[i]!)
-    const { offset, rows, persistent } = history ? align(messages, history) : { offset: -messages.length, rows: [], persistent: false }
-    // Unmatched but lined up row for row (see linesUp), the ledger is checked against the history's rows, which it was
-    // built from, and observed, timed and cut over them; only the raw tail is the context's. Otherwise unmatched, it is
-    // checked against the context: one row under the watermark that differs restarts it (see `reconcile`), and each
-    // chunk past the watermark is found where its rows read the same.
-    const lined = history !== undefined && !persistent && linesUp(messages, rows, offset)
-    const v = view(lined ? rows.slice(offset, offset + messages.length) : messages, await loadMarks($, loop), persistent || lined ? offset : undefined)
-    const base = v.base
-    const initial = await locked(() => loadLedger($, loop.key, v))
-    if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)
-    const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
-    // What the raw tail from `cut` takes in the compacted context, its old results cut (maskTail).
-    const tailTokens = (cut: number) => maskTail(messages.slice(cut)).reduce((n, m) => n + estimateTokens(rowText(m)), 0)
-
-    // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
-    // observed is observed now, in chunks, all at once. A chunk pi fails on stays raw: the cut is wherever the rest
-    // reaches, and with nothing observed at all the floor compiles a brief of the rest (see `build`).
-    const chunks: Chunk[] = []
-    const failures: { rows: number; why: string }[] = [] // shown once the compaction stands: a fallback says so instead
-    let sync = { calls: 0, ms: 0 }
-    let deadlineHit = false
-    const start = tailStart(v, base)
-    if (!fits(initial.watermark.to) && start > initial.watermark.to) {
-      // The loop's background calls in flight cover their rows: they are waited on, not made again.
-      const inFlight = running.flatMap((job) => {
-        const at = job.loop.key === loop.key && job.stamp === life ? locate(v, job.range, initial.watermark.to) : undefined
-        return at ? [{ job, at }] : []
-      })
-      const gaps: [number, number][] = []
-      let from = initial.watermark.to
-      for (const c of [...initial.chunks, ...inFlight.map((f) => f.at), { from: start, to: start }].sort((a, b) => a.from - b.from)) {
-        for (let to; from < Math.min(c.from, start); from = to) gaps.push([from, (to = chunkEnd(v, from, Math.min(c.from, start), false)!)])
-        from = Math.max(from, c.to)
-      }
-      // Every call, and the wait on those in flight, ends by the deadline or when the compaction is abandoned: the
-      // calls still running are killed, and their rows left unobserved as a failed chunk's.
-      const deadline = new AbortController()
-      const signal = AbortSignal.any([deadline.signal, next.signal])
-      const stopped = signal.aborted ? Promise.resolve(undefined) : new Promise<undefined>((r) => signal.addEventListener('abort', () => r(undefined), { once: true }))
-      // A chunk that failed fast (a bad reply, a pi error) is observed again once: a chunk left raw holds back every
-      // chunk after it. A timeout is not, as it would hold the compaction for another timeout; nor is one with less
-      // time left than a call takes, nor an unreadable history's, which gets one round of calls.
-      let retries = 0
-      const once = (from: number, to: number) => {
-        const before = beforeRows(initial, from)
-        return observe($, v, from, to, 'compaction', before, signal).catch(async (error) => {
-          if (!history || signal.aborted || failureClass(errorText(error)) === 'timeout') throw error
-          if ((await $.clock.now()) - syncStarted > COMPACTION_DEADLINE_MS - OBSERVER_CALL_MS) throw error
-          retries++
-          log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
-          return observe($, v, from, to, 'compaction', before, signal)
-        })
-      }
-      const syncStarted = await $.clock.now()
-      if (!isLive(loop, life)) throw new LoopEnded()
-      const timer = $.clock.after(COMPACTION_DEADLINE_MS, () => deadline.abort(new Error(DEADLINE_PASSED)))
-      const [settled, waited] = await Promise.all([
-        Promise.allSettled(gaps.map(([from, to]) => once(from, to))),
-        Promise.all(inFlight.map((f) => Promise.race([f.job.landed, stopped]))),
-      ])
-      timer.cancel()
-      deadlineHit = deadline.signal.aborted
-      sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - syncStarted }
-      settled.forEach((r, i) => {
-        if (r.status === 'fulfilled') return void (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length))
-        log($, `observation of rows ${gaps[i]![0]}-${gaps[i]![1]} at compaction failed (${errorText(r.reason)}); left unobserved`)
-        failures.push({ rows: gaps[i]![1] - gaps[i]![0], why: reason(r.reason, OBSERVER_TIMEOUT_MS) })
-      })
-      // A background call that failed says so itself; one still running is cut off here, its rows left unobserved.
-      waited.forEach((landed, i) => {
-        if (landed !== undefined) return
-        const { at } = inFlight[i]!
-        log($, `background observation of rows ${at.from}-${at.to} was still running at compaction (${errorText(signal.reason)}); left unobserved`)
-        failures.push({ rows: at.to - at.from, why: reason(signal.reason, OBSERVER_TIMEOUT_MS) })
-      })
-    }
-    const priorMemory = base ? parseMemory(messages[0]!) : undefined
-    const prior = priorMemory?.skills ?? []
-    // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
-    const recorded = main ? (((await $.store.get(skillsKey(sessionId))) as Skill[] | undefined) ?? []) : []
-    const goal = main ? (((await $.store.get(goalKey(sessionId))) as Goal | undefined)?.line ?? priorMemory?.session) : undefined
-    const turns = main ? await loadTurns($, sessionId) : undefined
-    const known = mergeSkills(prior, recorded)
-    // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
-    const prompts = messages.flatMap((m, i) => {
-      const text = i < base ? undefined : typed(m, known)
-      return text === undefined ? [] : [{ i, message: { ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text } }]
-    })
-    // The reply ending each turn: the last assistant text before the next prompt, from rows past the memory message.
-    const replyRows = prompts.flatMap((p, k) => {
-      const lo = k ? prompts[k - 1]!.i : base - 1
-      for (let j = p.i - 1; j > lo; j--) {
-        const m = messages[j]!
-        if (m.role === 'assistant' && m.text.trim()) return [{ i: j, message: { ...(v.at[j] === undefined ? {} : { at: stamp(v.at[j]!) }), text: m.text.trim() } }]
-      }
-      return []
-    })
-    // An omitted-count line stands for dropped prompts, never for the latest one.
-    // A prompt cut to its note alone quotes nothing.
-    const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
-    // A subagent's memory names no file, but om_recall reaches its thread through the session's.
-    const transcriptPath = (await $.store.get(transcriptKey(sessionId))) as string | undefined
-    const transcript = main ? transcriptPath : undefined
-    // The compacted context fits half the room the overhead leaves below the point auto-compaction runs at, so the
-    // session can work before compacting again. The session's figures are its main model's: a subagent's model may
-    // have a smaller window. The overhead grows by what the breakdown lists beside the system prompt and built-in tools.
-    // Dense text (code, other scripts) takes more tokens than its characters estimate: the last response's measure,
-    // less the overhead, over the estimate of the same messages scales the raw tail's up, never down.
-    const breakdown = usage?.context.breakdown
-    const limit = breakdown?.autoCompactThreshold ?? breakdown?.rawMaxTokens ?? usage?.context.window ?? WINDOW_TOKENS
-    const listed = [...(breakdown?.mcpTools.filter((t) => t.isLoaded) ?? []), ...(breakdown?.memoryFiles ?? []), ...(breakdown?.agents ?? []), breakdown?.skills, breakdown?.slashCommands]
-    const overhead = OVERHEAD_TOKENS + listed.reduce((n, l) => n + (l?.tokens ?? 0), 0)
-    const budget = Math.floor(((main ? limit : Math.min(limit, WINDOW_TOKENS)) - overhead) / 2)
-    const measured = main ? usage?.context.tokens : undefined
-    const density = measured === undefined ? 1 : Math.max(1, (measured - overhead) / Math.max(1, tokensBetween(v, 0, messages.length)))
-
-    // Rows [from, to) as the session brief compiles them, each line with its om_recall reference when the model can
-    // read it: the transcript file, the session's directory and home are read once, and only when a brief is compiled.
-    let corpus: Promise<Awaited<ReturnType<typeof loadTranscript>> | undefined> | undefined
-    let dirs: Promise<[string, string | undefined]> | undefined
-    const compile = async (from: number, to: number) => {
-      const rows = messages.slice(from, to)
-      let refOf
-      if (recall && transcriptPath) {
-        corpus ??= loadTranscript(recallIo($), transcriptPath).catch((error) => void log($, `could not read the transcript for the brief's references (${errorText(error)})`))
-        const c = await corpus
-        refOf = c && (await refsOf(c, rows, e.agentId).catch(() => undefined))
-      }
-      dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
-      const [cwd, home] = await dirs
-      return compileBrief(rows, v.at.slice(from, to), cwd, home, refOf)
-    }
-
-    // The memory message from the ledger once this compaction's chunks commit: cut at the watermark, as observed.
-    // Where that cannot stand (nothing observed, the Observer failed, or over the budget), the floor: the same memory
-    // with the raw tail cut later, the rows between the watermark and the cut compiled by code into the session brief.
-    // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for a context that
-    // is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
-    // `kept`: the ledger is stored with the memory message, so a line the message leaves out (see unsaid) comes back.
-    const build = async (ledger: Ledger, kept: boolean) => {
-      const observed = ledger.watermark.to
-      const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
-      const attempt = async (cut: number, floor: boolean) => {
-        const tail = messages.slice(cut)
-        // The brief carried from the memory message, with the rows leaving context merged in: those the floor
-        // compiles. A brief is carried even where the Observer's memory stands again: it holds rows the Observer never
-        // observed, which no observation covers.
-        const from = floor ? observed : cut
-        const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
-        dirs ??= Promise.all([$.session.cwd().catch(() => '/'), $.env.get('HOME').then((h) => h ?? undefined, () => undefined)])
-        const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs))
-        let memory: Memory = {
-          corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
-            estimateTokens(renderCorrections(l)),
-          ),
-          observations: renderGrouped(ledger.entries),
-          currentTask: ledger.currentTask,
-          ...(goal ? { session: goal } : {}),
-          ...(covered ? { stateAt: stamp(covered.to) } : {}),
-          skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
-          userMessages: capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)]),
-          // The session's first prompt, a crewmate's whole brief, is quoted above; quoted again as the latest request it
-          // would send the agent back to the top of its brief.
-          // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
-          nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
-          ...(environment ? { environment } : {}),
-          ...(failures.length ? { failures } : {}),
-          ...(brief ? { brief } : {}),
-          ...(floor ? { floor } : {}),
-          transcript,
-          recoverable: transcriptPath !== undefined,
-          recall,
-          recentKept: tail.length > 0,
-          resumeDirectly: e.trigger === 'auto',
-        }
-        // The compacted context: the memory message with its margin, and the raw tail at its density.
-        const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
-        // The replies fill what room is left below REPLIES_ROOM_TOKENS, at most REPLIES_MAX_TOKENS.
-        const room = REPLIES_ROOM_TOKENS - contextTokens(memoryMessage(memory))
-        memory.replies = capReplies([...(priorMemory?.replies ?? []), ...replyRows.filter((r) => r.i < cut).map((r) => r.message)], Math.min(REPLIES_MAX_TOKENS, Math.floor(room / MEMORY_HEADROOM)))
-        // The observations as shown beside the replies: where the ledger keeps every line, one quoting a reply is left out.
-        let sources = true
-        const shown = (m: Memory): Memory => ({ ...m, observations: renderGrouped(kept ? unsaid(ledger.entries, m.replies) : ledger.entries, sources) })
-        memory = shown(memory)
-        let message = memoryMessage(memory)
-        // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
-        // compaction), then the skills become lines and the user messages the brief alone, which om_recall can still
-        // find; the corrections (within their cap), observations and continuation record stay whole.
-        const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(briefer(m))]]
-        if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
-        const over = contextTokens(message)
-        let tokens = over
-        const made: string[] = []
-        for (const [what, shorten] of cuts) {
-          if (tokens <= budget) break
-          memory = shorten(memory)
-          message = memoryMessage(memory)
-          tokens = contextTokens(message)
-          made.push(what)
-        }
-        return { ledger, cut, memory, message, tokens, over, made, floor, briefed: floor ? cut - observed : 0 } // rows the Observer had not observed
-      }
-      const stands = (a: Awaited<ReturnType<typeof attempt>>) => {
-        if (a.made.length) log($, `over the ~${budget}-token budget at ~${a.over} tokens: ${a.made.join('; ')}`)
-        return a
-      }
-      let last
-      if (observed > base && (last = await attempt(observed, false)).tokens <= budget) return stands(last)
-      for (const cut of floorCuts(v, observed)) if ((last = await attempt(cut, true)).tokens <= budget) return stands(last)
-      if (!last) throw new Error(MEMORY_ALONE)
-      throw new Error(overLimit(OVER_BUDGET, last.tokens, budget))
-    }
-    // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
-    // message that stands; once installed, the watermark restarts after the memory message, and the chunks past
-    // it are found again there. One that does not stand leaves the chunks committed, not installed.
-    // An abandoned compaction's memory never enters the context: its chunks are stored committed, not installed.
-    const settle = async (l: Ledger) => {
-      const ledger = commit({ ...l, chunks: [...l.chunks, ...chunks] }, v)
-      // The rows this compaction's own chunks committed: not one left waiting behind a gap, nor one landed before it.
-      const observedNow = chunks.reduce((n, c) => n + (c.from >= l.watermark.to && c.to <= ledger.watermark.to ? c.to - c.from : 0), 0)
-      const stores = persistent && ledger.watermark.to > base && isLive(loop, life) // under the lock, as a loop's end deletes
-      let built
-      try {
-        built = await build(ledger, stores && installs)
-      } catch (error) {
-        if (stores && chunks.length) await $.store.set(ledgerKey(loop.key), ledger)
-        throw error
-      }
-      const abandoned = next.signal.aborted
-      if (stores && (!installs || abandoned)) await $.store.set(ledgerKey(loop.key), ledger)
-      if (abandoned) throw new Error(ABANDONED)
-      if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
-      return { ...built, observedNow }
-    }
-    const { ledger, cut, memory, message, floor, briefed, observedNow } = await locked(async () => settle(await loadLedger($, loop.key, v)))
-    // Failed rows the floor compiled into the brief are not kept.
-    for (const f of failures) show($, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
-    const kept = new Set(order.slice(cut))
-    const observed = ledger.watermark.to
-    // Why the floor ran, as `build` found it.
-    const why = observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : 'nothing was observed yet'
-    const briefTokens = memory.brief ? estimateTokens(renderBrief(memory.brief, memory.recall)) : 0
-    log(
-      $,
-      (observedNow ? `observed ${observedNow} rows now, ` : floor ? '' : 'cut at the background watermark with no Observer call, ') +
-        (floor ? `the floor (${why}): ${briefed} rows compiled into the session brief, ` : '') +
-        `kept ${messages.length - cut} raw messages (~${tailTokens(cut)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
-        `${ledger.entries.length} observations, ${memory.skills.length} skill(s)${memory.brief ? `, brief ~${briefTokens} tokens` : ''}`,
-    )
-    show(
-      $,
-      `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
-        `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}` +
-        (floor ? ` · ${plural(briefed, 'message')} in a brief compiled by code (${why})` : ''),
-      e.agentId,
-    )
-    const compaction = {
-      trigger: main ? e.trigger : 'subagent',
-      fellBack: false,
-      floor,
-      tokensBefore: main ? usage?.context.tokens : undefined, // the last response's input: system prompt and tools included
-      estTokensAfter: estimateTokens(message.text) + tailTokens(cut), // messages only
-      syncCalls: sync.calls,
-      syncMs: sync.ms,
-      rowsObservedNow: observedNow,
-      rowsObservedBefore: observed - base - observedNow,
-      ...(deadlineHit ? { deadlineHit } : {}),
-      ...(history ? {} : { unreadable: true }), // a history the session cannot read: a workflow agent's, a fork's
-      ...(briefed ? { rowsBriefed: briefed } : {}),
-      memoryTokens: estimateTokens(message.text),
-      ...(memory.brief ? { briefTokens } : {}),
-      observations: ledger.entries.length,
-    }
-    record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
-    if (persistent && installs) void maybeReflect($, loop, life).catch((error) => log($, errorText(error)))
-    // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
-    // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
-    // In the context's own order.
-    return { messages: [message, ...dedupWrappers(maskTail(live.filter((_, i) => kept.has(i)).map(({ handle: _, ...m }) => m)))] }
   }).catch(async ($, e, next) => {
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
-    if (next.error.message === ABANDONED) return log($, `${ABANDONED}; its chunks are kept, not installed`), { skip: `observational-memory: ${ABANDONED}` }
     log($, `${next.error.message}; using the built-in compaction`)
     const message = next.error.message ?? ''
     const why = message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
