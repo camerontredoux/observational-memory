@@ -4,7 +4,7 @@ import { add, addCompaction, clipLine, count, addLuna, addRecall, addReflection,
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
-import type { RecallInput, RecallIo, TranscriptCache } from './recall'
+import type { RecallIo, TranscriptCache } from './recall'
 import { compileBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
   applyConstraints,
@@ -35,13 +35,6 @@ import {
   WHERE,
 } from './memory'
 import type { Bounds, Entry, Memory, Skill, Source, Unmarked, UserMessage } from './memory'
-
-declare module 'claude-code' {
-  interface McpToolInputs {
-    'mcp__observational-memory__om_recall': RecallInput
-    'mcp__observational-memory__om_stats': { scope?: 'session' | 'all'; sessionId?: string; since?: string; full?: boolean }
-  }
-}
 
 // Every model call: pi with GPT-5.6 Luna, the prompt on stdin, run from a neutral directory.
 const PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low']

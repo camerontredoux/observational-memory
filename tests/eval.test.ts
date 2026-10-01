@@ -336,7 +336,7 @@ function world(on: On, sessionId: string | (() => string)) {
     return { value: files[e.path]! }
   })
   on('fs.write', ($, e) => ((files[e.path] = e.text), { value: undefined }))
-  on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, isLink: false })) }))
+  on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, mtimeMs: 0, isLink: false })) }))
   on('fs.stat', ($, e) => {
     if (!(e.path in files)) throw new Error(`ENOENT: ${e.path}`)
     return { value: { kind: 'file' as const, size: files[e.path]!.length, mtimeMs: 0, isLink: false } }
@@ -351,7 +351,7 @@ function world(on: On, sessionId: string | (() => string)) {
 // git, which reads the environment at compaction, as outside a repository.
 function pi(on: On) {
   const seen = { prompts: [] as string[], logs: [] as string[] }
-  on('process.run', (): { value: ProcessRunResult } => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } }))
+  on('process.run', (): { value: ProcessRunResult } => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('process.spawn', async function* ($, e, next) {
     if (e.argv[0] !== 'pi') return yield* next(e)
     const prompt = e.input ?? ''

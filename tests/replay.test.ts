@@ -191,7 +191,7 @@ describe('the om chain through hooks/register.ts', () => {
     })
     on('skill.prompt', ($, e) => ({ text: e.text }))
     const observed: string[][] = []
-    on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' } })) // git, outside a repository
+    on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n', isStdoutTruncated: false, isStderrTruncated: false } })) // git, outside a repository
     on('process.spawn', async function* ($, e, next) {
       if (e.argv[0] !== 'pi') return yield* next(e)
       const prompt = e.input ?? ''

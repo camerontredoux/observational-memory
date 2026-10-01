@@ -7,13 +7,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 import { COMPACT_WRAPPER } from './prompts'
 import { liveTranscript, loadTranscript, recall, SEARCH_MAX_HITS } from './recall'
-import type { RecallInput, RecallIo } from './recall'
-
-declare module 'claude-code' {
-  interface McpToolInputs {
-    'mcp__observational-memory__om_recall': RecallInput
-  }
-}
+import type { RecallIo } from './recall'
 
 const transcriptKey = (sessionId: string) => `transcript:${sessionId}`
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))

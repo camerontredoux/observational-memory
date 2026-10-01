@@ -106,7 +106,7 @@ function world(
     if (options.failWrites) throw new Error('EACCES: permission denied')
     return (files[e.path] = e.text), { value: undefined }
   })
-  on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, isLink: false })) }))
+  on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, mtimeMs: 0, isLink: false })) }))
   on('fs.stat', ($, e) => {
     if (!(e.path in files)) throw new Error(`ENOENT: ${e.path}`)
     return { value: { kind: 'file' as const, size: files[e.path]!.length, mtimeMs: 0, isLink: false } }
@@ -121,7 +121,11 @@ type Ledger = { entries: { id: string; line: string; source?: { from: number; to
 type PiCall = { argv: readonly string[]; cwd?: string }
 
 // git outside a repository, as the plugin's environment read meets it by default.
-const NOT_A_REPO: ProcessRunResult = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
+// pi's or git's exit code and output, as a fake answers them; `ran` adds what `$.process.run` also reports.
+type Run = Pick<ProcessRunResult, 'exitCode' | 'stdout' | 'stderr'>
+const ran = (r: Run): ProcessRunResult => ({ ...r, isStdoutTruncated: false, isStderrTruncated: false })
+
+const NOT_A_REPO: Run = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
 
 // pi on the host, as `$.process.spawn` runs it: it observes by naming the prompts of its chunk, each at the time
 // its block shows; the reflector answers `reflect(n, prompt)` for its nth call, by default a reflection near its target. `hold` delays the nth call's answer, `fail`
@@ -132,18 +136,18 @@ function pi(
   on: On,
   options: {
     hold?: (n: number, prompt: string) => Promise<void> | undefined
-    fail?: (n: number, prompt: string) => ProcessRunResult | undefined
+    fail?: (n: number, prompt: string) => Run | undefined
     reflect?: (n: number, prompt: string) => string
     reply?: (prompt: string) => string | undefined
-    git?: (argv: readonly string[]) => ProcessRunResult | undefined
-    session?: (prompt: string) => string | ProcessRunResult
+    git?: (argv: readonly string[]) => Run | undefined
+    session?: (prompt: string) => string | Run
   } = {},
 ) {
   const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[] }
   let reflections = 0
   on('process.run', ($, e) => {
-    if (e.argv[0] !== 'git') return { value: { exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` } }
-    return seen.git.push(e.argv), { value: options.git?.(e.argv) ?? NOT_A_REPO }
+    if (e.argv[0] !== 'git') return { value: ran({ exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` }) }
+    return seen.git.push(e.argv), { value: ran(options.git?.(e.argv) ?? NOT_A_REPO) }
   })
   // What pi prints comes in pieces, the middle of a line ending one, as a child writes it. A call killed while held
   // stops holding at once.
@@ -162,7 +166,7 @@ function pi(
       if (!answered) seen.stopped++
     }
   })
-  async function answer(argv: readonly string[], cwd: string | undefined, prompt: string, killed: Promise<never>): Promise<ProcessRunResult> {
+  async function answer(argv: readonly string[], cwd: string | undefined, prompt: string, killed: Promise<never>): Promise<Run> {
     if (argv[argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT) {
       seen.sessions.push(prompt)
       const r = options.session?.(prompt) ?? 'Session: the test goal'
@@ -2504,7 +2508,7 @@ describe('register', () => {
     text: 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. Primary Request and Intent: read the files.',
     toolUses: [],
   }
-  const overloaded = (): ProcessRunResult => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' })
+  const overloaded = (): Run => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' })
   // A context window too small for any memory while `tiny()`: with the Observer failing too, the floor's brief is over
   // the budget at every cut, and the built-in compaction runs. Otherwise the host gives no usage: the default budget.
   const window = (on: On, tiny: () => boolean) =>
@@ -3403,7 +3407,7 @@ describe('register', () => {
       argvs.push(e.argv)
       const pattern = e.argv[2]!
       const hit = e.argv.slice(4).filter((p) => files[p]?.includes(pattern))
-      return { value: { exitCode: hit.length ? 0 : 1, stdout: hit.map((p) => `${p}\n`).join(''), stderr: '' } }
+      return { value: ran({ exitCode: hit.length ? 0 : 1, stdout: hit.map((p) => `${p}\n`).join(''), stderr: '' }) }
     })
 
     await $.classic.Stop({ session_id: 'session-1', transcript_path: `/t/${NEW}.jsonl`, stop_hook_active: false })
@@ -4673,7 +4677,7 @@ describe('the floor', () => {
 describe('the handoff', () => {
   const CORE = "# Context management\nWhen the conversation grows long, some or all of the current context is summarized; the summary, along with any remaining unsummarized context, is provided in the next context window so work can continue — you don't need to wrap up early or hand off mid-task."
   // git as a repository with `changed` files uncommitted: a status whose first line names the branch, and HEAD.
-  const repo = (changed: string[]) => (argv: readonly string[]): ProcessRunResult | undefined =>
+  const repo = (changed: string[]) => (argv: readonly string[]): Run | undefined =>
     argv.includes('status')
       ? { exitCode: 0, stdout: ['## issue-15...origin/issue-15 [ahead 2]', ...changed, ''].join('\n'), stderr: '' }
       : argv.includes('log')
@@ -4801,7 +4805,7 @@ describe('the handoff', () => {
   test('outside a git repository, or when git fails, the record has no environment and compaction goes on', async ($, on) => {
     mock.clock(on)
     world(on)
-    let git: (argv: readonly string[]) => ProcessRunResult | undefined = () => undefined // outside a repository
+    let git: (argv: readonly string[]) => Run | undefined = () => undefined // outside a repository
     pi(on, { reply: constraining({}, { two: 'Active: a' }), git: (argv) => git(argv) })
     const messages = [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)]
 

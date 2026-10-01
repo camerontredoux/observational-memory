@@ -36,7 +36,7 @@ function world(
     if (o.listFails) throw new Error('EACCES')
     if (e.path === '/home/u/.claude/sessions') o.onList?.(++lists)
     if (!dirs().has(e.path)) throw new Error(`ENOENT: ${e.path}`)
-    return { value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`) && !p.slice(e.path.length + 1).includes('/')).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, isLink: false })) }
+    return { value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`) && !p.slice(e.path.length + 1).includes('/')).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, mtimeMs: 0, isLink: false })) }
   })
   on('fs.read', ($, e) => {
     if (!(e.path in files)) throw new Error(`ENOENT: ${e.path}`)
