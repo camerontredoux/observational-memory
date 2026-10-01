@@ -1728,12 +1728,15 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
   // observed is observed now, in chunks, all at once. A chunk pi fails on stays raw: the cut is wherever the rest
   // reaches, and with nothing observed at all the floor compiles a brief of the rest (see `build`).
+  // A manual compaction with nothing observed since the last one, and less before the raw tail than the whole chunk
+  // the background waits for, observes nothing: the person waits on it, so the floor's brief stands for those rows.
   const chunks: Chunk[] = []
   const failures: { rows: number; why: string }[] = [] // shown once the compaction stands: a fallback says so instead
   let sync = { calls: 0, ms: 0 }
   let deadlineHit = false
   const start = tailStart(v, base)
-  if (!fits(initial.watermark.to) && start > initial.watermark.to) {
+  const briefOnly = main && e.trigger === 'manual' && initial.watermark.to === base && chunkEnd(v, base, start, true) === undefined
+  if (!briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to) {
     // The loop's background calls in flight cover their rows: they are waited on, not made again.
     const inFlight = running.flatMap((job) => {
       const at = job.loop.key === loop.key && job.stamp === life ? locate(v, job.range, initial.watermark.to) : undefined
@@ -1946,7 +1949,8 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const kept = new Set(order.slice(cut))
   const observed = ledger.watermark.to
   // Why the floor ran, as `build` found it.
-  const why = observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : 'nothing was observed yet'
+  const why =
+    observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : briefOnly && start > base ? 'too little to observe yet' : 'nothing was observed yet'
   const briefTokens = memory.brief ? estimateTokens(renderBrief(memory.brief, memory.recall)) : 0
   log(
     $,

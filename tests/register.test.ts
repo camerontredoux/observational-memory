@@ -4621,6 +4621,58 @@ describe('the floor', () => {
     expect(stats.metrics['compaction.manual.briefTokens']!.sum).toBeGreaterThan(0)
   })
 
+  // A manual /compact soon after the last compaction: less than the whole chunk the background waits for lies before
+  // the raw tail, so nothing was observed. The person waits on a manual compaction; an auto one observes as before.
+  const SHORT = [...turn('a', 'a', 16_000), ...turn('b', 'b', 16_000)] // ~4k tokens before the raw tail, which starts at row 3
+
+  test('a manual compaction with less than a chunk unobserved briefs it by code, with no Observer call', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    const seen = pi(on)
+
+    const result = await $.session.compact({ trigger: 'manual', messages: SHORT })
+    await clock.advance(5_000)
+
+    expect(seen.prompts).toEqual([])
+    expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
+    expect(result.messages?.slice(1)).toEqual(SHORT.slice(3))
+    expect(seen.screen).toEqual(['Compacted in 0 ms · memory 0 notes · 3 messages in a brief compiled by code (too little to observe yet)'])
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
+    expect(stats.counts['compaction.manual.floor']).toBe(1)
+    expect(stats.metrics['compaction.manual.syncCalls']!.sum).toBe(0)
+  })
+
+  test('an auto compaction with less than a chunk unobserved still observes it on the spot', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+
+    const result = await $.session.compact({ trigger: 'auto', messages: SHORT })
+
+    expect(seen.prompts).toHaveLength(1)
+    expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
+    expect(briefIn(result.messages![0]!.text)).toBeUndefined()
+  })
+
+  test('a manual compaction with background observations since the last one cuts at the watermark, as before', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on)
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
+    await clock.settle() // [0, 4) observed
+    await runTurn($, turn('c', 'c', 100), at(22, 15, 1))
+    const before = seen.prompts.length
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(seen.prompts).toHaveLength(before)
+    expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
+    expect(briefIn(result.messages![0]!.text)).toBeUndefined()
+    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+  })
+
   test('a context that is the memory message alone leaves the floor nothing to compile: the built-in compaction runs, saying why', async ($, on) => {
     mock.clock(on)
     world(on)
