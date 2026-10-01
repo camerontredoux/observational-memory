@@ -250,6 +250,9 @@ async function om(o: Options) {
   let timers = 0
   type Pending = { due: number; result: Promise<PiResult>; resolve: (v: PiResult) => void }
   const pending: Pending[] = []
+  // The timers set with a delay (pi's timeout, the compaction's deadline, the delayed store writes), on the virtual clock.
+  type Timer = { due: number; fn: () => void }
+  const delayed: Timer[] = []
   const calls: Call[] = []
   let compacting = false
   // Each reflection, caught where the ledger is stored with observations gone, and the compactions run by then.
@@ -337,11 +340,12 @@ async function om(o: Options) {
     clock: {
       now: async () => now,
       after: (ms: number, fn: () => void) => {
-        // after(0) is OM's way off the hook's path: counted, so a drain waits for it. The stats file's write delay
-        // runs on real time and is flushed at the end.
+        // after(0) is OM's way off the hook's path: counted, so a drain waits for it. A delay fires when the virtual
+        // clock reaches it (advance, compact).
         if (ms > 0) {
-          const h = setTimeout(fn, 10)
-          return { cancel: () => clearTimeout(h) }
+          const timer = { due: now + ms, fn }
+          delayed.push(timer)
+          return { cancel: () => void (delayed.includes(timer) && delayed.splice(delayed.indexOf(timer), 1)) }
         }
         timers++
         let live = true
@@ -374,30 +378,40 @@ async function om(o: Options) {
       },
     },
     process: {
-      run: (argv: string[], init: { cwd?: string; stdin?: string } = {}) => {
-        if (argv[0] !== 'pi') return Promise.reject(new Error(`the replay runs pi alone, not ${argv[0]}`))
-        const stdin = init.stdin ?? ''
-        const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : 'observer'
-        const level = kind === 'reflector' ? LEVELS.findLastIndex((l) => stdin.includes(`\n${l}\n`)) + 1 : 0
-        const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
-        calls.push(call)
-        const result = runPi(argv, stdin, init, kind).then(
-          ({ r, hit, realMs }) => {
-            const m = piMessage(r.stdout)
-            Object.assign(call, { hit, realMs, ok: r.exitCode === 0 && !!m, in: m?.usage?.input ?? 0, out: m?.usage?.output ?? 0, cost: m?.usage?.cost?.total ?? 0 })
-            // The Reflector's reply as it came back, for reading what it kept.
-            if (kind === 'reflector') writeFileSync(`${out}/reflector-${calls.indexOf(call) + 1}-level-${level}.txt`, m ? m.content.map((b: { text?: string }) => b.text ?? '').join('') : `(exit ${r.exitCode}) ${r.stderr}`)
-            return r
-          },
-          (error: Error) => ({ exitCode: 1, stdout: '', stderr: error.message }),
-        )
-        return new Promise<PiResult>((resolve) => pending.push({ due: now + (kind === 'reflector' ? REFLECTOR_MS : OBSERVER_MS), result, resolve }))
-      },
-      spawn: () => {
-        throw new Error('the replay spawns nothing')
+      // `run` for a build before pi went through `spawn`.
+      run: (argv: string[], init: { cwd?: string; stdin?: string } = {}) => start(argv, init.stdin ?? '', init),
+      // The reply in one piece per stream once its call lands. A run the plugin leaves early lands all the same.
+      spawn: (request: { argv: string[]; cwd?: string; input?: string }) => {
+        const landed = start(request.argv, request.input ?? '', request)
+        landed.catch(() => {})
+        return (async function* () {
+          const r = await landed
+          if (r.stdout) yield { stream: 'stdout', text: r.stdout }
+          if (r.stderr) yield { stream: 'stderr', text: r.stderr }
+          return { code: r.exitCode, signal: null }
+        })()
       },
     },
     ui: { invalidate: () => {} },
+  }
+  // One pi call, landing after its kind's fixed latency on the virtual clock.
+  function start(argv: string[], stdin: string, init: { cwd?: string }) {
+    if (argv[0] !== 'pi') return Promise.reject(new Error(`the replay runs pi alone, not ${argv[0]}`))
+    const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : 'observer'
+    const level = kind === 'reflector' ? LEVELS.findLastIndex((l) => stdin.includes(`\n${l}\n`)) + 1 : 0
+    const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
+    calls.push(call)
+    const result = runPi(argv, stdin, init, kind).then(
+      ({ r, hit, realMs }) => {
+        const m = piMessage(r.stdout)
+        Object.assign(call, { hit, realMs, ok: r.exitCode === 0 && !!m, in: m?.usage?.input ?? 0, out: m?.usage?.output ?? 0, cost: m?.usage?.cost?.total ?? 0 })
+        // The Reflector's reply as it came back, for reading what it kept.
+        if (kind === 'reflector') writeFileSync(`${out}/reflector-${calls.indexOf(call) + 1}-level-${level}.txt`, m ? m.content.map((b: { text?: string }) => b.text ?? '').join('') : `(exit ${r.exitCode}) ${r.stderr}`)
+        return r
+      },
+      (error: Error) => ({ exitCode: 1, stdout: '', stderr: error.message }),
+    )
+    return new Promise<PiResult>((resolve) => pending.push({ due: now + (kind === 'reflector' ? REFLECTOR_MS : OBSERVER_MS), result, resolve }))
   }
   $.ui.log = (text: any, opts?: any) => {
     const line = typeof text === 'string' ? text : text.text
@@ -423,17 +437,27 @@ async function om(o: Options) {
       quiet = timers === 0 ? quiet + 1 : 0
     }
   }
-  // Moves the clock to `to`, landing each pi call due by then in order, OM's work after each one drained.
+  // What is due next by `to`: a pi call or a delayed timer, the pi call first when both are due at once.
+  function nextDue(to: number) {
+    const call = pending.filter((p) => p.due <= to).sort((a, b) => a.due - b.due)[0]
+    const timer = delayed.filter((d) => d.due <= to).sort((a, b) => a.due - b.due)[0]
+    return call && (!timer || call.due <= timer.due) ? call : timer
+  }
+  async function land(next: Pending | Timer) {
+    now = Math.max(now, next.due)
+    if ('fn' in next) {
+      delayed.splice(delayed.indexOf(next), 1)
+      next.fn()
+    } else {
+      pending.splice(pending.indexOf(next), 1)
+      next.resolve(await next.result)
+    }
+  }
+  // Moves the clock to `to`, landing each pi call and firing each timer due by then in order, OM's work after each
+  // one drained.
   async function advance(to: number) {
     await drain()
-    for (;;) {
-      const next = pending.filter((p) => p.due <= to).sort((a, b) => a.due - b.due)[0]
-      if (!next) break
-      pending.splice(pending.indexOf(next), 1)
-      now = Math.max(now, next.due)
-      next.resolve(await next.result)
-      await drain()
-    }
+    for (let next; (next = nextDue(to)); await drain()) await land(next)
     now = Math.max(now, to)
   }
   // The compaction, and its fallback: with no built-in compaction to fall back to, a fallback is an error; with
@@ -444,14 +468,19 @@ async function om(o: Options) {
     compacting = true
     let done = false
     const input = { trigger: 'auto', messages: [...live] }
-    const builtin = async () => {
-      throw new Error('the built-in compaction (a fallback) is not replayed')
-    }
+    // A replay never abandons a compaction: its `next.signal` never aborts.
+    const signal = new AbortController().signal
+    const builtin = Object.assign(
+      async () => {
+        throw new Error('the built-in compaction (a fallback) is not replayed')
+      },
+      { signal },
+    )
     const run = (async () => {
       try {
         return await hooks['session.compact']($, input, builtin)
       } catch (error) {
-        const recorded = async () => ({ messages: [{ role: 'user', text: boundary.summary, toolUses: [] }, ...boundary.kept] })
+        const recorded = Object.assign(async () => ({ messages: [{ role: 'user', text: boundary.summary, toolUses: [] }, ...boundary.kept] }), { signal })
         const next = Object.assign(recordedFallback ? recorded : builtin, { called: false, error })
         const fallback = await hooks['session.compact:catch']?.($, input, next)
         if (recordedFallback) {
@@ -462,14 +491,9 @@ async function om(o: Options) {
       }
     })().finally(() => (done = true))
     for (await drain(); !done; await drain()) {
-      const next = pending.sort((a, b) => a.due - b.due)[0]
-      if (!next) {
-        await tick()
-        continue
-      }
-      pending.splice(pending.indexOf(next), 1)
-      now = Math.max(now, next.due)
-      next.resolve(await next.result)
+      const next = nextDue(Infinity)
+      if (next) await land(next)
+      else await tick()
     }
     const r = await run
     compacting = false
@@ -533,7 +557,7 @@ async function om(o: Options) {
   reflections.forEach((r, i) => writeFileSync(`${out}/reflection-${i + 1}.json`, JSON.stringify(r, null, 1)))
   writeFileSync(`${out}/log.txt`, logs.map((l) => `${new Date(l.at).toISOString()} ${l.to ?? ''} ${l.text}`).join('\n'))
   console.log(`[${name}] ${JSON.stringify(summary)}`)
-  // The stats file's delayed write (`clock.after` with a delay) runs on a real timer the plugin may leave armed.
+  // The timers still on the virtual clock never fire.
   process.exit(0)
 }
 
