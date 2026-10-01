@@ -106,7 +106,7 @@ Use precise action verbs.
 Frame state changes as supersession so the old state is explicit.
   GOOD: User will use React Query (switching from SWR).
 
-Split compound statements into separate observations. One observation per independent fact.
+Split unrelated events into separate observations. Keep each event's own details on its line: the value measured, the reason given, the error quoted, the path changed.
 
 Retrieval cues. Keep the details that let the assistant find the original again with om_recall:
 - File/location: full path + line number when relevant (src/auth.ts:45, not "the auth file").
