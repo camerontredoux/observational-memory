@@ -322,7 +322,7 @@ export const SCENARIOS: readonly Scenario[] = [
     // shards.sh prints 200 records (22,836 characters, within Claude Code's inline Bash output limit,
     // bashOutputMaxChars, default 30,000) with checksums from sha256sum, which the allow list does not let the session
     // run. shard-101 sits at characters 11,400-11,513, inside what the plugin cuts from a tool result for the Observer
-    // (excerpt() in hooks/register.ts keeps the first 10,000 and the last ~10,000 characters), so the memory holds it
+    // (excerpt() in hooks/memory.ts keeps the first 10,000 and the last ~10,000 characters), so the memory holds it
     // only if the Observer's excerpt changes; the user never names it before the continuation. A second run refuses
     // and prints no checksum. Each run of logs.sh prints the next ~27,600 characters of worker log (roughly 8k-12k
     // tokens), so 12-19 growth prompts reach a 190k threshold. Sonnet 5 took to redirecting it to a file and printing the last

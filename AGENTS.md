@@ -5,6 +5,7 @@ A Claude Code function-hooks plugin that replaces compaction with observational 
 ### Layout
 
 - `hooks/register.ts` registers every hook. It holds the ledger, the background observation and reflection, and compaction. `hooks/hooks.json` lists the events it handles.
+- `hooks/memory.ts` renders the memory message and reads it back at the next compaction. It also holds the line, source and constraint formats that the memory message shares with the Observer's and Reflector's replies.
 - `hooks/recall.ts` is the `om_recall` tool. `hooks/stats.ts` is `om_stats` and `/om-stats`. `hooks/prune.ts` prunes old sessions from `$.store`.
 - `hooks/prompts.ts` holds the model prompts and the compaction texts. The Observer and Reflector prompts are the plugin's own; edit them there. Its header names the texts copied from other sources. Copy those again from their source rather than editing them.
 - `.claude/types/` holds the plugin API types. Claude Code writes these files. Do not edit them.

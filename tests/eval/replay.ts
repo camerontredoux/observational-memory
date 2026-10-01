@@ -731,7 +731,7 @@ export function tallyQuestions(results: readonly QuestionResult[]): QuestionTall
 
 // ---- Configurations and the dry run's plan ----
 
-/** Characters per token for estimates, as `hooks/register.ts` estimates. */
+/** Characters per token for estimates, as `hooks/memory.ts` estimates. */
 const CHARS_PER_TOKEN = 4
 export const estimateTokens = (text: string) => Math.ceil(text.length / CHARS_PER_TOKEN)
 /** The Observer's chunk, as in `hooks/register.ts`. */

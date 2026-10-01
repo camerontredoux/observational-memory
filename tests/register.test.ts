@@ -207,7 +207,7 @@ function nearTarget(prompt: string, head = '') {
   return `<observations>\n${lines.join('\n')}\n</observations>`
 }
 const isFiller = (line: string) => / filler detail \d+$/.test(line)
-// The size of entries as the memory renders them, each with its source range, as hooks/register.ts estimates it.
+// The size of entries as the memory renders them, each with its source range, as hooks/memory.ts estimates it.
 const stampAt = (ms: number) => stampOf(new Date(ms).toISOString())
 const tokensOf = (entries: readonly { line: string; source?: { from: number; to: number } }[]) =>
   Math.ceil(entries.map((e) => `* ${e.line}${e.source ? ` (source ${stampAt(e.source.from)} to ${stampAt(e.source.to)})` : ''}`).join('\n').length / 4)
