@@ -66,6 +66,29 @@ No mismatch had happened on v1.4.1 yet at 2026-09-25 21:45. Next: after a mismat
 `/om-stats full` or in `~/.claude/plugins/data/observational-memory/stats/<session>.json`, then fix the cause. The
 compaction A/B benchmark cannot test this: its replays never produce a mismatch.
 
+On 2026-10-02 (v1.7.5), 7 subagent compactions in sessions `5ee0282a` and `e6ad9851` kept no notes and blocked 14 to
+24 s. To match a mismatch to its compaction, compare the time of its `compaction.notPersistent.fromEnd` sample with the
+subagent's `compact_boundary` time minus its `durationMs`.
+
+3 of the 7 have a known cause, an engine bug with fork subagents. When subagent `a847200a` started forks `a3fbb496` and
+`a455d07f`, Claude Code wrote the context each fork inherits into the parent's transcript, not into the fork's
+transcript. The parent's transcript got the rows since its last compaction twice (144 rows with repeated uuids). Each
+fork's transcript has only its 6 newest inherited rows, so its first line names a parent row that is not in the file.
+The results:
+
+- The two forks' first compactions found a context longer than the history (`short`), and all rows differed.
+- The parent's next compaction found the copies in the middle of its history: 126 of 272 rows differed.
+
+Other forks in the same sessions got the copy in their own transcript and matched. The plugin cannot fix this
+safely. The inherited rows never reach the fork's history, so the plugin must observe them at compaction in any case.
+
+The other 4 have no known cause: `a24fdd07` twice, `aa87bc4b` and `a509ebbe`. Their transcripts have no repeated rows
+and no missing parent rows. `aa87bc4b` started no other agents. `a24fdd07` failed just after 5 `SendMessage` calls.
+To find the cause, v1.7.6 writes each mismatch to
+`~/.claude/plugins/data/observational-memory/mismatches/<session>-<time>-<n>.json`: each side's rows with their kind,
+a short hash, length, tool names and first 80 characters (`captureMismatch`, tagged `[DEBUG-np01]`). Next: read the
+captures from the next mismatches, fix the cause, then remove everything tagged `[DEBUG-np01]`.
+
 ## Engine bug: the kept raw tail shows twice after a compaction
 
 After the plugin compacts, Claude Code shows the kept raw tail again, after the compaction notice. Auto-compaction
