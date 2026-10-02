@@ -4100,6 +4100,13 @@ describe('register', () => {
     ])
     const file = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
     expect(file.counts['compaction.notPersistent']).toBe(2)
+    // [DEBUG-np01] each mismatch leaves both sides' row shapes beside the stats
+    const dumps = Object.keys(files).filter((k) => k.startsWith('/mismatches/session-1-')).sort()
+    expect(dumps).toHaveLength(2)
+    const dump = JSON.parse(files[dumps[1]!]!) as { trigger: string; offset: number; context: { kind: string; chars: number }[]; history: { kind: string; chars: number }[] }
+    expect(dump).toMatchObject({ trigger: 'auto', offset: 0 })
+    expect(dump.context).toHaveLength(8)
+    expect([dump.context[2], dump.history[2]]).toMatchObject([{ kind: 'result', chars: 34 }, { kind: 'result', chars: 40001 }])
   })
 
   test('a context that differs from the history past the watermark keeps the ledger up to it and counts how it differs', async ($, on) => {
