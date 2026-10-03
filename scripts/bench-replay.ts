@@ -30,7 +30,7 @@
 //   full run would make (om's Observer and Reflector calls, the built-in chain's /compact calls, the question
 //   stage's headless Sonnet sessions) with estimated tokens and cost per configuration. It spends nothing.
 // om: replays the transcript through the checkout's (or --src's) hooks/register.ts with a hand-built `$` on a
-//   virtual clock, and compacts where the session compacted, each compaction on the previous one's output. Observer
+//   virtual clock (its `claude-code` imports from scripts/claude-code-shim.ts), and compacts where the session compacted, each compaction on the previous one's output. Observer
 //   and Reflector calls go to pi through a response cache (<main checkout>/.scratch/om-replay/luna-cache; the earlier prior-art
 //   replay's luna-cache under .scratch/om-vcc is read too when this machine still has it): --pi stub answers every call with
 //   a canned reply built from its prompt (free; checks the chain, not a measurement), --pi strict (the default)
@@ -77,6 +77,8 @@ import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { basename, dirname, resolve } from 'path'
+// First: the hooks' `claude-code` imports resolve to it, not to npm's package of that name.
+import './claude-code-shim'
 import type { SessionMessage } from 'claude-code'
 import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
 import {
@@ -251,6 +253,9 @@ async function om(o: Options) {
   // The chain's history (every row, each compaction's output after the rows it compacted), as the engine shows it.
   let history: readonly SessionMessage[] = []
   const store = new Map<string, string>()
+  // `$.state`, the workers band's values (atom, read and update in scripts/claude-code-shim.ts): in memory, versioned.
+  const state = new Map<string, { value: unknown; version: number }>()
+  const stateKey = (ref: { plugin: string; key: string; id?: string }) => `${ref.plugin}/${ref.key}/${ref.id ?? ''}`
   const logs: { at: number; text: string; to?: string }[] = []
   let timers = 0
   type Pending = { due: number; result: Promise<PiResult>; resolve: (v: PiResult) => void }
@@ -341,6 +346,15 @@ async function om(o: Options) {
       },
       delete: async (k: string) => void store.delete(k),
       keys: async () => [...store.keys()],
+    },
+    state: {
+      get: async (ref: any) => state.get(stateKey(ref)) ?? { value: undefined, version: 0 },
+      set: async (ref: any, value: unknown, opts?: { ifVersion?: number }) => {
+        const version = state.get(stateKey(ref))?.version ?? 0
+        if (opts?.ifVersion !== undefined && opts.ifVersion !== version) return { isSet: false, version }
+        state.set(stateKey(ref), { value, version: version + 1 })
+        return { isSet: true, version: version + 1 }
+      },
     },
     clock: {
       now: async () => now,
