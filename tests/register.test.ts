@@ -3697,7 +3697,7 @@ describe('register', () => {
     expect(tool).toMatch(/1 compaction\(s\), \d+ Luna call\(s\) \(0 failed\)/)
     expect(tool).toMatch(/\| observer\.background\.ms \| 2 \|/)
     files['/stats/other.json'] = JSON.stringify({ version: 1, sessionId: 'other', firstSeen: 0, lastSeen: 0, counts: {}, metrics: { 'observer.background.ms': { count: 1, sum: 5, min: 5, max: 5, recent: [[0, 5]] } } })
-    expect((await $.command.run({ command: 'om-stats', args: 'all', ...COMPOSER })).text).toStartWith('observational-memory · all sessions (2) · ')
+    expect((await $.command.run({ command: 'om-stats', args: 'all', ...COMPOSER })).text).toStartWith('all sessions (2) · ')
     const all = await $.command.run({ command: 'om-stats', args: 'full all', ...COMPOSER })
     expect(all.text).toContain('## observational-memory stats, all sessions')
     expect(all.text).toMatch(/^2 session\(s\)/m)

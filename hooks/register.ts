@@ -2358,7 +2358,8 @@ export const register: Register = (on) => {
   })
 
   on('tool.call', { tool: 'mcp__observational-memory__om_stats' }, async ($, e) => ({ result: await report(statsIo($), e) }))
-  on('command.run', { command: 'om-stats' }, async ($, e) => ({ text: await report(statsIo($), parseArgs(e.args)) }))
+  // The engine puts the plugin's name before a command's output, so the summary's own goes.
+  on('command.run', { command: 'om-stats' }, async ($, e) => ({ text: (await report(statsIo($), parseArgs(e.args))).replace(/^observational-memory · /, '') }))
 
   // om_recall waits behind ToolSearch, its description unread, until a compaction removes what it finds; from then on
   // it is in the tool list. The answer holds for the session, so a compaction's SessionStart has it asked again, when
