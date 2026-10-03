@@ -375,6 +375,11 @@ export function record(io: Io, sessionId: string, fn: (s: SessionStats, at: numb
   })().catch((e) => warn(io, e))
 }
 
+// What Luna has cost a session, as /om-stats totals it: the stats this process holds for it, else its file.
+export async function costOf(io: Io, sessionId: string) {
+  return sumOf(await (live.get(sessionId) ?? load(io, sessionId)), '.cost')
+}
+
 // Writes a session's pending stats now: at the session's end, and before a report reads the files.
 export async function flush(io: Io, sessionId: string) {
   if (pending.has(sessionId)) await write(io, sessionId).catch((e) => warn(io, e))
