@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { add, addCompaction, addLuna, addRecall, count, emptyStats, failureClass, formatReport, formatSummary, merge, parseArgs, parseSince, percentile, report } from '../hooks/stats'
+import { add, addCacheUse, addCompaction, addLuna, addRecall, count, emptyStats, failureClass, formatReport, formatSummary, merge, parseArgs, parseSince, percentile, report } from '../hooks/stats'
 import type { Io, SessionStats } from '../hooks/stats'
 
 const T0 = Date.UTC(2026, 8, 20, 12, 0)
@@ -164,6 +164,17 @@ describe('stats', () => {
     const text = formatSummary('this session', merge([s]), '')
     expect(text).toContain('  Floor      2 compiled a brief by code of 42 messages the Observer had not observed')
     expect(text).not.toContain('Fallbacks')
+  })
+
+  test('the first request after a compaction counts its cache use by compactor, so the summary compares them', () => {
+    const s = emptyStats('a', T0)
+    addCacheUse(s, 'om', { uncached: 3, cacheRead: 18_000, cacheWrite: 30_000 }, T0)
+    addCacheUse(s, 'om', { uncached: 5, cacheRead: 18_000, cacheWrite: 26_000 }, T0 + 60_000)
+    addCacheUse(s, 'builtin', { uncached: 4, cacheRead: 0, cacheWrite: 60_000 }, T0 + 120_000)
+    expect(s.metrics['afterCompaction.om.uncachedTokens']).toMatchObject({ count: 2, sum: 8 })
+    const text = formatSummary('this session', merge([s]), '')
+    expect(text).toContain('Cache        the first request after a main compaction (median): om ~18,000 read, ~26,000 written (2); built-in ~0 read, ~60,000 written (1)')
+    expect(formatReport('t', merge([s]))).toContain('0 tokens in, 0 out.') // the main model's tokens, not Luna's
   })
 
   test('full gives the table, the default the summary', async () => {

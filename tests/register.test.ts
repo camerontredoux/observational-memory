@@ -3,7 +3,7 @@ import type { On, Register, SessionCompactInput, SessionMessage } from 'claude-c
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END } from '../hooks/prompts'
 import { planBudget } from '../hooks/register'
 import { originalId } from '../hooks/recall'
-import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, COMPOSER, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ran, pi, nearTarget, isFiller, tokensOf, live, gates, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, nextStepIn, recordIn, WHERE, noReplies, repliesIn, correctionsIn, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, stampOf, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, overloaded, fourTurns } from './harness'
+import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, COMPOSER, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ran, pi, nearTarget, isFiller, tokensOf, live, gates, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, nextStepIn, recordIn, WHERE, noReplies, repliesIn, correctionsIn, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, stampOf, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE, overloaded, fourTurns } from './harness'
 import type { Ledger, Run } from './harness'
 
 describe('register', () => {
@@ -2409,6 +2409,41 @@ describe('register', () => {
     const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(observationsIn(second.messages?.[0]?.text)).toContain('User: "b"')
+  })
+
+  test('stats: the first main request after a compaction counts what the prompt cache served of it, by compactor', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, files } = world(on)
+    pi(on)
+    on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
+    let cache = { cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    on('turn.step', async function* ($, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { ...USAGE, ...cache, model: 'claude' } }
+    })
+    const step = async (index: number, agentId?: string) => {
+      for await (const _ of $.turn.step({ turnId: 't', index, model: 'claude', messageCount: history.length, ...(agentId ? { agentId } : {}) }));
+      await clock.settle()
+    }
+    await clock.set(at(23, 9, 0))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('tail', 'r', 8_000))
+
+    const om = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    history.splice(0, history.length, ...om.messages!)
+    cache = { cache_read_input_tokens: 0, cache_creation_input_tokens: 9_000 }
+    await step(0, 'agent-1') // a subagent's request carries none of the main context
+    cache = { cache_read_input_tokens: 18_000, cache_creation_input_tokens: 30_000 }
+    await step(1)
+    cache = { cache_read_input_tokens: 48_000, cache_creation_input_tokens: 100 }
+    await step(2) // past the first request: no longer the compaction's cost
+    await $.session.compact({ trigger: 'manual', instructions: 'Keep the auth bug', messages: [...history] })
+    cache = { cache_read_input_tokens: 0, cache_creation_input_tokens: 60_000 }
+    await step(3)
+    await clock.advance(5_000)
+
+    const file = JSON.parse(files['/stats/session-1.json']!) as { metrics: Record<string, { count: number; sum: number }> }
+    expect(file.metrics['afterCompaction.om.cacheReadTokens']).toMatchObject({ count: 1, sum: 18_000 })
+    expect(file.metrics['afterCompaction.om.cacheWriteTokens']).toMatchObject({ count: 1, sum: 30_000 })
+    expect(file.metrics['afterCompaction.builtin.cacheWriteTokens']).toMatchObject({ count: 1, sum: 60_000 })
   })
 
   test('a compaction request with blank instructions is treated as ordinary compaction, not delegated', async ($, on) => {

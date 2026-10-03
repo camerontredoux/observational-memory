@@ -48,6 +48,9 @@ export type Compaction = {
   deadlineHit?: boolean // observation at compaction was cut off at its deadline
   unreadable?: boolean // the loop's history could not be read: its whole context was observed on the spot
 }
+// What the first main request after a compaction cost in input tokens: what the prompt cache served, what it wrote,
+// and the rest. The context the compaction installed is written afresh; the prefix before it may be read.
+export type CacheUse = { uncached: number; cacheRead: number; cacheWrite: number }
 export type Reflection = { ms: number; tokensBefore: number; tokensAfter: number; level: number }
 
 export const emptyStats = (sessionId: string, now: number, cwd?: string): SessionStats => ({
@@ -118,6 +121,14 @@ export function addCompaction(s: SessionStats, c: Compaction, at: number) {
   add(s, `${key}.rowsBriefed`, c.rowsBriefed, at)
   add(s, `${key}.briefTokens`, c.briefTokens, at)
   add(s, `${key}.observations`, c.observations, at)
+}
+
+// By the compactor that made the context, `om` or `builtin`, so the two compare.
+export function addCacheUse(s: SessionStats, compactor: 'om' | 'builtin', u: CacheUse, at: number) {
+  const key = `afterCompaction.${compactor}`
+  add(s, `${key}.uncachedTokens`, u.uncached, at)
+  add(s, `${key}.cacheReadTokens`, u.cacheRead, at)
+  add(s, `${key}.cacheWriteTokens`, u.cacheWrite, at)
 }
 
 export function addReflection(s: SessionStats, r: Reflection, at: number) {
@@ -277,6 +288,12 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   if (floor) row('  Floor', `${grouped(floor)} compiled a brief by code of ${plural(briefed, 'message')} the Observer had not observed`)
   if (main.context.length)
     row('Context', `after a main compaction: ~${grouped(median(main.context))} tokens (median)${main.notes.length ? `, ~${plural(median(main.notes), 'note')}` : ''}`)
+  const cache = (['om', 'builtin'] as const).flatMap((c) => {
+    const [read, wrote] = [s.metrics[`afterCompaction.${c}.cacheReadTokens`], s.metrics[`afterCompaction.${c}.cacheWriteTokens`]]
+    if (!read || !wrote) return []
+    return `${c === 'om' ? 'om' : 'built-in'} ~${grouped(median(values(read)))} read, ~${grouped(median(values(wrote)))} written (${grouped(read.count)})`
+  })
+  if (cache.length) row('Cache', `the first request after a main compaction (median): ${cache.join('; ')}`)
   const background = s.metrics['observer.background.ms']
   if (background) {
     const notes = values(s.metrics['observer.background.observations'])

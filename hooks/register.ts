@@ -1,6 +1,6 @@
-import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage } from 'claude-code'
+import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
-import { add, addCompaction, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
+import { add, addCacheUse, addCompaction, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { registerNotes } from './notes'
@@ -343,6 +343,17 @@ async function showGauges($: EngineInterface, loop: Loop) {
   } catch (error) {
     log($, `could not write the gauges (${errorText(error)})`)
   }
+}
+// The main conversation's last compaction, by session, until a request carries the context it installed: which
+// compactor made it. That request's usage says what the compaction cost in prompt cache.
+const uncarried = new Map<string, 'om' | 'builtin'>()
+async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
+  const sessionId = await $.session.id()
+  const compactor = uncarried.get(sessionId)
+  if (compactor === undefined) return
+  uncarried.delete(sessionId)
+  const use = { uncached: usage.input_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens }
+  record(statsIo($), sessionId, (s, at) => addCacheUse(s, compactor, use, at))
 }
 const plural = (n: number, noun: string) => `${grouped(n)} ${noun}${n === 1 ? '' : 's'}`
 // A pi failure in a few words for the screen: how it ended, never what it printed.
@@ -1778,6 +1789,7 @@ async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, nex
       addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
     )
   const [summary, ...kept] = r.messages ?? []
+  if (installs && summary && sessionId !== undefined && e.agentId === undefined) uncarried.set(sessionId, 'builtin')
   if (installs && summary && loop && isLive(loop, stamp!)) {
     const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
     await $.store.set(liveKey(loop.key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
@@ -2109,6 +2121,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
   // In the context's own order.
   const tail = dedupWrappers(maskTail(withoutLocalCommands(live.filter((m, i) => kept.has(i) && !isEmptyReply(m))).map(({ handle: _, ...m }) => m)))
+  if (main && installs) uncarried.set(sessionId, 'om')
   return { messages: [message, ...freshToolIds(tail, started.toString(36))] }
 }
 
@@ -2366,10 +2379,13 @@ export const register: Register = (on) => {
   })
 
   // Each model request of the main loop or a subagent's, the previous step's tool results in the history: off the
-  // request's path.
+  // request's path. A main request's usage, once it has streamed, says what the last compaction cost in cache.
   on('turn.step', async function* ($, e, next) {
     $.clock.after(0, () => void onStep($, e.agentId).catch((error) => log($, errorText(error))))
-    return yield* next(e)
+    const r = yield* next(e)
+    const usage = r.usage
+    if (e.agentId === undefined && usage) $.clock.after(0, () => void noteCacheUse($, usage).catch((error) => log($, errorText(error))))
+    return r
   })
 
   // A subagent's is its answer: its loop is done, and what it stored goes. A teammate's is one of many, as main's.
@@ -2395,6 +2411,7 @@ export const register: Register = (on) => {
     if (cleared) end(e.sessionId)
     transcripts.delete(e.sessionId)
     pendingTokens.delete(e.sessionId)
+    uncarried.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     await flushHeld($) // and so does the held times' timer
     const kinds = cleared ? KINDS.map((kind) => key(kind, e.sessionId)) : []
