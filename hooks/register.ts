@@ -10,7 +10,7 @@ import type { Gauges } from './workers'
 import type { Worker } from '../types'
 import { COPY_ID, INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallIo, TranscriptCache } from './recall'
-import { compileBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
+import { compileBrief, emptyBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
   applyConstraints,
   baseOf,
@@ -1989,13 +1989,19 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const build = async (ledger: Ledger, kept: boolean) => {
     const observed = ledger.watermark.to
     const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
+    // The files the observed rows changed: they leave context at every cut, and an observation may not name each file.
+    const observedFiles = observed > base ? compile(base, observed) : undefined
     const attempt = async (cut: number, floor: boolean) => {
       const tail = messages.slice(cut)
-      // The brief carried from the memory message, with the rows leaving context merged in: those the floor
-      // compiles. A brief is carried even where the Observer's memory stands again: it holds rows the Observer never
-      // observed, which no observation covers.
+      // The brief carried from the memory message, with the rows leaving context merged in: of the observed rows their
+      // files alone, the rest of the brief being the observations' to hold; the rows the floor compiles whole. A brief
+      // is carried even where the Observer's memory stands again: it holds rows the Observer never observed, which no
+      // observation covers.
       const from = floor ? observed : cut
-      const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
+      let brief = priorMemory?.brief
+      const files = await observedFiles
+      if (files?.modified.length || files?.created.length) brief = mergeBriefs(brief, { ...emptyBrief(), modified: files.modified, created: files.created, outstanding: brief?.outstanding ?? [] })
+      if (from < cut) brief = mergeBriefs(brief, await compile(from, cut))
       const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs()))
       let memory: Memory = {
         corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>

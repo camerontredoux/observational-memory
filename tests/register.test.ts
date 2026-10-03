@@ -4294,6 +4294,20 @@ describe('the floor', () => {
     expect(result.messages![0]!.text).not.toContain('<session-brief>')
   })
 
+  test('the files the observed rows changed are listed in the brief, and nothing else of those rows', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    pi(on)
+    const edit = (s: SessionMessage): SessionMessage => ({ ...s, toolUses: s.toolUses.map((u) => ({ ...u, tool: 'Edit' })) })
+    const [prompt, call, result, done] = turn('a', 'a', CHUNK)
+    const messages = [prompt!, edit(call!), result!, done!, ...turn('b', 'b', 8_000)]
+
+    const text = (await $.session.compact({ trigger: 'manual', messages })).messages![0]!.text
+
+    expect(observationsIn(text)).toContain('User: "a"')
+    expect(briefIn(text)).toBe([NOTE, '[Files And Changes]', '- Modified: /src/a.ts'].join('\n'))
+  })
+
   test("the brief's lines name the om_recall block they came from when the transcript is known and the model can call om_recall", async ($, on) => {
     mock.clock(on)
     const { files } = world(on)
