@@ -1831,6 +1831,11 @@ describe('register', () => {
       await clock.settle()
     }
     expect(seen.inFlight).toBe(4)
+    // The band above the prompt shows the main conversation's calls alone.
+    const band = await $.ui.render({ surface: 'terminal', component: 'AbovePrompt', requestId: 'band', props: { hasSurvey: false, isWorking: true, maxRows: 10, columns: 120 } as never })
+    const mains = seen.prompts.filter((p) => readers(p).has('main')).length
+    expect(mains).toBeLessThan(4)
+    expect(JSON.stringify(band).match(/\[observer\]/g)).toHaveLength(mains)
     for (let n = 1; n <= 20; n++) open(n)
     await clock.settle()
 

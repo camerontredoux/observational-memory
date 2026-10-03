@@ -311,10 +311,13 @@ const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' }
 // A subagent's lines go to the debug log only: the main chat shows the main conversation's.
 const show = ($: EngineInterface, text: string, agentId?: string) => (agentId === undefined ? $.ui.log(text) : $.ui.log(text, { to: 'debug' }))
 // The band above the prompt (workers.ts draws it; the scan wants the reference spelled in the file that writes it).
-// A failed write leaves the band as it was, and the call it tracks goes on.
+// It shows the main conversation's calls alone, as `show` does its lines. A failed write leaves the band as it was,
+// and the call it tracks goes on.
 const workers = atom({ plugin: 'observational-memory', key: 'workers' } as const, [] as Worker[])
-const track = ($: EngineInterface, change: (ws: Worker[]) => Worker[]) =>
-  update($, workers, change).catch((error) => log($, `could not update the workers band (${errorText(error)})`))
+const track = async ($: EngineInterface, loop: Loop, change: (ws: Worker[]) => Worker[]) => {
+  if (loop.agentId !== undefined) return
+  await update($, workers, change).catch((error) => log($, `could not update the workers band (${errorText(error)})`))
+}
 // The footer's gauges, for the main conversation only: written to `gauges/<sessionId>.json` beside the stats for a
 // status line script to draw, since `$.ui.status` puts the plugin's name before its line. `pending` is the history
 // no Observer call covers yet, as the last scheduling pass counted it; `cost` is what Luna has cost the session, as
@@ -1362,7 +1365,7 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
   let chunk: Chunk | undefined
   const started = await $.clock.now()
   const worker = newWorker('observer')
-  if (isLive(loop, stamp)) await track($, startedWorker(worker))
+  if (isLive(loop, stamp)) await track($, loop, startedWorker(worker))
   if (isLive(loop, stamp))
     try {
       chunk = await observe($, sessionId, v, job.range.from, job.range.to, 'background', job.before, stopOf(loop, stamp))
@@ -1401,7 +1404,7 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
   }).catch((error) => (log($, errorText(error)), false))
   done(landed)
   // Landed, its observations count; failed while the loop runs, a cross; otherwise (the loop ended, the rows moved) it goes.
-  await track($, settled(worker, await $.clock.now(), landed ? { added: chunk!.lines.length } : !chunk && isLive(loop, stamp) ? 'failed' : undefined))
+  await track($, loop, settled(worker, await $.clock.now(), landed ? { added: chunk!.lines.length } : !chunk && isLive(loop, stamp) ? 'failed' : undefined))
   if (landed) await showGauges($, loop)
   if (landed) backoff.delete(loop.key)
   else if (!chunk && isLive(loop, stamp)) await backOff($, loop, stamp)
@@ -1497,7 +1500,7 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
   let installed = false
   $.clock.after(0, () => {
     const run = async () => {
-      await track($, startedWorker(worker))
+      await track($, loop, startedWorker(worker))
       const started = await $.clock.now()
       let recent = snapshot.length
       for (let chars = -1; recent > 0; recent--) {
@@ -1610,7 +1613,7 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
       })
       .finally(async () => {
         reflecting.delete(key)
-        await track($, settled(worker, await $.clock.now(), installed ? {} : failed ? 'failed' : undefined))
+        await track($, loop, settled(worker, await $.clock.now(), installed ? {} : failed ? 'failed' : undefined))
         if (installed) await showGauges($, loop)
       })
   })
