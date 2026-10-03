@@ -84,10 +84,12 @@ export const register: Register = (on) => {
     return { result: found.text }
   })
 
-  // As hooks/register.ts's: om_recall joins the tool list once a compaction has run.
+  // As hooks/register.ts's: om_recall joins the tool list once a compaction has run, and stays.
+  const listed = new Set<string>()
   on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => {
-    const described = await next(e)
-    const compacted = await $.session.messages().then((rows) => rows.some((m) => m.role === 'user' && m.text.startsWith(COMPACT_WRAPPER)), () => false)
+    const [described, sessionId] = await Promise.all([next(e), $.session.id()])
+    const compacted = listed.has(sessionId) || (await $.session.messages().then((rows) => rows.some((m) => m.role === 'user' && m.text.startsWith(COMPACT_WRAPPER)), () => false))
+    if (compacted) listed.add(sessionId)
     return compacted ? { ...described, isDeferred: false } : described
   })
 

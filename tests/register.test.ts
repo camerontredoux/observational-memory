@@ -1652,13 +1652,36 @@ describe('register', () => {
     expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: false })
   })
 
+  // The tool list is in the prompt cache: asked again mid-session, the answer must not change back.
+  test("om_recall stays in the tool list when described again after the summary has left the history's newest rows, until a /clear", async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    on('ui.invalidate', () => ({ value: undefined }))
+    on('classic.SessionStart', () => ({}))
+    on('tool.describe', ($, e) => deferredByEngine(e))
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
+    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    history.push(...result.messages!)
+    await $.classic.SessionStart(COMPACT_START)
+    expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: false })
+
+    history.splice(0, history.length, ...turn('d', 'd', 0)) // the newest rows, the summary past them
+    const again = await $.tool.describe(RECALL_DESCRIBE)
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+
+    expect(again).toEqual({ description: 'Searches', isDeferred: false })
+    expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: true })
+  })
+
   test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
     pi(on)
     const evalHooks = recallOnlyHooks()
     const invalidated: string[] = []
-    const evalWorld = { session: { messages: async () => history }, ui: { invalidate: (event: string) => void invalidated.push(event) } }
+    const evalWorld = { session: { id: async () => 'session-1', messages: async () => history }, ui: { invalidate: (event: string) => void invalidated.push(event) } }
     const describe = () => evalHooks.get('tool.describe')!(evalWorld, RECALL_DESCRIBE, deferredByEngine)
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
 

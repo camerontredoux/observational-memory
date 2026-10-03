@@ -1683,6 +1683,8 @@ async function output($: EngineInterface, argv: string[], path: string) {
 }
 // Each session's transcript as om_recall last parsed it, parsed on from there by its next call.
 const transcripts = new Map<string, TranscriptCache>()
+// The sessions whose om_recall the tool list holds (its tool.describe).
+const listed = new Set<string>()
 
 function noteRecall($: EngineInterface, sessionId: string, result: string, fromFile: boolean) {
   record(statsIo($), sessionId, (s, at) => addRecall(s, Number(result.match(/^(\d+) match/)?.[1] ?? 0), fromFile, at))
@@ -2352,9 +2354,12 @@ export const register: Register = (on) => {
   // om_recall waits behind ToolSearch, its description unread, until a compaction removes what it finds; from then on
   // it is in the tool list. The answer holds for the session, so a compaction's SessionStart has it asked again, when
   // the prompt is rebuilt anyway. A resumed session that was compacted has a summary in its history too.
+  // Once listed it stays listed: asked again (another plugin's invalidate, a reload), the summary may have left the
+  // newest ROWS_CAP rows, or the history may not read, and the tool list would change back, spending the prompt cache.
   on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => {
-    const described = await next(e)
-    const compacted = await $.session.messages().then((rows) => rows.some(isSummary), () => false)
+    const [described, sessionId] = await Promise.all([next(e), $.session.id()])
+    const compacted = listed.has(sessionId) || (await $.session.messages().then((rows) => rows.some(isSummary), () => false))
+    if (compacted) listed.add(sessionId)
     return compacted ? { ...described, isDeferred: false } : described
   })
 
@@ -2410,6 +2415,7 @@ export const register: Register = (on) => {
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
     transcripts.delete(e.sessionId)
+    if (cleared) listed.delete(e.sessionId)
     pendingTokens.delete(e.sessionId)
     uncarried.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
