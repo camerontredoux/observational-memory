@@ -91,6 +91,28 @@ describe('register', () => {
     expect(seen.prompts[0]).toContain('[Tool result for Bash]: 2 passed, 1 failed')
   })
 
+  // The history holds the host's interruption row, so the chunk carries it and the Observer is told what it means.
+  test('an interrupted turn reaches the Observer with its interruption row, which the Observer reads as unfinished work', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'migrate the schema', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm run migrate' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: "The user doesn't want to proceed with this tool use.", isError: true }] },
+      { role: 'user', text: '[Request interrupted by user for tool use]', toolUses: [] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts[0]).toContain("[Tool result for Bash (error)]: The user doesn't want to proceed with this tool use.\n\n[User]: [Request interrupted by user for tool use]")
+    expect(seen.systems[0]).toContain("is Claude Code's mark that the user stopped the assistant mid-turn, not the user's words")
+    expect(seen.systems[0]).toContain('That work is unfinished, never Completed, unless a later block shows it done.')
+  })
+
   test('an oversized tool result keeps a bounded beginning and ending for the Observer, the omission marked explicitly', async ($, on) => {
     mock.clock(on)
     world(on)
