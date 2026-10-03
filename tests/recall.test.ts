@@ -4,6 +4,7 @@ import { legacyRecall } from './eval/legacy-recall'
 import { liveTranscript, loadTranscript, parseInput, recall, refsOf } from '../hooks/recall'
 import type { SessionMessage } from 'claude-code'
 import type { RecallInput, RecallIo, TranscriptCache } from '../hooks/recall'
+import { memoryIo } from './harness'
 
 const OLD = 'aaaaaaaa-1111-4111-8111-111111111111'
 const NEW = 'bbbbbbbb-2222-4222-8222-222222222222'
@@ -45,35 +46,9 @@ const subagent = [
   msg('assistant', 1, [{ type: 'text', text: 'GRAPE-9 lives in config.ts' }], { isSidechain: true }),
 ].join('\n')
 
-function memoryIo(files: Record<string, string>): RecallIo & { reads: string[] } {
-  const reads: string[] = []
-  return {
-    reads,
-    read: async (path) => {
-      reads.push(path)
-      if (!(path in files)) throw new Error(`ENOENT: ${path}`)
-      return files[path]!
-    },
-    list: async (dir) => {
-      const names = Object.keys(files)
-        .filter((p) => p.startsWith(`${dir}/`))
-        .map((p) => p.slice(dir.length + 1).split('/')[0]!)
-      return [...new Set(names)]
-    },
-    continuing: async (dir, names, id) => names.find((n) => files[`${dir}/${n}`]?.includes(`"continuedInSessionId":"${id}"`)),
-    now: async () => 0,
-  }
-}
 const chain = (extra: Record<string, string> = {}) =>
   memoryIo({ [`${DIR}/${OLD}.jsonl`]: oldFile, [`${DIR}/${NEW}.jsonl`]: newFile, [`${DIR}/cccccccc-3333-4333-8333-333333333333.jsonl`]: 'unrelated', ...extra })
 const run = async (input: RecallInput, io = chain(), path = `${DIR}/${NEW}.jsonl`) => (await recall(await loadTranscript(io, path, { asking: true }), input)).text
-
-// The test runner prints what a test file logs; the hooks module's own globals have no console.
-declare const console: { warn: (message: string) => void }
-const realChain = await import('./fixtures/recall-chain.local').then(
-  (m: { files: Record<string, string> }) => m.files,
-  (error: unknown) => (String(error).includes('no such file') ? undefined : error instanceof Error ? error : new Error(String(error))),
-)
 
 describe('recall', () => {
   test('follows the continued-in chain back from the new file, and forward from the old one', async () => {
@@ -673,40 +648,5 @@ describe('recall', () => {
 
   test('legacy: v0.4.9 search over one file', () => {
     expect(legacyRecall(oldFile, 'plan alpha')).toMatch(/^1 match\(es\) for "plan alpha" in \d+ messages\.\n\[#\d+ assistant [\d-]+ [\d:]+\] After compaction, the plan is ALPHA\.$/)
-  })
-
-  // The real chain Claude Code moved a crewmate session across, copied to /tmp/om-recall/chain and cut down to the rows
-  // this test reads, in a gitignored module, by scripts/make-recall-fixture.ts. Without it the test is skipped, saying
-  // so; a module the harness will not import fails it.
-  const REAL = 'a real moved session: both files, compaction replays read once, blocks readable in full'
-  if (!realChain) console.warn(`SKIP recall > ${REAL}: no tests/fixtures/recall-chain.local.ts; bun scripts/make-recall-fixture.ts writes it`)
-  else test(REAL, { timeoutMs: 60_000 }, async () => {
-    if (realChain instanceof Error) throw realChain
-    const io = memoryIo(Object.fromEntries(Object.entries(realChain).map(([k, v]) => [`/c/${k}`, v])))
-    const c = await loadTranscript(io, '/c/b8d50671-d9df-4001-9679-8d1ba9ec834c.jsonl', { asking: true })
-    const outline = (await recall(c, { mode: 'outline', from: 'a79f045b:2108', to: 'b8d50671:65' })).text
-    expect(outline).toMatch(/^Outline of 2 transcript files \(a79f045b → b8d50671\): [\d,]+ entries,.*; 1 subagent transcript \(af4c8dc0\)\./)
-    expect(outline).toContain('a79f045b:2134')
-    expect(outline).toContain('b8d50671:62')
-    // What the compaction wrote again after its boundary is read once, where it first was.
-    expect(outline).not.toContain('a79f045b:2140')
-    expect(outline).not.toContain('(no content)')
-    const found = (await recall(c, { query: '"Test Files" passed' })).text
-    expect(found).toMatch(/^\d+ match\(es\) for ""Test Files" passed" in [\d,]+ blocks of 2 transcript files\./)
-    expect(found).toContain('[a79f045b:1902 ')
-    expect(found).toContain('[b8d50671:')
-    // vitest's colour codes are gone, so its summary line reads, and matches, as printed.
-    expect((await recall(c, { query: '"Test Files 10 passed"', to: 'b8d50671:147' })).text).toContain('  61:  Test Files 10 passed (10)')
-    const page = (await recall(c, { ref: 'a79f045b:73' })).text
-    expect(page.split('\n')[0]).toMatch(/^\[a79f045b:73 · .* · Bash result\] lines 1-\d+ of 748 \(call: a79f045b:70\)$/)
-    expect(page.split('\n').at(-1)).toMatch(/^… \d+ more lines \([\d,]+ characters\); only if you still need them: \{"mode": "read", "ref": "a79f045b:73", "lines": "\d+-\d+"\}\.$/)
-    expect(page.length).toBeLessThan(14_000)
-    // In a long result, the line holding every term shows, not the first lines holding one.
-    expect((await recall(c, { query: 'Test Files passed' })).text).toContain('\n  55:  Test Files 1 failed | 1 passed (2)\n')
-    const wide = (await recall(c, { ref: 'a79f045b:73', before: 5, after: 5 })).text
-    expect(wide.length).toBeLessThanOrEqual(16_000)
-    expect(wide).toContain('[a79f045b:78 ')
-    expect((await recall(c, { query: 'gorman lunar checksum' })).text.split('\n')[1]).toBe('No occurrences in the main transcript of: lunar, checksum.')
-    expect((await recall(c, { query: 'plan', subagents: true })).text).toContain('and 1 subagent transcript')
   })
 })

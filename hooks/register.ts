@@ -1380,11 +1380,11 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
         `observed rows ${at.from}-${at.to} in the background, ${chunk.lines.length} observations; ` +
           `watermark ${next.watermark.to}, ${next.chunks.length} chunk(s) waiting on a gap`,
       )
+    // The debug log only: the band above the prompt shows the chunk landing.
     if (at)
-      show(
+      log(
         $,
         `Observed ${plural(at.to - at.from, 'message')} in ${duration(ms)} · +${plural(chunk.lines.length, 'note')} · memory ${plural(next.entries.length + next.chunks.reduce((n, c) => n + c.lines.length, 0), 'note')}`,
-        loop.agentId,
       )
     return !!at
   }).catch((error) => (log($, errorText(error)), false))
@@ -2079,12 +2079,12 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
       `kept ${messages.length - cut} raw messages (~${tailTokens(cut)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
       `${ledger.entries.length} observations, ${memory.skills.length} skill(s)${memory.brief ? `, brief ~${briefTokens} tokens` : ''}`,
   )
-  show(
+  // The debug log only: the memory row in the chat marks the compaction.
+  log(
     $,
     `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
       `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}` +
       (floor ? ` · ${plural(briefed, 'message')} in a brief compiled by code (${why})` : ''),
-    e.agentId,
   )
   const compaction = {
     trigger: main ? e.trigger : 'subagent',

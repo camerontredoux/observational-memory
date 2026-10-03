@@ -18,13 +18,13 @@ A Claude Code function-hooks plugin that replaces compaction with observational 
 ### Code rules
 
 - The engine does not let `$` cross an import. A helper module takes plain I/O functions from its caller, as `recall.ts` takes `RecallIo` and `stats.ts` takes `Io`.
-- `claude plugin test` does not import a module over 1 MiB. Keep each fixture module under that limit. `scripts/make-recall-fixture.ts` shows how to trim one.
+- `claude plugin test` does not import a module over 1 MiB. Keep each fixture module under that limit. `scripts/make-recall-fixture.ts` shows how to trim one. Nor does it load a module holding `import()`.
 
 ### Checks
 
 - Tests: `claude plugin test`.
-- Types: `bunx -p typescript tsc -p .`. The only expected errors are missing `tests/fixtures/*.local.ts` modules.
-- Replay tests import `tests/fixtures/*.local.ts` modules built from private transcripts. Each test's comment names the script that writes its module. Without the module, the test passes without replaying (`recall.test.ts` prints a `SKIP` line). Keep these modules local; they are gitignored.
+- Types: `bunx -p typescript tsc -p .`.
+- The replay tests in `tests/replays.ts` take `tests/fixtures/*.local.ts` modules built from private transcripts. Each test's comment names the script that writes its module. The test runner loads no module holding `import()`, so `bun scripts/wire-fixtures.ts` writes `tests/fixtures.local.test.ts`, which imports the modules present and runs their tests; the scripts that write a module run it. Without a module, its test does not run. Keep these modules and that file local; they are gitignored.
 
 ### Releases
 

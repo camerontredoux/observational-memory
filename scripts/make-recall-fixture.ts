@@ -6,6 +6,7 @@
 //   bun scripts/make-recall-fixture.ts [/tmp/om-recall/chain]
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { loadTranscript } from '../hooks/recall'
+import { wireFixtures } from './wire-fixtures'
 import type { RecallIo } from '../hooks/recall'
 
 const OLD = 'a79f045b-2bea-4864-b384-cc8e7124b683.jsonl'
@@ -110,3 +111,4 @@ if (size > LIMIT) throw new Error(`the fixture is ${size} bytes, over the ${LIMI
 const path = new URL('../tests/fixtures/recall-chain.local.ts', import.meta.url).pathname
 writeFileSync(path, module)
 console.log(`${path}: ${Object.keys(out).length} files, ${[...keep.values()].reduce((n, s) => n + s.size, 0)} rows kept, ${size} bytes`)
+await wireFixtures()

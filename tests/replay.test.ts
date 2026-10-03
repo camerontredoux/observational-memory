@@ -38,13 +38,10 @@ import {
 } from './eval/replay'
 import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } from './eval/replay'
 import type { Configuration } from './eval/runner'
-import { factHolds, grade, negativeControl, norm, score } from './eval/rubric'
+import { factHolds, grade, norm, score } from './eval/rubric'
 import { gradeAnswer, parse as parseReply } from './eval/behavior'
 import { categoryOf, continuation, continuationBehavior, probeCategory } from './eval/continuation'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
-
-// The test runner prints what a test file logs; the hooks module's own globals have no console.
-declare const console: { warn: (message: string) => void }
 
 // Synthetic transcripts in Claude Code's JSONL shape. A compaction is a `compact_boundary` row, then its summary and
 // the rows it kept raw, both stamped before the boundary (as Claude Code writes them), then the session goes on.
@@ -902,20 +899,6 @@ describe('the compaction rubric', () => {
     const f = { id: 'purpose:x', expect: ['orchestrator', ['subagent', 'subagents']] }
     const at = (s: string) => factHolds(f, s.toLowerCase(), norm(s), s)
     expect([at('Session: the assistant is the orchestrator, building each change in subagents.'), at('The orchestrator read a file.\nA subagent ran the tests.')]).toEqual([true, false])
-  })
-
-  // The negative control over the real rubrics: no hand-authored item may pass a context that cannot answer it (another
-  // transcript's, or its own before the item's `from`). `bun scripts/bench-compact.ts controls` writes the module.
-  test('no hand-authored item passes a foreign context or one before its from', async () => {
-    const fx = (await import('./fixtures/rubric-controls.local').catch(() => undefined)) as
-      | { items: Parameters<typeof negativeControl>[0]; names: string[] }
-      | undefined
-    if (!fx) return console.warn('SKIP the compaction rubric > negative control: no tests/fixtures/rubric-controls.local.ts; bun scripts/bench-compact.ts controls writes it')
-    if (!fx.names) throw new Error('tests/fixtures/rubric-controls.local.ts is in the old one-module form: rerun bun scripts/bench-compact.ts controls')
-    // Each transcript's lines and cuts are a module of their own (tests/fixtures/rubric-controls.<name>.local.ts).
-    const parts = await Promise.all(fx.names.map(async (name) => [name, (await import(`./fixtures/rubric-controls.${name}.local`)) as { lines: string[]; cuts: { n: number; at: number[] }[] }] as const))
-    const contexts = Object.fromEntries(parts.map(([name, p]) => [name, p.cuts.map((c) => ({ n: c.n, prose: c.at.map((i) => p.lines[i]).join('\n') }))]))
-    expect(negativeControl(fx.items, contexts)).toEqual([])
   })
 
   test("grades a reader's answers by code: a quote from the context, the permission word, unknown with a recall that finds it", () => {

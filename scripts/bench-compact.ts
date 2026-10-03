@@ -74,6 +74,7 @@ import { BGATES, contextSquashed, gradeAnswer, input, isUnknown, parse, probes, 
 import type { Category, ContinuationScore } from '../tests/eval/continuation'
 import { CATEGORIES, CATEGORY_WEIGHTS, continuation, continuationBehavior } from '../tests/eval/continuation'
 import { fail, mainCheckout, num, options, str } from './cli'
+import { wireFixtures } from './wire-fixtures'
 
 const HERE = resolve(import.meta.dir, '..')
 const OUT = `${mainCheckout()}/.scratch/bench-compact`
@@ -931,4 +932,5 @@ else if (command === 'run') {
     writeFileSync(m.file, m.body, { mode: 0o600 })
     console.log(`${m.file}: ${m.body.length} bytes`)
   }
+  await wireFixtures()
 } else fail('usage: bun scripts/bench-compact.ts corpus | controls [--plugin <ref|dir>] | run --plugin <ref|dir> | ab --a <ref|dir> --b <ref|dir> (see the header)')

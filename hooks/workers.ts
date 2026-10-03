@@ -58,11 +58,8 @@ export const registerWorkers = (on: On) => {
       const added = w.settled.added ? [Text({ color: SUCCESS, children: [` +${w.settled.added}`] })] : []
       return Text({ children: [Text({ color: SUCCESS, children: ['✓'] }), Text({ color: MUTED, children: [` ${label}`] }), ...added] })
     }
-    const theirs = await next(e)
-    return Box({
-      flexDirection: 'column',
-      children: [Box({ flexDirection: 'row', columnGap: 3, children: ws.map(segment) }), ...(theirs ? [theirs] : [])],
-    })
+    // The band alone while it shows: the engine's own (an opaque element) draws a blank row under it.
+    return Box({ flexDirection: 'row', columnGap: 3, children: ws.map(segment) })
   })
 }
 

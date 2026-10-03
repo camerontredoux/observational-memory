@@ -1,384 +1,10 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, ProcessRunResult, Register, SessionCompactInput, SessionMessage } from 'claude-code'
-import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END, SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
+import type { On, Register, SessionCompactInput, SessionMessage } from 'claude-code'
+import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END } from '../hooks/prompts'
 import { planBudget } from '../hooks/register'
 import { originalId } from '../hooks/recall'
-import { register as recallOnly } from './eval/recall-plugin/hooks/register'
-
-// A compaction's kept rows under their calls' original ids: it hands them back under fresh ones (freshToolIds).
-const originals = (rows: readonly SessionMessage[] | undefined) =>
-  rows?.map((m) => ({
-    ...m,
-    toolUses: m.toolUses.map((u) => ({ ...u, tool_use_id: originalId(u.tool_use_id) })),
-    ...(m.toolResults ? { toolResults: m.toolResults.map((r) => ({ ...r, tool_use_id: originalId(r.tool_use_id) })) } : {}),
-  }))
-
-// One turn: the prompt, a Read call, its result of `size` characters (size / 4 tokens) and the answer.
-const turn = (prompt: string, reply: string, size = 0): SessionMessage[] => [
-  { role: 'user', text: prompt, toolUses: [] },
-  { role: 'assistant', text: reply, toolUses: [{ tool_use_id: `t-${prompt}`, tool: 'Read', input: { file_path: `/src/${prompt}.ts` } }] },
-  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `t-${prompt}`, text: 'x'.repeat(size), isError: false }] },
-  { role: 'assistant', text: `${reply} done`, toolUses: [] },
-]
-
-const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
-const PI_USAGE = { input: 9206, output: 558, cacheRead: 3072, cacheWrite: 0, reasoning: 31, totalTokens: 9764, cost: { input: 0.0023, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.0025108 } }
-const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low', '--system-prompt']
-const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
-// pi's session id for one piece of work, which its codex provider sends as the prompt cache key. The hash is FNV-1a
-// of 'session-1'. pi rejects an id outside its characters, and the provider cuts one past 64 characters.
-const OBSERVER_SESSION = 'om-obs-736a51cd'
-const PI_SESSION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
-const piSessionOf = (argv: readonly string[]) => {
-  const id = argv[argv.indexOf('--session-id') + 1] ?? ''
-  if (!argv.includes('--session-id') || !PI_SESSION_ID.test(id) || id.length > 64) throw new Error(`no valid pi session id in ${JSON.stringify(argv.slice(-2))}`)
-  return id
-}
-
-// What pi 0.85.1 prints with `--mode json` for one answer: one event per line, the prompt echoed, the answer
-// streamed, then the final assistant message with its usage (as /tmp/obs-bench/pi1.jsonl, abridged).
-function piOutput(prompt: string, text: string, end: { stopReason?: string; errorMessage?: string } = { stopReason: 'stop' }) {
-  const user = { role: 'user', content: [{ type: 'text', text: prompt }], timestamp: 0 }
-  const assistant = {
-    role: 'assistant',
-    content: [{ type: 'thinking', thinking: '', thinkingSignature: '{}' }, { type: 'text', text }],
-    api: 'openai-codex-responses',
-    provider: 'openai-codex',
-    model: 'gpt-5.6-luna',
-    usage: PI_USAGE,
-    ...end,
-    timestamp: 0,
-  }
-  return [
-    { type: 'session', version: 3, id: 'pi-session', timestamp: '2026-09-23T03:51:47.144Z', cwd: '/tmp' },
-    { type: 'agent_start' },
-    { type: 'turn_start' },
-    { type: 'message_start', message: user },
-    { type: 'message_end', message: user },
-    { type: 'message_start', message: { ...assistant, content: [] } },
-    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 1, delta: text.slice(0, 20) } },
-    { type: 'message_end', message: assistant },
-    { type: 'turn_end', message: assistant, toolResults: [] },
-    { type: 'agent_end', messages: [user, assistant] },
-    { type: 'agent_settled' },
-  ]
-    .map((event) => JSON.stringify(event))
-    .join('\n')
-}
-const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
-const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
-const TOOL_RESULT_MAX_CHARS = 5_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/register.ts
-
-// Local time on a day of September 2026.
-const at = (day: number, hour: number, minute: number) => new Date(2026, 8, day, hour, minute).getTime()
-
-// The main conversation's history, grown as the engine would, each listed subagent's under `agents` (any other id
-// is denied), a store the test can read, and a context size. `holdGet` delays a store read's answer, read before the
-// hold, so it can be out of date when it arrives; `holdList` delays the listing of agents the same way.
-function world(
-  on: On,
-  options: {
-    failWrites?: boolean
-    unreadable?: string[]
-    teammates?: string[]
-    holdGet?: (key: string) => Promise<void> | undefined
-    holdList?: () => Promise<void> | undefined
-    env?: Record<string, string>
-    rowsCap?: number
-  } = {},
-) {
-  on('session.id', () => ({ value: 'session-1' }))
-  const history: SessionMessage[] = []
-  const agents: Record<string, SessionMessage[]> = {}
-  const main = () => (options.rowsCap && history.length > options.rowsCap ? history.slice(-options.rowsCap) : history)
-  const asked = { main: 0 } // how often the main conversation's history was read
-  on('session.messages', ($, e) => ({ value: e.agentId === undefined ? (asked.main++, main()) : (agents[e.agentId] ?? { deny: `no agent ${e.agentId} in this session` }) }))
-  const listed = () => [...Object.keys(agents), ...(options.unreadable ?? [])]
-  const type = (id: string) => (options.teammates?.includes(id) ? 'teammate' : 'general-purpose')
-  on('agent.list', async () => {
-    const value = listed().map((id) => ({ id, description: id, type: type(id), status: 'running' as const }))
-    await options.holdList?.()
-    return { value }
-  })
-  const stored: Record<string, unknown> = {}
-  on('store.keys', () => ({ value: Object.keys(stored) }))
-  on('store.get', async ($, e) => {
-    const value = stored[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(stored[e.key]))
-    await options.holdGet?.(e.key)
-    return { value }
-  })
-  const writes: string[] = [] // the keys written, in order
-  on('store.set', ($, e) => (writes.push(e.key), (stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
-  on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
-  // The stats files, in memory under OM_STATS_DIR.
-  const files: Record<string, string> = {}
-  mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u', ...options.env })
-  const reads: string[] = []
-  on('fs.read', ($, e) => {
-    reads.push(e.path)
-    if (!(e.path in files)) throw new Error(`ENOENT: ${e.path}`)
-    return { value: files[e.path]! }
-  })
-  on('fs.write', ($, e) => {
-    if (options.failWrites) throw new Error('EACCES: permission denied')
-    return (files[e.path] = e.text), { value: undefined }
-  })
-  on('fs.list', ($, e) => ({ value: Object.keys(files).filter((p) => p.startsWith(`${e.path}/`)).map((p) => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: files[p]!.length, mtimeMs: 0, isLink: false })) }))
-  on('fs.stat', ($, e) => {
-    if (!(e.path in files)) throw new Error(`ENOENT: ${e.path}`)
-    return { value: { kind: 'file' as const, size: files[e.path]!.length, mtimeMs: 0, isLink: false } }
-  })
-  on('fs.exists', ($, e) => ({ value: e.path in files || Object.keys(files).some((p) => p.startsWith(`${e.path}/`)) }))
-  on('session.cwd', () => ({ value: '/work/project' }))
-  on('command.register', ($, e) => ({ value: { command: e.name } }))
-  return { history, agents, stored, files, reads, writes, asked }
-}
-
-type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
-type PiCall = { argv: readonly string[]; cwd?: string }
-
-// git outside a repository, as the plugin's environment read meets it by default.
-// pi's or git's exit code and output, as a fake answers them; `ran` adds what `$.process.run` also reports.
-type Run = Pick<ProcessRunResult, 'exitCode' | 'stdout' | 'stderr'>
-const ran = (r: Run): ProcessRunResult => ({ ...r, isStdoutTruncated: false, isStderrTruncated: false })
-
-const NOT_A_REPO: Run = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
-
-// pi on the host, as `$.process.spawn` runs it: it observes by naming the prompts of its chunk, each at the time
-// its block shows; the reflector answers `reflect(n, prompt)` for its nth call, by default a reflection near its target. `hold` delays the nth call's answer, `fail`
-// answers it with a failed run instead; `stopped` counts the calls killed before they answered. git, through
-// `$.process.run`, is answered by `git`, else as outside a repository, and is no pi call.
-// `$.model.complete` is counted, and answers nothing.
-function pi(
-  on: On,
-  options: {
-    hold?: (n: number, prompt: string) => Promise<void> | undefined
-    fail?: (n: number, prompt: string) => Run | undefined
-    reflect?: (n: number, prompt: string) => string
-    reply?: (prompt: string) => string | undefined
-    git?: (argv: readonly string[]) => Run | undefined
-    session?: (prompt: string) => string | Run
-  } = {},
-) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], sessionIds: [] as string[] }
-  let reflections = 0
-  on('process.run', ($, e) => {
-    if (e.argv[0] !== 'git') return { value: ran({ exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` }) }
-    return seen.git.push(e.argv), { value: ran(options.git?.(e.argv) ?? NOT_A_REPO) }
-  })
-  // What pi prints comes in pieces, the middle of a line ending one, as a child writes it. A call killed while held
-  // stops holding at once.
-  on('process.spawn', async function* ($, e, next) {
-    if (e.argv[0] !== 'pi') return yield* next(e)
-    const killed = new Promise<never>((_, reject) => next.signal.addEventListener('abort', () => reject(next.signal.reason), { once: true }))
-    killed.catch(() => {})
-    let answered = false
-    try {
-      const r = await answer(e.argv, e.cwd, e.input ?? '', killed)
-      answered = true
-      const half = Math.floor(r.stdout.length / 2)
-      for (const [stream, text] of [['stdout', r.stdout.slice(0, half)], ['stdout', r.stdout.slice(half)], ['stderr', r.stderr]] as const) if (text) yield { stream, text }
-      return { value: { code: r.exitCode, signal: null } }
-    } finally {
-      if (!answered) seen.stopped++
-    }
-  })
-  async function answer(argv: readonly string[], cwd: string | undefined, prompt: string, killed: Promise<never>): Promise<Run> {
-    if (argv[argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT) {
-      seen.sessions.push(prompt)
-      seen.sessionIds.push(piSessionOf(argv))
-      const r = options.session?.(prompt) ?? 'Session: the test goal'
-      return typeof r === 'string' ? { exitCode: 0, stdout: piOutput(prompt, r), stderr: '' } : r
-    }
-    seen.prompts.push(prompt)
-    seen.systems.push(argv[argv.indexOf('--system-prompt') + 1] ?? '')
-    seen.calls.push({ argv, cwd })
-    const n = seen.prompts.length
-    seen.inFlight++
-    seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight)
-    try {
-      await Promise.race([options.hold?.(n, prompt), killed])
-    } finally {
-      seen.inFlight--
-    }
-    const failed = options.fail?.(n, prompt)
-    if (failed) return failed
-    let text: string
-    if (prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
-      reflections++
-      text = options.reflect?.(reflections, prompt) ?? nearTarget(prompt, '* 🟡 2026-09-22 14:30 Reflected')
-    } else
-      text =
-        options.reply?.(prompt) ??
-        `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
-        `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
-    return { exitCode: 0, stdout: piOutput(prompt, text), stderr: '' }
-  }
-  on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
-  on('ui.log', ($, e) => ((e.to === 'debug' ? seen.logs : seen.screen).push(e.text), { value: undefined }))
-  return seen
-}
-
-// A Reflector's reply to `prompt` that lands near the size target the prompt gives: `head`, then filler lines at
-// the first observation's time, up to about 70% of the target. `isFiller` tells those lines apart.
-function nearTarget(prompt: string, head = '') {
-  const target = Number(prompt.match(/Size target: at most ~(\d+) tokens/)![1])
-  const time = prompt.match(/^\* \S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /m)?.[1] ?? ''
-  const filler = (i: number) => `* 🟢 ${time} filler detail ${i}`
-  const lines = head ? [head] : []
-  for (let i = 0, chars = head.length; chars < 0.7 * target * 4; i++) lines.push(filler(i)), (chars += filler(i).length + 1)
-  return `<observations>\n${lines.join('\n')}\n</observations>`
-}
-const isFiller = (line: string) => / filler detail \d+$/.test(line)
-// The size of entries as the memory renders them, each with its source range, as hooks/memory.ts estimates it.
-const stampAt = (ms: number) => stampOf(new Date(ms).toISOString())
-const tokensOf = (entries: readonly { line: string; source?: { from: number; to: number } }[]) =>
-  Math.ceil(entries.map((e) => `* ${e.line}${e.source ? ` (source ${stampAt(e.source.from)} to ${stampAt(e.source.to)})` : ''}`).join('\n').length / 4)
-
-// A live main conversation: each turn's prompt at `startAt`, the rest of it and turn.complete a minute later.
-function live(on: On, clock: MockClock, history: SessionMessage[]) {
-  on('turn.start', ($, e) => ({ turnId: e.turnId }))
-  on('turn.complete', () => ({ text: '' }))
-  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
-  return async ($: Engine, messages: SessionMessage[], startAt: number) => {
-    const turnId = `turn-${history.length}`
-    await clock.set(startAt)
-    history.push(messages[0]!)
-    await $.turn.start({ text: messages[0]!.text, turnId })
-    await clock.advance(60_000)
-    history.push(...messages.slice(1))
-    await $.turn.complete({ answer: '', durationMs: 60_000, isAborted: false, turnId, reason: 'answer' })
-  }
-}
-
-// A promise per held call, released by the test.
-function gates() {
-  const release = new Map<number, () => void>()
-  const held = new Map<number, Promise<void>>()
-  const gate = (n: number) => {
-    if (!held.has(n)) held.set(n, new Promise<void>((resolve) => release.set(n, resolve)))
-    return held.get(n)!
-  }
-  return { gate, open: (n: number) => (gate(n), release.get(n)!()) }
-}
-
-// The recall-only eval plugin's hooks by event, the last registered for each, to run with a `$` the test builds: the
-// test kit loads an inline plugin from its register function alone, which this one's top-level helpers are not in,
-// and the test's own `$` makes no call a plugin alone makes, such as `$.tool.register`.
-function recallOnlyHooks() {
-  const hooks = new Map<string, (...args: any[]) => Promise<unknown>>()
-  recallOnly(((event: string, ...rest: unknown[]) => void hooks.set(event, rest.at(-1) as never)) as unknown as On, {} as never)
-  return hooks
-}
-
-// The engine's own answer to om_recall's `tool.describe`: an MCP tool is deferred.
-const deferredByEngine = (e: { description: string; isDeferred?: true }) => ({ description: e.description, ...(e.isDeferred ? { isDeferred: e.isDeferred } : {}) })
-const RECALL_DESCRIBE = { tool: 'mcp__observational-memory__om_recall', description: 'Searches', isDeferred: true as const, provider: { plugin: 'observational-memory', tier: 'user' as const } }
-const COMPACT_START = { source: 'compact' as const, session_id: 'session-1', transcript_path: '' }
-
-// A turn's work after its prompt: no new prompt.
-const work = (name: string, size = 0) => turn(name, 'r', size).slice(1)
-// The user's latest request the continuation record quotes: `(n chars):` then exactly n characters.
-function nextStepIn(text?: string) {
-  const m = text?.match(/\n\n<continuation>\n[\s\S]*?^The user's latest request [^\n]*\((\d+) chars\):\n/m)
-  return m ? text!.slice(m.index! + m[0].length, m.index! + m[0].length + Number(m[1])) : undefined
-}
-// The continuation record's state of the work: its lines before the quoted request, if any.
-const recordIn = (text?: string) => text?.match(/\n\n<continuation>\n([\s\S]*?)(?:\n^The user's latest request [^\n]*\(\d+ chars\):\n[\s\S]*)?\n<\/continuation>/m)?.[1]
-const WHERE = 'Where the work stood as last recorded, up to the last message this memory covers'
-// A memory message's text without its replies section (I42), which sits between the corrections and the observations.
-const noReplies = (text = '') => text.replace(/<your-replies>\n[\s\S]*?<\/your-replies>\n\n/, '')
-const repliesIn = (text?: string) => text?.match(/\n<your-replies>\n([\s\S]*?)<\/your-replies>\n\n<observations>/)?.[1]
-const correctionsIn = (text?: string) => text?.match(/\n<corrections>\n([\s\S]*?)\n<\/corrections>/)?.[1]
-const renderedObservationsIn = (text?: string) => text?.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1]
-// A memory message with its observations replaced by `observations`, as rendered.
-const withObservations = (m: SessionMessage, observations: string): SessionMessage => ({ ...m, text: m.text.replace(/(<observations>\n)[\s\S]*?(\n<\/observations>)/, (_, a, b) => `${a}${observations}${b}`) })
-// The observations with each day's date, written once on its `@ YYYY-MM-DD` line, put back on its lines and source ends.
-function observationsIn(text?: string) {
-  let day = ''
-  const at = (t: string) => (/^\d{2}:\d{2}$/.test(t) ? `${day} ${t}` : t)
-  return renderedObservationsIn(text)
-    ?.split('\n')
-    .flatMap((l) => {
-      const d = l.match(/^@ (\d{4}-\d{2}-\d{2})$/)
-      if (d) return (day = d[1]!), []
-      return [day ? l.replace(/^(\* \S+ )(\d{2}:\d{2}) /, (_, m, t) => `${m}${at(t)} `).replace(/\(source (\S+(?: \S+)?) to (\S+(?: \S+)?)\)$/, (_, a, b) => `(source ${at(a)} to ${at(b)})`) : l]
-    })
-    .join('\n')
-}
-// The entries of the user messages section: `* User[ @ time] (n chars):` then exactly n characters, or an
-// omission line, read as `(n omitted)`; a day's `@ YYYY-MM-DD` line is skipped.
-function userMessagesIn(text?: string) {
-  const start = text?.indexOf('\n\n<all-user-messages>\n') ?? -1
-  if (!text || start < 0) return undefined
-  const out: string[] = []
-  const entry = /\* User(?: @ (?:[\d-]+ )?[\d:]+)? \((\d+) chars\):\n|\* \((\d+) earlier user messages omitted(?:; om_recall can search them)?\)\n|@ [\d-]+\n/y
-  entry.lastIndex = start + '\n\n<all-user-messages>\n'.length
-  for (let m; (m = entry.exec(text)); )
-    if (!m[1] && !m[2]) continue
-    else if (m[2]) out.push(`(${m[2]} omitted)`)
-    else out.push(text.slice(entry.lastIndex, entry.lastIndex + Number(m[1]))), (entry.lastIndex += Number(m[1]) + 1)
-  return out
-}
-const pad = (n: number) => String(n).padStart(2, '0')
-const stampOf = (iso: string) => {
-  const d = new Date(iso)
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-const briefIn = (text?: string) => text?.match(/<session-brief>\n([\s\S]*?)\n<\/session-brief>/)?.[1]
-const skillsIn = (text?: string) => text?.match(/<skills-in-use>\n([\s\S]*?)\n<\/skills-in-use>/)?.[1]
-const FINISHED = '(finished; invoke it again to reread its text, or om_recall to find where it loaded)'
-
-// Turns a to c of a live session, then turn d still running: `old` is loaded in turn a, `mid` in b, `now` in d.
-async function fourTurns($: Engine, on: On) {
-  const clock = mock.clock(on)
-  const { history, stored } = world(on)
-  const seen = pi(on)
-  on('skill.prompt', ($, e) => ({ text: e.text }))
-  const runTurn = live(on, clock, history)
-  await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 0))
-  await $.skill.prompt({ skill: 'old', text: 'Old steps' })
-  await runTurn($, turn('b', 'b', 100), at(22, 14, 10))
-  await $.skill.prompt({ skill: 'mid', text: 'Mid steps' })
-  await runTurn($, turn('c', 'c', 100), at(22, 14, 20))
-  await clock.set(at(22, 14, 30))
-  history.push({ role: 'user', text: 'd', toolUses: [] })
-  await $.turn.start({ text: 'd', turnId: 'turn-d' })
-  await clock.advance(30_000)
-  await $.skill.prompt({ skill: 'now', text: 'Now steps' })
-  history.push(...work('d', 8_000))
-  await clock.settle()
-  const first = await $.session.compact({ trigger: 'auto', messages: [...history] })
-  return { clock, history, stored, seen, runTurn, first }
-}
-
-// The engine's model requests inside a turn: each answered at once beneath the plugin, read to its end.
-function steps(on: On) {
-  on('turn.step', async function* ($, e) {
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
-  })
-  return async ($: Engine, turnId: string, index: number, messageCount: number, agentId?: string) => {
-    const stream = $.turn.step({ turnId, index, model: 'claude', messageCount, ...(agentId ? { agentId } : {}) })
-    for await (const _ of stream);
-    return stream.result
-  }
-}
-
-// One tool call of a long turn: the call and its result of `size` characters.
-const call = (n: number, size: number): SessionMessage[] => [
-  { role: 'assistant', text: '', toolUses: [{ tool_use_id: `c${n}`, tool: 'Read', input: { file_path: `/src/f${n}.ts` } }] },
-  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `c${n}`, text: 'x'.repeat(size), isError: false }] },
-]
-
-// One tool call of a subagent `agent` (or the main loop's): it reads `/src/<agent>-<n>.ts`.
-const agentCall = (agent: string, n: number, size: number): SessionMessage[] => [
-  { role: 'assistant', text: '', toolUses: [{ tool_use_id: `${agent}-c${n}`, tool: 'Read', input: { file_path: `/src/${agent}-${n}.ts` } }] },
-  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `${agent}-c${n}`, text: 'x'.repeat(size), isError: false }] },
-]
-// An Observer that names the files its chunk read.
-const readsIn = (prompt: string) => `<observations>\n* 🟡 Read ${[...prompt.matchAll(/"file_path":"\/src\/([\w-]+)\.ts"/g)].map((m) => m[1]).join(', ')}\n</observations>`
-const readers = (text: string) => new Set([...text.matchAll(/\b(main|one|two)-\d+/g)].map((m) => m[1]))
+import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, COMPOSER, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ran, pi, nearTarget, isFiller, tokensOf, live, gates, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, nextStepIn, recordIn, WHERE, noReplies, repliesIn, correctionsIn, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, stampOf, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, overloaded, fourTurns } from './harness'
+import type { Ledger, Run } from './harness'
 
 describe('register', () => {
   test('the kept calls come back under fresh ids, a call and its result alike, renamed from the original at each compaction', async ($, on) => {
@@ -426,8 +52,9 @@ describe('register', () => {
     expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
     expect(text).toContain(`${MEMORY_HEADER}\n\n<memory-guide>\n- The observations are this session's own earlier history`)
     expect(text).not.toContain('only as background')
-    expect(seen.logs.at(-1)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
-    expect(seen.screen).toEqual(['Compacted in 0 ms · observed 7 messages on the spot · memory 2 notes'])
+    expect(seen.logs.at(-2)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
+    expect(seen.logs).toContain('Compacted in 0 ms · observed 7 messages on the spot · memory 2 notes')
+    expect(seen.screen).toEqual([])
   })
 
   test('the Observer records what happened, never what a chunk lacks', async ($, on) => {
@@ -517,15 +144,15 @@ describe('register', () => {
       ].join('\n'),
     )
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
-    expect(seen.logs.slice(-3)).toEqual([
+    expect(seen.logs.slice(-4)).toEqual([
       'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
       'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
       expect.stringMatching(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, kept 1 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 0 observations, 0 skill\(s\), brief ~\d+ tokens$/),
+      expect.stringMatching(/^Compacted in .* · memory 0 notes · 7 messages in a brief compiled by code \(the Observer failed\)$/),
     ])
     expect(seen.screen).toEqual([
       'Observation failed (pi stopped (error)) and put 3 messages in the session brief',
       'Observation failed (pi stopped (error)) and put 4 messages in the session brief',
-      expect.stringMatching(/^Compacted in .* · memory 0 notes · 7 messages in a brief compiled by code \(the Observer failed\)$/),
     ])
     await clock.advance(5_000)
     const stats = JSON.parse(files['/stats/session-1.json']!)
@@ -782,7 +409,8 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(1)
     expect(seen.logs.filter((l) => l.startsWith('retrying rows') || l.includes('at compaction failed'))).toEqual([])
-    expect(seen.screen).toEqual(['Compacted in 0 ms · observed 5 messages on the spot · memory 1 note'])
+    expect(seen.logs.at(-1)).toBe('Compacted in 0 ms · observed 5 messages on the spot · memory 1 note')
+    expect(seen.screen).toEqual([])
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "a"')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(5))
   })
@@ -938,12 +566,10 @@ describe('register', () => {
 
     expect(seen.stopped).toBe(1)
     expect(seen.logs).toContain("observation of rows 0-3 at compaction failed (the compaction's 30s deadline passed); left unobserved")
-    expect(seen.logs.at(-1)).toMatch(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, /)
+    expect(seen.logs.at(-2)).toMatch(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, /)
+    expect(seen.logs.at(-1)).toBe('Compacted in 30.0 s · memory 0 notes · 7 messages in a brief compiled by code (the Observer failed)')
     expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
-    expect(seen.screen).toEqual([
-      "Observation failed (the compaction's 30s deadline passed) and put 3 messages in the session brief",
-      'Compacted in 30.0 s · memory 0 notes · 7 messages in a brief compiled by code (the Observer failed)',
-    ])
+    expect(seen.screen).toEqual(["Observation failed (the compaction's 30s deadline passed) and put 3 messages in the session brief"])
     await clock.advance(5_000)
     const stats = JSON.parse(files['/stats/session-1.json']!)
     expect(stats.counts['compaction.manual.deadlineHit']).toBe(1)
@@ -993,7 +619,7 @@ describe('register', () => {
     expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "b"')
     expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "g"')
     expect(seen.logs.filter((l) => l.includes('deadline'))).toEqual([])
-    expect(seen.screen.at(-1)).toMatch(/^Compacted in 10.0 s · observed \d+ messages on the spot · memory \d+ notes$/)
+    expect(seen.logs.at(-1)).toMatch(/^Compacted in 10.0 s · observed \d+ messages on the spot · memory \d+ notes$/)
   })
 
   test('a background pi call still running at its timeout on the clock is killed, and a later pass retries its chunk', async ($, on) => {
@@ -1087,7 +713,9 @@ describe('register', () => {
     expect(seen.prompts[0]).toContain('[User @ 2026-09-22 14:00]: a\n\n[Assistant @ 2026-09-22 14:00]: a\n[Read({"file_path":"/src/a.ts"})]')
     expect(seen.prompts[0]).toContain('[Assistant @ 2026-09-22 14:01]: a done\n\n[User @ 2026-09-22 14:30]: a')
     expect(seen.logs).toContain('observed rows 0-7 in the background, 4 observations; watermark 7, 0 chunk(s) waiting on a gap')
-    expect(seen.screen).toEqual(['Observed 7 messages in 0 ms · +4 notes · memory 4 notes'])
+    // The debug log only: the band above the prompt shows it on screen.
+    expect(seen.logs).toContain('Observed 7 messages in 0 ms · +4 notes · memory 4 notes')
+    expect(seen.screen).toEqual([])
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
     // Clamped into the chunk's times, 13:59 to 14:32 (the latest time recorded plus a minute); a line without a
     // real time gets the chunk's latest. The chunk's source range closes its run of lines.
@@ -1195,8 +823,8 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(2)
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(3))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call, kept 9 raw messages/)
-    expect(seen.screen.at(-1)).toBe('Compacted in 0 ms · memory 1 note')
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call, kept 9 raw messages/)
+    expect(seen.logs.at(-1)).toBe('Compacted in 0 ms · memory 1 note')
     history.push(...result.messages!) // the engine appends the compaction's result to the history
     open(2)
     await clock.settle()
@@ -2166,11 +1794,10 @@ describe('register', () => {
     expect(new Set(seen.calls.map((c) => piSessionOf(c.argv)))).toEqual(new Set([OBSERVER_SESSION]))
     // Every call read one loop's rows, and a loop left short of a slot got the next one free.
     for (const prompt of seen.prompts) expect(readers(prompt).size).toBe(1)
-    // Only main's observations show in the chat; the subagents' go to the debug log.
-    const byMain = seen.prompts.filter((p) => readers(p).has('main')).length
-    expect(byMain).toBeGreaterThan(0)
-    expect(seen.screen.filter((l) => l.startsWith('Observed'))).toHaveLength(byMain)
-    expect(seen.logs.filter((l) => l.startsWith('Observed'))).toHaveLength(seen.prompts.length - byMain)
+    // Every loop's observations go to the debug log, none to the chat: the band above the prompt shows them.
+    expect(seen.prompts.some((p) => readers(p).has('main'))).toBe(true)
+    expect(seen.screen.filter((l) => l.startsWith('Observed'))).toEqual([])
+    expect(seen.logs.filter((l) => l.startsWith('Observed'))).toHaveLength(seen.prompts.length)
     const ledgers = { main: 'ledger:session-1', one: 'ledger:session-1/agent-1', two: 'ledger:session-1/agent-2' }
     for (const [who, key] of Object.entries(ledgers)) {
       const ledger = stored[key] as Ledger
@@ -2265,7 +1892,7 @@ describe('register', () => {
 
     expect(result.messages).toHaveLength(1)
     expect(observationsIn(result.messages?.[0]?.text)).toContain('Read f1')
-    expect(seen.logs.at(-1)).toMatch(/^observed 6 rows now, kept 0 raw messages/)
+    expect(seen.logs.at(-2)).toMatch(/^observed 6 rows now, kept 0 raw messages/)
   })
 
   test('a memory message over the budget a small window leaves keeps its skills as lines and its user messages as the brief, and the rest whole', async ($, on) => {
@@ -2448,7 +2075,7 @@ describe('register', () => {
     expect(correctionsIn(text)).toBe(corrections.map((c) => `* ${c}`).join('\n'))
     expect(result.messages).toHaveLength(1) // no raw tail
     expect(briefIn(text)).toStartWith(FLOOR_NOTE)
-    expect(seen.screen.at(-1)).toMatch(/ · \d+ messages in a brief compiled by code \(the memory was over its budget\)$/)
+    expect(seen.logs.at(-1)).toMatch(/ · \d+ messages in a brief compiled by code \(the memory was over its budget\)$/)
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual(corrections)
   })
 
@@ -2555,13 +2182,6 @@ describe('register', () => {
     expect(originals(result.messages?.slice(-2))).toEqual(agentCall('one', 7, 36_000))
   })
 
-  // What a built-in compaction hands back: its summary, then the newest call and result it keeps, with their handles.
-  const SUMMARY: SessionMessage = {
-    role: 'user',
-    text: 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. Primary Request and Intent: read the files.',
-    toolUses: [],
-  }
-  const overloaded = (): Run => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' })
   // A context window too small for any memory while `tiny()`: with the Observer failing too, the floor's brief is over
   // the budget at every cut, and the built-in compaction runs. Otherwise the host gives no usage: the default budget.
   const window = (on: On, tiny: () => boolean) =>
@@ -2651,7 +2271,7 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(calls)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent') || l.includes('restarting the ledger'))).toEqual([])
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
     expect(observationsIn(second.messages?.[0]?.text)).toContain('main-10')
   })
 
@@ -2756,7 +2376,7 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(calls)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent') || l.includes('restarting the ledger'))).toEqual([])
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
     const observed = observationsIn(second.messages?.[0]?.text)
     expect(observed).toContain('main-10')
     expect(observed).not.toMatch(/\bmain-0\b/) // the chunk the brief took
@@ -3541,8 +3161,8 @@ describe('register', () => {
       'observed rows 7-13 in the background, 1 observations; watermark 0, 1 chunk(s) waiting on a gap',
       'observed rows 0-7 in the background, 1 observations; watermark 13, 0 chunk(s) waiting on a gap',
     ])
-    // On screen, a chunk held behind a gap already counts toward the memory.
-    expect(seen.screen.filter((l) => l.startsWith('Observed')).map((l) => l.replace(/ in .* · \+/, ' · +'))).toEqual([
+    // A chunk held behind a gap already counts toward the memory.
+    expect(seen.logs.filter((l) => l.startsWith('Observed')).map((l) => l.replace(/ in .* · \+/, ' · +'))).toEqual([
       'Observed 6 messages · +1 note · memory 1 note',
       'Observed 7 messages · +1 note · memory 2 notes',
     ])
@@ -3618,222 +3238,6 @@ describe('register', () => {
     expect(userMessagesIn(second.messages?.[0]?.text)).toEqual([quoted])
   })
 
-  // A real crewmate turn, replayed from a private transcript: /tmp/om-v043/make-fixture.py writes the module
-  // (gitignored). Without it the test has nothing to replay and passes.
-  test('replays a crewmate transcript: one long turn, observed in the background, compacted with no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
-    const fx = (await import('./fixtures/crewmate.local').catch(() => undefined)) as
-      | { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
-      | undefined
-    if (!fx) return
-    const clock = mock.clock(on, { now: fx.at[0] })
-    const { history, stored } = world(on)
-    const seen = pi(on, { hold: () => clock.sleep(12_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
-    const step = steps(on)
-    on('turn.start', ($, e) => ({ turnId: e.turnId }))
-    on('turn.complete', () => ({ text: '' }))
-    const tokens = (m: SessionMessage) =>
-      Math.ceil([m.text, ...m.toolUses.map((u) => `${u.tool} ${JSON.stringify(u.input)}`), ...(m.toolResults ?? []).map((r) => r.text)].join('\n').length / 4)
-
-    history.push(fx.rows[0]!)
-    await $.turn.start({ text: fx.brief, turnId: 't' })
-    let index = 0
-    let live = 0 // where the live context starts in the history
-    const report: { lunaAtCompaction: number; midTurnLanded: number; rawTokens: number; nextStep: boolean }[] = []
-    for (let i = 1; i < fx.rows.length; i++) {
-      await clock.set(Math.max(clock.now(), fx.at[i]!))
-      if (fx.compactions.some((c) => c.at === i)) {
-        const before = seen.prompts.length
-        const landed = seen.logs.filter((l) => l.includes('in the background')).length
-        const result = await $.session.compact({ trigger: 'auto', messages: history.slice(live) })
-        const text = result.messages?.[0]?.text ?? ''
-        const watermark = history.length - (result.messages!.length - 1)
-        report.push({
-          lunaAtCompaction: seen.prompts.length - before,
-          midTurnLanded: landed,
-          rawTokens: history.slice(watermark).reduce((n, m) => n + tokens(m), 0),
-          nextStep: nextStepIn(text) !== undefined,
-        })
-        expect(userMessagesIn(text)).toEqual([fx.brief])
-        live = history.length
-        history.push(...result.messages!)
-      }
-      if (fx.step[i]) await step($, 't', index++, history.length)
-      history.push(fx.rows[i]!)
-      await clock.settle()
-    }
-    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })
-
-    expect(report).toHaveLength(fx.compactions.length)
-    for (const r of report) {
-      expect(r.lunaAtCompaction).toBe(0)
-      expect(r.midTurnLanded).toBeGreaterThan(0)
-      expect(r.rawTokens).toBeLessThanOrEqual(6_000 + 10_000 + 2_000) // the raw tail and about one chunk, as chunks end past CHUNK_TOKENS
-      expect(r.nextStep).toBe(false)
-    }
-    const ledger = stored['ledger:session-1'] as Ledger
-    for (const e of ledger.entries) expect(e.line).toMatch(/^\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2} /)
-  })
-
-  // A real subagent's run, replayed from a private transcript: /tmp/om-sub/make-fixture.py writes the module
-  // (gitignored). Its session compacted it three times at ~157-160k tokens, observing everything before the raw tail on
-  // the spot (22.4 s, 15.4 s, 13.0 s). Here each Observer call takes 15 s of the replay's clock. Without the module the
-  // test has nothing to replay and passes.
-  test('replays a subagent transcript: its own steps observe it in the background, and each compaction makes no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
-    const fx = (await import('./fixtures/subagent.local').catch(() => undefined)) as
-      | { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
-      | undefined
-    if (!fx) return
-    const clock = mock.clock(on, { now: fx.at[0] })
-    const { agents, stored } = world(on)
-    const seen = pi(on, { hold: () => clock.sleep(15_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
-    const step = steps(on)
-    on('turn.complete', () => ({ text: '' }))
-    const rows: SessionMessage[] = (agents['agent-1'] = [fx.rows[0]!])
-    const tokens = (m: SessionMessage) =>
-      Math.ceil([m.text, ...m.toolUses.map((u) => `${u.tool} ${JSON.stringify(u.input)}`), ...(m.toolResults ?? []).map((r) => r.text)].join('\n').length / 4)
-
-    let index = 0
-    let live = 0 // where the live context starts in the subagent's history
-    const report: { lunaAtCompaction: number; landed: number; rawTokens: number; nextStep: boolean }[] = []
-    for (let i = 1; i < fx.rows.length; i++) {
-      await clock.set(Math.max(clock.now(), fx.at[i]!))
-      if (fx.compactions.some((c) => c.at === i)) {
-        const before = seen.prompts.length
-        const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: rows.slice(live) })
-        const text = result.messages?.[0]?.text ?? ''
-        report.push({
-          lunaAtCompaction: seen.prompts.length - before,
-          landed: seen.logs.filter((l) => l.includes('in the background')).length,
-          rawTokens: result.messages!.slice(1).reduce((n, m) => n + tokens(m), 0),
-          nextStep: nextStepIn(text) !== undefined,
-        })
-        expect(userMessagesIn(text)).toEqual([fx.brief])
-        live = rows.length
-        rows.push(...result.messages!)
-      }
-      if (fx.step[i]) await step($, 's', index++, rows.length, 'agent-1')
-      rows.push(fx.rows[i]!)
-      await clock.settle()
-    }
-    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
-
-    expect(report).toHaveLength(fx.compactions.length)
-    for (const r of report) {
-      expect(r.lunaAtCompaction).toBe(0)
-      expect(r.landed).toBeGreaterThan(0)
-      expect(r.rawTokens).toBeLessThanOrEqual(6_000 + 5_000 + 10_000) // the raw tail, a scheduling interval, a chunk in flight
-      expect(r.nextStep).toBe(false)
-    }
-    expect(seen.screen).toEqual([])
-    expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual(fx.compactions.map(() => expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/)))
-    expect(Object.keys(stored)).toEqual([]) // the finished subagent's keys are gone
-  })
-
-  // Run 1 of the v0.4.10 subagent smoke (/tmp/om-sub/live/run1), replayed from its subagent's transcript:
-  // /tmp/om-tail/make-fixture.py writes the module (gitignored). The subagent read 36 KB files (~9k tokens each, more
-  // than the raw tail's budget) and was compacted five times, each right after a read; every one fell back to the
-  // built-in summary. Here the Observer fails until the first compaction, as in run 1, so the floor briefs what leaves
-  // context; the engine appends its memory message to the subagent's history. Each later compaction must match that
-  // history and cut at the background watermark. Without the module the test has nothing to replay and passes.
-  test('replays run 1 of the subagent smoke: after the floor stands in for a failed Observer, later compactions match the history and make no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
-    const fx = (await import('./fixtures/fallback.local').catch(() => undefined)) as
-      | { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
-      | undefined
-    if (!fx) return
-    const clock = mock.clock(on, { now: fx.at[0] })
-    const { agents, stored } = world(on)
-    let failing = true
-    const seen = pi(on, { hold: () => (failing ? undefined : clock.sleep(15_000)), reply: () => '<observations>\n* 🟡 Read a chapter\n</observations>', fail: () => (failing ? overloaded() : undefined) })
-    const step = steps(on)
-    on('turn.complete', () => ({ text: '' }))
-    let builtin = 0
-    on('session.compact', () => (builtin++, { messages: [SUMMARY] }))
-    const rows: SessionMessage[] = (agents['agent-1'] = [fx.rows[0]!])
-
-    let index = 0
-    let live = 0 // where the live context starts in the subagent's history
-    const report: { lunaAtCompaction: number; floor: boolean }[] = []
-    for (let i = 1; i < fx.rows.length; i++) {
-      await clock.set(Math.max(clock.now(), fx.at[i]!))
-      if (fx.compactions.some((c) => c.at === i)) {
-        const before = seen.prompts.length
-        const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: rows.slice(live) })
-        report.push({ lunaAtCompaction: seen.prompts.length - before, floor: briefIn(result.messages![0]!.text)?.startsWith(FLOOR_NOTE) ?? false })
-        live = rows.length
-        rows.push(...result.messages!)
-        failing = false
-      }
-      if (fx.step[i]) await step($, 's', index++, rows.length, 'agent-1')
-      rows.push(fx.rows[i]!)
-      await clock.settle()
-    }
-    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
-
-    expect(builtin).toBe(0)
-    expect(report).toHaveLength(fx.compactions.length)
-    expect(report[0]!).toEqual({ lunaAtCompaction: expect.any(Number), floor: true })
-    for (const r of report.slice(1)) expect(r).toEqual({ lunaAtCompaction: 0, floor: false })
-    expect(seen.logs.filter((l) => l.startsWith('compaction not persistent') || l.includes('restarting the ledger'))).toEqual([])
-    expect(seen.screen).toEqual([])
-    expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual([
-      expect.stringMatching(/^Compacted subagent in 0 ms · memory 0 notes · \d+ messages in a brief compiled by code \(the Observer failed\)$/),
-      ...fx.compactions.slice(1).map(() => expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes?$/)),
-    ])
-    expect(Object.keys(stored)).toEqual([])
-  })
-
-  // A real firstmate stretch, replayed from a private transcript: /tmp/om-stall/work/make-fixture.ts writes the
-  // module (gitignored). From the context the 14:31 compaction left to the 15:11 compaction: short turns, many opened
-  // by a task notification, with a parallel block that compaction wrote back grouped. Without it the test has nothing
-  // to replay and passes.
-  test('replays a firstmate transcript: short turns are observed in the background, and compaction cuts at the watermark', { timeoutMs: 120_000 }, async ($, on) => {
-    const fx = (await import('./fixtures/firstmate.local').catch(() => undefined)) as
-      | { rows: SessionMessage[]; at: number[]; start: number; live: number; events: { kind: 'start' | 'step' | 'complete' | 'reload' | 'compact'; rows: number; at: number }[] }
-      | undefined
-    if (!fx) return
-    const clock = mock.clock(on, { now: fx.at[0] })
-    const { history } = world(on)
-    const seen = pi(on, { hold: () => clock.sleep(16_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
-    const step = steps(on)
-    on('turn.start', ($, e) => ({ turnId: e.turnId }))
-    on('turn.complete', () => ({ text: '' }))
-
-    history.push(...fx.rows.slice(0, fx.start))
-    let turn = 0
-    let index = 0
-    let atCompaction = -1
-    for (const e of fx.events) {
-      while (history.length < e.rows) {
-        await clock.set(Math.max(clock.now(), fx.at[history.length]!))
-        history.push(fx.rows[history.length]!)
-        await clock.settle()
-      }
-      await clock.set(Math.max(clock.now(), e.at))
-      if (e.kind === 'start') {
-        turn++
-        index = 0
-        await $.turn.start({ text: history.at(-1)!.text, turnId: `t${turn}` })
-      } else if (e.kind === 'step') await step($, `t${turn}`, index++, history.length)
-      else if (e.kind === 'complete') await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: `t${turn}`, reason: 'answer' })
-      else if (e.kind === 'compact') {
-        const before = seen.prompts.length
-        await $.session.compact({ trigger: 'auto', messages: history.slice(fx.live) })
-        atCompaction = seen.prompts.length - before
-      }
-      await clock.settle()
-    }
-
-    // As the session logged: rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail
-    // until the turn that ended at 15:08:26. Past the stub's one line, each chunk carries the assistant's own sentences.
-    expect(seen.logs.filter((l) => l.includes('in the background'))).toEqual([
-      'observed rows 1-56 in the background, 2 observations; watermark 56, 0 chunk(s) waiting on a gap',
-      'observed rows 56-139 in the background, 6 observations; watermark 139, 0 chunk(s) waiting on a gap',
-    ])
-    expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
-    expect(atCompaction).toBe(0)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
-  })
-
   test('stats: a discarded background chunk counts its cost but not its observations', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
@@ -3885,8 +3289,8 @@ describe('register', () => {
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(seen.prompts).toHaveLength(observed)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
-    expect(seen.screen.at(-1)).toMatch(/^Compacted in 0 ms · memory \d+ notes?$/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-1)).toMatch(/^Compacted in 0 ms · memory \d+ notes?$/)
     const tail = originals(result.messages!.slice(1))!
     expect(tail).toEqual(context.slice(context.length - tail.length))
     expect(tailKeepsCalls(tail)).toBe(true)
@@ -3910,7 +3314,7 @@ describe('register', () => {
 
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(seen.prompts).toHaveLength(observed)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
     const tail = originals(result.messages!.slice(1))!
     expect(tail.slice(-4)).toEqual(block.context)
     expect(tailKeepsCalls(tail)).toBe(true)
@@ -3942,7 +3346,7 @@ describe('register', () => {
     expect(history.length).toBeGreaterThan(context.length)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(seen.prompts).toHaveLength(observed)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
   test('an older wrapper row in the raw tail keeps only the lines a newer one does not repeat, and reads whole again after the compaction', async ($, on) => {
@@ -3975,7 +3379,7 @@ describe('register', () => {
     expect(seen.prompts.join('\n').split('then reply to the lead').length - 1).toBe(2)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(seen.prompts).toHaveLength(observed)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
   test('an older tool input and result the raw tail cut read whole again after the compaction', async ($, on) => {
@@ -4023,7 +3427,7 @@ describe('register', () => {
     expect(seen.prompts.join('\n')).toContain(output)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(seen.prompts).toHaveLength(observed)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
   // A compaction writes its kept tail back in the context's order, so the history then holds a parallel block
@@ -4056,7 +3460,7 @@ describe('register', () => {
 
     expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(seen.prompts).toHaveLength(observed)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
   test('a compaction finds its context when the history holds rows past it (the /compact command) and keeps the ledger', async ($, on) => {
@@ -4077,7 +3481,7 @@ describe('register', () => {
 
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([])
     expect(seen.prompts).toHaveLength(observed)
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
   test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
@@ -4675,7 +4079,8 @@ describe('the floor', () => {
     expect(briefIn(result.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
     expect(userMessagesIn(result.messages![0]!.text)).toEqual(['a', 'b'])
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(8)) // the newest turn stays raw
-    expect(seen.screen).toEqual([expect.stringMatching(/^Compacted in 0 ms · memory 0 notes · 8 messages in a brief compiled by code \(nothing was observed yet\)$/)])
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^Compacted in 0 ms · memory 0 notes · 8 messages in a brief compiled by code \(nothing was observed yet\)$/))
+    expect(seen.screen).toEqual([])
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
     expect(stats.counts).toEqual({ 'compaction.manual.floor': 1, 'compaction.notPersistent': 1, 'compaction.notPersistent.manual': 1, 'compaction.notPersistent.short': 1 })
     expect(stats.metrics['compaction.manual.rowsBriefed']!.sum).toBe(8)
@@ -4697,7 +4102,8 @@ describe('the floor', () => {
     expect(seen.prompts).toEqual([])
     expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
     expect(originals(result.messages?.slice(1))).toEqual(SHORT.slice(3))
-    expect(seen.screen).toEqual(['Compacted in 0 ms · memory 0 notes · 3 messages in a brief compiled by code (too little to observe yet)'])
+    expect(seen.logs).toContain('Compacted in 0 ms · memory 0 notes · 3 messages in a brief compiled by code (too little to observe yet)')
+    expect(seen.screen).toEqual([])
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { sum: number }> }
     expect(stats.counts['compaction.manual.floor']).toBe(1)
     expect(stats.metrics['compaction.manual.syncCalls']!.sum).toBe(0)
@@ -4761,7 +4167,7 @@ describe('the floor', () => {
     expect(seen.prompts).toHaveLength(before)
     expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
     expect(briefIn(result.messages![0]!.text)).toBeUndefined()
-    expect(seen.logs.at(-1)).toMatch(/^cut at the background watermark with no Observer call/)
+    expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
   test('a context that is the memory message alone leaves the floor nothing to compile: the built-in compaction runs, saying why', async ($, on) => {

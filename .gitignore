@@ -2,3 +2,4 @@ tests/fixtures/*.local.ts
 .worktrees/
 tests/fixtures/replay/
 .scratch/
+tests/*.local.test.ts
