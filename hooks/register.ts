@@ -1,9 +1,13 @@
 import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
-import { add, addCompaction, clipLine, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
+import { add, addCompaction, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { registerNotes } from './notes'
+import { atom, update } from 'claude-code'
+import { newWorker, registerWorkers, settled, started as startedWorker } from './workers'
+import type { Gauges } from './workers'
+import type { Worker } from '../types'
 import { COPY_ID, INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallIo, TranscriptCache } from './recall'
 import { compileBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
@@ -306,6 +310,40 @@ const INPUT_MASKED = new RegExp(noteSource(omissionMarker(0, 'input').trim()))
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
 // A subagent's lines go to the debug log only: the main chat shows the main conversation's.
 const show = ($: EngineInterface, text: string, agentId?: string) => (agentId === undefined ? $.ui.log(text) : $.ui.log(text, { to: 'debug' }))
+// The band above the prompt (workers.ts draws it; the scan wants the reference spelled in the file that writes it).
+// A failed write leaves the band as it was, and the call it tracks goes on.
+const workers = atom({ plugin: 'observational-memory', key: 'workers' } as const, [] as Worker[])
+const track = ($: EngineInterface, change: (ws: Worker[]) => Worker[]) =>
+  update($, workers, change).catch((error) => log($, `could not update the workers band (${errorText(error)})`))
+// The footer's gauges, for the main conversation only: written to `gauges/<sessionId>.json` beside the stats for a
+// status line script to draw, since `$.ui.status` puts the plugin's name before its line. `pending` is the history
+// no Observer call covers yet, as the last scheduling pass counted it; `cost` is what Luna has cost the session, as
+// /om-stats totals it.
+const pendingTokens = new Map<string, number>()
+async function showGauges($: EngineInterface, loop: Loop) {
+  if (loop.agentId !== undefined) return
+  try {
+    const [stored, usage, dir, cost] = await Promise.all([
+      $.store.get(ledgerKey(loop.key)) as Promise<Ledger | undefined>,
+      $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
+      statsDir(statsIo($)),
+      costOf(statsIo($), loop.sessionId),
+    ])
+    const context = usage?.context
+    const gauges: Gauges = {
+      pending: pendingTokens.get(loop.key) ?? 0,
+      chunk: CHUNK_TOKENS,
+      ledger: estimateTokens(renderLines(stored?.entries ?? [])),
+      reflectAt: REFLECT_AT_TOKENS,
+      context: context?.tokens,
+      compactAt: context?.breakdown?.autoCompactThreshold ?? context?.window,
+      cost,
+    }
+    await $.fs.write(`${dir.replace(/[^/]*$/, 'gauges')}/${loop.sessionId}.json`, JSON.stringify(gauges))
+  } catch (error) {
+    log($, `could not write the gauges (${errorText(error)})`)
+  }
+}
 const plural = (n: number, noun: string) => `${grouped(n)} ${noun}${n === 1 ? '' : 's'}`
 // A pi failure in a few words for the screen: how it ended, never what it printed.
 function reason(error: unknown, timeoutMs: number) {
@@ -1297,6 +1335,10 @@ function schedule($: EngineInterface, loop: Loop, stamp: string) {
     }
     if (slots > 0) waiting.delete(loop.key)
     else waiting.set(loop.key, { loop, stamp })
+    let pending = 0
+    for (let i = ledger.watermark.to; i < limit; i++) if (!covered.some((r) => r.from <= i && i < r.to)) pending += v.tokens[i]!
+    pendingTokens.set(loop.key, pending)
+    void showGauges($, loop)
   })
 }
 
@@ -1308,6 +1350,8 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
   const { sessionId } = loop
   let chunk: Chunk | undefined
   const started = await $.clock.now()
+  const worker = newWorker('observer')
+  if (isLive(loop, stamp)) await track($, startedWorker(worker))
   if (isLive(loop, stamp))
     try {
       chunk = await observe($, sessionId, v, job.range.from, job.range.to, 'background', job.before, stopOf(loop, stamp))
@@ -1345,6 +1389,9 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
     return !!at
   }).catch((error) => (log($, errorText(error)), false))
   done(landed)
+  // Landed, its observations count; failed while the loop runs, a cross; otherwise (the loop ended, the rows moved) it goes.
+  await track($, settled(worker, await $.clock.now(), landed ? { added: chunk!.lines.length } : !chunk && isLive(loop, stamp) ? 'failed' : undefined))
+  if (landed) await showGauges($, loop)
   if (landed) backoff.delete(loop.key)
   else if (!chunk && isLive(loop, stamp)) await backOff($, loop, stamp)
   // The slot it held goes to a loop waiting for one first, whether this chunk landed or not.
@@ -1435,8 +1482,11 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
   const text = renderLines(snapshot)
   if (estimateTokens(text) < REFLECT_AT_TOKENS || !isLive(loop, stamp) || reflecting.has(key)) return
   reflecting.add(key)
+  const worker = newWorker('reflector')
+  let installed = false
   $.clock.after(0, () => {
     const run = async () => {
+      await track($, startedWorker(worker))
       const started = await $.clock.now()
       let recent = snapshot.length
       for (let chars = -1; recent > 0; recent--) {
@@ -1527,6 +1577,7 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
         const after = estimateTokens(renderLines([...reflected, ...kept]))
         await $.store.set(ledgerKey(key), { ...ledger, entries, seq })
+        installed = true
         record(statsIo($), sessionId, (s, at) => addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: after, level }, at))
         log(
           $,
@@ -1537,13 +1588,20 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
         show($, `Condensed memory in ${duration((await $.clock.now()) - started)} · ${grouped(ledger.entries.length)} → ${plural(entries.length, 'note')}`, loop.agentId)
       })
     }
+    // Installed, a tick; failed, a cross; skipped or discarded, it goes.
+    let failed = false
     run()
       .catch((error) => {
         if (error instanceof LoopEnded) return log($, 'a reflection outlived its loop; discarded')
+        failed = true
         log($, `reflection failed (${errorText(error)})`)
         show($, `Condensing failed (${reason(error, REFLECTOR_TIMEOUT_MS)}) and will retry later`, loop.agentId)
       })
-      .finally(() => reflecting.delete(key))
+      .finally(async () => {
+        reflecting.delete(key)
+        await track($, settled(worker, await $.clock.now(), installed ? {} : failed ? 'failed' : undefined))
+        if (installed) await showGauges($, loop)
+      })
   })
 }
 
@@ -2148,6 +2206,7 @@ async function isCopy(requestId: string) {
 export const register: Register = (on) => {
   registerPrune(on)
   registerNotes(on)
+  registerWorkers(on)
   on('session.compact', async ($, e, next) => {
     try {
       return await compact($, e, next)
@@ -2335,6 +2394,7 @@ export const register: Register = (on) => {
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
     transcripts.delete(e.sessionId)
+    pendingTokens.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     await flushHeld($) // and so does the held times' timer
     const kinds = cleared ? KINDS.map((kind) => key(kind, e.sessionId)) : []
