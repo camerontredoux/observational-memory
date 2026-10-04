@@ -4612,6 +4612,24 @@ describe('the Session line', () => {
   })
 })
 
+describe('the spinner after a compaction mid-turn', () => {
+  test("the SessionStart message shows while the hooks run and goes once the turn moves past a request, until the message changes", async ($, on) => {
+    const drawn: (string | null)[] = []
+    on('ui.render', { component: 'Spinner' }, ($, e) => (drawn.push(e.props.message), { type: 'Text', children: [e.props.word] }))
+    const draw = (message: string | null, mode: 'requesting' | 'responding') =>
+      $.ui.render({ surface: 'terminal', component: 'Spinner', requestId: 'main', props: { word: 'Baking', message, suffix: '…', mode } })
+    const hooks = 'Running SessionStart hooks…'
+
+    await draw(hooks, 'requesting')
+    await draw(hooks, 'responding')
+    await draw(hooks, 'requesting')
+    await draw(null, 'requesting')
+    await draw(hooks, 'requesting')
+
+    expect(drawn).toEqual([hooks, null, null, null, hooks])
+  })
+})
+
 // The memory message is a user message the engine draws as typed: collapsed, its row is one line.
 describe('the memory row', () => {
   test('a collapsed memory message draws as one line, an expanded one and any other prompt as written', async ($, on) => {

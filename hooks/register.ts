@@ -1693,6 +1693,9 @@ async function output($: EngineInterface, argv: string[], path: string) {
 const transcripts = new Map<string, TranscriptCache>()
 // The sessions whose om_recall the tool list holds (its tool.describe).
 const listed = new Set<string>()
+// The spinners (by agent) whose SessionStart message has outlasted its hooks.
+const SESSION_START_SPINNER = 'Running SessionStart hooks'
+const staleSpinners = new Set<string>()
 
 function noteRecall($: EngineInterface, sessionId: string, result: string, fromFile: boolean) {
   record(statsIo($), sessionId, (s, at) => addRecall(s, Number(result.match(/^(\d+) match/)?.[1] ?? 0), fromFile, at))
@@ -2281,6 +2284,14 @@ export const register: Register = (on) => {
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
   // A plugin command's output row (`/notes`); a local command's rows are not kept (withoutLocalCommands).
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
+
+  // A compaction mid-turn leaves the engine's `Running SessionStart hooks` on the spinner for the rest of the turn.
+  // Once the turn has moved past a request, the hooks are done: the spinner draws its word until the message changes.
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    if (!e.props.message?.startsWith(SESSION_START_SPINNER)) return void staleSpinners.delete(e.requestId), next(e)
+    if (e.props.mode !== 'requesting') staleSpinners.add(e.requestId)
+    return staleSpinners.has(e.requestId) ? next({ ...e, props: { ...e.props, message: null } }) : next(e)
+  })
 
   on('session.start', async ($, e, next) => {
     await $.tool
