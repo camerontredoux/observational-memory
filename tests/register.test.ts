@@ -616,11 +616,13 @@ describe('register', () => {
     expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (pi exited 1: Error: network down); left unobserved')
   })
 
-  test('compaction waits for a background call in flight over rows it must observe instead of making the call again', async ($, on) => {
+  // The hook's budget runs on through a wait that is not a `$` call: a compaction that waited on the background call
+  // alone outran it and fell back to the built-in compaction.
+  test('compaction observes the rows of a background call in flight itself, and a background call that lands first stops its own', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
+    const seen = pi(on, { hold: (n, prompt) => (n === 2 || (n > 2 && prompt.includes(']: b\n')) ? gate(n) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -631,14 +633,13 @@ describe('register', () => {
     history.push(...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK), ...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000))
     const compacting = $.session.compact({ trigger: 'manual', messages: [...history] })
     await clock.advance(10_000)
-    const calls = seen.prompts.length
-    expect(seen.inFlight).toBe(1)
+    expect(seen.inFlight).toBe(2) // the background call and the compaction's own over rows 3-7, both held
     open(2)
     const result = await compacting
 
-    expect(seen.prompts).toHaveLength(calls)
-    expect(seen.prompts.filter((p) => p.includes(']: b\n'))).toHaveLength(1)
+    expect(seen.stopped).toBe(1)
     expect(seen.logs).toContain('observed rows 3-7 in the background, 1 observations; watermark 7, 0 chunk(s) waiting on a gap')
+    expect(seen.logs.filter((l) => l.includes('at compaction failed'))).toEqual([])
     expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "b"')
     expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "g"')
     expect(seen.logs.filter((l) => l.includes('deadline'))).toEqual([])
@@ -1820,6 +1821,20 @@ describe('register', () => {
     expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
   })
 
+  // A hot reload cancels the old code's pending waits: a worker it started never settles, and spun on.
+  test("the band drops an earlier load's unsettled worker when the session starts again", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    // The value the earlier load left in the host's state, until the plugin writes it.
+    let workers: unknown = [{ id: 'observer-oldload-1', kind: 'observer' }]
+    let version = 1
+    on('state.get', ($, e, next) => (e.key === 'workers' ? { value: { value: workers, version } } : next(e)))
+    on('state.set', ($, e, next) => (e.key === 'workers' ? ((workers = e.value), { value: { isSet: true, version: ++version } }) : next(e)))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: true })
+    expect(workers).toEqual([])
+  })
+
   test('main and two subagents observe in the background side by side, each under its own keys, four Observer calls in flight across them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
@@ -2364,11 +2379,9 @@ describe('register', () => {
 
     await run(0, 10)
     expect([seen.inFlight, seen.prompts[0]]).toEqual([1, expect.stringContaining('/src/one-0.ts')]) // the first chunk, held
-    // Compaction waits on the held call until its deadline, then leaves its rows unobserved.
-    const compacting = $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: context() })
-    await clock.advance(30_000)
-    const first = await compacting
-    expect(seen.logs).toContainEqual(expect.stringMatching(/^background observation of rows \d+-\d+ was still running at compaction \(the compaction's 30s deadline passed\); left unobserved$/))
+    // Compaction observes the held call's rows itself, and fails there too.
+    const first = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: context() })
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^observation of rows 0-\d+ at compaction failed \(.*\); left unobserved$/))
     expect(builtin).toBe(0)
     expect(briefIn(first.messages![0]!.text)).toStartWith(FLOOR_NOTE)
     rows.push(...first.messages!)
@@ -2390,7 +2403,7 @@ describe('register', () => {
     expect(observed).toContain('one-10')
     expect(observed).not.toMatch(/\bone-0\b/) // the chunk the brief took
     expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual([
-      expect.stringMatching(/^Compacted subagent in 30.0 s · memory 0 notes · \d+ messages in a brief compiled by code \(the Observer failed\)$/),
+      expect.stringMatching(/^Compacted subagent in 0 ms · memory 0 notes · \d+ messages in a brief compiled by code \(the Observer failed\)$/),
       expect.stringMatching(/^Compacted subagent in 0 ms · memory \d+ notes$/),
     ])
     await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })

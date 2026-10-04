@@ -20,8 +20,12 @@ const MUTED = '#7d8590'
 const workers = atom({ plugin: 'observational-memory', key: 'workers' } as const, [] as Worker[])
 const frame = atom({ plugin: 'observational-memory', key: 'frame' } as const, 0)
 
+// A worker's id names the load of this code that started it. A hot reload cancels the old code's pending waits, so a
+// worker it started never settles: the new load's session.start drops it, or it would spin until the session ends.
+const LOAD = Math.random().toString(36).slice(2, 8)
 let seq = 0
-export const newWorker = (kind: Worker['kind']): Worker => ({ id: `${kind}-${++seq}`, kind })
+export const newWorker = (kind: Worker['kind']): Worker => ({ id: `${kind}-${LOAD}-${++seq}`, kind })
+const orphaned = (w: Worker) => !w.settled && !w.id.startsWith(`${w.kind}-${LOAD}-`)
 export const started = (worker: Worker) => (ws: Worker[]) => [...ws, worker]
 // `outcome` undefined drops the worker at once: its call ended with the loop, or its result was discarded.
 export const settled = (worker: Worker, at: number, outcome: { added?: number } | 'failed' | undefined) => (ws: Worker[]) =>
@@ -31,6 +35,9 @@ export const settled = (worker: Worker, at: number, outcome: { added?: number } 
 
 export const registerWorkers = (on: On) => {
   on('session.start', { isInteractive: true }, async ($, e, next) => {
+    await update($, workers, (ws) => (ws.some(orphaned) ? ws.filter((w) => !orphaned(w)) : ws)).catch((error) =>
+      $.ui.log(`the workers band could not drop a reload's workers (${errorText(error)})`, { to: 'debug' }),
+    )
     $.clock.every(FRAME_MS, async () => {
       try {
         const ws = await read($, workers)

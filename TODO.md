@@ -89,6 +89,31 @@ To find the cause, v1.7.6 writes each mismatch to
 a short hash, length, tool names and first 80 characters (`captureMismatch`, tagged `[DEBUG-np01]`). Next: read the
 captures from the next mismatches, fix the cause, then remove everything tagged `[DEBUG-np01]`.
 
+On 2026-10-03, subagent `a6261f17` in session `e6ad9851` also mismatched. It has no known cause either.
+
+## Workflow agents get no background observation
+
+A workflow's agents (`"agentType":"workflow-subagent"`) write their transcripts to
+`<project>/<session>/subagents/workflows/wf_*/agent-<id>.jsonl`. `$.agent.list()` does not list their ids, and
+`$.session.messages({ agentId })` refuses their history. So `onStep` in `hooks/register.ts` returns for them, and
+each of their compactions observes the whole context on the spot. In sessions `6396851a` and `28895069`, 57 of 57
+such compactions blocked, each with 5 to 7 Observer calls and for 17 to 24 s. This has been so since v0.4.10.
+
+A fix must read the agent's history from its transcript file. The rows must hash the same as the engine's
+`e.messages` (`rowHash`), for the background passes and for the compaction's alignment. The engine does not
+document how it maps transcript lines to `SessionMessage` rows. First, confirm that `turn.step` fires with a
+workflow agent's id.
+
+## Fast subagents outrun the background observation
+
+A subagent that reads fast fills its window before background chunks land. For example, Explore `a1a60770` grew
+from 16k to 152k tokens in 65 s. At its compaction more than `RAW_MAX_TOKENS` was unobserved, so it observed on the
+spot. `MAX_PARALLEL` is shared across the main loop and every subagent. Two changes could help, each with a cost:
+
+- Let the raw tail grow to what the budget leaves after the memory message. The compacted context is then larger,
+  and the next compaction comes sooner.
+- Give a free slot to the loop nearest its compaction threshold first. Other loops then wait longer.
+
 ## Engine bug: the kept raw tail shows twice after a compaction
 
 After the plugin compacts, Claude Code shows the kept raw tail again, after the compaction notice. Auto-compaction
