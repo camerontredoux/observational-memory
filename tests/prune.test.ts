@@ -114,7 +114,7 @@ describe('register', () => {
     const w = world(on, { ...session('a', NOW - 60 * DAY), ...session('b', NOW - 60 * DAY) }, true, [], {}, { writeFails: true })
     await w.start($)
     expect(Object.keys(w.stored).filter((k) => k.startsWith('ledger:')).sort()).toEqual(['ledger:a', 'ledger:b'])
-    expect(w.logs).toEqual(['could not prune old sessions (no implementation for fs.write)'])
+    expect(w.logs.filter((l) => !l.startsWith('could not write the gauges'))).toEqual(['could not prune old sessions (no implementation for fs.write)'])
   })
 
   test("a subagent's keys belong to its session: pruned with an old one, kept with the current one and under the cap", async ($, on) => {

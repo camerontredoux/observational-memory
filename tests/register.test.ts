@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On, Register, SessionCompactInput, SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END } from '../hooks/prompts'
+import { estimateTokens } from '../hooks/memory'
 import { planBudget } from '../hooks/register'
 import { originalId } from '../hooks/recall'
 import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, COMPOSER, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ran, pi, nearTarget, isFiller, tokensOf, live, gates, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, nextStepIn, recordIn, WHERE, noReplies, repliesIn, correctionsIn, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, stampOf, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE, overloaded, fourTurns } from './harness'
@@ -1615,6 +1616,18 @@ describe('register', () => {
     )
     const whole = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', ref: '#33', lines: '1' })).result)
     expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines \(1,031 characters\); only if you still need them: \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
+  })
+
+  test('the gauges are written at session.start, so the status line draws them before the first turn ends', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    on('tool.register', ($, e) => ({ value: { tool: `mcp__observational-memory__${e.name}` } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+    await clock.settle()
+
+    expect(JSON.parse(files['/gauges/session-1.json']!)).toMatchObject({ pending: 0, ledger: 0, cost: 0 })
   })
 
   test('the recall-only eval plugin registers om_recall exactly as the plugin does, so built-in+recall is offered the same tool', async ($, on) => {
@@ -4612,7 +4625,7 @@ describe('the memory row', () => {
     await draw(memory, true)
     await draw('fix the build', false)
 
-    expect(drawn).toEqual(['Compacted into observational memory (ctrl+o to see the full memory)', memory, 'fix the build'])
+    expect(drawn).toEqual([`Compacted into observational memory · ${estimateTokens(memory)} tokens`, memory, 'fix the build'])
   })
 
   test('the rows a compaction kept draw once: the copies it wrote after the memory row draw as nothing, the rows after them as written', async ($, on) => {

@@ -427,8 +427,13 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
 }
 // A memory message of any version, told as recall.ts's `isMemoryText` tells one.
 const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && isMemoryText(m.text)
-// What the transcript shows in place of a memory message while the row is collapsed.
-const MEMORY_ROW = 'Compacted into observational memory (ctrl+o to see the full memory)'
+// What the transcript shows in place of a memory message while the row is collapsed, then its size: `· 8.4k tokens`.
+// ui-extension draws a row starting with this prefix as its own `[memory]` row, so keep the two in step.
+const MEMORY_ROW = 'Compacted into observational memory · '
+const memoryRow = (text: string) => {
+  const n = estimateTokens(text)
+  return `${MEMORY_ROW}${n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n} tokens`
+}
 // A row drawn as nothing.
 const NOTHING = { type: 'Box' as const }
 const isSummary = (m: SessionMessage | undefined) => m?.role === 'user' && m.text.startsWith(COMPACT_WRAPPER) // either compaction's
@@ -2266,7 +2271,7 @@ export const register: Register = (on) => {
     if (isMemoryText(e.props.text)) {
       const id = rowId(e.requestId)
       if (id) void copiesAfter($, id)
-      return e.props.isExpanded ? next(e) : next({ ...e, props: { ...e.props, text: MEMORY_ROW } })
+      return e.props.isExpanded ? next(e) : next({ ...e, props: { ...e.props, text: memoryRow(e.props.text) } })
     }
     return !e.props.isExpanded && (await isCopy(e.requestId)) ? NOTHING : next(e)
   })
@@ -2333,6 +2338,8 @@ export const register: Register = (on) => {
       log($, `could not register the stats tool and command (${errorText(error)})`)
       show($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
     })
+    // The footer's gauges from the start, rather than once the first turn ends.
+    void showGauges($, loopOf(await $.session.id()))
     return next(e)
   })
 
