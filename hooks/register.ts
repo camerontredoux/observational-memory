@@ -1,4 +1,4 @@
-import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, TurnUsage } from 'claude-code'
+import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
 import { add, addCacheUse, addCompaction, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
@@ -2235,6 +2235,12 @@ async function isCopy(requestId: string) {
   return false
 }
 
+// A call with no id (an older desktop host) cannot be told apart, so the group's own id decides.
+async function onlyCopies(calls: readonly ToolGroupCall[]) {
+  for (const c of calls) if (c.tool_use_id !== undefined && !(await isCopy(c.tool_use_id))) return false
+  return true
+}
+
 export const register: Register = (on) => {
   registerPrune(on)
   registerNotes(on)
@@ -2280,7 +2286,10 @@ export const register: Register = (on) => {
     return !e.props.isExpanded && (await isCopy(e.requestId)) ? NOTHING : next(e)
   })
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
-  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => (!e.props.isExpanded && (await isCopy(e.requestId)) ? NOTHING : next(e)))
+  // A compaction mid-turn folds the turn's next calls into the group its copies start: it draws while one call is new.
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) =>
+    !e.props.isExpanded && (await isCopy(e.requestId)) && (await onlyCopies(e.props.calls)) ? NOTHING : next(e),
+  )
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
   // A plugin command's output row (`/notes`); a local command's rows are not kept (withoutLocalCommands).

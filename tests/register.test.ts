@@ -4700,4 +4700,28 @@ describe('the memory row', () => {
     expect(drawn.command).not.toEqual(nothing)
     expect(drawn.next).not.toEqual(nothing)
   })
+
+  test('a tool group the next calls joined after the copies draws: only a group of copies alone draws as nothing', async ($, on) => {
+    const { stored, files } = world(on)
+    on('ui.render', ($, e) => ({ type: 'Text', children: [String(e.requestId)] }))
+    stored['transcript:session-1'] = '/t/session-1.jsonl'
+    files['/home/u/.claude/sessions/1.json'] = JSON.stringify({ sessionId: 'session-1', startedAt: Date.parse('2026-10-01T07:00:00.000Z') })
+    const memory = `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<observations>\n- 🟡 a note\n</observations>`
+    const row = (uuid: string, timestamp: string, content: unknown) => JSON.stringify({ type: 'user', uuid: `${uuid}-0000-4000-8000-000000000000`, timestamp, message: { content } })
+    // A compaction mid-turn: the kept tail ends in a call, and the turn's next calls fold into the same group.
+    files['/t/session-1.jsonl'] = [
+      row('11111111', '2026-10-01T07:09:32.741Z', memory),
+      row('33333333', '2026-10-01T07:09:32.742Z', [{ type: 'tool_use', id: 't-c__om1', name: 'Edit', input: {} }]),
+      row('44444444', '2026-10-01T07:09:32.742Z', [{ type: 'tool_result', tool_use_id: 't-c__om1', content: 'ok' }]),
+      row('55555555', '2026-10-01T07:09:40.000Z', [{ type: 'tool_use', id: 't-new', name: 'Bash', input: {} }]),
+    ].join('\n')
+    const call = (id: string) => ({ tool_use_id: id, tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false })
+    const group = (requestId: string, ids: string[]) =>
+      $.ui.render({ surface: 'terminal', component: 'ToolGroup', requestId, props: { calls: ids.map(call), isActive: true, isExpanded: false } })
+
+    await $.ui.render({ surface: 'terminal', component: 'UserMessage', requestId: '11111111-0000-4000-8000-000000000000', props: { text: memory, origin: { kind: 'unclassified' }, isExpanded: false } })
+    const nothing = { type: 'Box' }
+    expect(await group('t-c__om1', ['t-c__om1'])).toEqual(nothing)
+    expect(await group('t-c__om1', ['t-c__om1', 't-new'])).not.toEqual(nothing)
+  })
 })
