@@ -25,7 +25,7 @@ export const turn = (prompt: string, reply: string, size = 0): SessionMessage[] 
 
 export const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
 export const PI_USAGE = { input: 9206, output: 558, cacheRead: 3072, cacheWrite: 0, reasoning: 31, totalTokens: 9764, cost: { input: 0.0023, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.0025108 } }
-export const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low', '--system-prompt']
+export const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-6-luna', '--thinking', 'low', '--system-prompt']
 export const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
 // pi's session id for one piece of work, which its codex provider sends as the prompt cache key. The hash is FNV-1a
 // of 'session-1'. pi rejects an id outside its characters, and the provider cuts one past 64 characters.

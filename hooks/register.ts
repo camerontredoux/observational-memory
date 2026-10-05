@@ -41,8 +41,8 @@ import {
 } from './memory'
 import type { Bounds, Entry, Memory, Skill, Source, Unmarked, UserMessage } from './memory'
 
-// Every model call: pi with GPT-5.6 Luna, the prompt on stdin, run from a neutral directory.
-const PI = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'low']
+// Every model call: pi with GPT-6 Luna, the prompt on stdin, run from a neutral directory.
+const PI = ['pi', '-p', '--model', 'openai-codex/gpt-6-luna', '--thinking', 'low']
 const PI_ISOLATION = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
 const PI_CWD = '/tmp'
 // pi's `--session-id`, which its codex provider sends as the prompt cache key: one per piece of work, so the calls
