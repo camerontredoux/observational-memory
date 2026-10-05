@@ -2287,11 +2287,12 @@ export const register: Register = (on) => {
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => ((await isCopy(e.requestId)) ? NOTHING : next(e)))
 
   // A compaction mid-turn leaves the engine's `Running SessionStart hooks` on the spinner for the rest of the turn.
-  // Once the turn has moved past a request, the hooks are done: the spinner draws its word until the message changes.
+  // Once the turn has moved past a request, the hooks are done: the spinner draws its word until the message changes,
+  // with the ellipsis the message's own one stood in for.
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
     if (!e.props.message?.startsWith(SESSION_START_SPINNER)) return void staleSpinners.delete(e.requestId), next(e)
     if (e.props.mode !== 'requesting') staleSpinners.add(e.requestId)
-    return staleSpinners.has(e.requestId) ? next({ ...e, props: { ...e.props, message: null } }) : next(e)
+    return staleSpinners.has(e.requestId) ? next({ ...e, props: { ...e.props, message: null, suffix: '…' } }) : next(e)
   })
 
   on('session.start', async ($, e, next) => {

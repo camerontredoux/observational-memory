@@ -4627,10 +4627,10 @@ describe('the Session line', () => {
 
 describe('the spinner after a compaction mid-turn', () => {
   test("the SessionStart message shows while the hooks run and goes once the turn moves past a request, until the message changes", async ($, on) => {
-    const drawn: (string | null)[] = []
-    on('ui.render', { component: 'Spinner' }, ($, e) => (drawn.push(e.props.message), { type: 'Text', children: [e.props.word] }))
+    const drawn: string[] = []
+    on('ui.render', { component: 'Spinner' }, ($, e) => (drawn.push(e.props.message ?? e.props.word + e.props.suffix), { type: 'Text', children: [e.props.word] }))
     const draw = (message: string | null, mode: 'requesting' | 'responding') =>
-      $.ui.render({ surface: 'terminal', component: 'Spinner', requestId: 'main', props: { word: 'Baking', message, suffix: '…', mode } })
+      $.ui.render({ surface: 'terminal', component: 'Spinner', requestId: 'main', props: { word: 'Baking', message, suffix: message ? '' : '…', mode } })
     const hooks = 'Running SessionStart hooks…'
 
     await draw(hooks, 'requesting')
@@ -4639,7 +4639,7 @@ describe('the spinner after a compaction mid-turn', () => {
     await draw(null, 'requesting')
     await draw(hooks, 'requesting')
 
-    expect(drawn).toEqual([hooks, null, null, null, hooks])
+    expect(drawn).toEqual([hooks, 'Baking…', 'Baking…', 'Baking…', hooks])
   })
 })
 
