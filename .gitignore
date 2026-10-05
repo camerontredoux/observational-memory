@@ -1,5 +1,6 @@
 tests/fixtures/*.local.ts
 .worktrees/
+.claude/worktrees/
 tests/fixtures/replay/
 .scratch/
 tests/*.local.test.ts
