@@ -4656,7 +4656,30 @@ describe('the memory row', () => {
     await draw(memory, true)
     await draw('fix the build', false)
 
-    expect(drawn).toEqual([`Compacted into observational memory · ${estimateTokens(memory)} tokens`, memory, 'fix the build'])
+    expect(drawn).toEqual([`Compacted into observational memory · with ${estimateTokens(memory)} tokens of memory`, memory, 'fix the build'])
+  })
+
+  test('once the first main request after a compaction is answered, its row shows the context that request carried', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    const drawn: string[] = []
+    on('ui.render', { component: 'UserMessage' }, ($, e) => (drawn.push(e.props.text), { type: 'Text', children: [e.props.text] }))
+    on('turn.step', async function* ($, e) {
+      const usage = { ...USAGE, input_tokens: 300, cache_read_input_tokens: 18_000, cache_creation_input_tokens: 30_000, model: 'claude' }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage }
+    })
+    const draw = (text: string) => $.ui.render({ surface: 'terminal', component: 'UserMessage', requestId: 'm1', props: { text, origin: { kind: 'unclassified' }, isExpanded: false } })
+    await clock.set(at(23, 9, 0))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('tail', 'r', 8_000))
+
+    const memory = (await $.session.compact({ trigger: 'auto', messages: [...history] })).messages![0]!.text
+    await draw(memory)
+    for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude', messageCount: 1 }));
+    await clock.settle()
+    await draw(memory)
+
+    expect(drawn).toEqual([`Compacted into observational memory · with ${estimateTokens(memory)} tokens of memory`, 'Compacted into observational memory · to 48.3k tokens'])
   })
 
   test('the rows a compaction kept draw once: the copies it wrote after the memory row draw as nothing, the rows after them as written', async ($, on) => {

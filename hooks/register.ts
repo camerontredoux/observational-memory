@@ -348,15 +348,28 @@ async function showGauges($: EngineInterface, loop: Loop) {
   }
 }
 // The main conversation's last compaction, by session, until a request carries the context it installed: which
-// compactor made it. That request's usage says what the compaction cost in prompt cache.
-const uncarried = new Map<string, 'om' | 'builtin'>()
+// compactor made it, and the hash of an om compaction's memory message. That request's usage says what the
+// compaction cost in prompt cache, and its input is the context the compaction left, which the memory row shows.
+const uncarried = new Map<string, { compactor: 'om' | 'builtin'; memory?: string }>()
 async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
   const sessionId = await $.session.id()
-  const compactor = uncarried.get(sessionId)
-  if (compactor === undefined) return
+  const last = uncarried.get(sessionId)
+  if (last === undefined) return
   uncarried.delete(sessionId)
   const use = { uncached: usage.input_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens }
-  record(statsIo($), sessionId, (s, at) => addCacheUse(s, compactor, use, at))
+  record(statsIo($), sessionId, (s, at) => addCacheUse(s, last.compactor, use, at))
+  if (last.memory === undefined) return
+  const sizes = { ...(await sizesOf($, sessionId)), [last.memory]: use.uncached + use.cacheRead + use.cacheWrite }
+  contextSizes.set(sessionId, Promise.resolve(sizes))
+  await $.store.set(sizeKey(sessionId), sizes)
+  $.ui.invalidate('ui.render')
+}
+// The context each om compaction of the main conversation left, in tokens, by its memory message's hash.
+const contextSizes = new Map<string, Promise<Record<string, number>>>()
+function sizesOf($: EngineInterface, sessionId: string) {
+  let sizes = contextSizes.get(sessionId)
+  if (!sizes) contextSizes.set(sessionId, (sizes = $.store.get(sizeKey(sessionId)).then((v) => (v ?? {}) as Record<string, number>, () => ({}))))
+  return sizes
 }
 const plural = (n: number, noun: string) => `${grouped(n)} ${noun}${n === 1 ? '' : 's'}`
 // A pi failure in a few words for the screen: how it ended, never what it printed.
@@ -427,12 +440,15 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
 }
 // A memory message of any version, told as recall.ts's `isMemoryText` tells one.
 const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && isMemoryText(m.text)
-// What the transcript shows in place of a memory message while the row is collapsed, then its size: `· 8.4k tokens`.
-// ui-extension draws a row starting with this prefix as its own `[memory]` row, so keep the two in step.
+// What the transcript shows in place of a memory message while the row is collapsed, then the context the compaction
+// left, `· to 52.3k tokens`, once a request has measured it; until then, or for a subagent's, the message's own size,
+// `· with 4.0k tokens of memory`.
+// ui-extension draws a row starting with this prefix as its own `[memory] compacted session` row, so keep the two in step.
 const MEMORY_ROW = 'Compacted into observational memory · '
-const memoryRow = (text: string) => {
-  const n = estimateTokens(text)
-  return `${MEMORY_ROW}${n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n} tokens`
+const memoryRow = (text: string, context: number | undefined) => {
+  const n = context ?? estimateTokens(text)
+  const size = `${n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n} tokens`
+  return `${MEMORY_ROW}${context === undefined ? `with ${size} of memory` : `to ${size}`}`
 }
 // A row drawn as nothing.
 const NOTHING = { type: 'Box' as const }
@@ -1128,6 +1144,7 @@ const skillsKey = (sessionId: string) => key('skills', sessionId)
 const turnsKey = (sessionId: string) => key('turns', sessionId) // the main loop's newest turn starts
 const transcriptKey = (sessionId: string) => key('transcript', sessionId)
 const goalKey = (sessionId: string) => key('goal', sessionId) // the Session line (see writeSession)
+const sizeKey = (sessionId: string) => key('size', sessionId) // the context each compaction left (see noteCacheUse)
 
 // The kinds a subagent's loop keeps: dropped when it finishes.
 const LOOP_KEYS = [ledgerKey, timesKey, liveKey]
@@ -1802,7 +1819,7 @@ async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, nex
       addCompaction(s, { trigger: e.agentId === undefined ? e.trigger : 'subagent', fellBack, ms: at - started, tokensBefore: r.skip === undefined ? r.tokensBefore : undefined, tokensAfter: r.skip === undefined ? r.tokensAfter : undefined }, at),
     )
   const [summary, ...kept] = r.messages ?? []
-  if (installs && summary && sessionId !== undefined && e.agentId === undefined) uncarried.set(sessionId, 'builtin')
+  if (installs && summary && sessionId !== undefined && e.agentId === undefined) uncarried.set(sessionId, { compactor: 'builtin' })
   if (installs && summary && loop && isLive(loop, stamp!)) {
     const fallback: Fallback = { summary: rowHash(summary), kept: kept.map(rowHash) }
     await $.store.set(liveKey(loop.key), fallback).catch((error) => log($, `could not record the built-in compaction (${errorText(error)})`))
@@ -2140,7 +2157,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
   // In the context's own order.
   const tail = dedupWrappers(maskTail(withoutLocalCommands(live.filter((m, i) => kept.has(i) && !isEmptyReply(m))).map(({ handle: _, ...m }) => m)))
-  if (main && installs) uncarried.set(sessionId, 'om')
+  if (main && installs) uncarried.set(sessionId, { compactor: 'om', memory: hash(message.text) })
   return { messages: [message, ...freshToolIds(tail, started.toString(36))] }
 }
 
@@ -2281,7 +2298,9 @@ export const register: Register = (on) => {
     if (isMemoryText(e.props.text)) {
       const id = rowId(e.requestId)
       if (id) void copiesAfter($, id)
-      return e.props.isExpanded ? next(e) : next({ ...e, props: { ...e.props, text: memoryRow(e.props.text) } })
+      if (e.props.isExpanded) return next(e)
+      const context = await $.session.id().then((id) => sizesOf($, id).then((sizes) => sizes[hash(e.props.text)]), () => undefined)
+      return next({ ...e, props: { ...e.props, text: memoryRow(e.props.text, context) } })
     }
     return !e.props.isExpanded && (await isCopy(e.requestId)) ? NOTHING : next(e)
   })
@@ -2457,6 +2476,7 @@ export const register: Register = (on) => {
     if (cleared) listed.delete(e.sessionId)
     pendingTokens.delete(e.sessionId)
     uncarried.delete(e.sessionId)
+    contextSizes.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     await flushHeld($) // and so does the held times' timer
     const kinds = cleared ? KINDS.map((kind) => key(kind, e.sessionId)) : []
