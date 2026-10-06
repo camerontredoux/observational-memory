@@ -1926,7 +1926,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   let sync = { calls: 0, ms: 0 }
   let deadlineHit = false
   const start = tailStart(v, base)
-  const briefOnly = main && e.trigger === 'manual' && initial.watermark.to === base && chunkEnd(v, base, start, true) === undefined
+  const briefOnly = main && (e.trigger === 'manual' || e.trigger === 'plugin') && initial.watermark.to === base && chunkEnd(v, base, start, true) === undefined
   if (!briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to) {
     // The loop's background calls in flight over rows it must observe are made again here, and the first to end
     // stands: a background call that lands first stops this one. The hook's budget (HookBudget) runs on through any
@@ -2288,13 +2288,24 @@ async function onlyCopies(calls: readonly ToolGroupCall[]) {
   return true
 }
 
+// The prompt cache lives an hour from the last request that read it, which comes before turn.complete fires, so 60
+// minutes after turn.complete is already past it. A main conversation idle this long is compacted, so that the next
+// request rewrites the smaller context.
+export const IDLE_COMPACT_MS = 60 * 60 * 1000
+
 export const register: Register = (on) => {
+  // The idle timer, whether a main turn runs, and whether the conversation grew since its last compaction.
+  let idleTimer: { cancel: () => void } | undefined
+  let mainTurnRunning = false
+  let changedSinceCompaction = false
   registerPrune(on)
   registerNotes(on)
   registerWorkers(on)
   on('session.compact', async ($, e, next) => {
     try {
-      return await compact($, e, next)
+      const r = await compact($, e, next)
+      if (e.agentId === undefined && e.trigger !== 'precompute' && r.skip === undefined) changedSinceCompaction = false
+      return r
     } catch (error) {
       // Once the compaction is abandoned, a throw would run the hooks beneath, the built-in compactor's model call
       // among them, for a result the dispatch no longer takes; a return runs nothing.
@@ -2461,6 +2472,7 @@ export const register: Register = (on) => {
 
   // Subagents raise no turn.start, so each is the main conversation's prompt.
   on('turn.start', async ($, e, next) => {
+    mainTurnRunning = true
     await current($)
       .then(async ({ loop, stamp }) => {
         await markTime($, true, loop, stamp)
@@ -2484,6 +2496,17 @@ export const register: Register = (on) => {
   // A subagent's is its answer: its loop is done, and what it stored goes. A teammate's is one of many, as main's.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    if (e.agentId === undefined) {
+      mainTurnRunning = false
+      changedSinceCompaction = true
+      idleTimer?.cancel()
+      idleTimer = $.clock.after(IDLE_COMPACT_MS, () => {
+        idleTimer = undefined
+        if (mainTurnRunning || !changedSinceCompaction) return
+        // Rejects while a turn runs that this hook did not see start; then the next turn's end sets a new timer.
+        void $.session.compact().catch((error) => log($, `idle compaction not run (${errorText(error)})`))
+      })
+    }
     try {
       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
       const { loop, stamp } = await current($, e.agentId)
@@ -2499,6 +2522,9 @@ export const register: Register = (on) => {
   // drops the main conversation's too. An ordinary end keeps the main conversation's, and its work in flight, for a
   // resume. The lives end at once; the keys go under the lock, after any ledger write already under way.
   on('session.end', async ($, e, next) => {
+    idleTimer?.cancel()
+    idleTimer = undefined
+    mainTurnRunning = false
     const cleared = e.reason === 'clear'
     if (cleared) (recallIndexes.delete(e.sessionId), recallLoads.delete(e.sessionId))
     end(`${e.sessionId}/`)

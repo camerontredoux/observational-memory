@@ -4748,3 +4748,77 @@ describe('the memory row', () => {
     expect(await group('t-c__om1', ['t-c__om1', 't-new'])).not.toEqual(nothing)
   })
 })
+
+describe('idle compaction', () => {
+  const MIN = 60_000
+  const setup = ($: Parameters<typeof live>[0] extends never ? never : Parameters<ReturnType<typeof live>>[0], on: On) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = pi(on, { reply: readsIn })
+    const runTurn = live(on, clock, history)
+    let idle = 0
+    on('session.compact', (_, e) => ((e.trigger !== 'manual' && idle++), { messages: [SUMMARY] }))
+    const compactions = () => idle
+    const compact = () => $.session.compact({ trigger: 'manual', messages: [...history] })
+    let n = 0
+    const next = (minute: number) => runTurn($, turn(`p${n}`, `r${n++}`, CHUNK), at(23, 9, 0) + minute * MIN)
+    return { clock, history, seen, compactions, compact, next }
+  }
+
+  test('compacts once the main conversation has been idle 60 minutes', async ($, on) => {
+    const { clock, compactions, next } = setup($, on)
+    await next(0) // its turn ends a minute in
+    await clock.advance(58 * MIN)
+    expect(compactions()).toBe(0)
+    await clock.advance(2 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(1)
+  })
+
+  test('a turn at minute 50 resets the timer', async ($, on) => {
+    const { clock, compactions, next } = setup($, on)
+    await next(0)
+    await next(50)
+    await clock.set(at(23, 9, 0) + 62 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(0)
+    await clock.set(at(23, 9, 0) + 112 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(1)
+  })
+
+  test('does nothing when nothing was added since the last compaction', async ($, on) => {
+    const { clock, compactions, compact, next } = setup($, on)
+    await next(0)
+    await compact()
+    await clock.settle()
+    const before = compactions()
+    await clock.advance(120 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(before)
+  })
+
+  test("a subagent's turn neither starts nor resets the timer", async ($, on) => {
+    const { clock, compactions, next } = setup($, on)
+    await clock.set(at(23, 9, 0) + 30 * MIN)
+    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    await clock.advance(120 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(0) // it started none
+    await next(150)
+    await clock.set(at(23, 9, 0) + 200 * MIN)
+    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
+    await clock.set(at(23, 9, 0) + 212 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(1) // not reset at minute 50
+  })
+
+  test('session.end cancels it', async ($, on) => {
+    const { clock, compactions, next } = setup($, on)
+    await next(0)
+    await $.session.end({ sessionId: 'session-1', reason: 'other' } as never)
+    await clock.advance(120 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(0)
+  })
+})
