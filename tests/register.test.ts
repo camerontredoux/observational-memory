@@ -4846,4 +4846,66 @@ describe('idle compaction', () => {
     await clock.settle()
     expect(compactions()).toBe(0)
   })
+
+  describe('a load into an already idle session', () => {
+    const START = at(23, 9, 0)
+    const reply = (ms: number, extra = '') => JSON.stringify({ type: 'assistant', timestamp: new Date(ms).toISOString(), ...(extra ? JSON.parse(extra) : {}) })
+    const boundary = (ms: number) => JSON.stringify({ type: 'system', subtype: 'compact_boundary', timestamp: new Date(ms).toISOString() })
+    const load = async ($: Parameters<typeof setup>[0], on: On, files: Record<string, string>, stored: Record<string, unknown> = {}) => {
+      const clock = mock.clock(on)
+      const w = world(on)
+      pi(on, { reply: readsIn })
+      let idle = 0
+      on('session.compact', (_, e) => ((e.trigger !== 'manual' && idle++), { messages: [SUMMARY] }))
+      on('tool.register', () => ({ value: { tool: 'x' } }))
+      on('session.start', ($, e) => ({ cwd: e.cwd }))
+      Object.assign(w.files, files)
+      Object.assign(w.stored, stored)
+      await clock.set(START)
+      await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+      await clock.settle()
+      return { clock, compactions: () => idle }
+    }
+    const cache = (ms: number | null) => ({ '/gauges/session-1.cache.json': JSON.stringify({ at: ms }) })
+
+    test('a cache 70 minutes old compacts at once', async ($, on) => {
+      const { compactions } = await load($, on, cache(START - 70 * MIN))
+      expect(compactions()).toBe(1)
+    })
+
+    test('a cache 20 minutes old compacts at minute 60, not before', async ($, on) => {
+      const { clock, compactions } = await load($, on, cache(START - 20 * MIN))
+      await clock.advance(39 * MIN)
+      expect(compactions()).toBe(0)
+      await clock.advance(2 * MIN)
+      await clock.settle()
+      expect(compactions()).toBe(1)
+    })
+
+    test('a null cache starts no timer', async ($, on) => {
+      const { clock, compactions } = await load($, on, cache(null))
+      await clock.advance(200 * MIN)
+      await clock.settle()
+      expect(compactions()).toBe(0)
+    })
+
+    test('without a cache file, the transcript names the last reply, after a compact_boundary', async ($, on) => {
+      const lines = [reply(START - 200 * MIN), boundary(START - 100 * MIN), reply(START - 70 * MIN), reply(START - 1 * MIN, '{"isSidechain":true}')]
+      const { compactions } = await load($, on, { '/t/s.jsonl': lines.join('\n') }, { 'transcript:session-1': '/t/s.jsonl' })
+      expect(compactions()).toBe(1)
+    })
+
+    test('a transcript whose last reply precedes its compact_boundary is not changed', async ($, on) => {
+      const lines = [reply(START - 200 * MIN), boundary(START - 100 * MIN)]
+      const { compactions } = await load($, on, { '/t/s.jsonl': lines.join('\n') }, { 'transcript:session-1': '/t/s.jsonl' })
+      expect(compactions()).toBe(0)
+    })
+
+    test('no request at all starts nothing', async ($, on) => {
+      const { clock, compactions } = await load($, on, {})
+      await clock.advance(200 * MIN)
+      await clock.settle()
+      expect(compactions()).toBe(0)
+    })
+  })
 })

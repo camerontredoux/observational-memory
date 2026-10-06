@@ -2304,6 +2304,51 @@ async function onlyCopies(calls: readonly ToolGroupCall[]) {
 // request rewrites the smaller context.
 export const IDLE_COMPACT_MS = 60 * 60 * 1000
 
+// When the main conversation last made a request, and whether it changed since its last compaction, for a plugin
+// that loads into a session already idle (a fresh start, or a hot reload that lost the timer and flags). The cache
+// file says it, when the last request wrote it: `at` null means a compaction stands with nothing after it. Without
+// the file, the transcript's last main-thread assistant entry stands for the last request, and changed when it comes
+// after the last compact_boundary (or there is none). A transcript over 4 MiB is read from its last 2 MiB by `tail`:
+// a boundary before that window is no boundary after the entry found in it, so the answer holds; a window with no
+// main assistant entry gives none.
+const TAIL_BYTES = 2 * 1024 * 1024
+async function idleState($: EngineInterface): Promise<{ at: number } | undefined> {
+  const [dir, sessionId] = await Promise.all([statsDir(statsIo($)), $.session.id()])
+  const cache = await $.fs.read(`${dir.replace(/[^/]*$/, 'gauges')}/${sessionId}.cache.json`).then((t) => JSON.parse(String(t)) as { at?: unknown }, () => undefined)
+  if (cache) return typeof cache.at === 'number' ? { at: cache.at } : undefined
+  const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
+  if (!path) return undefined
+  const size = await $.fs.stat(path).then((s) => s.size, () => undefined)
+  if (size === undefined) return undefined
+  let text = size < 4 * 1024 * 1024 ? String(await $.fs.read(path)) : await output($, ['tail', '-c', String(TAIL_BYTES), '--', path], path)
+  if (size >= 4 * 1024 * 1024) text = text.slice(text.indexOf('\n') + 1)
+  let last: number | undefined
+  let lastAt = -1
+  let boundary = -1
+  const lines = text.split('\n')
+  lines.forEach((line, i) => {
+    if (line.includes('"subtype":"compact_boundary"')) boundary = i
+    else if (line.includes('"type":"assistant"')) {
+      try {
+        const row = JSON.parse(line) as { type?: string; isSidechain?: boolean; timestamp?: string }
+        const t = Date.parse(row.timestamp ?? '')
+        if (row.type === 'assistant' && row.isSidechain !== true && !Number.isNaN(t)) (last = t, (lastAt = i))
+      } catch {}
+    }
+  })
+  return last !== undefined && lastAt > boundary ? { at: last } : undefined
+}
+
+// Compacts once the main conversation has been idle for `after` more ms, unless `ready` says a turn runs or nothing
+// changed. Rejects while a turn runs that the hooks did not see start; then the next turn's end sets a new timer.
+function armIdle($: EngineInterface, after: number, ready: () => boolean, done: () => void) {
+  return $.clock.after(after, () => {
+    done()
+    if (!ready()) return
+    void $.session.compact().catch((error) => log($, `idle compaction not run (${errorText(error)})`))
+  })
+}
+
 export const register: Register = (on) => {
   // The idle timer, whether a main turn runs, and whether the conversation grew since its last compaction.
   let idleTimer: { cancel: () => void } | undefined
@@ -2436,6 +2481,18 @@ export const register: Register = (on) => {
     })
     // The footer's gauges from the start, rather than once the first turn ends.
     void showGauges($, loopOf(await $.session.id()))
+    // A session already idle when this code loads (a fresh start, or a hot reload that lost the timer and flags).
+    if (idleTimer === undefined && !mainTurnRunning) {
+      try {
+        const idle = await idleState($)
+        if (idle) {
+          changedSinceCompaction = true
+          idleTimer = armIdle($, Math.max(0, IDLE_COMPACT_MS - ((await $.clock.now()) - idle.at)), () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
+        }
+      } catch (error) {
+        log($, `could not tell how long the session has been idle (${errorText(error)})`)
+      }
+    }
     return next(e)
   })
 
@@ -2518,12 +2575,7 @@ export const register: Register = (on) => {
       mainTurnRunning = false
       changedSinceCompaction = true
       idleTimer?.cancel()
-      idleTimer = $.clock.after(IDLE_COMPACT_MS, () => {
-        idleTimer = undefined
-        if (mainTurnRunning || !changedSinceCompaction) return
-        // Rejects while a turn runs that this hook did not see start; then the next turn's end sets a new timer.
-        void $.session.compact().catch((error) => log($, `idle compaction not run (${errorText(error)})`))
-      })
+      idleTimer = armIdle($, IDLE_COMPACT_MS, () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
     }
     try {
       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
