@@ -1631,6 +1631,31 @@ describe('register', () => {
     expect(JSON.parse(files['/gauges/session-1.json']!)).toMatchObject({ pending: 0, ledger: 0, cost: 0 })
   })
 
+  test('the cache time is written as each main request starts, not a subagent one, and as null once a compaction installs', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    pi(on)
+    on('turn.step', async function* ($, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const }
+    })
+    on('session.compact', () => ({ messages: [SUMMARY] }))
+    const cacheAt = () => JSON.parse(files['/gauges/session-1.cache.json'] ?? '{}').at
+    await clock.set(at(23, 9, 0))
+
+    for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude', messageCount: 1 }));
+    await clock.settle()
+    expect(cacheAt()).toBe(at(23, 9, 0))
+
+    await clock.set(at(23, 9, 5))
+    for await (const _ of $.turn.step({ turnId: 's', index: 0, model: 'claude', messageCount: 1, agentId: 'agent-1' }));
+    await clock.settle()
+    expect(cacheAt()).toBe(at(23, 9, 0))
+
+    await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK)] })
+    await clock.settle()
+    expect(cacheAt()).toBeNull()
+  })
+
   test('the recall-only eval plugin registers om_recall exactly as the plugin does, so built-in+recall is offered the same tool', async ($, on) => {
     mock.clock(on)
     world(on)

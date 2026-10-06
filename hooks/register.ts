@@ -350,6 +350,17 @@ async function showGauges($: EngineInterface, loop: Loop) {
     log($, `could not write the gauges (${errorText(error)})`)
   }
 }
+// When the main conversation's prompt cache was last read, for the footer's countdown to its expiry: written to
+// `gauges/<sessionId>.cache.json` as each main request starts, the moment the cache's hour restarts, and as `null`
+// once a compaction installs, since the next request matches none of the cached conversation.
+async function noteCacheAt($: EngineInterface, at: number | null) {
+  try {
+    const [dir, sessionId] = await Promise.all([statsDir(statsIo($)), $.session.id()])
+    await $.fs.write(`${dir.replace(/[^/]*$/, 'gauges')}/${sessionId}.cache.json`, JSON.stringify({ at }))
+  } catch (error) {
+    log($, `could not write the cache time (${errorText(error)})`)
+  }
+}
 // The main conversation's last compaction, by session, until a request carries the context it installed: which
 // compactor made it, and the hash of an om compaction's memory message. That request's usage says what the
 // compaction cost in prompt cache, and its input is the context the compaction left, which the memory row shows.
@@ -2304,7 +2315,10 @@ export const register: Register = (on) => {
   on('session.compact', async ($, e, next) => {
     try {
       const r = await compact($, e, next)
-      if (e.agentId === undefined && e.trigger !== 'precompute' && r.skip === undefined) changedSinceCompaction = false
+      if (e.agentId === undefined && e.trigger !== 'precompute' && r.skip === undefined) {
+        changedSinceCompaction = false
+        $.clock.after(0, () => void noteCacheAt($, null))
+      }
       return r
     } catch (error) {
       // Once the compaction is abandoned, a throw would run the hooks beneath, the built-in compactor's model call
@@ -2487,6 +2501,10 @@ export const register: Register = (on) => {
   // request's path. A main request's usage, once it has streamed, says what the last compaction cost in cache.
   on('turn.step', async function* ($, e, next) {
     $.clock.after(0, () => void onStep($, e.agentId).catch((error) => log($, errorText(error))))
+    if (e.agentId === undefined) {
+      const at = await $.clock.now()
+      $.clock.after(0, () => void noteCacheAt($, at))
+    }
     const r = yield* next(e)
     const usage = r.usage
     if (e.agentId === undefined && usage) $.clock.after(0, () => void noteCacheUse($, usage).catch((error) => log($, errorText(error))))
