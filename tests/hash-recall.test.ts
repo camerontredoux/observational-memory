@@ -45,14 +45,14 @@ describe('# recall', () => {
     world(on, 'hr-rank', { 'ledger:hr-rank': LEDGER })
     const { suggestions } = await ask($, '#auth')
     expect(suggestions).toEqual([
-      { text: 'User: "keep auth tokens out of logs" ', label: '🔴 User: "keep auth tokens out of logs"', description: '2026-09-22 09:00 · constraint' },
-      { text: 'User: "auth goes through the proxy" ', label: '🔴 User: "auth goes through the proxy"', description: '2026-09-21 08:00 · constraint' },
-      { text: 'User asked to log auth errors ', label: '🔴 User asked to log auth errors', description: '2026-09-23 11:00' },
-      { text: 'User asked to fix auth token refresh ', label: '🔴 User asked to fix auth token refresh', description: '2026-09-22 09:30' },
-      { text: 'Auth only flow drafted ', label: '🟡 Auth only flow drafted', description: '2026-09-20 12:00 · condensed' },
-      { text: 'Agent read auth config ', label: '🟢 Agent read auth config', description: '2026-09-22 10:00' },
-      { text: 'Agent read authentication docs ', label: '🟢 Agent read authentication docs', description: '2026-09-22 10:00' },
-      { text: 'Old auth idea ', label: '🟢 Old auth idea', description: '2026-09-19 10:00' },
+      { text: 'User: "keep auth tokens out of logs" ', label: '🔴 09-22 09:00 [constraint] User: "keep auth tokens out of logs"' },
+      { text: 'User: "auth goes through the proxy" ', label: '🔴 09-21 08:00 [constraint] User: "auth goes through the proxy"' },
+      { text: 'User asked to log auth errors ', label: '🔴 09-23 11:00 User asked to log auth errors' },
+      { text: 'User asked to fix auth token refresh ', label: '🔴 09-22 09:30 User asked to fix auth token refresh' },
+      { text: 'Auth only flow drafted ', label: '🟡 09-20 12:00 Auth only flow drafted (condensed)' },
+      { text: 'Agent read auth config ', label: '🟢 09-22 10:00 Agent read auth config' },
+      { text: 'Agent read authentication docs ', label: '🟢 09-22 10:00 Agent read authentication docs' },
+      { text: 'Old auth idea ', label: '🟢 09-19 10:00 Old auth idea' },
     ])
   })
 
@@ -63,12 +63,20 @@ describe('# recall', () => {
     expect(await texts($, '#AUTH')).toEqual(await texts($, '#auth'))
   })
 
-  test('a line with no marker ranks last, and one with no time gives only its tag', async ($, on) => {
+  test('a line with no marker ranks last, and one with no time shows no time', async ($, on) => {
     const entries = [{ id: 'o0', line: 'Auth note with no marker or time', r: true }, { id: 'o1', line: '✅ 2026-09-23 12:00 Auth tests pass' }]
     world(on, 'hr-bare', { 'ledger:hr-bare': { seq: 2, chunks: [], corrections: [], entries } })
     expect((await ask($, '#auth')).suggestions).toEqual([
-      { text: 'Auth tests pass ', label: '✅ Auth tests pass', description: '2026-09-23 12:00' },
-      { text: 'Auth note with no marker or time ', label: 'Auth note with no marker or time', description: 'condensed' },
+      { text: 'Auth tests pass ', label: '✅ 09-23 12:00 Auth tests pass' },
+      { text: 'Auth note with no marker or time ', label: 'Auth note with no marker or time (condensed)' },
+    ])
+  })
+
+  test('a label shows look-alikes for / and \\, so the typeahead cuts it at its end, not as a path; the text keeps them', async ($, on) => {
+    const entries = [{ id: 'o0', line: '🟡 2026-09-22 10:00 Agent edited hooks/register.ts and C:\\auth.ini' }]
+    world(on, 'hr-path', { 'ledger:hr-path': { seq: 1, chunks: [], corrections: [], entries } })
+    expect((await ask($, '#auth')).suggestions).toEqual([
+      { text: 'Agent edited hooks/register.ts and C:\\auth.ini ', label: '🟡 09-22 10:00 Agent edited hooks∕register.ts and C:⧵auth.ini' },
     ])
   })
 

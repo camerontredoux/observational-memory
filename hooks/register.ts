@@ -11,6 +11,7 @@ import type { Worker } from '../types'
 import { COPY_ID, INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallIo, TranscriptCache } from './recall'
 import { indexOf, queryOf, suggest } from './hash-recall'
+import { withConstraints } from './spawn'
 import type { Index } from './hash-recall'
 import { compileBrief, emptyBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
@@ -2532,6 +2533,17 @@ export const register: Register = (on) => {
       log($, `# recall failed (${errorText(error)})`)
       return given
     }
+  })
+
+  // A subagent is given the main session's constraints in force: the ledger's and those of the chunks waiting. A fork
+  // inherits the conversation and a workflow agent's prompt cannot be rewritten: both pass through. A hook that fails
+  // is skipped by the engine and the subagent starts, which is the right failure.
+  on('agent.spawn', async ($, e, next) => {
+    if (e.fork || e.subagentType === 'fork' || e.workflow) return next(e)
+    const ledger = (await $.store.get(ledgerKey(await $.session.id()))) as Ledger | undefined
+    if (!ledger) return next(e)
+    const prompt = withConstraints(e.prompt, beforeRows(ledger, Infinity).constraints)
+    return next(prompt === e.prompt ? e : { ...e, prompt })
   })
 
   // Subagent preloads fire here too; the event does not say which loop the skill loads into.

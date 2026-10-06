@@ -6,7 +6,6 @@ import { baseOf } from './memory'
 import type { Entry } from './memory'
 
 const MAX_ROWS = 8
-const LABEL_MAX_CHARS = 100
 const MARKERS = ['🔴', '🟡', '🟢', '✅'] // in rank order; a line with none ranks after them
 const TRIGGER = /^#\p{L}/u // `#` alone (a heading), `##`, `#!` and `#123` (an issue reference) are not asked
 const SPLIT = /[^\p{L}\p{N}]+/u
@@ -42,13 +41,15 @@ export function indexOf(ledger: { entries?: readonly Entry[]; corrections?: read
     .map((l) => ({ ...l, rank: l.marker ? MARKERS.indexOf(l.marker) : MARKERS.length }))
     .sort((a, b) => Number(b.constraint) - Number(a.constraint) || a.rank - b.rank || (b.time ?? '').localeCompare(a.time ?? '') || b.place - a.place)
   return ranked.map((l) => {
-    const flat = `${l.marker ? `${l.marker} ` : ''}${l.text}`.replace(/\s+/g, ' ')
-    const description = [l.time, l.tag].filter(Boolean).join(' · ')
-    const suggestion: PromptAutocompleteSuggestion = {
-      text: `${l.text} `, // the trailing space ends the token: the box asks nothing more of the last word
-      label: flat.length > LABEL_MAX_CHARS ? `${flat.slice(0, LABEL_MAX_CHARS - 1)}…` : flat,
-      ...(description ? { description } : {}),
-    }
+    // All on the label, with no description: the typeahead cuts a described row's label to 40% of the width and wraps
+    // it, while a bare label runs the whole row, cut there. It cuts a label holding `/` or `\` as a path, keeping the
+    // tail, so the label shows look-alikes (∕ U+2215, ⧵ U+29F5) and is cut at its end; `text` keeps the real ones.
+    const head = [l.marker, l.time?.slice(5), l.constraint ? '[constraint]' : undefined].filter(Boolean).join(' ')
+    const label = `${head ? `${head} ` : ''}${l.text}${l.tag === 'condensed' ? ' (condensed)' : ''}`
+      .replace(/\s+/g, ' ')
+      .replace(/\//g, '∕')
+      .replace(/\\/g, '⧵')
+    const suggestion: PromptAutocompleteSuggestion = { text: `${l.text} `, label } // the trailing space ends the token: the box asks nothing more of the last word
     return { suggestion, words: wordsOf(l.text) }
   })
 }

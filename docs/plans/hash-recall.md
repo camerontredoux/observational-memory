@@ -33,8 +33,8 @@ From the 2.1.292 types (`PromptAutocompleteInput`, `PromptAutocompleteResult`, `
    - At most 8 rows.
 5. **Row.**
    - `text`: the line's words as they read, without the marker, date and time or replaced-constraint note, then one space: `User asked to keep errored Bash results folded `. The trailing space ends the token, so the box asks nothing more of this row's last word and the person types on.
-   - `label`: the marker and that same text, on one line (whitespace runs collapsed), cut to 100 characters with `…`.
-   - `description`: the line's date and time as the line gives them (`2026-09-22 09:00`), then ` · constraint` for a correction or ` · condensed` for a Reflector line (`r: true`), as the /notes pane names it. A line with no time gives only the tag, or no description.
+   - `label`: the marker, the line's date and time without the year (`09-22 09:00`), `[constraint]` for a correction, then that same text, then ` (condensed)` for a Reflector line (`r: true`), as the /notes pane names it. One line, whitespace runs collapsed; the surface cuts it to the row.
+   - No `description`. The terminal's typeahead cuts a described row's label to 40% of its width and wraps it onto a second line; a bare label runs the whole row (v1.9.1). It cuts a label holding `/` or `\` as a path, keeping the tail, so the label shows the look-alikes `∕` (U+2215) and `⧵` (U+29F5) and is cut at its end; `text` keeps the real characters.
 6. **No match, no ledger yet** (a fresh session before the first observation), **or a failure** reading or matching: return what `next(e)` gave, unchanged. The hook never throws.
 7. **Order with other plugins.** Other plugins' rows from `next(e)` come first, this plugin's after them.
 
@@ -43,7 +43,7 @@ From the 2.1.292 types (`PromptAutocompleteInput`, `PromptAutocompleteResult`, `
 1. **What taking a row writes:** the line as it reads, without the marker and date (the draft's option a). The person sees exactly what goes in and can edit it. A quote wrapper adds words the person did not choose, and a reference the model must expand costs a tool call for every use.
 2. **Trigger character:** `#` then a letter. Plugin rows join beneath the engine's own and other plugins' rows rather than replacing them, so a clash costs at most a few extra rows; requiring a letter keeps headings, shebangs and issue numbers out. A longer prefix such as `#om:` would make the feature hard to find and slower to type.
 3. **Scope:** the main session only (see Source).
-4. **Reflected lines:** ranked like any other line. They are already older than the Observer's newer lines, so newest-first places them; the description tags them `condensed`.
+4. **Reflected lines:** ranked like any other line. They are already older than the Observer's newer lines, so newest-first places them; the label tags them `(condensed)`.
 
 ## Cost
 
@@ -64,11 +64,11 @@ The hook must not await `$.store` per keystroke.
 
 ## Tests (`claude plugin test`, a new `tests/hash-recall.test.ts`)
 
-- `#auth` against a stubbed ledger returns the matching lines: constraints first, then by marker, then newest, at most 8, with `text`, `label` and `description` as above.
+- `#auth` against a stubbed ledger returns the matching lines: constraints first, then by marker, then newest, at most 8, with `text` and `label` as above, and no `description`.
 - `#auth-tok` matches "auth token" and not "auth only"; `#AUTH` matches like `#auth`.
 - `#`, `##`, `#123` and `#zzz` (no match) return `next(e)`'s suggestions unchanged.
 - Another plugin's suggestions from `next(e)` are kept, ahead of this plugin's rows.
-- A Reflector line is described `condensed`; a constraint's replaced-constraint note is not in its `text`.
+- A Reflector line's label ends `(condensed)`; a constraint's replaced-constraint note is not in its `text`.
 - The hook makes no `$.store` call when the index is warm, and one call in all for several keystrokes from cold.
 - A ledger commit updates the rows the next keystroke sees.
 - A subagent's ledger lines never show.
