@@ -10,6 +10,8 @@ import type { Gauges } from './workers'
 import type { Worker } from '../types'
 import { COPY_ID, INJECTED_WRAPPER, isMemoryText, liveTranscript, loadTranscript, recall, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallIo, TranscriptCache } from './recall'
+import { indexOf, queryOf, suggest } from './hash-recall'
+import type { Index } from './hash-recall'
 import { compileBrief, emptyBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
   applyConstraints,
@@ -1138,6 +1140,33 @@ function reconcile($: EngineInterface, stored: Ledger | undefined, v: View): Led
 
 const loopOf = (sessionId: string, agentId?: string): Loop => ({ sessionId, agentId, key: agentId === undefined ? sessionId : `${sessionId}/${agentId}` })
 const ledgerKey = (sessionId: string) => key('ledger', sessionId)
+// `#` recall's rows per main session id, rebuilt from each ledger the main loop writes so a keystroke reads no store
+// (see recallIndexOf). A subagent's ledger goes when it finishes, so its lines would come and go: it updates nothing.
+const recallIndexes = new Map<string, Index>()
+const recallLoads = new Map<string, Promise<Index>>() // a cold read in flight, shared by the keystrokes that wait on it
+async function saveLedger($: EngineInterface, loop: Loop, ledger: Ledger) {
+  await $.store.set(ledgerKey(loop.key), ledger)
+  if (loop.agentId === undefined) recallIndexes.set(loop.sessionId, indexOf(ledger))
+}
+// The session's index, read from the store once when missing (a worker restart, a resume); no ledger is cached empty.
+// A load that lands after a write built the index does not replace it.
+function recallIndexOf($: EngineInterface, sessionId: string): Index | Promise<Index> {
+  const warm = recallIndexes.get(sessionId)
+  if (warm) return warm
+  let load = recallLoads.get(sessionId)
+  if (!load) {
+    load = ($.store.get(ledgerKey(sessionId)) as Promise<Ledger | undefined>)
+      .then((ledger) => {
+        if (recallLoads.get(sessionId) !== load) return indexOf(ledger ?? {}) // dropped by /clear meanwhile: not cached
+        const index = recallIndexes.get(sessionId) ?? indexOf(ledger ?? {})
+        recallIndexes.set(sessionId, index)
+        return index
+      })
+      .finally(() => recallLoads.get(sessionId) === load && recallLoads.delete(sessionId))
+    recallLoads.set(sessionId, load)
+  }
+  return load
+}
 const timesKey = (sessionId: string) => key('times', sessionId)
 const liveKey = (sessionId: string) => key('live', sessionId)
 const skillsKey = (sessionId: string) => key('skills', sessionId)
@@ -1343,7 +1372,7 @@ function schedule($: EngineInterface, loop: Loop, stamp: string) {
     const ledger = reconcile($, stored, v)
     if (!isLive(loop, stamp)) return
     // Written only when reconciling changed it: each write rewrites the whole store.
-    if (JSON.stringify(ledger) !== JSON.stringify(stored)) await $.store.set(ledgerKey(loop.key), ledger)
+    if (JSON.stringify(ledger) !== JSON.stringify(stored)) await saveLedger($, loop, ledger)
     if (!isLive(loop, stamp)) return
     const mine = running.filter((j) => j.loop.key === loop.key && j.stamp === stamp) // an ended life's calls observe nothing
     const covered: Range[] = [ledger.watermark, ...ledger.chunks, ...mine.flatMap((j) => locate(v, j.range, ledger.watermark.to) ?? [])]
@@ -1408,7 +1437,7 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
     const at = locate(now, chunk, ledger.watermark.to)
     if (!at) log($, `rows ${chunk.from}-${chunk.to} were observed but no longer match the transcript; discarded`)
     const next = at ? commit({ ...ledger, chunks: [...ledger.chunks, { ...chunk, ...at }] }, now) : ledger
-    await $.store.set(ledgerKey(loop.key), next)
+    await saveLedger($, loop, next)
     if (at) noteObservations($, sessionId, 'background', chunk.lines.length)
     if (at)
       log(
@@ -1612,7 +1641,7 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
         const rest = ledger.entries.filter((e) => !ids.has(e.id))
         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
         const after = estimateTokens(renderLines([...reflected, ...kept]))
-        await $.store.set(ledgerKey(key), { ...ledger, entries, seq })
+        await saveLedger($, loop, { ...ledger, entries, seq })
         installed = true
         record(statsIo($), sessionId, (s, at) => addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: after, level }, at))
         log(
@@ -2102,13 +2131,13 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     try {
       built = await build(ledger, stores && installs)
     } catch (error) {
-      if (stores && chunks.length) await $.store.set(ledgerKey(loop.key), ledger)
+      if (stores && chunks.length) await saveLedger($, loop, ledger)
       throw error
     }
     const abandoned = next.signal.aborted
-    if (stores && (!installs || abandoned)) await $.store.set(ledgerKey(loop.key), ledger)
+    if (stores && (!installs || abandoned)) await saveLedger($, loop, ledger)
     if (abandoned) throw new Error(ABANDONED)
-    if (stores && installs) await $.store.set(ledgerKey(loop.key), { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
+    if (stores && installs) await saveLedger($, loop, { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
     return { ...built, observedNow }
   }
   const { ledger, cut, memory, message, floor, briefed, observedNow } = await locked(async () => settle(await loadLedger($, loop.key, v)))
@@ -2470,6 +2499,7 @@ export const register: Register = (on) => {
   // resume. The lives end at once; the keys go under the lock, after any ledger write already under way.
   on('session.end', async ($, e, next) => {
     const cleared = e.reason === 'clear'
+    if (cleared) (recallIndexes.delete(e.sessionId), recallLoads.delete(e.sessionId))
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
     transcripts.delete(e.sessionId)
@@ -2485,6 +2515,23 @@ export const register: Register = (on) => {
       await Promise.all([...subagents, ...kinds].map((key) => $.store.delete(key)))
     }).catch((error) => log($, `could not drop the ended session's state (${errorText(error)})`))
     return next(e)
+  })
+
+  // `#` then a word in the prompt box: the main session's matching memory lines, beneath other plugins' rows. Per
+  // keystroke, so it reads the in-memory index; it never throws, and on any failure gives what `next(e)` gave.
+  on('prompt.autocomplete', { token: /^#/ }, async ($, e, next) => {
+    const given = await next(e)
+    try {
+      const query = queryOf(e.token)
+      if (!query.length) return given
+      const found = suggest(await recallIndexOf($, await $.session.id()), query)
+      // A row's trailing space ends the token; a space already after the cursor does that, so it would double.
+      const rows = /^\s/.test(e.text.slice(e.cursor)) ? found.map((s) => ({ ...s, text: s.text.trimEnd() })) : found
+      return rows.length ? { suggestions: [...given.suggestions, ...rows] } : given
+    } catch (error) {
+      log($, `# recall failed (${errorText(error)})`)
+      return given
+    }
   })
 
   // Subagent preloads fire here too; the event does not say which loop the skill loads into.
