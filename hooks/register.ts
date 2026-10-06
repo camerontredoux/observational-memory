@@ -2481,18 +2481,20 @@ export const register: Register = (on) => {
     })
     // The footer's gauges from the start, rather than once the first turn ends.
     void showGauges($, loopOf(await $.session.id()))
-    // A session already idle when this code loads (a fresh start, or a hot reload that lost the timer and flags).
-    if (idleTimer === undefined && !mainTurnRunning) {
+    // A session already idle when this code loads (a fresh start, or a hot reload that lost the timer and flags),
+    // checked in the background: reading the transcript must not hold up the session's start.
+    $.clock.after(0, async () => {
+      if (idleTimer !== undefined || mainTurnRunning) return
       try {
         const idle = await idleState($)
-        if (idle) {
+        if (idle && idleTimer === undefined && !mainTurnRunning) {
           changedSinceCompaction = true
           idleTimer = armIdle($, Math.max(0, IDLE_COMPACT_MS - ((await $.clock.now()) - idle.at)), () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
         }
       } catch (error) {
         log($, `could not tell how long the session has been idle (${errorText(error)})`)
       }
-    }
+    })
     return next(e)
   })
 

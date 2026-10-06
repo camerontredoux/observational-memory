@@ -1636,7 +1636,7 @@ describe('register', () => {
     const { files } = world(on)
     pi(on)
     on('turn.step', async function* ($, e) {
-      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const }
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { ...USAGE, model: 'claude' } }
     })
     on('session.compact', () => ({ messages: [SUMMARY] }))
     const cacheAt = () => JSON.parse(files['/gauges/session-1.cache.json'] ?? '{}').at
