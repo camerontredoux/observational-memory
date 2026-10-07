@@ -11,6 +11,8 @@ declare module 'claude-code' {
     'observational-memory': {
       workers: Worker[]
       frame: number
+      // Each memory row's label (`to 52.3k tokens`, `to ~52.3k tokens`) by its memory message's hash, for ui-extension
+      rows: Record<string, string>
     }
   }
 }

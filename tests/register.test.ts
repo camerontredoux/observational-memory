@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On, Register, SessionCompactInput, SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END } from '../hooks/prompts'
-import { estimateTokens } from '../hooks/memory'
+import { estimateTokens, hash } from '../hooks/memory'
 import { planBudget } from '../hooks/register'
 import { originalId } from '../hooks/recall'
 import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, COMPOSER, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ran, pi, nearTarget, isFiller, tokensOf, live, gates, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, nextStepIn, recordIn, WHERE, noReplies, repliesIn, correctionsIn, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, stampOf, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE, overloaded, fourTurns } from './harness'
@@ -16,7 +16,7 @@ describe('register', () => {
 
     const first = await $.session.compact({ trigger: 'manual', messages })
     await clock.advance(60_000)
-    const second = await $.session.compact({ trigger: 'manual', messages: first.messages! })
+    const second = await $.session.compact({ trigger: 'manual', messages: [...first.messages!, { role: 'assistant', text: 'c, again', toolUses: [] }] })
 
     const ids = (rows: readonly SessionMessage[]) => [...rows.flatMap((m) => m.toolUses.map((u) => u.tool_use_id)), ...rows.flatMap((m) => (m.toolResults ?? []).map((r) => r.tool_use_id))]
     const [call, result] = ids(first.messages!.slice(1))
@@ -26,6 +26,24 @@ describe('register', () => {
     expect(again).toMatch(/^t-c__om\w+$/)
     expect(again).not.toBe(call)
     expect(originalId(again!)).toBe('t-c')
+  })
+
+  test('a compaction handed the context the last one installed, local commands aside, is skipped; one with a new prompt runs', async ($, on) => {
+    const clock = mock.clock(on, { now: at(23, 12, 0) })
+    world(on)
+    pi(on)
+    const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+    await clock.advance(60_000)
+    const command = [
+      { role: 'user' as const, text: '<local-command-caveat>Caveat: the command below was run directly.</local-command-caveat>', toolUses: [] },
+      { role: 'user' as const, text: '<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>', toolUses: [] },
+      { role: 'user' as const, text: '<local-command-stdout>Compacted</local-command-stdout>', toolUses: [] },
+    ]
+
+    expect(await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...command] })).toEqual({ skip: 'observational-memory: nothing new to compact since the last compaction' })
+    // A skipped `/compact` leaves its caveat and echo; its "Not compacted" is a system row the context does not carry.
+    expect(await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...command, ...command.slice(0, 2)] })).toEqual({ skip: 'observational-memory: nothing new to compact since the last compaction' })
+    expect((await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...command, ...turn('d', 'd')] })).messages).toBeDefined()
   })
 
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
@@ -4691,6 +4709,7 @@ describe('the spinner after a compaction mid-turn', () => {
 
 // The memory message is a user message the engine draws as typed: collapsed, its row is one line.
 describe('the memory row', () => {
+  // A row with no size recorded (a compaction from before they were) says none, never the memory's own size.
   test('a collapsed memory message draws as one line, an expanded one and any other prompt as written', async ($, on) => {
     const drawn: string[] = []
     on('ui.render', { component: 'UserMessage' }, ($, e) => (drawn.push(e.props.text), { type: 'Text', children: [e.props.text] }))
@@ -4702,7 +4721,7 @@ describe('the memory row', () => {
     await draw(memory, true)
     await draw('fix the build', false)
 
-    expect(drawn).toEqual([`Compacted into observational memory · with ${estimateTokens(memory)} tokens of memory`, memory, 'fix the build'])
+    expect(drawn).toEqual(['Compacted into observational memory', memory, 'fix the build'])
   })
 
   test('once the first main request after a compaction is answered, its row shows the context that request carried', async ($, on) => {
@@ -4719,14 +4738,17 @@ describe('the memory row', () => {
     await clock.set(at(23, 9, 0))
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('tail', 'r', 8_000))
 
+    const published: unknown[] = []
+    on('state.set', ($, e, next) => (e.key === 'rows' ? (published.push(e.value), { value: { isSet: true, version: published.length } }) : next(e)))
     const memory = (await $.session.compact({ trigger: 'auto', messages: [...history] })).messages![0]!.text
     await draw(memory)
     for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude', messageCount: 1 }));
     await clock.settle()
     await draw(memory)
 
-    // Before it, the compaction's own estimate of the context it left.
+    // Before it, the compaction's own estimate of the context it left. ui-extension reads the same labels.
     expect(drawn).toEqual(['Compacted into observational memory · to ~22.7k tokens', 'Compacted into observational memory · to 48.3k tokens'])
+    expect(published).toEqual([{ [hash(memory)]: 'to ~22.7k tokens' }, { [hash(memory)]: 'to 48.3k tokens' }])
   })
 
   test('the rows a compaction kept draw once: the copies it wrote after the memory row draw as nothing, the rows after them as written', async ($, on) => {
