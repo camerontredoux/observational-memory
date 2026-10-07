@@ -378,6 +378,13 @@ async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
   await $.store.set(sizeKey(sessionId), sizes)
   $.ui.invalidate('ui.render')
 }
+// Until a request measures it, the row shows the context the compaction estimated it left, under `~` and the hash:
+// an idle compaction's row may wait an hour for its measure.
+async function noteContextEstimate($: EngineInterface, sessionId: string, memory: string, tokens: number) {
+  const sizes = { ...(await sizesOf($, sessionId)), [`~${memory}`]: tokens }
+  contextSizes.set(sessionId, Promise.resolve(sizes))
+  await $.store.set(sizeKey(sessionId), sizes).catch((error) => log($, `could not record the compacted context's estimate (${errorText(error)})`))
+}
 // The context each om compaction of the main conversation left, in tokens, by its memory message's hash.
 const contextSizes = new Map<string, Promise<Record<string, number>>>()
 function sizesOf($: EngineInterface, sessionId: string) {
@@ -455,14 +462,14 @@ function align(messages: readonly SessionMessage[], history: readonly SessionMes
 // A memory message of any version, told as recall.ts's `isMemoryText` tells one.
 const isMemory = (m: SessionMessage | undefined) => m?.role === 'user' && isMemoryText(m.text)
 // What the transcript shows in place of a memory message while the row is collapsed, then the context the compaction
-// left, `· to 52.3k tokens`, once a request has measured it; until then, or for a subagent's, the message's own size,
-// `· with 4.0k tokens of memory`.
+// left, `· to 52.3k tokens` once a request has measured it, `· to ~52.3k tokens` as the compaction estimated it until
+// then; for a subagent's, which has neither, the message's own size, `· with 4.0k tokens of memory`.
 // ui-extension draws a row starting with this prefix as its own `[memory] compacted session` row, so keep the two in step.
 const MEMORY_ROW = 'Compacted into observational memory · '
-const memoryRow = (text: string, context: number | undefined) => {
+const memoryRow = (text: string, context: number | undefined, estimated = false) => {
   const n = context ?? estimateTokens(text)
   const size = `${n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n} tokens`
-  return `${MEMORY_ROW}${context === undefined ? `with ${size} of memory` : `to ${size}`}`
+  return `${MEMORY_ROW}${context === undefined ? `with ${size} of memory` : `to ${estimated ? '~' : ''}${size}`}`
 }
 // A row drawn as nothing.
 const NOTHING = { type: 'Box' as const }
@@ -1884,7 +1891,7 @@ export function planBudget(usage: SessionUsage | undefined, main: boolean, total
   const budget = Math.floor(((main ? limit : Math.min(limit, WINDOW_TOKENS)) - overhead) / 2)
   const measured = main ? usage?.context.tokens : undefined
   const density = measured === undefined ? 1 : Math.max(1, (measured - overhead) / Math.max(1, totalTokens))
-  return { budget, density }
+  return { budget, density, overhead }
 }
 
 // The compaction from the ledger: what the session.compact hook runs.
@@ -2029,7 +2036,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // An omitted-count line stands for dropped prompts, never for the latest one.
   // A prompt cut to its note alone quotes nothing.
   const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
-  const { budget, density } = planBudget(usage, main, tokensBetween(v, 0, messages.length))
+  const { budget, density, overhead } = planBudget(usage, main, tokensBetween(v, 0, messages.length))
 
   // Rows [from, to) as the session brief compiles them, each line with its om_recall reference when the model can
   // read it: the transcript file is read once, and only when a brief is compiled. The session's directory and home,
@@ -2201,7 +2208,10 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
   // In the context's own order.
   const tail = dedupWrappers(maskTail(withoutLocalCommands(live.filter((m, i) => kept.has(i) && !isEmptyReply(m))).map(({ handle: _, ...m }) => m)))
-  if (main && installs) uncarried.set(sessionId, { compactor: 'om', memory: hash(message.text) })
+  if (main && installs) {
+    uncarried.set(sessionId, { compactor: 'om', memory: hash(message.text) })
+    await noteContextEstimate($, sessionId, hash(message.text), overhead + estimateTokens(message.text) + Math.ceil(tailTokens(cut) * density))
+  }
   return { messages: [message, ...freshToolIds(tail, started.toString(36))] }
 }
 
@@ -2409,8 +2419,10 @@ export const register: Register = (on) => {
       const id = rowId(e.requestId)
       if (id) void copiesAfter($, id)
       if (e.props.isExpanded) return next(e)
-      const context = await $.session.id().then((id) => sizesOf($, id).then((sizes) => sizes[hash(e.props.text)]), () => undefined)
-      return next({ ...e, props: { ...e.props, text: memoryRow(e.props.text, context) } })
+      const sizes = await $.session.id().then((id) => sizesOf($, id), () => ({}) as Record<string, number>)
+      const h = hash(e.props.text)
+      const text = sizes[h] !== undefined ? memoryRow(e.props.text, sizes[h]) : memoryRow(e.props.text, sizes[`~${h}`], true)
+      return next({ ...e, props: { ...e.props, text } })
     }
     return !e.props.isExpanded && (await isCopy(e.requestId)) ? NOTHING : next(e)
   })

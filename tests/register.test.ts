@@ -2268,14 +2268,14 @@ describe('register', () => {
       slashCommands: { totalCommands: 2, includedCommands: 2, tokens: 1_000 },
     }
     // (100k - 20k - 10k loaded - 6k - 2k - 1k - 1k) / 2; a deferred tool is outside the window. (80k - 40k) / 20k.
-    expect(planBudget(usage({ window: 200_000, tokens: 80_000, breakdown }), true, 20_000)).toEqual({ budget: 30_000, density: 2 })
+    expect(planBudget(usage({ window: 200_000, tokens: 80_000, breakdown }), true, 20_000)).toEqual({ budget: 30_000, density: 2, overhead: 40_000 })
     // No threshold: the window the breakdown measures against. Fewer tokens measured than estimated scale nothing down.
-    expect(planBudget(usage({ window: 1_000_000, tokens: 30_000, breakdown: { ...breakdown, autoCompactThreshold: undefined } }), true, 20_000)).toEqual({ budget: 80_000, density: 1 })
+    expect(planBudget(usage({ window: 1_000_000, tokens: 30_000, breakdown: { ...breakdown, autoCompactThreshold: undefined } }), true, 20_000)).toEqual({ budget: 80_000, density: 1, overhead: 40_000 })
     // A subagent's model may have a smaller window than the main model's, and its context is not the one measured.
-    expect(planBudget(usage({ window: 1_000_000, tokens: 900_000 }), false, 20_000)).toEqual({ budget: 90_000, density: 1 })
-    expect(planBudget(usage({ window: 1_000_000 }), true, 20_000)).toEqual({ budget: 490_000, density: 1 })
+    expect(planBudget(usage({ window: 1_000_000, tokens: 900_000 }), false, 20_000)).toEqual({ budget: 90_000, density: 1, overhead: 20_000 })
+    expect(planBudget(usage({ window: 1_000_000 }), true, 20_000)).toEqual({ budget: 490_000, density: 1, overhead: 20_000 })
     // No usage at all: the smallest window in use.
-    expect(planBudget(undefined, true, 20_000)).toEqual({ budget: 90_000, density: 1 })
+    expect(planBudget(undefined, true, 20_000)).toEqual({ budget: 90_000, density: 1, overhead: 20_000 })
   })
 
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
@@ -4720,7 +4720,8 @@ describe('the memory row', () => {
     await clock.settle()
     await draw(memory)
 
-    expect(drawn).toEqual([`Compacted into observational memory · with ${estimateTokens(memory)} tokens of memory`, 'Compacted into observational memory · to 48.3k tokens'])
+    // Before it, the compaction's own estimate of the context it left.
+    expect(drawn).toEqual(['Compacted into observational memory · to ~22.7k tokens', 'Compacted into observational memory · to 48.3k tokens'])
   })
 
   test('the rows a compaction kept draw once: the copies it wrote after the memory row draw as nothing, the rows after them as written', async ($, on) => {
