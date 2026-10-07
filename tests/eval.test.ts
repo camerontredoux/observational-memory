@@ -197,7 +197,7 @@ describe('eval runner', () => {
   test("the om configuration drives the plugin's own compaction hook through $.session.compact, chaining its ledger; builtin never calls $", async ($: Engine, on: On) => {
     mock.clock(on)
     const { history } = world(on, 'eval-session-om')
-    const seen = pi(on)
+    const seen = models(on)
     let builtinCalls = 0
     // "builtin" stands for a session with no observational-memory plugin loaded: a plain function, never $.
     const builtinIo: Io = { now: () => Date.now(), model: {}, compact: async (point, messagesSoFar) => (builtinCalls++, { messages: [...messagesSoFar, ...point.append, msg('built-in summary')] }) }
@@ -245,7 +245,7 @@ describe('eval runner', () => {
     mock.clock(on)
     let currentSessionId = ''
     const { stored, historyOf } = world(on, () => currentSessionId)
-    const seen = pi(on)
+    const seen = models(on)
     const omIo = (sessionId: string): Io => {
       const history = historyOf(sessionId)
       return {
@@ -277,7 +277,7 @@ describe('eval runner', () => {
   test('recall availability reaches the assistant explicitly: continueTask sees recallAvailable, and calls om_recall only then', async ($: Engine, on: On) => {
     mock.clock(on)
     world(on, 'eval-session-recall')
-    pi(on)
+    models(on)
     on('tool.register', ($, e) => ({ value: { tool: `mcp__observational-memory__${e.name}` } }))
     on('session.start', ($, e) => ({ cwd: e.cwd }))
     await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
@@ -347,21 +347,16 @@ function world(on: On, sessionId: string | (() => string)) {
   return { history: history(resolve()), historyOf: history, stored }
 }
 
-// pi on the host, trimmed from register.test.ts's own `pi`: answers every chunk with one observation per user row, and
-// git, which reads the environment at compaction, as outside a repository.
-function pi(on: On) {
+// The model beneath `$.model.complete`, trimmed from the harness's `models`: answers every chunk with one observation
+// per user row, and git, which reads the environment at compaction, as outside a repository.
+function models(on: On) {
   const seen = { prompts: [] as string[], logs: [] as string[] }
   on('process.run', (): { value: ProcessRunResult } => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n', isStdoutTruncated: false, isStderrTruncated: false } }))
-  on('process.spawn', async function* ($, e, next) {
-    if (e.argv[0] !== 'pi') return yield* next(e)
-    const prompt = e.input ?? ''
-    seen.prompts.push(prompt)
-    const text = `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>`
-    const event = { role: 'assistant', content: [{ type: 'text', text }], api: 'openai-codex-responses', provider: 'openai-codex', model: 'gpt-5.6-luna', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: 'stop', timestamp: 0 }
-    yield { stream: 'stdout' as const, text: [{ type: 'message_start', message: { ...event, content: [] } }, { type: 'message_end', message: event }, { type: 'turn_end', message: event, toolResults: [] }].map((e) => JSON.stringify(e)).join('\n') }
-    return { value: { code: 0, signal: null } }
+  on('model.complete', ($, e) => {
+    seen.prompts.push(e.prompt)
+    const text = `<observations>\n${[...e.prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} Saw ${m[2]}`).join('\n')}\n</observations>`
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }
   })
-  on('model.complete', () => ({ value: { isAnswered: false, reason: 'empty-reply', usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }))
   on('ui.log', ($, e) => ((e.to === 'debug' ? seen.logs : []).push(e.text), { value: undefined }))
   return seen
 }

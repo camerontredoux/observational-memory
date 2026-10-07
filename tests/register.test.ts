@@ -1,17 +1,18 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On, Register, SessionCompactInput, SessionMessage } from 'claude-code'
-import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END } from '../hooks/prompts'
+import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, COMPACT_WRAPPER, COMPACTION_BRIEFING, FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, SESSION_SYSTEM_PROMPT, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END } from '../hooks/prompts'
 import { estimateTokens } from '../hooks/memory'
 import { planBudget } from '../hooks/register'
 import { originalId } from '../hooks/recall'
-import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, COMPOSER, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ran, pi, nearTarget, isFiller, tokensOf, live, gates, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, nextStepIn, recordIn, WHERE, noReplies, repliesIn, correctionsIn, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, stampOf, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE, overloaded, fourTurns } from './harness'
+import { originals, turn, apiError, cutAt, cutShort, MODEL_COST, COMPOSER, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ran, models, nearTarget, isFiller, tokensOf, live, gates, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, nextStepIn, recordIn, WHERE, noReplies, repliesIn, correctionsIn, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, stampOf, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE, overloaded, fourTurns } from './harness'
 import type { Ledger, Run } from './harness'
+const HAIKU = 'claude-haiku-5-5'
 
 describe('register', () => {
   test('the kept calls come back under fresh ids, a call and its result alike, renamed from the original at each compaction', async ($, on) => {
     const clock = mock.clock(on, { now: at(23, 12, 0) })
     world(on)
-    pi(on)
+    models(on)
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     const first = await $.session.compact({ trigger: 'manual', messages })
@@ -31,7 +32,7 @@ describe('register', () => {
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
     mock.clock(on, { now: at(23, 12, 0) })
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     // The engine stamps a handle on each message it hands the hook; the kept ones must come back without it.
@@ -43,10 +44,9 @@ describe('register', () => {
     expect(seen.prompts[1]).toContain('[User]: b')
     expect(seen.prompts[1]).not.toContain('User: "a"') // a pure mapper: no observations so far
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
-    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS, '--session-id', OBSERVER_SESSION], cwd: '/tmp' })
-    expect(seen.calls.map((c) => piSessionOf(c.argv))).toEqual([OBSERVER_SESSION, OBSERVER_SESSION]) // the session's Observer calls share one cache key
-    expect(seen.modelCalls).toBe(0)
-    expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s')
+    expect(seen.calls[0]).toEqual({ model: HAIKU, systemBlocks: [{ text: seen.systems[0], cache: true }], maxTokens: 16_000, effort: 'low' })
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
+    expect(seen.logs).toContain('claude-haiku-5-5 observer: 6134 in, 558 out, $0.0009, 0s')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     const text = result.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"') // untimed history: no invented times
@@ -61,7 +61,7 @@ describe('register', () => {
   test('the Observer records what happened, never what a chunk lacks', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
 
     await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
 
@@ -73,7 +73,7 @@ describe('register', () => {
   test('the Observer input marks a failed tool result and names the tool, and never marks a successful one as failed', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     // Same tool, same result text, isError flipped: otherwise identical results must still read distinguishably.
     const messages: SessionMessage[] = [
       { role: 'user', text: 'run the tests', toolUses: [] },
@@ -96,7 +96,7 @@ describe('register', () => {
   test('an interrupted turn reaches the Observer with its interruption row, which the Observer reads as unfinished work', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const messages: SessionMessage[] = [
       { role: 'user', text: 'migrate the schema', toolUses: [] },
       { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm run migrate' } }] },
@@ -117,7 +117,7 @@ describe('register', () => {
   test('an oversized tool result keeps a bounded beginning and ending for the Observer, the omission marked explicitly', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const big = `BEGIN-MARKER first line\n${'middle '.repeat(20_000)}\nEND-MARKER: 3 passed, 2 failed`
     const messages: SessionMessage[] = [
       { role: 'user', text: 'run the tests', toolUses: [] },
@@ -144,7 +144,7 @@ describe('register', () => {
   test('when pi fails at compaction with nothing observed, the floor compiles a brief by code of what leaves context', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on, { fail: () => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' }) })
+    const seen = models(on, { fail: () => overloaded() })
     let builtin = 0
     on('session.compact', () => (builtin++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)]
@@ -152,7 +152,7 @@ describe('register', () => {
     const result = await $.session.compact({ trigger: 'auto', messages })
 
     expect(builtin).toBe(0)
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
     const text = result.messages![0]!.text
     expect(text).toStartWith(COMPACT_WRAPPER)
     expect(observationsIn(text)).toBe('')
@@ -168,14 +168,14 @@ describe('register', () => {
     )
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     expect(seen.logs.slice(-4)).toEqual([
-      'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
-      'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
+      'observation of rows 0-3 at compaction failed (API error 529: overloaded); left unobserved',
+      'observation of rows 3-7 at compaction failed (API error 529: overloaded); left unobserved',
       expect.stringMatching(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, kept 1 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 0 observations, 0 skill\(s\), brief ~\d+ tokens$/),
       expect.stringMatching(/^Compacted in .* · memory 0 notes · 7 messages in a brief compiled by code \(the Observer failed\)$/),
     ])
     expect(seen.screen).toEqual([
-      'Observation failed (pi stopped (error)) and put 3 messages in the session brief',
-      'Observation failed (pi stopped (error)) and put 4 messages in the session brief',
+      'Observation failed (API error (overloaded)) and put 3 messages in the session brief',
+      'Observation failed (API error (overloaded)) and put 4 messages in the session brief',
     ])
     await clock.advance(5_000)
     const stats = JSON.parse(files['/stats/session-1.json']!)
@@ -185,7 +185,7 @@ describe('register', () => {
   })
 
   test("a subagent's or precompute's fallback does not depend on the session's id, messages or clock", async ($, on) => {
-    pi(on) // and no session.id, session.messages or clock: each call rejects
+    models(on) // and no session.id, session.messages or clock: each call rejects
     const summary = { role: 'user' as const, text: 'built-in summary', toolUses: [] }
     on('session.compact', () => ({ messages: [summary] }))
 
@@ -199,7 +199,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let failing = false
-    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = models(on, { fail: () => (failing ? apiError(null, 'unknown') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -211,22 +211,22 @@ describe('register', () => {
 
     const failures = seen.logs.filter((l) => l.includes('at compaction failed'))
     expect(failures.length).toBeGreaterThan(0)
-    for (const line of failures) expect(line).toMatch(/^observation of rows (\d+)-\d+ at compaction failed \(pi exited 1: Error: network down\); left unobserved$/)
+    for (const line of failures) expect(line).toMatch(/^observation of rows (\d+)-\d+ at compaction failed \(API error with no response: unknown\); left unobserved$/)
     expect(failures[0]).toContain('rows 3-')
     expect(seen.screen.filter((l) => l.startsWith('Observation failed'))).toEqual(failures.map((l) => {
       const [, from, to] = l.match(/rows (\d+)-(\d+)/)!
-      return `Observation failed (pi exited 1) and kept ${Number(to) - Number(from)} messages in full`
+      return `Observation failed (API error (unknown)) and kept ${Number(to) - Number(from)} messages in full`
     }))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
     expect(originals(result.messages?.slice(1))).toEqual(history.slice(3))
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
   })
 
   test('at compaction, a chunk pi answers without observations is observed again once before it stays raw', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let spoil = 0
-    const seen = pi(on, { reply: () => (spoil > 0 ? (spoil--, 'I cannot help with that.') : undefined) })
+    const seen = models(on, { reply: () => (spoil > 0 ? (spoil--, 'I cannot help with that.') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -241,13 +241,13 @@ describe('register', () => {
     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toHaveLength(1)
     expect(seen.screen.filter((l) => l.startsWith('Observation failed'))).toEqual([])
     expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "c"')
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
   })
 
   test('a reply that leaves <observations> unclosed before its next section is observed, the section kept apart', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
         return `<corrections>\n* 🔴 User: "${name}"\n</corrections>\n<observations>\n* 🔴 User: "${name}"\n<continuation>\nActive: ${name}\n</continuation>`
@@ -266,7 +266,7 @@ describe('register', () => {
   test('a reply with no tags at all is observed from its marked lines; unclosed sections still keep apart', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
         return name === 'a'
@@ -287,7 +287,7 @@ describe('register', () => {
   test('an unmarked line continues the observation before it, but after a 🔴 line stands as its own 🟡 line; each is logged and counted', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "use pnpm, never npm"\nUser: "and keep the lockfile"\n</corrections>\n' +
         '<observations>\n* 🔴 User: "a"\nUser asked for b\n* 🟡 Read a.ts\n  and found the bug\n</observations>',
@@ -314,7 +314,7 @@ describe('register', () => {
     const { files } = world(on)
     // A worker's state file read in the chunk, which the Observer took for the user's.
     const state = 'Production remains read-only. The leaked production database password should be rotated and the 595 MB dump deleted after testing.'
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "Production stays read-only, don\'t write to it"\n* 🔴 User: "Rotate the leaked database password and delete the dump"\n</corrections>\n' +
         '<observations>\n* 🔴 User said the production database must stay read only\n' +
@@ -347,7 +347,7 @@ describe('register', () => {
   test('a quote the chunk relays as the user\'s verbatim words is grounded; one it only mentions is not', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, {
+    models(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "You never merge for me. Ever."\n* 🔴 User: "Always squash before merging"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
     })
@@ -364,7 +364,7 @@ describe('register', () => {
   test('a grounded correction that replaces a constraint in force still replaces it; an ungrounded one leaves it standing', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on, {
+    models(on, {
       reply: constraining({
         setup: { quote: 'Use pnpm, never npm' },
         invented: { quote: 'npm is fine now', replaces: 'Use pnpm' },
@@ -440,7 +440,7 @@ describe('register', () => {
   test("a 🔴 correction whose quote runs over several lines stays one line; after its closing quote an unmarked line is its own 🟡 line", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "Go a bit deeper yes please.\nI want you to compare them\nside by side." (replaces k1)\nUser asked for a table\n</corrections>\n' +
         '<observations>\n* 🟡 Saw a\n</observations>',
@@ -465,7 +465,7 @@ describe('register', () => {
   test('at compaction, a gap with nothing to show (thinking-only rows) is observed with no Observer call', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const thought = { role: 'assistant' as const, text: '', toolUses: [] }
     // Chunks cut before a row that would pass 10k tokens: [0, 3) is a, [3, 5) the two empty rows; the tail starts at y.
     const messages = [...turn('a', 'a', CHUNK).slice(0, 3), thought, thought, { role: 'user' as const, text: 'y'.repeat(CHUNK), toolUses: [] }, ...turn('c', 'c', 8_000)]
@@ -489,7 +489,7 @@ describe('register', () => {
       b: `<corrections>\n* ${correction}\n</corrections>\n<observations>\n</observations>`,
       c: '<observations>\n* 🔴\n* 🟡 2026-09-22 14:30\n</observations>',
     }
-    const seen = pi(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)/m)![1]!] })
+    const seen = models(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)/m)![1]!] })
     const messages = [...turn('a', 'a', CHUNK), ...turn('b: Never touch the migrations folder', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)]
 
     const result = await $.session.compact({ trigger: 'manual', messages })
@@ -504,7 +504,7 @@ describe('register', () => {
   test('the reply ending each turn that left context is quoted before the observations, carried forward, the newest within its cap', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 14:30 Saw ${prompt.match(/^\[User\]: (\w+)$/m)?.[1]}\n</observations>` })
+    models(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 14:30 Saw ${prompt.match(/^\[User\]: (\w+)$/m)?.[1]}\n</observations>` })
     const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'c', 8_000)]
 
     const first = await $.session.compact({ trigger: 'manual', messages })
@@ -531,7 +531,7 @@ describe('register', () => {
     mock.clock(on)
     const { stored, history } = world(on)
     // Each chunk: a quote of its own closing reply, in other case and spacing, and a quote no reply holds.
-    pi(on, {
+    models(on, {
       reply: (prompt) => {
         const p = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
         return `<observations>\n* 🟡 2026-09-22 14:30 Assistant said: "found  the bug in \`${p}.ts\` today"\n* 🟡 2026-09-22 14:31 Assistant said: "Nothing is deleted from ${p} anywhere"\n</observations>`
@@ -564,7 +564,7 @@ describe('register', () => {
   test('the replies take only the room the compacted context leaves below REPLIES_ROOM_TOKENS', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw it\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw it\n</observations>' })
     // A newest reply, kept raw, that alone nearly fills the room: nothing is quoted.
     const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'z'.repeat(39_500 * 4))]
 
@@ -580,7 +580,7 @@ describe('register', () => {
     mock.clock(on)
     world(on)
     const reply = `<observations>\nNothing worth noting.\n${'x'.repeat(600)}`
-    const seen = pi(on, { reply: () => reply })
+    const seen = models(on, { reply: () => reply })
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)]
 
@@ -595,11 +595,11 @@ describe('register', () => {
     expect(rejected[0]).toBe(`observer reply without observations (${reply.length} chars), began: ${JSON.stringify(reply.slice(0, 500))}`)
   })
 
-  test('at compaction, a chunk whose pi call timed out is not observed again', async ($, on) => {
+  test('at compaction, a chunk whose call the engine cut is not observed again', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let failing = false
-    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: request timed out' } : undefined) })
+    const seen = models(on, { fail: () => (failing ? cutShort() : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -620,7 +620,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { files } = world(on)
     const { gate } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const seen = models(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     const compacting = $.session.compact({ trigger: 'manual', messages })
@@ -646,7 +646,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined), fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = models(on, { hold: (n) => (n === 1 ? gate(1) : undefined), fail: (n) => (n === 1 ? apiError(null, 'unknown') : undefined) })
 
     const compacting = $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
     await clock.advance(16_000)
@@ -655,7 +655,7 @@ describe('register', () => {
 
     expect(seen.prompts).toHaveLength(2)
     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
-    expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (pi exited 1: Error: network down); left unobserved')
+    expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (API error with no response: unknown); left unobserved')
   })
 
   // The hook's budget runs on through a wait that is not a `$` call: a compaction that waited on the background call
@@ -664,7 +664,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n, prompt) => (n === 2 || (n > 2 && prompt.includes(']: b\n')) ? gate(n) : undefined) })
+    const seen = models(on, { hold: (n, prompt) => (n === 2 || (n > 2 && prompt.includes(']: b\n')) ? gate(n) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -692,7 +692,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const { gate } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const seen = models(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -704,7 +704,7 @@ describe('register', () => {
     await clock.advance(1_000)
 
     expect([seen.inFlight, seen.stopped]).toEqual([0, 1])
-    expect(seen.logs).toContain('background observation of rows 0-3 failed (pi timed out after 120000 ms); it will be retried')
+    expect(seen.logs).toContain('background observation of rows 0-3 failed (timed out after 120000 ms); it will be retried')
     await clock.advance(60_000)
     expect(seen.prompts).toHaveLength(2)
     expect(seen.logs).toContainEqual(expect.stringMatching(/^observed rows 0-3 in the background/))
@@ -713,17 +713,17 @@ describe('register', () => {
   test('a failed pi call in the background leaves its chunk unobserved, logged once, and a later pass retries it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, { fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'pi: 401 Unauthorized\n' } : undefined) })
+    const seen = models(on, { fail: (n) => (n === 1 ? apiError(401, 'authentication_failed') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await clock.settle()
 
     const failures = seen.logs.filter((l) => l.includes('failed'))
-    expect(failures).toEqual(['background observation of rows 0-3 failed (pi exited 1: pi: 401 Unauthorized); it will be retried'])
-    expect(seen.screen).toEqual(['Observation failed (pi exited 1) and will retry'])
+    expect(failures).toEqual(['background observation of rows 0-3 failed (API error 401: authentication_failed); it will be retried'])
+    expect(seen.screen).toEqual(['Observation failed (API error (authentication_failed)) and will retry'])
     expect(seen.prompts).toHaveLength(1)
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
     let ledger = stored['ledger:session-1'] as Ledger
     expect([ledger.watermark.to, ledger.entries, ledger.chunks]).toEqual([0, [], []])
 
@@ -733,25 +733,24 @@ describe('register', () => {
     expect(seen.prompts).toHaveLength(2)
     expect(seen.prompts[1]).toContain('[User @ 2026-09-22 14:30]: a')
     expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 User: "a"'])
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
   })
 
   test('a reply pi did not finish (token-limited, or ending in a way pi does not name) leaves its chunk unobserved', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const partial = '<observations>\n* 🔴 2026-09-22 14:30 User: "a"\n* 🟡 2026-09-22 14:31 Read /src/a.ts and fou'
-    const ends = [{ stopReason: 'length' }, {}]
-    const seen = pi(on, { fail: (n) => (n <= ends.length ? { exitCode: 0, stdout: piOutput('', partial, ends[n - 1]), stderr: '' } : undefined) })
+    const seen = models(on, { fail: (n) => (n <= 2 ? cutAt(partial, 16_000) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await clock.settle()
-    await clock.advance(5_000) // its back-off over, the loop calls pi again
+    await clock.advance(5_000) // its back-off over, the loop calls the model again
     await clock.settle()
 
     expect(seen.logs.filter((l) => l.startsWith('background observation'))).toEqual([
-      'background observation of rows 0-3 failed (pi exited 0, stopReason length: ); it will be retried',
-      'background observation of rows 0-3 failed (pi exited 0, stopReason none: ); it will be retried',
+      'background observation of rows 0-3 failed (reply cut at the 16000-token cap); it will be retried',
+      'background observation of rows 0-3 failed (reply cut at the 16000-token cap); it will be retried',
     ])
     const ledger = stored['ledger:session-1'] as Ledger
     expect([ledger.watermark.to, ledger.entries, ledger.chunks]).toEqual([0, [], []])
@@ -760,7 +759,7 @@ describe('register', () => {
   test('observes in the background after turn.complete, off the dispatch, with real timestamps checked against the chunk', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
           ? '<observations>\n* 🔴 2026-09-22 14:30 User said "a"\n* 🟡 2019-01-01 00:00 Too early\n* 🟢 2026-02-30 10:00 Not a date\n* ✅ Untimed\n  * -> a detail\n</observations>'
@@ -795,7 +794,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n) })
+    const seen = models(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
@@ -817,7 +816,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     let failing = true
-    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = models(on, { fail: () => (failing ? apiError(null, 'unknown') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
@@ -849,7 +848,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    pi(on, { hold: (n) => gate(n) })
+    models(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)], at(22, 14, 30))
@@ -873,7 +872,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
+    const seen = models(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -909,7 +908,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, {
+    const seen = models(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(100 + n) : undefined),
       reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🔴 2026-09-22 14:39 User: "b"\n</observations>`),
       reflect: (n, prompt) => (n === 1 ? big : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module')),
@@ -941,13 +940,14 @@ describe('register', () => {
     expect(seen.systems.at(-1)).toContain('reflection agent for a coding assistant')
     const entries = (stored['ledger:session-1'] as Ledger).entries
     expect(seen.screen).toContain(`Condensed memory in 9m 0s · 4,001 → ${entries.length.toLocaleString('en-US')} notes`)
-    expect(seen.calls.at(-1)!.argv).toEqual([...PI_ARGV, seen.systems.at(-1), ...PI_FLAGS, '--session-id', 'om-reflect-736a51cd-4000'])
-    // Both attempts are one pi session, named by the ledger's seq at the snapshot, so the second reads the observations
-    // they both send first from the provider's cache. The Observer's calls keep the session's own.
-    const ids = seen.calls.map((c) => piSessionOf(c.argv))
-    const isReflection = (_: string, i: number) => seen.prompts[i]!.startsWith('## OBSERVATIONS')
-    expect(ids.filter(isReflection)).toEqual(['om-reflect-736a51cd-4000', 'om-reflect-736a51cd-4000'])
-    expect(new Set(ids.filter((id, i) => !isReflection(id, i)))).toEqual(new Set([OBSERVER_SESSION]))
+    // Both attempts send the observations first and mark them, so the second reads them from the prompt cache.
+    const reflected = seen.calls.filter((_, i) => seen.prompts[i]!.startsWith('## OBSERVATIONS'))
+    const opening = reflected.map((c) => c.promptBlocks?.[0])
+    expect(reflected.map((c) => [c.model, c.maxTokens])).toEqual([[HAIKU, 48_000], [HAIKU, 48_000]])
+    expect(opening[0]).toEqual(opening[1])
+    expect(opening[0]).toMatchObject({ cache: true })
+    expect(opening[0]!.text).toStartWith('## OBSERVATIONS TO REFLECT ON')
+    expect(opening[0]!.text).toEndWith('===== END OBSERVATIONS =====\n\n')
     expect(entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
       '🟡 2026-09-22 14:30 Explored the auth module',
       '🔴 2026-09-22 14:39 User: "b"',
@@ -969,7 +969,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const lines = (time: string, what: string, n: number) => `<observations>\n${Array.from({ length: n }, (_, i) => `* 🟡 ${time} ${what} ${i}`).join('\n')}\n</observations>`
-    const seen = pi(on, {
+    const seen = models(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a') ? lines('2026-09-22 14:30', 'read an old file with a long name', 1_200) : lines('2026-09-22 15:00', 'recent step', 700),
@@ -1000,7 +1000,7 @@ describe('register', () => {
   test('a reflection far under its target is not installed: the next attempt asks for more detail, and one near the target is', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => (n === 1 ? '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>' : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Read the auth module')),
     })
@@ -1023,7 +1023,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const notes = (time: string) => `<observations>\n${`* 🟡 ${time} read a file with a long name\n`.repeat(4_000)}</observations>`
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) => notes(prompt.includes('[User @ 2026-09-22 14:30]: a') ? '2026-09-22 14:30' : '2026-09-22 15:00'),
       reflect: (n, prompt) => nearTarget(prompt, `* 🟡 ${n === 1 ? '2026-09-22 14:30 First condensed' : '2026-09-22 15:00 Second condensed'}`),
     })
@@ -1047,7 +1047,7 @@ describe('register', () => {
   test('a path the condensed notes name and the reflection drops comes back as the clause that named it, at its time', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const pi_ = pi(on, {
+    const pi_ = models(on, {
       reply: () =>
         `<observations>\n* 🟡 2026-09-22 14:30 Assistant read the plan. Assistant fixed the totals in \`hooks/stats.ts\`.\n* 🟡 2026-09-22 14:30 Assistant pruned \`hooks/prune.ts\`.\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (_n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Assistant pruned sessions in `hooks/prune.ts`'),
@@ -1067,7 +1067,7 @@ describe('register', () => {
   test("a reply's sentences are carried one a reply, and a chunk's lines are kept oldest first", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:31 Assistant replied\n* 🟡 2026-09-22 14:30 Report arrived\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:31 Assistant replied\n* 🟡 2026-09-22 14:30 Report arrived\n</observations>' })
     const runTurn = live(on, clock, history)
     const [ask, read, result] = turn('a', 'a', CHUNK)
     const reply = 'The totals moved into `hooks/stats.ts` for the new report. The cap is now 40% of `hooks/prune.ts` because sessions grew.'
@@ -1085,7 +1085,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const line = '🟡 2026-09-22 14:30 read a file with a long name'
     let observed = 0
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () => (observed++ ? '<observations>\n* 🟡 2026-09-22 15:00 Looked again\n</observations>' : `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`),
       reflect: () => '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>',
     })
@@ -1118,7 +1118,7 @@ describe('register', () => {
       for (let i = 0, chars = head.length; chars < share * floor * 4; i++) lines.push(`* 🟢 2026-09-22 14:30 detail ${i}`), (chars += 32)
       return `<observations>\n${lines.join('\n')}\n</observations>`
     }
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => underFloor(prompt, n === 1 ? 0.8 : 0.9, n === 1 ? '* 🟡 2026-09-22 14:30 First try' : '* 🟡 2026-09-22 14:30 Second try'),
     })
@@ -1141,7 +1141,7 @@ describe('register', () => {
     const table = '🔴 2026-09-22 15:00 User wants the detailed table behind an `all` mode'
     const many = (time: string) => `* 🟡 ${time} read a file with a long name\n`.repeat(1_000)
     const { gate, open } = gates()
-    const seen = pi(on, {
+    const seen = models(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
@@ -1174,7 +1174,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const red = (i: number) => `🔴 2026-09-22 14:30 User required that module ${i} keep ${'its public interface and its tests unchanged, '.repeat(8)}always`
     const { gate, open } = gates()
-    const seen = pi(on, {
+    const seen = models(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
       reply: () => `<observations>\n${Array.from({ length: 350 }, (_, i) => `* ${red(i)}`).join('\n')}\n</observations>`,
       reflect: (n, prompt) => nearTarget(prompt),
@@ -1219,7 +1219,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const many = (time: string) => `<observations>\n${`* 🟡 ${time} read a file with a long name\n`.repeat(1_000)}</observations>`
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) => many(prompt.includes('[User @ 2026-09-22 14:30]: a') ? '2026-09-22 14:30' : '2026-09-22 15:00'),
       reflect: (n, prompt) =>
         nearTarget(
@@ -1258,7 +1258,7 @@ describe('register', () => {
     const clock = mock.clock(on, { now: at(22, 14, 0) })
     const { history, stored } = world(on)
     const many = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(2_000)}</observations>`
-    pi(on, {
+    models(on, {
       reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: c') ? many : prompt.includes('[User]: a') ? '<observations>\n* 🟡 Saw a\n</observations>' : undefined),
       reflect: (n, prompt) =>
         nearTarget(
@@ -1290,7 +1290,7 @@ describe('register', () => {
   test('a reflection with no observations is tried again at the next level, which says so', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) =>
         n === 1 ? '<corrections>\n* 🔴 2026-09-22 14:30 User: "never npm"\n</corrections>\n<observations>\n</observations>' : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Read files'),
@@ -1311,7 +1311,7 @@ describe('register', () => {
   test('the observer and reflector are given the same priority markers', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>` })
+    const seen = models(on, { reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>` })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -1327,7 +1327,7 @@ describe('register', () => {
   test('an unmarked line in a reflection continues the line before it, but after a 🔴 line stands as its own 🟡 line', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored, files } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => nearTarget(prompt, '* 🔴 2026-09-22 14:30 Use pnpm\nnever npm\n* 🟡 2026-09-22 14:30 Read files\nand a.ts'),
     })
@@ -1354,7 +1354,7 @@ describe('register', () => {
   test('a reflection in the older date-group form, which the prompts no longer ask for, is still read', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, {
+    models(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => nearTarget(prompt, 'Date: Sep 22, 2026\n* 🟡 (14:30) Read files'),
     })
@@ -1371,7 +1371,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const line = '🟡 2026-09-22 14:30 read a file with a long name'
     const big = `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`
-    const seen = pi(on, { reply: () => big, reflect: () => big.replace(/long name/g, 'longer name') })
+    const seen = models(on, { reply: () => big, reflect: () => big.replace(/long name/g, 'longer name') })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -1389,9 +1389,9 @@ describe('register', () => {
     const { history, stored } = world(on)
     const line = '🟡 2026-09-22 14:30 read a file with a long name'
     const short = '<observations>\n* 🔴 2026-09-22 14:30 Reflected\n</observations>'
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () => `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`,
-      fail: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? { exitCode: 0, stdout: piOutput('', short, { stopReason: 'length' }), stderr: '' } : undefined),
+      fail: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? cutAt(short, 48_000) : undefined),
     })
     const runTurn = live(on, clock, history)
 
@@ -1399,7 +1399,7 @@ describe('register', () => {
     await clock.settle()
 
     expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
-    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual(['reflection failed (pi exited 0, stopReason length: )'])
+    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual(['reflection failed (reply cut at the 48000-token cap)'])
     const ledger = stored['ledger:session-1'] as Ledger
     expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
     expect(ledger.entries).toHaveLength(4_000)
@@ -1410,7 +1410,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const correction = '🔴 2026-09-22 14:30 User: "Sorry, I meant the refresh endpoint, not login — ignore what I said about login"'
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
           ? `<corrections>\n* ${correction}\n</corrections>\n${big}\n<continuation>\nActive: fixing the refresh endpoint\n</continuation>`
@@ -1435,13 +1435,13 @@ describe('register', () => {
     for (const key of Object.keys(stored)) delete stored[key]
     const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)] })
     expect(noReplies(second.messages?.[0]?.text)).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n@ 2026-09-22\n* 🟡 14:30 Explored the auth module (source 14:30 to 14:31)\n`)
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
   })
 
   test('a memory mixing lines with and without a source reads back as it was written: rendered, carried forward and rendered again, it is the same', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw a\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw a\n</observations>' })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -1467,7 +1467,7 @@ describe('register', () => {
   test('an observation carries the span of transcript times it came from, never a range the Observer wrote, and keeps it through the memory message', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) => {
         const [, time, name] = prompt.match(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/m)!
         // The Observer is given no ranges: one it writes is invented.
@@ -1500,7 +1500,7 @@ describe('register', () => {
   test('the memory writes each day once, on a line before its first observation and its first user message, and reads the dates back', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, {
+    models(on, {
       reply: (prompt) => {
         const [, time, name] = prompt.match(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/m)!
         return `<observations>\n* 🟡 ${time ?? ''} Read ${name}\n</observations>`
@@ -1530,7 +1530,7 @@ describe('register', () => {
   test('an observation that ends in a parenthetical that is not a source range keeps it', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Read config.ts (source of truth for ports)\n* 🟡 Cited the RFC (source: IETF)\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Read config.ts (source of truth for ports)\n* 🟡 Cited the RFC (source: IETF)\n</observations>' })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
@@ -1542,7 +1542,7 @@ describe('register', () => {
   test("an observation's source range, given to om_recall as from and to, finds the rows it was observed from", async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on, { reply: (prompt) => `<observations>\n* 🟡 ${prompt.match(/^\[User @ ([\d-]+ [\d:]+)\]: \w+$/m)![1]} Read ${prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]}\n</observations>` })
+    models(on, { reply: (prompt) => `<observations>\n* 🟡 ${prompt.match(/^\[User @ ([\d-]+ [\d:]+)\]: \w+$/m)![1]} Read ${prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]}\n</observations>` })
     const runTurn = live(on, clock, history)
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
@@ -1561,7 +1561,7 @@ describe('register', () => {
   test('keeps every recorded skill not in the raw tail, most recent first, within the token cap, and logs what it drops', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'old deploy steps' })
@@ -1583,7 +1583,7 @@ describe('register', () => {
   test('skills carry forward through the memory message when the store has none', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     const { stored } = world(on)
-    pi(on)
+    models(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps\n</skill> mid-text stays' })
@@ -1624,7 +1624,7 @@ describe('register', () => {
   test('a memory message from before skill times still parses: its skills become lines, but stay whole in a subagent', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     const { stored } = world(on)
-    pi(on)
+    models(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps' })
@@ -1722,7 +1722,7 @@ describe('register', () => {
   test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    models(on)
     const evalHooks = recallOnlyHooks()
     const invalidated: string[] = []
     const evalWorld = { session: { id: async () => 'session-1', messages: async () => history }, ui: { invalidate: (event: string) => void invalidated.push(event) } }
@@ -1767,7 +1767,7 @@ describe('register', () => {
   test('/clear drops the cleared session\'s ledger, times, skills, Session line and seen stamp, its subagents\' too', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on)
+    models(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
     const runTurn = live(on, clock, history)
 
@@ -1786,7 +1786,7 @@ describe('register', () => {
   test('a rewound transcript restarts the ledger from the memory message', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -1803,7 +1803,7 @@ describe('register', () => {
   test('a subagent whose history the session cannot read is observed at compaction from its context alone, and its steps store nothing', async ($, on) => {
     const clock = mock.clock(on)
     const { stored } = world(on, { unreadable: ['agent-1'] })
-    const seen = pi(on)
+    const seen = models(on)
     const step = steps(on)
 
     await step($, 's', 0, 3, 'agent-1')
@@ -1823,7 +1823,7 @@ describe('register', () => {
   test("an unreadable subagent history gets one round of Observer calls, a failed chunk briefed rather than observed again, and is counted", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on, { unreadable: ['agent-1'] })
-    const seen = pi(on, { fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = models(on, { fail: (n) => (n === 1 ? apiError(null, 'unknown') : undefined) })
 
     const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
 
@@ -1839,7 +1839,7 @@ describe('register', () => {
   test("a subagent's budget takes the smallest window, not the main model's million", async ($, on) => {
     mock.clock(on)
     world(on, { unreadable: ['agent-1'] })
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(6_000)}</observations>` })
+    const seen = models(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(6_000)}</observations>` })
     // ~100k tokens of observations: under the main model's (1M - 20k) / 2, over a 200k window's 90k.
     on('session.usage', () => ({ value: { context: { window: 1_000_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
@@ -1869,7 +1869,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const seen = models(on, { hold: (n) => gate(n), reply: readsIn })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     await clock.set(at(23, 9, 0))
@@ -1898,8 +1898,6 @@ describe('register', () => {
     await clock.settle()
 
     expect(seen.maxInFlight).toBe(4)
-    // The subagents' Observer calls are the session's piece of work too: one cache key for all of them.
-    expect(new Set(seen.calls.map((c) => piSessionOf(c.argv)))).toEqual(new Set([OBSERVER_SESSION]))
     // Every call read one loop's rows, and a loop left short of a slot got the next one free.
     for (const prompt of seen.prompts) expect(readers(prompt).size).toBe(1)
     // Every loop's observations go to the debug log, none to the chat: the band above the prompt shows them.
@@ -1928,7 +1926,7 @@ describe('register', () => {
   test("a subagent's compaction cuts at its own background watermark with no Observer call, its brief quoted, counted as a subagent's", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored, files } = world(on)
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     const step = steps(on)
     const brief = 'Prototype the change in the worktree, then report back.'
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: brief, toolUses: [] }])
@@ -1975,7 +1973,7 @@ describe('register', () => {
   test('a newest tool result past the raw tail budget, with nothing observed yet, stays raw with its call and the rest is observed', async ($, on) => {
     mock.clock(on)
     const { history, agents } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     // The newest row, a 36 KB read (~9k tokens), is more than the raw tail's 6k on its own. Turn b is short of a chunk
     // so the kept tail is just the call and its result: with a full-size b, b's closing reply stays raw too.
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000), ...call(1, 36_000))
@@ -1993,7 +1991,7 @@ describe('register', () => {
   test('a newest call and result past RAW_MAX_TOKENS on their own are observed too, and nothing stays raw', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     history.push(...turn('a', 'a', CHUNK), ...call(1, 200_000)) // a 50k-token result
 
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
@@ -2007,7 +2005,7 @@ describe('register', () => {
     mock.clock(on, { now: at(22, 9, 0) })
     world(on)
     const correction = '🔴 User: "Keep the public API unchanged"'
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]
         return `${name === 'a' ? `<corrections>\n* ${correction}\n</corrections>\n` : ''}<observations>\n* 🔴 User: "${name}"\n</observations>\n<continuation>\nActive: ${name}\n</continuation>`
@@ -2036,7 +2034,7 @@ describe('register', () => {
   test('a memory over its budget with source ranges and within it without leaves them out of that message only, before touching skills or user messages', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 ${prompt.includes(']: a\n') ? '14:30 read a file' : '15:30 read c'}\n</observations>` })
+    const seen = models(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 ${prompt.includes(']: a\n') ? '14:30 read a file' : '15:30 read c'}\n</observations>` })
     let window = 200_000
     on('session.usage', () => ({ value: { context: { window }, rateLimits: [] } }) as never)
     const runTurn = live(on, clock, history)
@@ -2079,7 +2077,7 @@ describe('register', () => {
   test('a plugin-started compaction is skipped where another would fall back to the built-in compactor', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    models(on)
     let builtin = 0
     on('session.compact', () => (builtin++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     history.push(...turn('a', 'a', CHUNK))
@@ -2098,7 +2096,7 @@ describe('register', () => {
     const { gate, open } = gates()
     const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
     const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(8_000)}</observations>`
-    const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
+    const seen = models(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
     // Dense text: the last response measured 150k tokens where the characters estimate ~15k of messages, so the raw
     // tail's ~5k count ~43k beside ~100k of memory, and the memory alone, with no raw tail, is over the 90k budget.
     on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
@@ -2124,7 +2122,7 @@ describe('register', () => {
   test('a memory over its budget with chunks observed on the spot falls back and stores them committed, not installed', async ($, on) => {
     mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_000)}</observations>` })
+    const seen = models(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_000)}</observations>` })
     // A 15k-token budget, under the ~20k of observations the two chunks bring even with the skills and prompts cut.
     on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
@@ -2150,7 +2148,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored, files } = world(on)
     const { gate } = gates()
-    const seen = pi(on, { hold: (n) => (n === 3 ? gate(3) : undefined) })
+    const seen = models(on, { hold: (n) => (n === 3 ? gate(3) : undefined) })
     const runTurn = live(on, clock, history)
     let builtIn = 0
     on('session.compact', () => (builtIn++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
@@ -2183,7 +2181,7 @@ describe('register', () => {
     mock.clock(on)
     const { history, stored } = world(on)
     const corrections = Array.from({ length: 600 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) =>
         `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n${'* 🟡 read a file with a long name\n'.repeat(250)}</observations>`,
     })
@@ -2209,7 +2207,7 @@ describe('register', () => {
     const long = (i: number) => `🔴 User: "Leave module ${i} as it is, ${'and do not touch its tests or its fixtures '.repeat(9)}"`
     const named = '🔴 User: "Keep src/widget_registry.ts as it is: widget_registry is public"'
     const corrections = [named, ...Array.from({ length: 100 }, (_, i) => long(i))]
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
     })
     // The default 90k-token budget holds the ~10k the corrections take whole; their 8k-token cap does not.
@@ -2235,7 +2233,7 @@ describe('register', () => {
   test("the budget is half the room below the auto-compaction threshold, less the overhead the session's breakdown lists", async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(2_000)}</observations>` })
+    const seen = models(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(2_000)}</observations>` })
     // (100k to auto-compaction - 20k - 10k of a loaded MCP tool - 10k of memory files) / 2: a 30k-token budget,
     // under the ~34k of observations the two chunks bring. A deferred tool is outside the window.
     const breakdown = {
@@ -2286,7 +2284,7 @@ describe('register', () => {
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
     const clock = mock.clock(on)
     const { agents } = world(on)
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     const step = steps(on)
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'Read the chapters in order.', toolUses: [] }])
     // As run 1 of the subagent smoke: each step starts on a 36 KB read, the newest row.
@@ -2318,7 +2316,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on)
     let failing = true
-    const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    const seen = models(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
     window(on, () => failing)
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
@@ -2364,7 +2362,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let failing = true
-    const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    const seen = models(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
     window(on, () => failing)
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -2407,7 +2405,7 @@ describe('register', () => {
     const { agents, stored } = world(on)
     const { gate, open } = gates()
     let failing = true
-    const seen = pi(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
+    const seen = models(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     let builtin = 0
@@ -2461,7 +2459,7 @@ describe('register', () => {
     const { history } = world(on)
     const { gate, open } = gates()
     let failing = true
-    const seen = pi(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
+    const seen = models(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     let builtin = 0
@@ -2507,7 +2505,7 @@ describe('register', () => {
   test('a compaction request with explicit instructions delegates to the built-in compactor unchanged, and a later compaction still finds the live context', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     let received: SessionCompactInput | undefined
     on('session.compact', ($, e) => ((received = e), { messages: [SUMMARY, ...e.messages.slice(-2)] }))
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -2522,7 +2520,7 @@ describe('register', () => {
     expect(received?.instructions).toBe('Focus on the auth bug only') // forwarded unchanged
     expect(received?.messages).toEqual(history)
     expect(seen.prompts).toEqual([]) // no Observer call: nothing observed
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
     expect(seen.screen).toEqual(['Compaction instructions given. Using built-in compaction'])
 
     // Ordinary compaction remains available without explicit instructions, and stays persistent across the delegated one.
@@ -2536,7 +2534,7 @@ describe('register', () => {
   test('stats: the first main request after a compaction counts what the prompt cache served of it, by compactor', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    pi(on)
+    models(on)
     on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
     let cache = { cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     on('turn.step', async function* ($, e) {
@@ -2571,7 +2569,7 @@ describe('register', () => {
   test('a compaction request with blank instructions is treated as ordinary compaction, not delegated', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     let builtinCalls = 0
     on('session.compact', () => (builtinCalls++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
 
@@ -2585,7 +2583,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? undefined : gate(n)), reply: readsIn })
+    const seen = models(on, { hold: (n) => (n === 1 ? undefined : gate(n)), reply: readsIn })
     const step = steps(on)
     const runTurn = live(on, clock, history)
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0))
@@ -2625,7 +2623,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { gate, open } = gates()
     const { agents, stored } = world(on, { holdGet: (key) => (key === 'ledger:session-1/agent-1' ? gate(1) : undefined) })
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -2652,7 +2650,7 @@ describe('register', () => {
       holdGet: (key) => (key === 'ledger:session-1/agent-1' && reflected && !held ? ((held = true), gate(1)) : undefined),
     })
     const big = `<observations>\n${'* 🟡 2026-09-23 10:00 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, { reply: () => big, reflect: (n, prompt) => ((reflected = true), nearTarget(prompt, '* 🟡 2026-09-23 10:00 Condensed')) })
+    const seen = models(on, { reply: () => big, reflect: (n, prompt) => ((reflected = true), nearTarget(prompt, '* 🟡 2026-09-23 10:00 Condensed')) })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -2679,7 +2677,7 @@ describe('register', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, { hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined), reply: () => big, reflect: () => big })
+    const seen = models(on, { hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined), reply: () => big, reflect: () => big })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -2699,7 +2697,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const seen = models(on, { hold: (n) => gate(n), reply: readsIn })
     const step = steps(on)
     const runTurn = live(on, clock, history)
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -2739,7 +2737,7 @@ describe('register', () => {
     const { gate, open } = gates()
     let lists = 0
     const { agents, stored } = world(on, { holdList: () => (++lists === 1 ? gate(1) : undefined) })
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -2763,7 +2761,7 @@ describe('register', () => {
     const { agents, stored } = world(on, {
       holdGet: (key) => (key === 'ledger:session-1/agent-1' && observed && !held ? ((held = true), gate(1)) : undefined),
     })
-    const seen = pi(on, { reply: (prompt) => ((observed = true), readsIn(prompt)) })
+    const seen = models(on, { reply: (prompt) => ((observed = true), readsIn(prompt)) })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -2787,7 +2785,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { gate, open } = gates()
     const { agents, stored } = world(on, { holdGet: (key) => (key === 'ledger:session-1/agent-1' ? gate(1) : undefined) })
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     on('session.end', ($, e) => ({ sessionId: e.sessionId }))
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }])
     for (let n = 0; n < 10; n++) rows.push(...agentCall('one', n, 16_000))
@@ -2811,7 +2809,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const seen = models(on, { hold: (n) => gate(n), reply: readsIn })
     on('session.end', ($, e) => ({ sessionId: e.sessionId }))
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }])
     for (let n = 0; n < 10; n++) rows.push(...agentCall('one', n, 16_000))
@@ -2830,7 +2828,7 @@ describe('register', () => {
   test("a teammate's turn.complete is one of many: its keys stay, and a pass runs as main's does", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on, { teammates: ['mate-1'] })
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     on('turn.complete', () => ({ text: '' }))
     agents['mate-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
     for (let n = 0; n < 4; n++) agents['mate-1'].push(...agentCall('one', n, 16_000))
@@ -2845,7 +2843,7 @@ describe('register', () => {
   test("the steps' times and the turn's start are held and written together a moment later, at once at the turn's end, and a prune by another process stays done", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored, writes } = world(on)
-    pi(on)
+    models(on)
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     on('turn.complete', () => ({ text: '' }))
@@ -2883,7 +2881,7 @@ describe('register', () => {
   test('a scheduling pass that changes nothing in the ledger does not write it again', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored, writes } = world(on)
-    pi(on)
+    models(on)
     const runTurn = live(on, clock, history)
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0))
     await clock.settle()
@@ -2912,7 +2910,7 @@ describe('register', () => {
   test('a genuine prompt that happens to start with a tag is told apart from a named injected wrapper by name, not by shape', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    models(on)
     const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
     const messages = [
       ...turn('a', 'a', CHUNK),
@@ -2938,7 +2936,7 @@ describe('register', () => {
   test('a prompt typed after pasted images is kept with their markers; an image note with no text is not a prompt', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    models(on)
     const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
     const messages = [
       ...turn('a', 'a', CHUNK),
@@ -2958,7 +2956,7 @@ describe('register', () => {
   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
     on('classic.SessionStart', ($, e) => ({}))
     await $.classic.SessionStart({ source: 'startup', session_id: 'session-1', transcript_path: '/home/u/.claude/projects/p/session-1.jsonl' })
@@ -2986,7 +2984,7 @@ describe('register', () => {
     expect(text).not.toContain('read the full transcript at:')
     expect(text).toContain('\nRecent messages are preserved verbatim.')
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
-    expect(seen.modelCalls).toBe(0)
+    expect(seen.calls.filter((c) => c.model !== HAIKU)).toEqual([]) // no call to another model
 
     // A second compaction carries the section forward, verbatim, and parses the rest around it.
     const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
@@ -3001,7 +2999,7 @@ describe('register', () => {
   test('the user messages section keeps the brief, the newest prompts within its cap and the last three whole', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const long = (n: number) => `${n} ${'w'.repeat(4_000)}`
     const brief = `brief ${'b'.repeat(14_600)}`
     const messages = [...turn(brief, 'r', 2_000), ...Array.from({ length: 30 }, (_, i) => turn(long(i), 'r', 2_000)).flat(), ...turn('last', 'r', 8_000)]
@@ -3040,7 +3038,7 @@ describe('register', () => {
   test('short prompts past the cap stay whole, in order, with the long ones between counted', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const long = (n: number) => `${n} ${'w'.repeat(8_000)}`
     const prompts = Array.from({ length: 12 }, (_, i) => (i % 3 === 0 ? `no, use option ${i} instead` : long(i)))
     const messages = [...turn('brief', 'r', 2_000), ...prompts.flatMap((p) => turn(p, 'r', 2_000)), ...turn('last', 'r', 8_000)]
@@ -3064,7 +3062,7 @@ describe('register', () => {
   test('an oversized brief is cut short of the cap, so the newest prompt keeps a reserve and stays the next step', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(50_000)}`
     const newest = `newest ${'n'.repeat(50_000)}`
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn('mid', 'r', 2_000), ...turn(newest, 'r', CHUNK), ...work('w', 8_000)] })
@@ -3087,7 +3085,7 @@ describe('register', () => {
   test('the newest prompt is the next step only when it leaves context, never when the raw tail keeps it', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const kept = await $.session.compact({ trigger: 'manual', messages: [...turn('first', 'r', CHUNK), ...turn('second', 'r', CHUNK), ...turn('in the tail', 'r', 2_000)] })
     expect(kept.messages?.slice(1).some((m) => m.text === 'in the tail')).toBe(true)
     expect(nextStepIn(kept.messages?.[0]?.text)).toBeUndefined()
@@ -3099,7 +3097,7 @@ describe('register', () => {
   test('the next step after a compaction of [brief, (n omitted), x] with no new prompt is x', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(14_600)}`
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn(`mid ${'m'.repeat(30_000)}`, 'r', 2_000), ...turn('do the thing', 'r', CHUNK), ...work('w', 8_000)] })
     expect(userMessagesIn(result.messages?.[0]?.text)).toEqual([brief, '(1 omitted)', 'do the thing'])
@@ -3112,7 +3110,7 @@ describe('register', () => {
   test('an oversized brief keeps its head and its last lines with a marker counting the omission, and is not cut again', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const body = Array.from({ length: 1_000 }, (_, i) => `step ${i}: ${'b'.repeat(60)}`).join('\n')
     const rules = 'Report: the head commit and the test results.\nAcceptance: every test passes; no push.'
     const brief = `Goal: rename the store.\n${body}\n${rules}`
@@ -3137,7 +3135,7 @@ describe('register', () => {
   test('a brief within the cap stays whole and a newest prompt over the remainder is cut', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(14_600)}`
     const newest = `newest ${'n'.repeat(40_000)}`
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn(newest, 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
@@ -3153,7 +3151,7 @@ describe('register', () => {
   test('a single-prompt session keeps that prompt once', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(50_000)}`
     const messages: SessionMessage[] = [...turn(brief, 'r', CHUNK), ...turn('tail', 'r', 8_000)]
     const result = await $.session.compact({ trigger: 'manual', messages })
@@ -3166,7 +3164,7 @@ describe('register', () => {
   test('only 🔴 corrections are quoted; the observer reserves 🔴 for the user\'s constraints', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: () => '<corrections>\n* 🔴 User: "use pnpm, never npm"\n* 🟡 User: "I meant the other file"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
     })
 
@@ -3294,7 +3292,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const seen = models(on, { hold: (n) => (n === 1 ? gate(1) : undefined), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     await clock.set(at(23, 9, 0))
@@ -3330,7 +3328,7 @@ describe('register', () => {
   test('past the 4096 rows the history reads as, a long turn still observes in the background mid-turn', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on, { rowsCap: 4096 })
-    const seen = pi(on, { reply: readsIn })
+    const seen = models(on, { reply: readsIn })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     await clock.set(at(23, 9, 0))
@@ -3355,7 +3353,7 @@ describe('register', () => {
   test("a crewmate's launch brief, its only prompt, is quoted in full across compactions and never offered as the next step", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const seen = models(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const brief = `FIRSTMATE_OP: v1 launch-brief: ${'Do the work on your own. '.repeat(600)}`.trim()
     const messages = [{ role: 'user' as const, text: brief, toolUses: [] }, ...call(0, CHUNK), ...call(1, CHUNK), ...call(2, 8_000)]
 
@@ -3375,7 +3373,7 @@ describe('register', () => {
   test('a short first prompt quotes across compactions the files it names that its turn read, and no other', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const prompt = "Operational input waiting: read '/state/inbox/b.msg' and handle its contents."
     const brief = 'Stay on branch fix-1. Never push.'
     const messages: SessionMessage[] = [
@@ -3399,7 +3397,7 @@ describe('register', () => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const seen = models(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -3430,7 +3428,7 @@ describe('register', () => {
   test('a context that groups parallel tool calls under the watermark still cuts there with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
     const block = parallel('a', 4, 10_000)
     const answer = { role: 'assistant' as const, text: 'a done', toolUses: [] }
@@ -3456,7 +3454,7 @@ describe('register', () => {
   test('a context that groups parallel tool calls in the raw tail, at the same length as the history, is persistent', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -3480,7 +3478,7 @@ describe('register', () => {
   test('after a compaction, a context that groups parallel tool calls matches the tail of the longer history', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -3509,7 +3507,7 @@ describe('register', () => {
   test('an older wrapper row in the raw tail keeps only the lines a newer one does not repeat, and reads whole again after the compaction', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
     const notice = (id: string) => `<task-notification>\n<task-id>${id}</task-id>\nThe watcher woke: read the inbox, act on each new file, then reply to the lead with what changed.\n</task-notification>`
 
@@ -3542,7 +3540,7 @@ describe('register', () => {
   test('an older tool input and result the raw tail cut read whole again after the compaction', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
     const script = `cat <<'EOF' > notes.txt\n${'a heredoc line\n'.repeat(300)}EOF`
     const output = `BEGIN build\n${'compiled module\n'.repeat(300)}END: build passed`
@@ -3593,7 +3591,7 @@ describe('register', () => {
   test('a parallel block a compaction wrote back grouped, under the watermark, still cuts there with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -3623,7 +3621,7 @@ describe('register', () => {
   test('a compaction finds its context when the history holds rows past it (the /compact command) and keeps the ledger', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -3644,7 +3642,7 @@ describe('register', () => {
   test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
 
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000))
@@ -3673,7 +3671,7 @@ describe('register', () => {
   test('a context that differs from the history past the watermark keeps the ledger up to it and counts how it differs', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files, stored } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -3708,7 +3706,7 @@ describe('register', () => {
   test('a context that differs from the history under the watermark only in a tool result keeps the ledger, checked against the history', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files, stored } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -3737,7 +3735,7 @@ describe('register', () => {
   test('stats: background calls and a compaction land in the session file, and om_stats and /om-stats report them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    pi(on)
+    models(on)
     on('session.usage', () => ({ value: { context: { tokens: 90_000, window: 200_000 }, rateLimits: [] } }) as never) // the fields the hook reads
     const runTurn = live(on, clock, history)
 
@@ -3750,9 +3748,9 @@ describe('register', () => {
     const file = JSON.parse(files['/stats/session-1.json']!) as { cwd: string; metrics: Record<string, { count: number; sum: number }> }
     expect(file.cwd).toBe('/work/project')
     expect(file.metrics['observer.background.ms']?.count).toBe(2)
-    expect(Math.round(file.metrics['observer.background.cost']!.sum * 1e7)).toBe(50_216)
-    expect(file.metrics['observer.background.in']?.sum).toBe(18_412)
-    expect(file.metrics['observer.background.cacheRead']?.sum).toBe(6_144) // pi's prompt-cache hits, apart from its input
+    expect(Math.round(file.metrics['observer.background.cost']!.sum * 1e7)).toBe(Math.round(2 * MODEL_COST * 1e7))
+    expect(file.metrics['observer.background.in']?.sum).toBe(12_268)
+    expect(file.metrics['observer.background.cacheRead']?.sum).toBe(6_144) // prompt-cache hits, apart from the input
     expect(file.metrics['observer.background.cacheWrite']?.sum).toBe(0)
     expect(file.metrics['observer.background.observations']?.sum).toBe(2)
     expect(file.metrics['observer.compaction.ms']?.count).toBeGreaterThan(0)
@@ -3766,7 +3764,7 @@ describe('register', () => {
     expect(summary).toMatch(/^Background   2 calls,/m)
     const tool = String((await $.tool.call({ tool: 'mcp__observational-memory__om_stats', full: true })).result)
     expect(tool).toContain('## observational-memory stats, session session-1 (/work/project)')
-    expect(tool).toMatch(/1 compaction\(s\), \d+ Luna call\(s\) \(0 failed\)/)
+    expect(tool).toMatch(/1 compaction\(s\), \d+ model call\(s\) \(0 failed\)/)
     expect(tool).toMatch(/\| observer\.background\.ms \| 2 \|/)
     files['/stats/other.json'] = JSON.stringify({ version: 1, sessionId: 'other', firstSeen: 0, lastSeen: 0, counts: {}, metrics: { 'observer.background.ms': { count: 1, sum: 5, min: 5, max: 5, recent: [[0, 5]] } } })
     expect((await $.command.run({ command: 'om-stats', args: 'all', ...COMPOSER })).text).toStartWith('all sessions (2) · ')
@@ -3781,7 +3779,7 @@ describe('register', () => {
   test('stats: a failed stats write is logged once and compaction and observation carry on', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on, { failWrites: true })
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(22, 14, 30))
@@ -3825,7 +3823,7 @@ describe('active constraints and the continuation record', () => {
   test('a constraint the user reverses is replaced, saying what it replaced, and an unrelated later one leaves it standing across compactions', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: constraining({
         setup: { quote: 'Use pnpm, never npm' },
         reverse: { quote: 'Use npm after all, pnpm breaks the lockfile', replaces: 'Use pnpm' },
@@ -3868,7 +3866,7 @@ describe('active constraints and the continuation record', () => {
     const { history } = world(on)
     const push = 'never_force_push_to_main_under_any_circumstances'
     const lint = 'always_run_the_linter_before_every_single_commit'
-    pi(on, {
+    models(on, {
       reply: constraining({
         [push]: { quote: push },
         [lint]: { quote: lint },
@@ -3916,7 +3914,7 @@ describe('active constraints and the continuation record', () => {
     const span = `${ok}"\n* 🔴 2026-09-22 14:20 User: `
     const lint = `always_run_the_linter_${'x'.repeat(span.length - 22)}`
     expect(lint.length).toBe(span.length)
-    pi(on, { reply: constraining({ reply: { quote: ok }, [lint]: { quote: lint } }) })
+    models(on, { reply: constraining({ reply: { quote: ok }, [lint]: { quote: lint } }) })
     const runTurn = live(on, clock, history)
 
     for (const [i, name] of ['hello', 'reply', lint, 'later'].entries()) {
@@ -3943,7 +3941,7 @@ describe('active constraints and the continuation record', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const reversed = '🔴 2026-09-22 14:01 User: "Go back to npm for this repo" (this replaces the earlier constraint 2026-09-22 14:00 User: "Use pnpm here")'
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) =>
         `${prompt.includes(']: back\n') ? `<corrections>\n* ${reversed}\n</corrections>\n` : ''}<observations>\n* 🟡 Saw\n</observations>`,
     })
@@ -3970,7 +3968,7 @@ describe('active constraints and the continuation record', () => {
     const A = 'Keep the public API unchanged'
     const B = 'Run the linter before each commit'
     const quotes: Record<string, string[]> = { one: [A], two: [A, B], three: [A] }
-    pi(on, {
+    models(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User\]: (\w+)$/m)![1]!
         const said = quotes[name] ?? []
@@ -3988,7 +3986,7 @@ describe('active constraints and the continuation record', () => {
   test('the continuation record says where the work stood, quotes a finished latest request without asking to start it again, and gives no step to redo', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, {
+    models(on, {
       reply: constraining({}, { fix: 'Completed: fixed the token refresh bug in src/auth/refresh.ts; npm test passes (212 tests)' }),
     })
 
@@ -4010,7 +4008,7 @@ describe('active constraints and the continuation record', () => {
   test('a decision waiting for the user stays a gate: no instruction forbids asking, and a newer message in the raw tail takes precedence', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, {
+    models(on, {
       reply: (prompt) =>
         prompt.includes(']: migrate\n')
           ? '<observations>\n* 🟡 Assistant asked the user to approve the production migration\n</observations>\n<continuation>\nActive: deploying the refresh fix\nWaiting for user: approval to run the production migration, which the deploy waits on\n</continuation>'
@@ -4035,7 +4033,7 @@ describe('active constraints and the continuation record', () => {
     const { history } = world(on)
     const gate = 'Waiting for user: approval to run the production migration, which the deploy waits on'
     // The Observer of `other` carries forward the gate it is shown and adds its own active work.
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: (prompt) =>
         '<observations>\n* 🟡 Saw\n</observations>\n<continuation>\n' +
         (prompt.includes(']: migrate\n') ? `Active: deploying the refresh fix\n${gate}` : `Active: tidying the logs\n${prompt.match(/^Waiting for user: .*$/m)?.[0] ?? ''}`) +
@@ -4059,7 +4057,7 @@ describe('active constraints and the continuation record', () => {
   test('the record is carried across repeated compactions, replaced by a newer one, and read from an older memory message without it', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, { reply: constraining({}, { two: 'Active: renaming the session store', four: 'Active: testing the renamed session store' }) })
+    const seen = models(on, { reply: constraining({}, { two: 'Active: renaming the session store', four: 'Active: testing the renamed session store' }) })
 
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
     expect(recordIn(first.messages?.[0]?.text)).toBe(`${WHERE}:\nActive: renaming the session store`)
@@ -4078,7 +4076,7 @@ describe('active constraints and the continuation record', () => {
   test('an older memory message, with repeated corrections, a current task and an optional next step, is read into the new form', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
     const legacy =
       `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\nSESSION HISTORY: older instructions.\n\n` +
       '<corrections>\n* 🔴 2026-09-22 14:30 User: "Use pnpm"\n* 🔴 2026-09-22 14:40 User: "Use pnpm"\n</corrections>\n\n' +
@@ -4112,7 +4110,7 @@ describe('active constraints and the continuation record', () => {
   test("a memory message in v1.4.1's framing is read whole and written again in the new one", async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
     const latest = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
     const old =
       `${COMPACT_WRAPPER}\n\n${V141.header}\n\n${V141.instructions}\n\n` +
@@ -4138,7 +4136,7 @@ describe('active constraints and the continuation record', () => {
   test('open failures stored under the older header and line form are read back and written in the new one', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
     const old =
       `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${MEMORY_GUIDE}\n</memory-guide>\n\n` +
       '<observations>\n* 🟡 Saw a\n</observations>' +
@@ -4164,7 +4162,7 @@ describe('active constraints and the continuation record', () => {
   test('omitted user messages are said to be recoverable only when the transcript that holds them is known', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    models(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     on('classic.SessionStart', () => ({}))
     const brief = `brief ${'b'.repeat(14_600)}`
     const long = (n: number) => `${n} ${'w'.repeat(16_000)}`
@@ -4183,7 +4181,7 @@ describe('active constraints and the continuation record', () => {
   test("the memory message ends by sending the model to om_recall before it says a detail is gone, only while the model can call om_recall", async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    models(on)
     let tools = [{ name: 'Read', description: 'Reads a file', mcp: false }]
     on('tool.list', () => ({ value: tools }))
     on('classic.SessionStart', () => ({}))
@@ -4225,7 +4223,7 @@ describe('the floor', () => {
   test('on a short conversation with nothing to observe before the raw tail, the floor briefs the turns before the newest, with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', 100), ...turn('b', 'b', 100), ...turn('c', 'c', 100)]
 
@@ -4251,7 +4249,7 @@ describe('the floor', () => {
   test('a manual compaction with less than a chunk unobserved briefs it by code, with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
 
     const result = await $.session.compact({ trigger: 'manual', messages: SHORT })
     await clock.advance(5_000)
@@ -4269,7 +4267,7 @@ describe('the floor', () => {
   test("a local slash command's rows stay out of the kept tail; a prompt command's echo, with no output after it, stays", async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    models(on)
     const user = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
     const effort = [
       user('<local-command-caveat>Caveat: the command below was run directly.</local-command-caveat>'),
@@ -4287,7 +4285,7 @@ describe('the floor', () => {
   test('a reply that was thinking alone stays out of the kept tail', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    models(on)
     const empty = (text: string): SessionMessage => ({ role: 'assistant', text, toolUses: [] })
     const messages = [...SHORT.slice(0, 4), empty(''), empty('(no content)'), ...SHORT.slice(4)]
 
@@ -4299,7 +4297,7 @@ describe('the floor', () => {
   test('an auto compaction with less than a chunk unobserved still observes it on the spot', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
 
     const result = await $.session.compact({ trigger: 'auto', messages: SHORT })
 
@@ -4311,7 +4309,7 @@ describe('the floor', () => {
   test('a manual compaction with background observations since the last one cuts at the watermark, as before', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -4330,7 +4328,7 @@ describe('the floor', () => {
   test('a context that is the memory message alone leaves the floor nothing to compile: the built-in compaction runs, saying why', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100)] })
 
@@ -4344,7 +4342,7 @@ describe('the floor', () => {
   test("a floor's brief is carried by later compactions: merged with the next floor's, kept whole once the Observer's memory stands again", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100)] })
     const second = await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...turn('c', 'c', 100)] })
     const briefed = briefIn(second.messages![0]!.text)
@@ -4360,7 +4358,7 @@ describe('the floor', () => {
   test('an observed memory has no session brief', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    models(on)
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
     expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
     expect(result.messages![0]!.text).not.toContain('<session-brief>')
@@ -4369,7 +4367,7 @@ describe('the floor', () => {
   test('the files the observed rows changed are listed in the brief, and nothing else of those rows', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    models(on)
     const edit = (s: SessionMessage): SessionMessage => ({ ...s, toolUses: s.toolUses.map((u) => ({ ...u, tool: 'Edit' })) })
     const [prompt, call, result, done] = turn('a', 'a', CHUNK)
     const messages = [prompt!, edit(call!), result!, done!, ...turn('b', 'b', 8_000)]
@@ -4383,7 +4381,7 @@ describe('the floor', () => {
   test("the brief's lines name the om_recall block they came from when the transcript is known and the model can call om_recall", async ($, on) => {
     mock.clock(on)
     const { files } = world(on)
-    pi(on)
+    models(on)
     on('classic.Stop', () => ({}))
     let tools = [{ name: 'mcp__observational-memory__om_recall', description: 'Searches', mcp: true }]
     on('tool.list', () => ({ value: tools }))
@@ -4455,7 +4453,7 @@ describe('the handoff', () => {
   test("the Observer's next steps and what the user was told are rendered in the record, and the reminder sends the model to them", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: constraining({}, {
         fix: 'Active: fixing the refresh bug\nNext steps: 1) run npm test -- src/auth; 2) commit as "fix(auth): check expiry"\nTold the user: the expiry check is in src/auth/refresh.ts:45',
       }),
@@ -4478,7 +4476,7 @@ describe('the handoff', () => {
     world(on)
     const steps = 'Next steps: 1) rename store.ts; 2) update the imports'
     const told = 'Told the user: the store is renamed in three places'
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: constraining({}, {
         two: `Active: renaming the session store\n${steps}\n${told}`,
         three: 'Active: updating the imports',
@@ -4500,7 +4498,7 @@ describe('the handoff', () => {
   test('a carried next steps or told-the-user field is bounded, however long the Observer writes it', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: constraining({}, { two: `Active: a\nNext steps: ${'step; '.repeat(2_000)}\nTold the user: ${'said; '.repeat(2_000)}` }) })
+    models(on, { reply: constraining({}, { two: `Active: a\nNext steps: ${'step; '.repeat(2_000)}\nTold the user: ${'said; '.repeat(2_000)}` }) })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
 
@@ -4517,7 +4515,7 @@ describe('the handoff', () => {
     world(on)
     const changed = Array.from({ length: 25 }, (_, i) => ` M hooks/file-${i}.ts`)
     let files = changed
-    const seen = pi(on, { reply: constraining({}, { two: 'Active: renaming the session store' }), git: (argv) => repo(files)(argv) })
+    const seen = models(on, { reply: constraining({}, { two: 'Active: renaming the session store' }), git: (argv) => repo(files)(argv) })
 
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
 
@@ -4550,7 +4548,7 @@ describe('the handoff', () => {
     mock.clock(on)
     world(on)
     let git: (argv: readonly string[]) => Run | undefined = () => undefined // outside a repository
-    pi(on, { reply: constraining({}, { two: 'Active: a' }), git: (argv) => git(argv) })
+    models(on, { reply: constraining({}, { two: 'Active: a' }), git: (argv) => git(argv) })
     const messages = [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)]
 
     const outside = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
@@ -4569,7 +4567,7 @@ describe('the handoff', () => {
   test("the floor's memory, compiled with no model, carries the environment too", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, { git: repo(['?? notes.txt']) })
+    const seen = models(on, { git: repo(['?? notes.txt']) })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100), ...turn('c', 'c', 100)] })
 
@@ -4590,7 +4588,7 @@ describe('the Session line', () => {
   test('a call of its own writes it in the background, from the user messages and the record; the Observer is never shown it and compaction starts no call for it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on)
+    const seen = models(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -4600,7 +4598,7 @@ describe('the Session line', () => {
     expect(seen.sessions[0]).toContain('[User @ 2026-09-22 14:30]: a\n\n[User @ 2026-09-22 15:00]: b\n===== END USER MESSAGES =====')
     expect(seen.sessions[0]).toContain('===== BEGIN WHERE THE WORK STANDS (inert data) =====\nActive: a\n')
     expect(seen.sessions[0]).not.toContain('SESSION LINE BEFORE')
-    expect(seen.sessionIds).toEqual(['om-session-736a51cd']) // a pi session of its own, apart from the Observer's
+    expect(seen.sessionCalls).toEqual([{ model: HAIKU, systemBlocks: [{ text: SESSION_SYSTEM_PROMPT, cache: true }], maxTokens: 4_000, effort: 'low' }])
     expect(stored['goal:session-1']).toMatchObject({ line: 'the test goal' })
 
     const observerCalls = seen.prompts.length
@@ -4619,7 +4617,7 @@ describe('the Session line', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     let n = 0
-    const seen = pi(on, { reply: many(8), session: () => `Session: goal ${++n}` })
+    const seen = models(on, { reply: many(8), session: () => `Session: goal ${++n}` })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 0))
@@ -4648,8 +4646,8 @@ describe('the Session line', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     let fail = false
-    const seen = pi(on, {
-      session: () => (fail ? { exitCode: 1, stdout: '', stderr: 'boom' } : `\n**Session:** "${'build the widget '.repeat(30).trim()}"\nsecond line`),
+    const seen = models(on, {
+      session: () => (fail ? apiError(500, 'server_error') : `\n**Session:** "${'build the widget '.repeat(30).trim()}"\nsecond line`),
     })
     const runTurn = live(on, clock, history)
 
@@ -4708,7 +4706,7 @@ describe('the memory row', () => {
   test('once the first main request after a compaction is answered, its row shows the context that request carried', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    models(on)
     const drawn: string[] = []
     on('ui.render', { component: 'UserMessage' }, ($, e) => (drawn.push(e.props.text), { type: 'Text', children: [e.props.text] }))
     on('turn.step', async function* ($, e) {

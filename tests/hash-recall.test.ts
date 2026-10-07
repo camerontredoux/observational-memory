@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, PromptAutocompleteInput, PromptAutocompleteResult } from 'claude-code'
-import { at, live, pi, turn, CHUNK, world as harness } from './harness'
+import { at, live, models, turn, CHUNK, world as harness } from './harness'
 
 // Core adds no rows of its own on this event: nothing beneath the plugins answers it unless a test does.
 // `theirs`: the rows `next(e)` gives, as another plugin's.
@@ -131,7 +131,7 @@ describe('# recall', () => {
     const clock = mock.clock(on)
     const { history } = harness(on)
     core(on)
-    pi(on, { reply: (prompt) => (prompt.includes(']: a') ? '<observations>\n* 🔴 2026-09-22 14:30 User asked about auth tokens\n</observations>' : '<observations>\n</observations>') })
+    models(on, { reply: (prompt) => (prompt.includes(']: a') ? '<observations>\n* 🔴 2026-09-22 14:30 User asked about auth tokens\n</observations>' : '<observations>\n</observations>') })
     const runTurn = live(on, clock, history)
     await runTurn($, turn('a', 'a', 8_000), at(22, 14, 0))
     await clock.settle()

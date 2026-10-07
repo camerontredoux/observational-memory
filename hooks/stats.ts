@@ -21,7 +21,7 @@ export type SessionStats = {
   counts: Record<string, number> // events without a value: failures by class, fallbacks, recall hits from the file
   metrics: Record<string, Metric>
 }
-export type LunaCall = {
+export type ModelCall = {
   kind: 'observer' | 'reflector' | 'session'
   phase: 'background' | 'compaction'
   ok: boolean
@@ -29,7 +29,7 @@ export type LunaCall = {
   ms: number
   input?: number
   output?: number
-  cacheRead?: number // input tokens pi's provider read from its prompt cache, apart from `input`
+  cacheRead?: number // input tokens read from the prompt cache, apart from `input`
   cacheWrite?: number
   cost?: number
   chunkTokens?: number
@@ -81,18 +81,19 @@ export function add(s: SessionStats, name: string, value: number | undefined, at
 }
 export const count = (s: SessionStats, name: string, by = 1) => void (s.counts[name] = (s.counts[name] ?? 0) + by)
 
-// A failure's class: how pi ended, never what it said.
+// A failure's class: how the call ended, never what it said.
 export function failureClass(message: string) {
   if (/timed? ?out|timeout/i.test(message)) return 'timeout'
-  const exit = message.match(/^pi exited (\d+)(?:, stopReason (\w+))?/)
-  if (exit?.[2]) return `stop-${exit[2]}`
-  if (exit && exit[1] !== '0') return `exit-${exit[1]}`
-  if (message.includes('no assistant message')) return 'no-message'
+  const api = message.match(/^API error [^:]*: (\w+)$/)
+  if (api) return `api-${api[1]}`
+  if (message.startsWith('reply cut at the')) return 'max-tokens'
+  if (message === 'the call was cut') return 'cut'
+  if (message.includes('no text in the reply')) return 'no-message'
   if (message.includes('<observations>')) return 'no-observations'
   return 'error'
 }
 
-export function addLuna(s: SessionStats, c: LunaCall, at: number) {
+export function addModelCall(s: SessionStats, c: ModelCall, at: number) {
   const key = `${c.kind}.${c.phase}`
   if (!c.ok) {
     add(s, `${key}.failed.ms`, c.ms, at)
@@ -232,7 +233,7 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const lines = [
     `## ${title}`,
     '',
-    `${sessions} session(s), ${when(s.firstSeen)} to ${when(s.lastSeen)} UTC. ${compactions} compaction(s), ${calls} Luna call(s) ` +
+    `${sessions} session(s), ${when(s.firstSeen)} to ${when(s.lastSeen)} UTC. ${compactions} compaction(s), ${calls} model call(s) ` +
       `(${failed} failed), ${dollars(sumOf(s, '.cost'))}, ${grouped(sumOf(s, '.in'))} tokens in, ${grouped(sumOf(s, '.out'))} out.`,
     '',
     '| metric | count | sum | mean | median | p90 | min | max |',
@@ -440,7 +441,7 @@ export function record(io: Io, sessionId: string, fn: (s: SessionStats, at: numb
   })().catch((e) => warn(io, e))
 }
 
-// What Luna has cost a session, as /om-stats totals it: the stats this process holds for it, else its file.
+// What the model calls have cost a session, as /om-stats totals it: the stats this process holds for it, else its file.
 export async function costOf(io: Io, sessionId: string) {
   return sumOf(await (live.get(sessionId) ?? load(io, sessionId)), '.cost')
 }

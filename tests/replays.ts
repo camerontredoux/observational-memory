@@ -7,7 +7,7 @@ import type { SessionMessage } from 'claude-code'
 import { FLOOR_NOTE } from '../hooks/prompts'
 import { loadTranscript, recall } from '../hooks/recall'
 import { negativeControl } from './eval/rubric'
-import { briefIn, memoryIo, nextStepIn, overloaded, pi, steps, SUMMARY, userMessagesIn, world } from './harness'
+import { briefIn, memoryIo, nextStepIn, overloaded, models, steps, SUMMARY, userMessagesIn, world } from './harness'
 import type { Ledger } from './harness'
 
 type Turns = { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
@@ -19,7 +19,7 @@ export const crewmate = (fx: Turns) =>
   test('replays a crewmate transcript: one long turn, observed in the background, compacted with no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
     const clock = mock.clock(on, { now: fx.at[0] })
     const { history, stored } = world(on)
-    const seen = pi(on, { hold: () => clock.sleep(12_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const seen = models(on, { hold: () => clock.sleep(12_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     on('turn.complete', () => ({ text: '' }))
@@ -73,7 +73,7 @@ export const subagent = (fx: Turns) =>
   test('replays a subagent transcript: its own steps observe it in the background, and each compaction makes no Observer call', { timeoutMs: 120_000 }, async ($, on) => {
     const clock = mock.clock(on, { now: fx.at[0] })
     const { agents, stored } = world(on)
-    const seen = pi(on, { hold: () => clock.sleep(15_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const seen = models(on, { hold: () => clock.sleep(15_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     const rows: SessionMessage[] = (agents['agent-1'] = [fx.rows[0]!])
@@ -128,7 +128,7 @@ export const fallback = (fx: Turns) =>
     const clock = mock.clock(on, { now: fx.at[0] })
     const { agents, stored } = world(on)
     let failing = true
-    const seen = pi(on, { hold: () => (failing ? undefined : clock.sleep(15_000)), reply: () => '<observations>\n* 🟡 Read a chapter\n</observations>', fail: () => (failing ? overloaded() : undefined) })
+    const seen = models(on, { hold: () => (failing ? undefined : clock.sleep(15_000)), reply: () => '<observations>\n* 🟡 Read a chapter\n</observations>', fail: () => (failing ? overloaded() : undefined) })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     let builtin = 0
@@ -174,7 +174,7 @@ export const firstmate = (fx: Firstmate) =>
   test('replays a firstmate transcript: short turns are observed in the background, and compaction cuts at the watermark', { timeoutMs: 120_000 }, async ($, on) => {
     const clock = mock.clock(on, { now: fx.at[0] })
     const { history } = world(on)
-    const seen = pi(on, { hold: () => clock.sleep(16_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const seen = models(on, { hold: () => clock.sleep(16_000), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     on('turn.complete', () => ({ text: '' }))
