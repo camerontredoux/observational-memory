@@ -350,17 +350,6 @@ async function showGauges($: EngineInterface, loop: Loop) {
     log($, `could not write the gauges (${errorText(error)})`)
   }
 }
-// When the main conversation's prompt cache was last read, for the footer's countdown to its expiry: written to
-// `gauges/<sessionId>.cache.json` as each main request starts, the moment the cache's hour restarts, and as `null`
-// once a compaction installs, since the next request matches none of the cached conversation.
-async function noteCacheAt($: EngineInterface, at: number | null) {
-  try {
-    const [dir, sessionId] = await Promise.all([statsDir(statsIo($)), $.session.id()])
-    await $.fs.write(`${dir.replace(/[^/]*$/, 'gauges')}/${sessionId}.cache.json`, JSON.stringify({ at }))
-  } catch (error) {
-    log($, `could not write the cache time (${errorText(error)})`)
-  }
-}
 // The main conversation's last compaction, by session, until a request carries the context it installed: which
 // compactor made it, and the hash of an om compaction's memory message. That request's usage says what the
 // compaction cost in prompt cache, and its input is the context the compaction left, which the memory row shows.
@@ -380,7 +369,7 @@ async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
   $.ui.invalidate('ui.render')
 }
 // Until a request measures it, the row shows the context the compaction estimated it left, under `~` and the hash:
-// an idle compaction's row may wait an hour for its measure.
+// a compaction's row may wait an hour for its measure.
 async function noteContextEstimate($: EngineInterface, sessionId: string, memory: string, tokens: number) {
   const sizes = { ...(await sizesOf($, sessionId)), [`~${memory}`]: tokens }
   contextSizes.set(sessionId, Promise.resolve(sizes))
@@ -1865,7 +1854,7 @@ let captures = 0 // subagents compact in the same millisecond
 // a compaction; `fellBack` only marks whether it was a genuine fallback (something failed here) for stats, not
 // whether to record at all: an intentional delegation (explicit `/compact` instructions) still counts toward the
 // total, just not as a fallback.
-// A compaction a plugin started (the idle one) is skipped instead: it is there to save tokens, and the built-in
+// A compaction another plugin started is skipped instead: it is there to save tokens, and the built-in
 // compactor's summary call costs them.
 async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, next: (e: SessionCompactInput) => Promise<SessionCompactResult>, fellBack: boolean) {
   if (e.trigger === 'plugin') return log($, 'a plugin-started compaction would need the built-in compactor; skipped'), { skip: 'observational-memory: no built-in compaction for a plugin-started one' }
@@ -2321,78 +2310,13 @@ async function onlyCopies(calls: readonly ToolGroupCall[]) {
   return true
 }
 
-// The prompt cache lives an hour from the last request that read it, which comes before turn.complete fires, so 60
-// minutes after turn.complete is already past it. A main conversation idle this long is compacted, so that the next
-// request rewrites the smaller context.
-export const IDLE_COMPACT_MS = 60 * 60 * 1000
-// OM_IDLE_COMPACT_MS, a whole number of ms, replaces it in the process it is set for, to watch the idle compaction run
-// without waiting an hour.
-async function idleCompactMs($: EngineInterface) {
-  const ms = Number(await $.env.get('OM_IDLE_COMPACT_MS'))
-  return Number.isInteger(ms) && ms > 0 ? ms : IDLE_COMPACT_MS
-}
-
-// When the main conversation last made a request, and whether it changed since its last compaction, for a plugin
-// that loads into a session already idle (a fresh start, or a hot reload that lost the timer and flags). The cache
-// file says it, when the last request wrote it: `at` null means a compaction stands with nothing after it. Without
-// the file, the transcript's last main-thread assistant entry stands for the last request, and changed when it comes
-// after the last compact_boundary (or there is none). A transcript over 4 MiB is read from its last 2 MiB by `tail`:
-// a boundary before that window is no boundary after the entry found in it, so the answer holds; a window with no
-// main assistant entry gives none.
-const TAIL_BYTES = 2 * 1024 * 1024
-async function idleState($: EngineInterface): Promise<{ at: number } | undefined> {
-  const [dir, sessionId] = await Promise.all([statsDir(statsIo($)), $.session.id()])
-  const cache = await $.fs.read(`${dir.replace(/[^/]*$/, 'gauges')}/${sessionId}.cache.json`).then((t) => JSON.parse(String(t)) as { at?: unknown }, () => undefined)
-  if (cache) return typeof cache.at === 'number' ? { at: cache.at } : undefined
-  const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
-  if (!path) return undefined
-  const size = await $.fs.stat(path).then((s) => s.size, () => undefined)
-  if (size === undefined) return undefined
-  let text = size < 4 * 1024 * 1024 ? String(await $.fs.read(path)) : await output($, ['tail', '-c', String(TAIL_BYTES), '--', path], path)
-  if (size >= 4 * 1024 * 1024) text = text.slice(text.indexOf('\n') + 1)
-  let last: number | undefined
-  let lastAt = -1
-  let boundary = -1
-  const lines = text.split('\n')
-  lines.forEach((line, i) => {
-    if (line.includes('"subtype":"compact_boundary"')) boundary = i
-    else if (line.includes('"type":"assistant"')) {
-      try {
-        const row = JSON.parse(line) as { type?: string; isSidechain?: boolean; timestamp?: string }
-        const t = Date.parse(row.timestamp ?? '')
-        if (row.type === 'assistant' && row.isSidechain !== true && !Number.isNaN(t)) (last = t, (lastAt = i))
-      } catch {}
-    }
-  })
-  return last !== undefined && lastAt > boundary ? { at: last } : undefined
-}
-
-// Compacts once the main conversation has been idle for `after` more ms, unless `ready` says a turn runs or nothing
-// changed. Rejects while a turn runs that the hooks did not see start; then the next turn's end sets a new timer.
-function armIdle($: EngineInterface, after: number, ready: () => boolean, done: () => void) {
-  return $.clock.after(after, () => {
-    done()
-    if (!ready()) return
-    void $.session.compact().catch((error) => log($, `idle compaction not run (${errorText(error)})`))
-  })
-}
-
 export const register: Register = (on) => {
-  // The idle timer, whether a main turn runs, and whether the conversation grew since its last compaction.
-  let idleTimer: { cancel: () => void } | undefined
-  let mainTurnRunning = false
-  let changedSinceCompaction = false
   registerPrune(on)
   registerNotes(on)
   registerWorkers(on)
   on('session.compact', async ($, e, next) => {
     try {
-      const r = await compact($, e, next)
-      if (e.agentId === undefined && e.trigger !== 'precompute' && r.skip === undefined) {
-        changedSinceCompaction = false
-        $.clock.after(0, () => void noteCacheAt($, null))
-      }
-      return r
+      return await compact($, e, next)
     } catch (error) {
       // Once the compaction is abandoned, a throw would run the hooks beneath, the built-in compactor's model call
       // among them, for a result the dispatch no longer takes; a return runs nothing.
@@ -2402,6 +2326,8 @@ export const register: Register = (on) => {
       return { skip: `observational-memory: ${ABANDONED}` }
     }
   }).catch(async ($, e, next) => {
+    // A compaction this plugin raised itself never reaches the built-in compactor; no `$` here, which rejects.
+    if (next.error.kind === 're-entry') return { skip: 'observational-memory: a compaction the plugin raised itself is not run' }
     // Any failure falls back to the built-in compaction rather than leaving the session over its limit.
     if (next.called) return { skip: `observational-memory: ${next.error.message}` }
     if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
@@ -2514,20 +2440,6 @@ export const register: Register = (on) => {
     })
     // The footer's gauges from the start, rather than once the first turn ends.
     void showGauges($, loopOf(await $.session.id()))
-    // A session already idle when this code loads (a fresh start, or a hot reload that lost the timer and flags),
-    // checked in the background: reading the transcript must not hold up the session's start.
-    $.clock.after(0, async () => {
-      if (idleTimer !== undefined || mainTurnRunning) return
-      try {
-        const idle = await idleState($)
-        if (idle && idleTimer === undefined && !mainTurnRunning) {
-          changedSinceCompaction = true
-          idleTimer = armIdle($, Math.max(0, (await idleCompactMs($)) - ((await $.clock.now()) - idle.at)), () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
-        }
-      } catch (error) {
-        log($, `could not tell how long the session has been idle (${errorText(error)})`)
-      }
-    })
     return next(e)
   })
 
@@ -2569,7 +2481,6 @@ export const register: Register = (on) => {
 
   // Subagents raise no turn.start, so each is the main conversation's prompt.
   on('turn.start', async ($, e, next) => {
-    mainTurnRunning = true
     await current($)
       .then(async ({ loop, stamp }) => {
         await markTime($, true, loop, stamp)
@@ -2584,10 +2495,6 @@ export const register: Register = (on) => {
   // request's path. A main request's usage, once it has streamed, goes to the stats, and says what the last compaction cost in cache.
   on('turn.step', async function* ($, e, next) {
     $.clock.after(0, () => void onStep($, e.agentId).catch((error) => log($, errorText(error))))
-    if (e.agentId === undefined) {
-      const at = await $.clock.now()
-      $.clock.after(0, () => void noteCacheAt($, at))
-    }
     const r = yield* next(e)
     const usage = r.usage
     if (e.agentId === undefined && usage) $.clock.after(0, () => void noteCacheUse($, usage).catch((error) => log($, errorText(error))))
@@ -2597,12 +2504,6 @@ export const register: Register = (on) => {
   // A subagent's is its answer: its loop is done, and what it stored goes. A teammate's is one of many, as main's.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (e.agentId === undefined) {
-      mainTurnRunning = false
-      changedSinceCompaction = true
-      idleTimer?.cancel()
-      idleTimer = armIdle($, await idleCompactMs($), () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
-    }
     try {
       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
       const { loop, stamp } = await current($, e.agentId)
@@ -2618,9 +2519,6 @@ export const register: Register = (on) => {
   // drops the main conversation's too. An ordinary end keeps the main conversation's, and its work in flight, for a
   // resume. The lives end at once; the keys go under the lock, after any ledger write already under way.
   on('session.end', async ($, e, next) => {
-    idleTimer?.cancel()
-    idleTimer = undefined
-    mainTurnRunning = false
     const cleared = e.reason === 'clear'
     if (cleared) (recallIndexes.delete(e.sessionId), recallLoads.delete(e.sessionId))
     end(`${e.sessionId}/`)
