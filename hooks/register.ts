@@ -1849,7 +1849,10 @@ let captures = 0 // subagents compact in the same millisecond
 // a compaction; `fellBack` only marks whether it was a genuine fallback (something failed here) for stats, not
 // whether to record at all: an intentional delegation (explicit `/compact` instructions) still counts toward the
 // total, just not as a fallback.
+// A compaction a plugin started (the idle one) is skipped instead: it is there to save tokens, and the built-in
+// compactor's summary call costs them.
 async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, next: (e: SessionCompactInput) => Promise<SessionCompactResult>, fellBack: boolean) {
+  if (e.trigger === 'plugin') return log($, 'a plugin-started compaction would need the built-in compactor; skipped'), { skip: 'observational-memory: no built-in compaction for a plugin-started one' }
   const installs = e.trigger !== 'precompute'
   const [sessionId, started] = await Promise.all([$.session.id(), $.clock.now()]).catch(() => [])
   const loop = sessionId === undefined ? undefined : loopOf(sessionId, e.agentId)
@@ -2386,6 +2389,7 @@ export const register: Register = (on) => {
     const message = next.error.message ?? ''
     const timeout = next.error.kind === 'timeout'
     log($, `${timeout ? `the hook outran its time budget${message ? ` (${message})` : ''}` : message}; using the built-in compaction`)
+    if (e.trigger === 'plugin') return delegateToBuiltin($, e, next, true)
     const why = timeout ? 'Compaction timed out' : message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
     show($, `${why}. Using built-in compaction`, e.agentId)
     return delegateToBuiltin($, e, next, true)

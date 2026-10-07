@@ -2071,6 +2071,22 @@ describe('register', () => {
     expect(observationsIn(second.messages?.[0]?.text)?.split('\n').slice(0, 3)).toEqual(['* 🟡 2026-09-22 14:29 Saw a, before the ranges (source none)', '* 🟡 2026-09-22 14:30 read a file (source 2026-09-22 14:30 to 2026-09-22 14:30)', '* 🟡 2026-09-22 14:31 read a file (source 2026-09-22 14:31 to 2026-09-22 14:31)'])
   })
 
+  test('a plugin-started compaction is skipped where another would fall back to the built-in compactor', async ($, on) => {
+    mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    let builtin = 0
+    on('session.compact', () => (builtin++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
+    history.push(...turn('a', 'a', CHUNK))
+
+    const plugin = await $.session.compact({ trigger: 'plugin', instructions: 'keep the API', messages: [...history] })
+    expect(plugin.skip).toBe('observational-memory: no built-in compaction for a plugin-started one')
+    expect(builtin).toBe(0)
+    const manual = await $.session.compact({ trigger: 'manual', instructions: 'keep the API', messages: [...history] })
+    expect(manual.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    expect(builtin).toBe(1)
+  })
+
   test('over its budget at every cut the floor tries while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
