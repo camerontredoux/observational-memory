@@ -1010,9 +1010,11 @@ function carryClauses(v: View, from: number, to: number, lines: string[]) {
       }
     }
   }
-  // Each sentence is a line of its own, at the time it was said, among the Observer's lines in time order.
+  // Each sentence is a line of its own, at the time it was said, among the Observer's lines in time order: one a reply,
+  // its best, so a reply is not carried again sentence by sentence.
   const out = [...lines]
-  for (const f of found.sort((a, b) => b.score - a.score || b.at - a.at).slice(0, CARRIED_CLAUSES)) {
+  const best = found.sort((a, b) => b.score - a.score || b.at - a.at).filter((f, i, all) => all.findIndex((g) => g.at === f.at) === i)
+  for (const f of best.slice(0, CARRIED_CLAUSES)) {
     const t = v.at[f.at] === undefined ? undefined : stamp(v.at[f.at]!)
     const line = `🟡 ${t ? `${t} ` : ''}Assistant said: "${f.clause}"`
     const k = t ? out.findIndex((l) => (l.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? '') > t) : -1
@@ -1119,6 +1121,14 @@ function fresh(v: View, seq = 0): Ledger {
   }
 }
 
+// A chunk's lines oldest first: a report delivered after a later reply keeps its own, earlier time. A line without a
+// time stays after the line before it.
+function byTime(lines: readonly string[]) {
+  let last = ''
+  const timed = lines.map((line, k) => ({ line, k, t: (last = line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? last) }))
+  return timed.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : a.k - b.k)).map((x) => x.line)
+}
+
 // Moves every chunk that now continues the watermark into the entries, in row order.
 function commit(ledger: Ledger, v: View): Ledger {
   let { watermark, entries, corrections, seq, currentTask } = ledger
@@ -1126,7 +1136,7 @@ function commit(ledger: Ledger, v: View): Ledger {
   for (const c of [...ledger.chunks].sort((a, b) => a.from - b.from)) {
     if (c.from > watermark.to) waiting.push(c)
     if (c.from !== watermark.to) continue // past a gap, or overlapping what is already committed
-    entries = [...entries, ...c.lines.map((line) => ({ id: `o${seq++}`, line, ...(c.source ? { source: c.source } : {}) }))]
+    entries = [...entries, ...byTime(c.lines).map((line) => ({ id: `o${seq++}`, line, ...(c.source ? { source: c.source } : {}) }))]
     corrections = applyConstraints(corrections, c.corrections)
     watermark = range(v, watermark.from, c.to)
     currentTask = carry(currentTask, c.currentTask)
@@ -1757,8 +1767,6 @@ async function output($: EngineInterface, argv: string[], path: string) {
 }
 // Each session's transcript as om_recall last parsed it, parsed on from there by its next call.
 const transcripts = new Map<string, TranscriptCache>()
-// The sessions whose om_recall the tool list holds (its tool.describe).
-const listed = new Set<string>()
 // The spinners (by agent) whose SessionStart message has outlasted its hooks.
 const SESSION_START_SPINNER = 'Running SessionStart hooks'
 const staleSpinners = new Set<string>()
@@ -2548,21 +2556,12 @@ export const register: Register = (on) => {
   // The engine puts the plugin's name before a command's output, so the summary's own goes.
   on('command.run', { command: 'om-stats' }, async ($, e) => ({ text: (await report(statsIo($), parseArgs(e.args))).replace(/^observational-memory · /, '') }))
 
-  // om_recall waits behind ToolSearch, its description unread, until a compaction removes what it finds; from then on
-  // it is in the tool list. The answer holds for the session, so a compaction's SessionStart has it asked again, when
-  // the prompt is rebuilt anyway. A resumed session that was compacted has a summary in its history too.
-  // Once listed it stays listed: asked again (another plugin's invalidate, a reload), the summary may have left the
-  // newest ROWS_CAP rows, or the history may not read, and the tool list would change back, spending the prompt cache.
-  on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => {
-    const [described, sessionId] = await Promise.all([next(e), $.session.id()])
-    const compacted = listed.has(sessionId) || (await $.session.messages().then((rows) => rows.some(isSummary), () => false))
-    if (compacted) listed.add(sessionId)
-    return compacted ? { ...described, isDeferred: false } : described
-  })
+  // om_recall is in the tool list from the start, not behind ToolSearch: listing it at the first compaction would
+  // change the tool list, which heads the prompt, and write the whole prompt cache again.
+  on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
 
   // Where the transcript file is, for om_recall and the memory message: known at start and after every turn.
   on('classic.SessionStart', async ($, e, next) => {
-    if (e.source === 'compact') $.ui.invalidate('tool.describe')
     await noteTranscript($, e)
     return next(e)
   })
@@ -2627,7 +2626,6 @@ export const register: Register = (on) => {
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
     transcripts.delete(e.sessionId)
-    if (cleared) listed.delete(e.sessionId)
     pendingTokens.delete(e.sessionId)
     uncarried.delete(e.sessionId)
     contextSizes.delete(e.sessionId)

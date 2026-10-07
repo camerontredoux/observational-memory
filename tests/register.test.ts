@@ -744,7 +744,7 @@ describe('register', () => {
     // Clamped into the chunk's times, 13:59 to 14:32 (the latest time recorded plus a minute); a line without a
     // real time gets the chunk's latest. The chunk's source range closes its run of lines.
     expect(observationsIn(result.messages?.[0]?.text)).toBe(
-      ['🔴 2026-09-22 14:30 User said "a"', '🟡 2026-09-22 13:59 Too early', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail (source 2026-09-22 14:00 to 2026-09-22 14:31)'].map((l) => `* ${l}`).join('\n'),
+      ['🟡 2026-09-22 13:59 Too early', '🔴 2026-09-22 14:30 User said "a"', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail (source 2026-09-22 14:00 to 2026-09-22 14:31)'].map((l) => `* ${l}`).join('\n'),
     )
     expect(originals(result.messages?.slice(1))).toEqual(history.slice(7))
   })
@@ -1020,6 +1020,22 @@ describe('register', () => {
     expect(lines).toContain('🟡 2026-09-22 14:30 Assistant fixed the totals in `hooks/stats.ts`.')
     expect(lines.filter((l) => l.includes('prune.ts'))).toHaveLength(1)
     expect(lines.some((l) => l.includes('read the plan'))).toBe(false)
+  })
+
+  test("a reply's sentences are carried one a reply, and a chunk's lines are kept oldest first", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:31 Assistant replied\n* 🟡 2026-09-22 14:30 Report arrived\n</observations>' })
+    const runTurn = live(on, clock, history)
+    const [ask, read, result] = turn('a', 'a', CHUNK)
+    const reply = 'The totals moved into `hooks/stats.ts` for the new report. The cap is now 40% of `hooks/prune.ts` because sessions grew.'
+
+    await runTurn($, [ask!, { ...read!, text: reply }, result!, { role: 'assistant', text: 'ok', toolUses: [] }], at(22, 14, 30))
+    await clock.settle()
+
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    expect(lines.filter((l) => l.includes('Assistant said'))).toHaveLength(1)
+    expect(lines.filter((l) => !l.includes('Assistant said'))).toEqual(['🟡 2026-09-22 14:30 Report arrived', '🟡 2026-09-22 14:31 Assistant replied'])
   })
 
   test('a reflection that stays far under its target leaves the observations as they were: two attempts, no prompt sent twice, and the same observations are not sent again', async ($, on) => {
@@ -1671,7 +1687,8 @@ describe('register', () => {
     expect(evaluated).toEqual([registered.find((r) => r.name === 'om_recall')])
   })
 
-  test('om_recall waits behind ToolSearch until the first compaction, then is described again into the tool list', async ($, on) => {
+  // The tool list heads the prompt: listing om_recall only once the session compacts would write the cache again.
+  test('om_recall is in the tool list from the start and stays there through a compaction', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
     pi(on)
@@ -1683,35 +1700,12 @@ describe('register', () => {
 
     const before = await $.tool.describe(RECALL_DESCRIBE)
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
-    history.push(...result.messages!) // written after the boundary, as the engine does
-    await $.classic.SessionStart(COMPACT_START)
-
-    expect(before).toEqual({ description: 'Searches', isDeferred: true })
-    expect(invalidated).toEqual(['tool.describe'])
-    expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: false })
-  })
-
-  // The tool list is in the prompt cache: asked again mid-session, the answer must not change back.
-  test("om_recall stays in the tool list when described again after the summary has left the history's newest rows, until a /clear", async ($, on) => {
-    mock.clock(on)
-    const { history } = world(on)
-    pi(on)
-    on('ui.invalidate', () => ({ value: undefined }))
-    on('classic.SessionStart', () => ({}))
-    on('tool.describe', ($, e) => deferredByEngine(e))
-    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
-    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
-    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
     history.push(...result.messages!)
     await $.classic.SessionStart(COMPACT_START)
+
+    expect(before).toEqual({ description: 'Searches', isDeferred: false })
+    expect(invalidated).not.toContain('tool.describe')
     expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: false })
-
-    history.splice(0, history.length, ...turn('d', 'd', 0)) // the newest rows, the summary past them
-    const again = await $.tool.describe(RECALL_DESCRIBE)
-    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
-
-    expect(again).toEqual({ description: 'Searches', isDeferred: false })
-    expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: true })
   })
 
   test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
