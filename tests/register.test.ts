@@ -398,7 +398,7 @@ describe('register', () => {
   test('a correction copying a constraint in force the user did not say again is dropped, logged and counted; one the user says again moves to then', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    const seen = pi(on, {
+    const seen = models(on, {
       reply: constraining({
         setup: { quote: 'Use pnpm, never npm' },
         other: { quote: 'Keep every commit small' },
