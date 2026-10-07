@@ -241,9 +241,10 @@ function maskTail(rows: readonly SessionMessage[]) {
 const MASKED = new RegExp(noteSource(omissionMarker(0, 'result')))
 // A local slash command's rows (`/compact`, `/effort`): its caveat, its echo and what it printed, all three engine
 // framing. The kept tail leaves them out, as the transcript would draw their copies with no render hook to hide them.
-// An echo with no output after it and no caveat before it is a prompt command's (a skill's), whose arguments are the
-// person's request: kept. A local command's output can be a system row the context does not carry (a skipped
-// `/compact`'s "Not compacted"), so its caveat marks it too.
+// An echo with no output after it is a prompt command's (a skill's), whose arguments are the person's request: kept.
+// But a local command's output can be a system row the context does not carry (a skipped `/compact`'s "Not
+// compacted"), and its caveat is an isMeta row the engine leaves out of a compaction's messages, so a `/compact` echo,
+// never a prompt command's, goes whatever follows it.
 const COMMAND_ROW = /^<(local-command-caveat|command-name|command-message|command-args|local-command-stdout|local-command-stderr)>[^]*?<\/\1>\s*/
 const framing = (m: SessionMessage | undefined, tags: RegExp) => {
   if (!m || !isPrompt(m) || !tags.test(m.text.trim())) return false
@@ -252,11 +253,12 @@ const framing = (m: SessionMessage | undefined, tags: RegExp) => {
   return !text
 }
 const OUTPUT = /^<(?:local-command-caveat|local-command-std(?:out|err))>/
+const COMPACT_ECHO = /^\s*<command-name>\/compact<\/command-name>/
 const withoutLocalCommands = <M extends SessionMessage>(rows: readonly M[]) =>
   rows.filter(
     (m, i) =>
       !framing(m, OUTPUT) &&
-      !(framing(m, /^<command-name>/) && (framing(rows[i + 1], /^<local-command-std(?:out|err)>/) || framing(rows[i - 1], /^<local-command-caveat>/))),
+      !(framing(m, /^<command-name>/) && (framing(rows[i + 1], /^<local-command-std(?:out|err)>/) || COMPACT_ECHO.test(m.text))),
   )
 // A reply that was thinking alone: its copy loses the thinking, and the engine writes it as "(no content)". The kept
 // tail leaves it out.
@@ -374,9 +376,11 @@ async function countCompaction($: EngineInterface, sessionId: string) {
 // compaction cost in prompt cache, and its input is the context the compaction left, which the memory row shows.
 const uncarried = new Map<string, { compactor: 'om' | 'builtin'; memory?: string }>()
 // The context the main conversation's last compaction installed, by session, as `contextHash` reads it: a compaction
-// handed the same context again has nothing new to compact.
+// handed the same context again has nothing new to compact. It reads no command echo either: a local command's whose
+// output was a system row (`/reload-plugins`) looks like a prompt command's, and a prompt command's brings a reply.
 const installed = new Map<string, string>()
-const contextHash = (rows: readonly SessionMessage[]) => hash(withoutLocalCommands(rows).map(rowHash).join('\n'))
+const contextHash = (rows: readonly SessionMessage[]) =>
+  hash(withoutLocalCommands(rows).filter((m) => !framing(m, /^<command-name>/)).map(rowHash).join('\n'))
 async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
   const sessionId = await $.session.id()
   const use = { uncached: usage.input_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens }

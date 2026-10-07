@@ -34,16 +34,16 @@ describe('register', () => {
     pi(on)
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
     await clock.advance(60_000)
-    const command = [
-      { role: 'user' as const, text: '<local-command-caveat>Caveat: the command below was run directly.</local-command-caveat>', toolUses: [] },
-      { role: 'user' as const, text: '<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>', toolUses: [] },
-      { role: 'user' as const, text: '<local-command-stdout>Compacted</local-command-stdout>', toolUses: [] },
-    ]
+    // As the engine hands them over: no caveat, an isMeta row it leaves out, and no output for a command whose output
+    // is a system row (a skipped `/compact`'s "Not compacted", `/reload-plugins`'s summary).
+    const echo = (name: string) => ({ role: 'user' as const, text: `<command-name>/${name}</command-name>\n<command-message>${name}</command-message>\n<command-args></command-args>`, toolUses: [] })
+    const compacted = [echo('compact'), { role: 'user' as const, text: '<local-command-stdout>Compacted</local-command-stdout>', toolUses: [] }]
+    const skip = { skip: 'observational-memory: nothing new to compact since the last compaction' }
 
-    expect(await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...command] })).toEqual({ skip: 'observational-memory: nothing new to compact since the last compaction' })
-    // A skipped `/compact` leaves its caveat and echo; its "Not compacted" is a system row the context does not carry.
-    expect(await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...command, ...command.slice(0, 2)] })).toEqual({ skip: 'observational-memory: nothing new to compact since the last compaction' })
-    expect((await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...command, ...turn('d', 'd')] })).messages).toBeDefined()
+    expect(await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...compacted] })).toEqual(skip)
+    expect(await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...compacted, echo('compact')] })).toEqual(skip)
+    expect(await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...compacted, echo('compact'), echo('reload-plugins'), echo('compact')] })).toEqual(skip)
+    expect((await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...compacted, echo('compact'), ...turn('d', 'd')] })).messages).toBeDefined()
   })
 
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
