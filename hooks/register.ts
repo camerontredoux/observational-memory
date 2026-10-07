@@ -2303,6 +2303,12 @@ async function onlyCopies(calls: readonly ToolGroupCall[]) {
 // minutes after turn.complete is already past it. A main conversation idle this long is compacted, so that the next
 // request rewrites the smaller context.
 export const IDLE_COMPACT_MS = 60 * 60 * 1000
+// OM_IDLE_COMPACT_MS, a whole number of ms, replaces it in the process it is set for, to watch the idle compaction run
+// without waiting an hour.
+async function idleCompactMs($: EngineInterface) {
+  const ms = Number(await $.env.get('OM_IDLE_COMPACT_MS'))
+  return Number.isInteger(ms) && ms > 0 ? ms : IDLE_COMPACT_MS
+}
 
 // When the main conversation last made a request, and whether it changed since its last compaction, for a plugin
 // that loads into a session already idle (a fresh start, or a hot reload that lost the timer and flags). The cache
@@ -2489,7 +2495,7 @@ export const register: Register = (on) => {
         const idle = await idleState($)
         if (idle && idleTimer === undefined && !mainTurnRunning) {
           changedSinceCompaction = true
-          idleTimer = armIdle($, Math.max(0, IDLE_COMPACT_MS - ((await $.clock.now()) - idle.at)), () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
+          idleTimer = armIdle($, Math.max(0, (await idleCompactMs($)) - ((await $.clock.now()) - idle.at)), () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
         }
       } catch (error) {
         log($, `could not tell how long the session has been idle (${errorText(error)})`)
@@ -2577,7 +2583,7 @@ export const register: Register = (on) => {
       mainTurnRunning = false
       changedSinceCompaction = true
       idleTimer?.cancel()
-      idleTimer = armIdle($, IDLE_COMPACT_MS, () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
+      idleTimer = armIdle($, await idleCompactMs($), () => !mainTurnRunning && changedSinceCompaction, () => void (idleTimer = undefined))
     }
     try {
       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')

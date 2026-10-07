@@ -4776,9 +4776,9 @@ describe('the memory row', () => {
 
 describe('idle compaction', () => {
   const MIN = 60_000
-  const setup = ($: Parameters<typeof live>[0] extends never ? never : Parameters<ReturnType<typeof live>>[0], on: On) => {
+  const setup = ($: Parameters<typeof live>[0] extends never ? never : Parameters<ReturnType<typeof live>>[0], on: On, env: Record<string, string> = {}) => {
     const clock = mock.clock(on)
-    const { history } = world(on)
+    const { history } = world(on, { env })
     const seen = pi(on, { reply: readsIn })
     const runTurn = live(on, clock, history)
     let idle = 0
@@ -4795,6 +4795,14 @@ describe('idle compaction', () => {
     await next(0) // its turn ends a minute in
     await clock.advance(58 * MIN)
     expect(compactions()).toBe(0)
+    await clock.advance(2 * MIN)
+    await clock.settle()
+    expect(compactions()).toBe(1)
+  })
+
+  test('OM_IDLE_COMPACT_MS replaces the hour, to watch it run', async ($, on) => {
+    const { clock, compactions, next } = setup($, on, { OM_IDLE_COMPACT_MS: String(MIN) })
+    await next(0)
     await clock.advance(2 * MIN)
     await clock.settle()
     expect(compactions()).toBe(1)
