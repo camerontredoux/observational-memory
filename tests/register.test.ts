@@ -395,6 +395,48 @@ describe('register', () => {
     )
   })
 
+  test('a correction copying a constraint in force the user did not say again is dropped, logged and counted; one the user says again moves to then', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, files } = world(on)
+    const seen = pi(on, {
+      reply: constraining({
+        setup: { quote: 'Use pnpm, never npm' },
+        other: { quote: 'Keep every commit small' },
+        copy: { quote: 'Use pnpm, never npm' },
+        again: { quote: 'Use pnpm, never npm' },
+      }),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('setup\nUse pnpm, never npm', 'r', CHUNK), at(22, 14, 0))
+    await clock.settle()
+    await runTurn($, turn('other\nKeep every commit small', 'r', CHUNK), at(22, 14, 5))
+    await clock.settle()
+    // The Observer copies the pnpm constraint it was shown into a chunk where the user only mentioned its words.
+    await runTurn($, turn('copy\nIs pnpm faster than npm, never mind', 'r', CHUNK), at(22, 14, 8))
+    await clock.settle()
+    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 9))
+    await clock.settle()
+    const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(correctionsIn(first.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:00 User: "Use pnpm, never npm"\n* 🔴 2026-09-22 14:05 User: "Keep every commit small"')
+    expect(seen.logs.filter((l) => l.includes('restates a constraint'))).toEqual([
+      'a 🔴 line in the observer reply for rows 7-11 restates a constraint in force the user did not say again; dropped: "🔴 2026-09-22 14:08 User: \\"Use pnpm, never npm\\""',
+    ])
+
+    history.splice(0, history.length, ...first.messages!)
+    await runTurn($, turn('again\nUse pnpm, never npm', 'r', CHUNK), at(22, 14, 10))
+    await clock.settle()
+    await runTurn($, turn('more', 'r', 8_000), at(22, 14, 20))
+    await clock.settle()
+    const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    expect(correctionsIn(second.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:05 User: "Keep every commit small"\n* 🔴 2026-09-22 14:10 User: "Use pnpm, never npm"')
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
+    expect(Object.entries(stats.counts).filter(([k]) => k.endsWith('.restated'))).toEqual([['observer.background.restated', 1]])
+  })
+
   test("a 🔴 correction whose quote runs over several lines stays one line; after its closing quote an unmarked line is its own 🟡 line", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)

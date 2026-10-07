@@ -790,11 +790,12 @@ const stems = (text: string) =>
 // worked reaches no row of its own, only the assistant's echo of it).
 const SAID_SECTIONS = /<(corrections|all-user-messages)>\n([\s\S]*?)\n<\/\1>/g
 const RELAYED = /verbatim\W{0,12}["“]([^"”\n]{2,400})["”]/gi
-function userSaid(v: View, from: number, to: number) {
+// With `carried` false, only what the user said in the chunk itself: no summary's sections.
+function userSaid(v: View, from: number, to: number, carried = true) {
   const asked = new Set<string>()
   for (let i = v.base; i < to; i++) for (const u of v.messages[i]!.toolUses) if (u.tool === 'AskUserQuestion') asked.add(u.tool_use_id)
   const said: string[] = []
-  for (let i = 0; i < to; i++) {
+  for (let i = 0; carried && i < to; i++) {
     const m = v.messages[i]!
     if (isSummary(m)) for (const [, , body] of m.text.matchAll(SAID_SECTIONS)) said.push(...body!.split(/\n(?=\* )/))
   }
@@ -809,8 +810,9 @@ function userSaid(v: View, from: number, to: number) {
   }
   return said
 }
-/** Whether a 🔴 line (marker, time and any "(replaces …)" or replaced note included) is grounded in `said`. */
-function grounded(line: string, said: readonly string[]) {
+/** Whether a 🔴 line (marker, time and any "(replaces …)" or replaced note included) is grounded in `said`; with
+ * `quoted`, a line that quotes is grounded only by its quote. */
+function grounded(line: string, said: readonly string[], quoted = false) {
   if (!said.length) return false
   const body = baseOf(line)
     .replace(REPLACES, '')
@@ -821,6 +823,7 @@ function grounded(line: string, said: readonly string[]) {
     const parts = quote!.split(/\.\.\.|…|\[\.\.\.\]/).map(normSaid).filter((p) => p.trim())
     if (parts.length && texts.some((t) => parts.every((p) => t.includes(p)))) return true
   }
+  if (quoted && /["“”]/.test(body)) return false
   const words = stems(body)
   if (!words.size) return false
   const share = (t: string) => {
@@ -1057,14 +1060,25 @@ async function observe($: EngineInterface, sessionId: string, v: View, from: num
   // observations, without its "(replaces …)".
   // A line that replaces a constraint is grounded in the user's messages alone: it shares the words of the one it
   // replaces.
+  // A correction that restates a constraint in force the user did not say again in the chunk (its quote, when it
+  // quotes, not in a user message there) is dropped: the Observer sometimes copies the constraints it is shown, which
+  // would carry a constraint forward as said at the chunk's time.
   const users = userSaid(v, from, to)
-  const said = [...users, ...constraints.map((c) => keyOf(c))]
+  const keys = constraints.map((c) => keyOf(c))
+  const said = [...users, ...keys]
+  const typed = userSaid(v, from, to, false)
+  const restates = (line: string) => !REPLACES.test(baseOf(line)) && grounded(line, keys) && !grounded(line, typed, true)
   const demoted: string[] = []
   const demote = (l: string) => void demoted.push(l)
+  const restated: string[] = []
   const corrections: string[] = []
   for (const l of parseLines(correctionsOf(text), bounds, !bounds, (t, how) => (note(t, how), how.own && moved.push(how.own)))) {
     const line = splitSource(l).line
     if (!line.startsWith('🔴')) continue
+    if (restates(line)) {
+      restated.push(line)
+      continue
+    }
     const [kept] = groundRed([line], REPLACES.test(baseOf(line)) ? users : said, demote)
     if (kept!.startsWith('🔴')) corrections.push(kept!)
     else moved.push(baseOf(kept!).replace(REPLACES, ''))
@@ -1073,6 +1087,10 @@ async function observe($: EngineInterface, sessionId: string, v: View, from: num
   if (demoted.length) {
     for (const l of demoted) log($, `a 🔴 line in the observer reply for rows ${from}-${to} is not in the user's messages; kept as 🟡: ${JSON.stringify(l.slice(0, 160))}`)
     void $.session.id().then((id) => record(statsIo($), id, (s) => count(s, `observer.${phase}.demoted`, demoted.length)), () => {})
+  }
+  if (restated.length) {
+    for (const l of restated) log($, `a 🔴 line in the observer reply for rows ${from}-${to} restates a constraint in force the user did not say again; dropped: ${JSON.stringify(l.slice(0, 160))}`)
+    void $.session.id().then((id) => record(statsIo($), id, (s) => count(s, `observer.${phase}.restated`, restated.length)), () => {})
   }
   // A marker or a time alone is no observation. With none, the reply counts only when it says so: an empty block,
   // or corrections and no observations.
