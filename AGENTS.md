@@ -26,6 +26,13 @@ A Claude Code function-hooks plugin that replaces compaction with observational 
 - Types: `bunx -p typescript tsc -p .`.
 - The replay tests in `tests/replays.ts` take `tests/fixtures/*.local.ts` modules built from private transcripts. Each test's comment names the script that writes its module. The test runner loads no module holding `import()`, so `bun scripts/wire-fixtures.ts` writes `tests/fixtures.local.test.ts`, which imports the modules present and runs their tests; the scripts that write a module run it. Without a module, its test does not run. Keep these modules and that file local; they are gitignored.
 
+### Deploy
+
+This repo is the source. Claude Code loads the installed copy at `~/.claude/skills/observational-memory`. Never edit the installed copy.
+
+1. Run the checks.
+2. Run `bun scripts/deploy.ts`. It runs the type check and `claude plugin validate .`, then copies the shipped files to the installed copy. A running session reloads it. A deploy copies nothing when a check fails.
+
 ### Releases
 
 A user-visible change bumps `version` in `.claude-plugin/plugin.json`. The commit subject is `observational-memory vX.Y.Z: <change>`. Keep the `description` in `plugin.json` a short summary of the plugin. The `description` in `hooks/hooks.json` lists the behaviour per hook event, one short clause each, without constants. When a change adds or changes what a hook does, update its clause there.
