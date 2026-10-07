@@ -1,6 +1,6 @@
 import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
-import { add, addCacheUse, addCompaction, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
+import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { registerNotes } from './notes'
@@ -367,10 +367,11 @@ async function noteCacheAt($: EngineInterface, at: number | null) {
 const uncarried = new Map<string, { compactor: 'om' | 'builtin'; memory?: string }>()
 async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
   const sessionId = await $.session.id()
+  const use = { uncached: usage.input_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens }
+  record(statsIo($), sessionId, (s, at) => addRequest(s, use, at))
   const last = uncarried.get(sessionId)
   if (last === undefined) return
   uncarried.delete(sessionId)
-  const use = { uncached: usage.input_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens }
   record(statsIo($), sessionId, (s, at) => addCacheUse(s, last.compactor, use, at))
   if (last.memory === undefined) return
   const sizes = { ...(await sizesOf($, sessionId)), [last.memory]: use.uncached + use.cacheRead + use.cacheWrite }
@@ -2485,7 +2486,8 @@ export const register: Register = (on) => {
         description:
           "observational-memory's usage statistics, for this session or all sessions: by default a short summary in plain words (cost, " +
           'compactions and how many were instant, memory size, background observations, problems); with full, every metric with its ' +
-          'count, sum, mean, median, p90, min and max. Use it when the user asks for them.',
+          'count, sum, mean, median, p90, min and max; with cost, what the main requests cost in prompt cache and the auto-compaction ' +
+          'point that would cost least. Use it when the user asks for them.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2493,10 +2495,11 @@ export const register: Register = (on) => {
             sessionId: { type: 'string', description: 'Another session to report on' },
             since: { type: 'string', description: 'Only what happened after this: 7d, 12h, or an ISO date' },
             full: { type: 'boolean', description: 'Every metric in a table instead of the summary (default false)' },
+            cost: { type: 'boolean', description: "The main conversation's prompt-cache cost and the auto-compaction point that would cost least" },
           },
         },
       }),
-      $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|<session id>] [full] [7d|<ISO date>]' }),
+      $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|<session id>] [full|cost] [7d|<ISO date>]' }),
     ]).catch((error) => {
       log($, `could not register the stats tool and command (${errorText(error)})`)
       show($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
@@ -2579,7 +2582,7 @@ export const register: Register = (on) => {
   })
 
   // Each model request of the main loop or a subagent's, the previous step's tool results in the history: off the
-  // request's path. A main request's usage, once it has streamed, says what the last compaction cost in cache.
+  // request's path. A main request's usage, once it has streamed, goes to the stats, and says what the last compaction cost in cache.
   on('turn.step', async function* ($, e, next) {
     $.clock.after(0, () => void onStep($, e.agentId).catch((error) => log($, errorText(error))))
     if (e.agentId === undefined) {

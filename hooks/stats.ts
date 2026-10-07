@@ -2,6 +2,11 @@
 // figures are merged from the files when asked for. A stats failure is logged once and never breaks anything.
 const SAMPLES = 200 // raw samples kept per metric, newest, for medians and p90
 const WRITE_DELAY_MS = 2_000
+// What the prompt cache charges per token against plain input: a read, and a write with Claude Code's one-hour TTL.
+// The usage does not say which TTL a write had; a five-minute write costs 1.25.
+const READ_COST = 0.1
+const WRITE_COST = 2
+const INPUT_DOLLARS_PER_MTOK = 5 // Opus's input price, for a rough figure in dollars
 const DEFAULT_DIR = '.claude/plugins/data/observational-memory/stats' // under $HOME; OM_STATS_DIR overrides it
 
 export type Sample = [at: number, value: number]
@@ -131,6 +136,16 @@ export function addCacheUse(s: SessionStats, compactor: 'om' | 'builtin', u: Cac
   add(s, `${key}.cacheWriteTokens`, u.cacheWrite, at)
 }
 
+// Every main request: the context it was answered over and what that cost in input-token equivalents, and g, how
+// far the context grew since the request before. A context that shrank was compacted in between and gives no g.
+export function addRequest(s: SessionStats, u: CacheUse, at: number) {
+  const context = u.uncached + u.cacheRead + u.cacheWrite
+  const before = s.metrics['request.contextTokens']?.recent.at(-1)?.[1]
+  add(s, 'request.contextTokens', context, at)
+  add(s, 'request.costTokens', u.uncached + READ_COST * u.cacheRead + WRITE_COST * u.cacheWrite, at)
+  if (before !== undefined && context >= before) add(s, 'request.growthTokens', context - before, at)
+}
+
 export function addReflection(s: SessionStats, r: Reflection, at: number) {
   add(s, 'reflection.ms', r.ms, at)
   add(s, 'reflection.tokensBefore', r.tokensBefore, at)
@@ -255,6 +270,39 @@ function compactions(s: SessionStats, triggers: readonly string[]) {
     out.notes.push(...values(metric('observations')))
   }
   return out
+}
+
+// What `cost` answers: what the main requests cost in input-token equivalents, and the compaction point that would
+// cost least. Between compactions the context grows by g a request from C0, what a compaction leaves; compacting at T
+// costs a request READ_COST·(T+C0)/2 in reads and WRITE_COST·C0·g/(T−C0) for rewriting C0 cold once per cycle, least
+// at T = C0 + √(2·WRITE_COST·C0·g/READ_COST).
+export function formatCost(head: string, merged: ReturnType<typeof merge>) {
+  const { stats: s, sessions } = merged
+  const cost = s.metrics['request.costTokens']
+  if (!sessions || !cost) return `observational-memory · ${head}: no main requests recorded yet.`
+  const lines = [`observational-memory · ${head} · cache cost of the main conversation`, '']
+  const row = (label: string, text: string) => lines.push(`${label.padEnd(13)}${text}`)
+  const k = (n: number) => `${(n / 1000).toFixed(1)}k`
+  const usd = (tokens: number) => dollars((tokens * INPUT_DOLLARS_PER_MTOK) / 1e6)
+  row('Requests', `${plural(cost.count, 'request')}, ${k(cost.sum)} input-token equivalents (~${usd(cost.sum)}), ~${k(cost.sum / cost.count)} each`)
+  const g = median(values(s.metrics['request.growthTokens']))
+  const c0 = median(['uncachedTokens', 'cacheReadTokens', 'cacheWriteTokens'].reduce<number[]>((t, f) => {
+    const vs = values(s.metrics[`afterCompaction.om.${f}`])
+    return vs.map((v, i) => (t[i] ?? 0) + v)
+  }, []))
+  const at = median(values(s.metrics['compaction.auto.tokensBefore']))
+  if (Number.isFinite(g)) row('Growth', `g ~${k(g)} tokens a request (median)`)
+  if (!Number.isFinite(g) || !Number.isFinite(c0)) {
+    lines.push('', 'The best compaction point needs g and at least one om compaction measured after it.')
+    return lines.join('\n')
+  }
+  const per = (t: number) => READ_COST * ((t + c0) / 2) + (WRITE_COST * c0 * g) / (t - c0)
+  const best = c0 + Math.sqrt((2 * WRITE_COST * c0 * g) / READ_COST)
+  row('Compaction', `leaves C0 ~${k(c0)}, ~${k(WRITE_COST * c0)} once to write cold${Number.isFinite(at) ? `, ~${k(WRITE_COST * c0 - READ_COST * at)} more than reading the ~${k(at)} it replaced` : ''}`)
+  row('Best T', `~${k(best)} tokens: ~${k(per(best))} a request`)
+  if (Number.isFinite(at) && at > c0) row('Now', `auto compactions at ~${k(at)} (median): ~${k(per(at))} a request, ${((per(at) / per(best) - 1) * 100).toFixed(0)}% over the best`)
+  lines.push('', `Input-token equivalents: uncached ×1, cache read ×${READ_COST}, cache write ×${WRITE_COST} (one-hour TTL); dollars at $${INPUT_DOLLARS_PER_MTOK}/MTok.`)
+  return lines.join('\n')
 }
 
 // What om_stats and /om-stats answer by default: a few lines in plain words. `words` reproduce the scope for the hints.
@@ -434,17 +482,19 @@ export async function report(io: Io, args: Args) {
     head += after
   }
   if (args.full) return formatReport(title, merged)
+  if (args.cost) return formatCost(head, merged)
   const words = [args.scope === 'all' ? 'all' : id === current ? '' : id, args.since ?? ''].filter(Boolean).join(' ')
   return formatSummary(head, merged, words)
 }
 
-export type Args = { scope?: string; sessionId?: string; since?: string; full?: boolean }
+export type Args = { scope?: string; sessionId?: string; since?: string; full?: boolean; cost?: boolean }
 
 export function parseArgs(text: string) {
   const out: Args = {}
   for (const word of text.trim().split(/\s+/).filter(Boolean)) {
     if (word === 'all' || word === 'session') out.scope = word
     else if (word === 'full') out.full = true
+    else if (word === 'cost') out.cost = true
     else if (/^\d+(?:\.\d+)?[mhdw]$/.test(word) || /^\d{4}-\d{2}-\d{2}/.test(word)) out.since = word
     else out.sessionId = word
   }

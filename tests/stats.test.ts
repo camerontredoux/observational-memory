@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { add, addCacheUse, addCompaction, addLuna, addRecall, count, emptyStats, failureClass, formatReport, formatSummary, merge, parseArgs, parseSince, percentile, report } from '../hooks/stats'
+import { add, addCacheUse, addCompaction, addRequest, addLuna, addRecall, count, emptyStats, failureClass, formatCost, formatReport, formatSummary, merge, parseArgs, parseSince, percentile, report } from '../hooks/stats'
 import type { Io, SessionStats } from '../hooks/stats'
 
 const T0 = Date.UTC(2026, 8, 20, 12, 0)
@@ -175,6 +175,22 @@ describe('stats', () => {
     const text = formatSummary('this session', merge([s]), '')
     expect(text).toContain('Cache        the first request after a main compaction (median): om ~18,000 read, ~26,000 written (2); built-in ~0 read, ~60,000 written (1)')
     expect(formatReport('t', merge([s]))).toContain('0 tokens in, 0 out.') // the main model's tokens, not Luna's
+  })
+
+  test('each main request records its cost and growth, and cost gives the cheapest compaction point from them', () => {
+    const s = emptyStats('a', T0)
+    addRequest(s, { uncached: 2, cacheRead: 100_000, cacheWrite: 1_000 }, T0)
+    addRequest(s, { uncached: 2, cacheRead: 101_000, cacheWrite: 2_000 }, T0 + 1) // grew 2k
+    addRequest(s, { uncached: 2, cacheRead: 8_000, cacheWrite: 32_000 }, T0 + 2) // compacted: no growth
+    addCacheUse(s, 'om', { uncached: 2, cacheRead: 8_000, cacheWrite: 32_000 }, T0 + 2)
+    addCompaction(s, { trigger: 'auto', fellBack: false, ms: 20, tokensBefore: 160_000 }, T0 + 2)
+    expect(s.metrics['request.growthTokens']).toMatchObject({ count: 1, sum: 2_000 })
+    expect(s.metrics['request.costTokens']!.recent.at(-1)![1]).toBe(2 + 800 + 64_000)
+    const text = formatCost('this session', merge([s]))
+    // C0 = 40k, g = 2k: T = 40k + √(2·2·40k·2k/0.1) = 40k + 56.6k
+    expect(text).toContain('Best T       ~96.6k tokens')
+    expect(text).toContain('Now          auto compactions at ~160.0k (median)')
+    expect(parseArgs('all cost')).toEqual({ scope: 'all', cost: true })
   })
 
   test('full gives the table, the default the summary', async () => {
