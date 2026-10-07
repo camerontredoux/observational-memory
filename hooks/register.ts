@@ -1,4 +1,4 @@
-import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, TurnUsage } from 'claude-code'
+import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, ToolSpec, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
 import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
@@ -2384,6 +2384,10 @@ export const register: Register = (on) => {
     await $.tool
       .register({
         name: RECALL_TOOL,
+        // In the tool list from the start, not behind ToolSearch: listing it at the first compaction would change the
+        // tool list, which heads the prompt, and write the whole prompt cache again. The engine takes `isDeferred`; the
+        // copy of its types in .claude/types predates it, hence the cast.
+        isDeferred: false,
         description:
           "Use it before telling the user you no longer have a detail from earlier in this session, or that it was never " +
           "shown: a summary that does not show a tool's full output is not evidence that the output is lost. Use it too " +
@@ -2409,7 +2413,7 @@ export const register: Register = (on) => {
             subagents: { type: 'boolean', description: "Search the subagents' transcripts too (default false)" },
           },
         },
-      })
+      } as ToolSpec)
       .catch((error) => {
         log($, `could not register ${RECALL_TOOL} (${errorText(error)})`)
         show($, `Setup failed (${clipLine(errorText(error))}). ${RECALL_TOOL} is unavailable this session`)
@@ -2467,10 +2471,6 @@ export const register: Register = (on) => {
   on('tool.call', { tool: 'mcp__observational-memory__om_stats' }, async ($, e) => ({ result: await report(statsIo($), e) }))
   // The engine puts the plugin's name before a command's output, so the summary's own goes.
   on('command.run', { command: 'om-stats' }, async ($, e) => ({ text: (await report(statsIo($), parseArgs(e.args))).replace(/^observational-memory · /, '') }))
-
-  // om_recall is in the tool list from the start, not behind ToolSearch: listing it at the first compaction would
-  // change the tool list, which heads the prompt, and write the whole prompt cache again.
-  on('tool.describe', { tool: 'mcp__observational-memory__om_recall' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
 
   // Where the transcript file is, for om_recall and the memory message: known at start and after every turn.
   on('classic.SessionStart', async ($, e, next) => {

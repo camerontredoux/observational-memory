@@ -1659,28 +1659,22 @@ describe('register', () => {
     const tool = { register: async (spec: unknown) => (evaluated.push(spec), { tool: 'mcp__observational-memory__om_recall' }) }
     await recallOnlyHooks().get('session.start')!({ tool }, { cwd: '/tmp' }, (e: unknown) => e)
 
-    expect(evaluated).toEqual([registered.find((r) => r.name === 'om_recall')])
+    // Its placement apart: its own tool.describe holds the tool back until the first compaction.
+    const { isDeferred: _, ...spec } = registered.find((r) => r.name === 'om_recall') as { isDeferred?: boolean }
+    expect(evaluated).toEqual([spec])
   })
 
   // The tool list heads the prompt: listing om_recall only once the session compacts would write the cache again.
-  test('om_recall is in the tool list from the start and stays there through a compaction', async ($, on) => {
+  test('om_recall is registered into the tool list from the start', async ($, on) => {
     mock.clock(on)
-    const { history } = world(on)
-    pi(on)
-    const invalidated: string[] = []
-    on('ui.invalidate', ($, e) => (invalidated.push(e.event), { value: undefined }))
-    on('classic.SessionStart', () => ({}))
-    on('tool.describe', ($, e) => deferredByEngine(e))
-    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
+    world(on)
+    const registered: { name: string; isDeferred?: boolean }[] = []
+    on('tool.register', ($, e) => (registered.push(e), { value: { tool: `mcp__observational-memory__${e.name}` } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
 
-    const before = await $.tool.describe(RECALL_DESCRIBE)
-    const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
-    history.push(...result.messages!)
-    await $.classic.SessionStart(COMPACT_START)
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
 
-    expect(before).toEqual({ description: 'Searches', isDeferred: false })
-    expect(invalidated).not.toContain('tool.describe')
-    expect(await $.tool.describe(RECALL_DESCRIBE)).toEqual({ description: 'Searches', isDeferred: false })
+    expect(registered.find((r) => r.name === 'om_recall')).toHaveProperty('isDeferred', false)
   })
 
   test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
