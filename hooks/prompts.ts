@@ -82,7 +82,7 @@ Blocked: what stops the work, and on what.
 Waiting for user: each decision, answer or approval the assistant asked the user for and the chunk does not show given, and what waits on it.
 Leave out a field with nothing in it, and the whole section when neither the chunk nor the record before it shows where the work stands.
 
-Size. The request gives a size target: about how many observation lines the chunk has room for. The target is room to keep detail, not a ceiling to get far under: a reply far under it drops the numbers, reasons and exact strings the assistant needs. Spend it on the events and their details: put the value measured, the reason given, the error quoted or the path changed on the line of its event. Never spend it on extra lines about routine steps, and never pad: a chunk of routine reads and listings may need fewer lines. Fold bookkeeping (acknowledgements, status pings, monitor events, cleanup, pushes, ids and hashes already recorded, lists of version bumps) into one short line or a clause of a neighbouring one, and spend the room on what the assistant could not rebuild: what was found, decided or planned, and why.
+Size. The request gives a size target: about how many observation lines the chunk has room for. The target is room to keep detail, not a ceiling to get far under: a reply far under it drops the numbers, reasons and exact strings the assistant needs. Spend it on the events and their details: put the value measured, the reason given, the error quoted or the path changed on the line of its event. Never spend it on extra lines about routine steps, and never pad: a chunk of routine reads and listings may need fewer lines. Fold bookkeeping (acknowledgements, status pings, monitor events, cleanup, pushes, lists of version bumps) into one short line or a clause of a neighbouring one that still names the files, commands and ids involved, and spend the room on what the assistant could not rebuild: what was found, decided or planned, and why.
 
 What to observe:
 - Group repeated similar tool calls into a single observation rather than one per call.
@@ -116,7 +116,7 @@ Split unrelated events into separate observations. Keep each event's own details
 
 Retrieval cues. Keep the details that let the assistant find the original again with om_recall:
 - File/location: full path + line number when relevant (src/auth.ts:45, not "the auth file").
-- Identifiers and names: package names, function names, ticket ids, commit SHAs, error codes, markers, verbatim.
+- Identifiers and names: package names, function names, ticket ids, commit SHAs, error codes, markers, verbatim. Write one only as the chunk shows it in full: never complete, extend or guess a hash, id, path or value the chunk does not show.
 - Error messages: quote verbatim.
 - Numerical results: exact values, units, direction.
 - Decision lists: preserve the distinguishing attribute per item.`
