@@ -303,7 +303,7 @@ describe('eval runner', () => {
 })
 
 // One turn: the prompt, a Read call, its result of `size` characters, and the answer. Trimmed from
-// tests/register.test.ts's own `turn`; used only by the tests above that drive the real compaction hook.
+// tests/harness.ts's `turn`; used only by the tests above that drive the real compaction hook.
 function turn(prompt: string, reply: string, size = 0): SessionMessage[] {
   return [
     { role: 'user', text: prompt, toolUses: [] },
@@ -314,7 +314,7 @@ function turn(prompt: string, reply: string, size = 0): SessionMessage[] {
 }
 
 // The minimal host capabilities a manual $.session.compact (and, in one test, $.tool.call) need to succeed,
-// trimmed from register.test.ts's own `world`: a session id, its store, and its file system (the plugin persists
+// trimmed from tests/harness.ts's `world`: a session id, its store, and its file system (the plugin persists
 // the ledger and stats through them).
 function world(on: On, sessionId: string | (() => string)) {
   const resolve = () => (typeof sessionId === 'function' ? sessionId() : sessionId)
@@ -347,7 +347,7 @@ function world(on: On, sessionId: string | (() => string)) {
   return { history: history(resolve()), historyOf: history, stored }
 }
 
-// pi on the host, trimmed from register.test.ts's own `pi`: answers every chunk with one observation per user row, and
+// pi on the host, trimmed from tests/harness.ts's `pi`: answers every chunk with one observation per user row, and
 // git, which reads the environment at compaction, as outside a repository.
 function pi(on: On) {
   const seen = { prompts: [] as string[], logs: [] as string[] }

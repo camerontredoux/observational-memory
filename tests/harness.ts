@@ -409,3 +409,24 @@ export function memoryIo(files: Record<string, string>): RecallIo & { reads: str
     now: async () => 0,
   }
 }
+
+// An Observer that quotes, for each prompt named in `said` in its chunk, the user's constraint, naming the listed
+// constraint it replaces (one whose words contain `replaces`) by the id the chunk's prompt gives it, and says where
+// the work stands when `state` names the prompt.
+export function constraining(said: Record<string, { quote: string; replaces?: string }>, state: Record<string, string> = {}) {
+  return (prompt: string) => {
+    const prompts = [...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => ({ time: m[1] ? `${m[1]} ` : '', name: m[2]! }))
+    const corrections = prompts.flatMap(({ time, name }) => {
+      const c = said[name]
+      if (!c) return []
+      const id = c.replaces && prompt.match(new RegExp(`^\\[(k[0-9a-f]+)\\] 🔴 .*${c.replaces}`, 'm'))?.[1]
+      return [`* 🔴 ${time}User: "${c.quote}"${id ? ` (replaces ${id})` : ''}`]
+    })
+    const current = prompts.flatMap(({ name }) => (state[name] ? [state[name]] : [])).at(-1)
+    return (
+      (corrections.length ? `<corrections>\n${corrections.join('\n')}\n</corrections>\n` : '') +
+      `<observations>\n${prompts.map(({ time, name }) => `* 🟡 ${time}User asked ${name}`).join('\n')}\n</observations>` +
+      (current ? `\n<continuation>\n${current}\n</continuation>` : '')
+    )
+  }
+}
