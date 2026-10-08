@@ -3,8 +3,9 @@
 // real-chain test in tests/recall.test.ts: every .jsonl and .meta.json under the directory, keyed by its path in it.
 // `claude plugin test` imports no module over 1 MiB, so each transcript keeps only the rows that test reads, every
 // other row left an empty line so each reference keeps its line number.
-//   bun scripts/make-recall-fixture.ts [/tmp/om-recall/chain]
+//   bun scripts/make-recall-fixture.ts [$TMPDIR/om-recall/chain]
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { loadTranscript } from '../hooks/recall'
 import { wireFixtures } from './wire-fixtures'
 import type { RecallIo } from '../hooks/recall'
@@ -20,7 +21,7 @@ const WANT: Record<string, [number, number][]> = {
 const SUBAGENT_LINES = 10 // a subagent transcript is only counted and named
 const LIMIT = 1024 * 1024
 
-const dir = process.argv[2] ?? '/tmp/om-recall/chain'
+const dir = process.argv[2] ?? `${tmpdir()}/om-recall/chain`
 const files: Record<string, string> = {}
 const walk = (rel: string) => {
   for (const name of readdirSync(`${dir}/${rel}`)) {

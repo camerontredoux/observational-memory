@@ -7,14 +7,14 @@
 //   bun scripts/bench-live.ts run --config om+recall --version new --scenario absent-fact --run 1 --pane w1:p2 \
 //     --budget-usd 20 [--dry-run] [--plugin-root DIR] [--results FILE] [--timeout-ms 600000] [--settle-ms 30000]
 //     [--ceiling-usd 1] [--start-timeout-ms 60000]
-//   bun scripts/bench-live.ts score --run-dir /tmp/om-bench/<runId> [--append] [--results FILE]
+//   bun scripts/bench-live.ts score --run-dir $TMPDIR/om-bench/<runId> [--append] [--results FILE]
 //   bun scripts/bench-live.ts report [--results FILE] [--versions old,new] [--out FILE]
 //
 // run: prints the plan (every herdr command and prompt, what the session should have loaded, the per-run ceiling and
 // the autocompact threshold the session will have, which the run never sets), then, unless --dry-run:
 //   1. refuses to start when the results JSONL's live runs plus the worst completed run's cost (before any, the
 //      --ceiling-usd, default $1), or the scenario's own per-run ceiling when that is more, would pass --budget-usd;
-//   2. writes the scenario's synthetic files to /tmp/om-bench/<runId>/project and the session's settings beside it
+//   2. writes the scenario's synthetic files to $TMPDIR/om-bench/<runId>/project and the session's settings beside it
 //      (and, for builtin+recall, assembles the recall-only plugin from tests/eval/recall-plugin and the version's
 //      hooks/recall.ts and hooks/prompts.ts); an existing run directory is never overwritten: use another --run;
 //   3. checks, with `claude --settings <file> plugin list --json` (no tokens), that exactly the configuration's plugin
@@ -32,7 +32,7 @@
 // tests/eval/live.ts. Claude Code may ask whether to trust the new project directory: answer it in the pane.
 //
 // Plugin versions: new is the main checkout; old is the c6c86a3 worktree at <main>/.worktrees/bench-old, which the
-// orchestrator creates; --plugin-root names any other. The results default to /tmp/om-bench/results.jsonl.
+// orchestrator creates; --plugin-root names any other. The results default to $TMPDIR/om-bench/results.jsonl.
 //
 // Overlapping memory protections (the observations, the verbatim user messages, the skills): the report's "What
 // carried each fact" table measures, per compaction, which parts of the memory message held each scenario fact, with
@@ -45,6 +45,7 @@
 // offline apart; every live cell not yet run, for the versions given.
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { makeRecord, parseTranscript, renderReport, runCost } from '../tests/eval/bench'
@@ -56,7 +57,7 @@ import type { Configuration } from '../tests/eval/runner'
 import { growStep, SCENARIOS, scenarioById } from '../tests/eval/scenarios'
 import { fail, findTranscripts, mainCheckout, num, options, send, str } from './cli'
 
-const BENCH_ROOT = '/tmp/om-bench'
+const BENCH_ROOT = `${tmpdir()}/om-bench` // under $TMPDIR, else /tmp
 const HERE = resolve(import.meta.dir, '..')
 
 // The checkout's commit, marked `-dirty` when it has uncommitted changes: what a version label stood for in this run.
@@ -221,7 +222,7 @@ function compactionsIn(sessionId: string): number {
 }
 
 function rescore(o: Record<string, string | true>) {
-  const dir = str(o, 'run-dir') ?? fail('--run-dir: a run directory under /tmp/om-bench')
+  const dir = str(o, 'run-dir') ?? fail('--run-dir: a run directory under $TMPDIR/om-bench')
   const meta = JSON.parse(readFileSync(`${dir}/meta.json`, 'utf8')) as RunMeta
   const record = score(meta)
   const results = str(o, 'results') ?? `${BENCH_ROOT}/results.jsonl`
