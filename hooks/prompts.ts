@@ -82,7 +82,7 @@ Blocked: what stops the work, and on what.
 Waiting for user: each decision, answer or approval the assistant asked the user for and the chunk does not show given, and what waits on it.
 Leave out a field with nothing in it, and the whole section when neither the chunk nor the record before it shows where the work stands.
 
-Size. The request gives a size target: about how many observation lines the chunk has room for. The target is room to keep detail, not a ceiling to get far under: a reply far under it drops the numbers, reasons and exact strings the assistant needs. Spend it on the events and their details: put the value measured, the reason given, the error quoted or the path changed on the line of its event. Never spend it on extra lines about routine steps, and never pad: a chunk of routine reads and listings may need fewer lines.
+Size. The request gives a size target: about how many observation lines the chunk has room for. The target is room to keep detail, not a ceiling to get far under: a reply far under it drops the numbers, reasons and exact strings the assistant needs. Spend it on the events and their details: put the value measured, the reason given, the error quoted or the path changed on the line of its event. Never spend it on extra lines about routine steps, and never pad: a chunk of routine reads and listings may need fewer lines. Fold bookkeeping (acknowledgements, status pings, monitor events, cleanup, pushes, ids and hashes already recorded, lists of version bumps) into one short line or a clause of a neighbouring one, and spend the room on what the assistant could not rebuild: what was found, decided or planned, and why.
 
 What to observe:
 - Group repeated similar tool calls into a single observation rather than one per call.
@@ -91,6 +91,8 @@ What to observe:
 - When a tool's output lists many records (lines, rows, entries), record what it listed, not only its last or summary line: the kind of record, how many, their range and the fields each has, in one observation, without copying the records. For example: Assistant ran psql -c "select * from orders", which printed 75 order rows (ids 1001 to 1075, each with customer, total, status and created_at), then "(75 rows)".
 - Record what happened, never what did not happen in the chunk: other chunks cover the rest of the session, so "no files were edited", "no tests were run" or "nothing is recorded yet" is soon false. A negative result is an event and stays: a command or test failed, a search for X found nothing.
 - Record unresolved work as it stands: a failing test, an unfixed error, a question left open, an approval the assistant is waiting for.
+- Record what was said, not only that it was said. When the assistant reports, explains, plans, decides or forbids something, or relays a report, review or file it read, its line carries the content: each finding, the plan's items in their order or grouping, the steps or commands the user must run, and the reason given ("because ...") with the value that decided it. "Assistant proposed a plan", "Assistant read the notes" or "the instructions are in a file" alone fails when the message or file states what was found, why, or what to do.
+- When an approach, option or suspected cause is considered and then dropped or ruled out, record it, why, and what replaced it.
 - Never write "this chunk" or "the chunk" in an observation or the continuation.
 
 Observation content rules:
@@ -100,8 +102,8 @@ When the user TELLS the assistant something about themselves, their project, or 
   BAD:  User discussed auth middleware.
   GOOD: User asked how to configure JWT auth middleware.
 
-Preserve unusual phrasing.
-When the user uses non-standard terminology, quote their exact words so the term can be searched for later.
+Preserve exact names and phrasing.
+When the user uses non-standard terminology, quote their exact words so the term can be searched for later. From any source, quote the session's own terms rather than describing them: labels, option, setting and constant names, API fields, a log line that shows a finding, the text a change adds, and a bug's expected and actual values. Copy counts as written ("3 of 40", not "rarely"), and keep the figure a conclusion rests on rather than your own aggregate of it.
 
 Use precise action verbs.
   BAD:  User got the library.
