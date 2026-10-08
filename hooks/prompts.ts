@@ -35,7 +35,7 @@ Output format:
 * 🟡 2026-09-23 14:36 User approved adding the expiry check the assistant proposed for refreshToken()
 * 🟡 2026-09-23 14:38 Assistant added the expiry check at src/auth/refresh.ts:45; not yet tested
 * ✅ 2026-09-23 14:40 Verified: npm test passes (212 tests) with the expiry check at src/auth/refresh.ts:45
-* 🟡 2026-09-23 14:41 Assistant told the user the fix passes npm test and proposed committing it as "fix(auth): check token expiry on refresh", then deploying once the user confirms it works on staging
+* 🟡 2026-09-23 14:41 Assistant proposed committing the fix as "fix(auth): check token expiry on refresh", then deploying once the user confirms it works on staging
 </observations>
 <continuation>
 Active: fixing the token refresh bug in src/auth/refresh.ts
@@ -87,6 +87,12 @@ Size. The request gives a size target: about how many observation lines the chun
 What to observe:
 - Group repeated similar tool calls into a single observation rather than one per call.
 - Skip routine, low-information events.
+- Write each event once, on the line that carries its outcome. Lines that only lead up to or repeat another line are noise the assistant must read past later:
+  - Reads and searches that found nothing of note get no line of their own: name their paths on the line of the finding, edit or step they served ("Assistant read hooks/a.ts and hooks/b.ts and found the cache key omits the model").
+  - A check that passed as expected (a test run, build or type check) goes on the line of the change it verified, with its count, not on a line of its own. A failure, or a pass that settled an open question, keeps its own line.
+  - Progress the chunk later overtakes ("started the build", "still running", "waiting for the tests") gets no line: record where it ended. Only work still unfinished at the end of the chunk is recorded as unfinished.
+  - When the assistant reports to the user what earlier lines already record, write one line with what it told the user and only what is new in it, such as its recommendation or question, with that recommendation's own figures, paths and options ("proposed raising the cache TTL from 60s to 300s", not "proposed a longer TTL"), without repeating the findings.
+  - A failed attempt the chunk later fixes stays, briefly, with its cause: the failure and why it failed are a lesson. Never fold away a reason, a number, a user's words or a decision.
 - Always record which files were read, created or edited (full paths) and which commands ran, with what outcome: the assistant may later be asked what it did.
 - When a tool's output lists many records (lines, rows, entries), record what it listed, not only its last or summary line: the kind of record, how many, their range and the fields each has, in one observation, without copying the records. For example: Assistant ran psql -c "select * from orders", which printed 75 order rows (ids 1001 to 1075, each with customer, total, status and created_at), then "(75 rows)".
 - Record what happened, never what did not happen in the chunk: other chunks cover the rest of the session, so "no files were edited", "no tests were run" or "nothing is recorded yet" is soon false. A negative result is an event and stays: a command or test failed, a search for X found nothing.
