@@ -5,10 +5,10 @@ import { contextText, holds, isTyped, neededIdentifiers } from './replay'
 import type { Expect, Gate, RubricSpec } from './rubric'
 import { hasExpect, itemGate, norm } from './rubric'
 
-export type BGate = 'rule' | 'permission' | 'done' | 'next' | 'value' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale' | 'dropped' | 'false'
-export const BGATES: BGate[] = ['rule', 'permission', 'done', 'next', 'value', 'lessons', 'file-state', 'multi-hop', 'rationale', 'dropped', 'false']
+export type BGate = 'rule' | 'permission' | 'done' | 'next' | 'value' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale' | 'purpose' | 'dropped' | 'false'
+export const BGATES: BGate[] = ['rule', 'permission', 'done', 'next', 'value', 'lessons', 'file-state', 'multi-hop', 'rationale', 'purpose', 'dropped', 'false']
 /** A rubric item's probe gate: the hard types keep their retention gate's name; constraints and reversals are rules. */
-const bgate = (g: Gate): BGate => (g === 'constraints' || g === 'reversals' ? 'rule' : g === 'lessons' || g === 'file-state' || g === 'multi-hop' || g === 'rationale' ? g : 'value')
+const bgate = (g: Gate): BGate => (g === 'constraints' || g === 'reversals' ? 'rule' : g === 'lessons' || g === 'file-state' || g === 'multi-hop' || g === 'rationale' || g === 'purpose' ? g : 'value')
 /** `answer`: a pattern (case-insensitive) for rule/value/next, the word for permission, the short SHA for done. */
 export type Probe = { gate: BGate; id: string; ask: string; answer?: string; expect?: readonly Expect[]; quoteOf?: string; query?: readonly string[] }
 export type Answer = { id?: string; answer?: unknown; evidence?: unknown; note?: unknown; recall_query?: unknown }
@@ -95,10 +95,15 @@ const squash = (s: string) => s.replace(/\s+/g, ' ').trim()
 const str = (x: unknown) => (typeof x === 'string' ? x : x === undefined || x === null ? '' : JSON.stringify(x))
 export const isUnknown = (a: Answer) => /^unknown\b/i.test(str(a.answer).trim())
 
-/** Grades one answer. `ctx` is the squashed context text; `recalled`, what om_recall's search returned for its recall_query. */
-export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string): { pass: boolean; why: string } {
+// An answer that joins facts (multi-hop, rationale, lessons) may quote up to three places, as "a"; "b", a; b, a … b, or
+// a JSON array of quotes. Any other probe's evidence is one quote: a path or value stitched from pieces is no quote.
+export const QUOTE_PARTS_MAX = 3
+const JOINED: readonly BGate[] = ['multi-hop', 'rationale', 'lessons']
+export const QUOTE_JOIN = /["”]\s*[;,]?\s*(?:and\s+)?["“]|\s(?:…|\.\.\.)\s|;\s+/
+/** Grades one answer. `ctx` is the squashed context text; `recalled`, what om_recall's search returned for its recall_query; `parts`, how many quotes the evidence may join (1: one quote; by default QUOTE_PARTS_MAX for a probe that joins facts). */
+export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string, parts = JOINED.includes(p.gate) ? QUOTE_PARTS_MAX : 1): { pass: boolean; why: string } {
   const ans = squash(str(a.answer))
-  const ev = squash(str(a.evidence))
+  const ev = squash(Array.isArray(a.evidence) ? a.evidence.map(str).join('"; "') : str(a.evidence))
   const short = (s: string) => (s.length > 70 ? `${s.slice(0, 70)}…` : s)
   const said = `"${short(ans)}"`
   if (!ans) return { pass: false, why: 'no answer' }
@@ -112,7 +117,10 @@ export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string)
   }
   // A quote survives the reader dropping markdown and quote marks, and a trailing ellipsis.
   const bare = (s: string) => squash(s.replace(/[`*_"'“”‘’]/g, '').replace(/(?:…|\.\.\.)$/, '')).toLowerCase()
-  if (ev.length < (p.quoteOf ? 2 : 8) || !bare(ctx).includes(bare(ev))) return { pass: false, why: `${said}, evidence not in the context: "${short(ev)}"` }
+  // Each part of joined quotes is verbatim in the context and at least 8 characters.
+  const pieces = ev.split(QUOTE_JOIN).map((x) => bare(x.replace(/^\s*(?:…|\.\.\.)/, '')))
+  const quoted = bare(ctx).includes(bare(ev)) || (pieces.length > 1 && pieces.length <= parts && pieces.every((x) => x.length >= 8 && bare(ctx).includes(x)))
+  if (ev.length < (p.quoteOf ? 2 : 8) || !quoted) return { pass: false, why: `${said}, evidence not in the context: "${short(ev)}"` }
   const both = `${ans}\n${ev}`
   const ok = (() => {
     switch (p.gate) {

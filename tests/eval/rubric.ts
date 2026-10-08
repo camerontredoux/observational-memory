@@ -2,28 +2,29 @@
 // against at every cut point. Mechanical gates are derived from the transcript; the rest come from the transcript's
 // ReplaySpec and its local RubricSpec. Pure: no file system or model.
 import type { Context, ReplaySpec, Row, Transcript } from './replay'
-import { contextText, earlyNeeded, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, scoreConstraints } from './replay'
+import { contextText, earlyNeeded, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, normalize, scoreConstraints } from './replay'
 
 export type Gate =
   | 'identifiers' | 'constraints' | 'verbatim' | 'corrections' | 'reversals' | 'approvals' | 'asks' | 'in-progress' | 'handoff'
   | 'files-edited' | 'commits' | 'failures' | 'facts' | 'decisions' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale'
-  | 'chronology' | 'recall' | 'absent' | 'tokens' | 'budget'
+  | 'chronology' | 'recall' | 'absent' | 'purpose' | 'tokens' | 'budget'
 
 /** Weight per gate: the one table. */
 export const WEIGHTS: Record<Gate, number> = {
   identifiers: 10, constraints: 6, verbatim: 5, corrections: 8, reversals: 6, approvals: 5, asks: 5, 'in-progress': 5, handoff: 8,
   'files-edited': 5, commits: 4, failures: 6, facts: 5, decisions: 5, lessons: 7, 'file-state': 7, 'multi-hop': 7, rationale: 7,
-  chronology: 6, recall: 5, absent: 5, tokens: 6, budget: 3,
+  chronology: 6, recall: 5, absent: 5, purpose: 5, tokens: 6, budget: 3,
 }
 /**
  * A hard hand-authored item's gate, by its id's type prefix (docs/research/hard-compaction-items.md), when its own gate
  * is facts, decisions or unset: neg → lessons (tried and dropped, and why), file → file-state (what a file does after its
- * last edit), hop/multi → multi-hop (two facts from far-apart spans), why → rationale (a decision with its reason).
+ * last edit), hop/multi → multi-hop (two facts from far-apart spans), why → rationale (a decision with its reason),
+ * purpose → purpose (what the whole session is about: its overall goal and the assistant's role, on one line).
  */
 export function itemGate(id: string, gate: Gate | undefined, dflt: Gate): Gate {
   if (gate && gate !== 'facts' && gate !== 'decisions') return gate
-  const by: Record<string, Gate> = { neg: 'lessons', file: 'file-state', hop: 'multi-hop', multi: 'multi-hop', why: 'rationale' }
-  const m = /^(neg|file|hop|multi|why)[:-]/.exec(id)
+  const by: Record<string, Gate> = { neg: 'lessons', file: 'file-state', hop: 'multi-hop', multi: 'multi-hop', why: 'rationale', purpose: 'purpose' }
+  const m = /^(neg|file|hop|multi|why|purpose)[:-]/.exec(id)
   return m ? by[m[1]!]! : (gate ?? dflt)
 }
 /**
@@ -51,7 +52,8 @@ export type RubricSpec = {
   probes?: (Span & { of: string; kind: 'rule' | 'permission' | 'done'; ask: string; answer: string })[]
 }
 
-export type Item = { gate: Gate; boundary: number; id: string; score: number; evidence: string }
+export type Needle = { s?: Expect; re?: readonly string[]; exact?: boolean }
+export type Item = { gate: Gate; boundary: number; id: string; score: number; evidence: string; needles?: Needle[] }
 
 const squash = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase()
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
@@ -85,9 +87,17 @@ function lastAt(squashed: string, normed: string, e: Expect, exact: boolean) {
 }
 type Fact = { id: string; expect: readonly Expect[] }
 type Latest = { current: string; stale: string }
-/** A fact item holds in a prose context (squashed, normed): every expect; for an order item (ord:/order:), in its order. */
-export function factHolds(f: Fact, ptext: string, pnorm: string) {
+const PURPOSE_LINE_MAX = 600
+/**
+ * A fact item holds in a prose context (squashed, normed): every expect; for an order item (ord:/order:), in its order;
+ * for a purpose item (purpose:), every expect on one line of `prose` no longer than PURPOSE_LINE_MAX, so that tokens
+ * scattered over the context, or over a dump such as a tool result's JSON on one line, do not make a statement of the
+ * session's goal.
+ */
+export function factHolds(f: Fact, ptext: string, pnorm: string, prose?: string) {
   const exact = isExact(f.id)
+  if (prose !== undefined && /^purpose[:-]/.test(f.id))
+    return prose.split('\n').some((l) => l.length <= PURPOSE_LINE_MAX && f.expect.every((e) => hasExpect(squash(l), norm(l), e, exact)))
   if (!f.expect.every((e) => hasExpect(ptext, pnorm, e, exact))) return false
   if (!/^ord(?:er)?[:-]/.test(f.id)) return true
   const at = f.expect.map((e) => lastAt(ptext, pnorm, e, exact))
@@ -108,7 +118,7 @@ export function negativeControl(items: Record<string, Pick<RubricSpec, 'facts' |
   const prepared = Object.fromEntries(Object.entries(contexts).map(([k, cs]) => [k, cs.map((c) => ({ ...c, ptext: squash(c.prose), pnorm: norm(c.prose) }))]))
   for (const [name, spec] of Object.entries(items)) {
     const tests = [
-      ...(spec.facts ?? []).map((f) => ({ id: f.id, shared: f.shared ?? [], ok: (c: { ptext: string; pnorm: string }) => factHolds(f, c.ptext, c.pnorm) })),
+      ...(spec.facts ?? []).map((f) => ({ id: f.id, shared: f.shared ?? [], ok: (c: { prose: string; ptext: string; pnorm: string }) => factHolds(f, c.ptext, c.pnorm, c.prose) })),
       ...(spec.latest ?? []).map((l) => ({ id: l.id, shared: l.shared ?? [], ok: (c: { prose: string }) => latestHolds(l, c.prose) })),
     ]
     for (const x of tests) {
@@ -120,7 +130,7 @@ export function negativeControl(items: Record<string, Pick<RubricSpec, 'facts' |
 }
 const inSpan = (x: Span, n: number) => x.from <= n && (x.to === undefined || n <= x.to)
 const cut = (s: string, n = 60) => (s.length > n ? `${s.slice(0, n)}…` : s)
-const pass = (gate: Gate, boundary: number, id: string, ok: boolean, evidence: string): Item => ({ gate, boundary, id, score: ok ? 1 : 0, evidence })
+const pass = (gate: Gate, boundary: number, id: string, ok: boolean, evidence: string, needles?: Needle[]): Item => ({ gate, boundary, id, score: ok ? 1 : 0, evidence, ...(ok || !needles ? {} : { needles }) })
 const home = (p: string) => p.replace(/^\/home\/[^/]+/, '~')
 /** The index just past the last match of `re` in `text`, or -1. */
 const lastMatch = (text: string, re: string) => {
@@ -155,7 +165,7 @@ export const isList = (line: string) => {
   const ids = idCount(line)
   return ids >= 3 && ids > line.split(/\s+/).filter(Boolean).length * LIST_DENSITY
 }
-const proseOnly = (text: string) => text.split('\n').filter((l) => isProse(l) && !isList(l)).join('\n')
+const proseOnly = (text: string, keep?: (line: string) => boolean) => text.split('\n').filter((l) => keep?.(l) || (isProse(l) && !isList(l))).join('\n')
 
 // ---- Grounding: an identifier counts where its context line says what the transcript said about it ----
 
@@ -206,24 +216,13 @@ const probeOf = (key: string, kind: string) => (kind === 'path' ? key.split('/')
  * The context as the token gates read it: the summary's prose lines, and the raw tail's rows whole when they are the
  * transcript's own rows (anything else in the tail, prose lines only). A list of bare identifiers counts for nothing.
  */
-export function proseContext(context: Context, before: readonly Row[]): string {
+export function proseContext(context: Context, before: readonly Row[], keep?: (line: string) => boolean): string {
   const genuine = new Set(before.map(messageText))
-  // Code-lane experiment only (RUBRIC_FAIR_MASK=1): a row the plugin masked (a head and tail of a genuine row around an
-  // om_recall omission marker) reads whole, as the verbatim transcript text it is.
-  const byHead = new Map<string, string[]>()
-  const fair = (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.RUBRIC_FAIR_MASK === '1'
-  if (fair) for (const g of genuine) byHead.set(g.slice(0, 48), [...(byHead.get(g.slice(0, 48)) ?? []), g])
-  const masked = (s: string) => {
-    const parts = s.split(/\n\.\.\. \[~\d+ tokens omitted; om_recall can retrieve the full result\] \.\.\.\n?/)
-    if (parts.length < 2) return false
-    const pool = parts[0]!.length >= 48 ? (byHead.get(parts[0]!.slice(0, 48)) ?? []) : [...genuine]
-    return pool.some((g) => g.startsWith(parts[0]!) && g.endsWith(parts.at(-1)!))
-  }
   const kept = context.kept.map((m) => {
     const s = messageText(m)
-    return { text: genuine.has(s) || (fair && masked(s)) ? s : proseOnly(s), toolUses: [], toolResults: undefined }
+    return { text: genuine.has(s) ? s : proseOnly(s, keep), toolUses: [], toolResults: undefined }
   })
-  return contextText({ summary: proseOnly(context.summary), kept })
+  return contextText({ summary: proseOnly(context.summary, keep), kept })
 }
 
 // A line that reports a claim as gone ("the $30 cap was dropped") does not state it as current.
@@ -232,7 +231,7 @@ const SUPERSEDED = /\b(?:dropped|no longer|replaced|superseded|revers|reverted|r
 const statedAsCurrent = (text: string, pattern: string) => text.split('\n').some((l) => new RegExp(pattern, 'i').test(l) && !SUPERSEDED.test(l))
 
 /** A user message's verbatim key: its first 100 characters, squashed. */
-const quoteKey = (text: string) => squash(text).slice(0, 100)
+const quoteKey = (text: string) => squash(normalize(text)).slice(0, 100)
 
 // ---- Identifiers beyond replay.ts's kinds: branch names, config constants, PR numbers, numbers the assistant quoted ----
 
@@ -319,23 +318,26 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
   const has = (key: string, kind: Parameters<typeof holds>[2]) => grounded(t, before.length, plines, key, probeOf(key, kind), (l) => holds(l, key, kind))
   const hasExtra = (key: string, kind: Extra) => grounded(t, before.length, plines, key, probeOf(key, kind), (l) => holdsExtra(l, key, kind))
 
-  for (const x of neededIdentifiers(t, n)) items.push(pass('identifiers', n, `${x.kind}:${x.key}`, has(x.key, x.kind), `used at line ${x.line}`))
-  for (const x of neededExtras(t, n)) items.push(pass('identifiers', n, `${x.kind}:${x.key}`, hasExtra(x.key, x.kind), `used at line ${x.line}`))
+  for (const x of neededIdentifiers(t, n)) items.push(pass('identifiers', n, `${x.kind}:${x.key}`, has(x.key, x.kind), `used at line ${x.line}`, [{ s: x.key, exact: true }]))
+  for (const x of neededExtras(t, n)) items.push(pass('identifiers', n, `${x.kind}:${x.key}`, hasExtra(x.key, x.kind), `used at line ${x.line}`, [{ s: x.key.replace(/^PR /, ''), exact: true }]))
 
   if (spec) {
     const s = scoreConstraints(spec.constraints, n, context)
-    for (const c of s.inForce) items.push(pass('constraints', n, c.id, c.held, 'pattern'))
+    for (const c of s.inForce) items.push(pass('constraints', n, c.id, c.held, 'pattern', [{ re: spec.constraints.find((k) => k.id === c.id)!.held }]))
     for (const c of spec.constraints.filter((c) => c.setIn < n && !(c.reversal && c.reversal.in < n)))
-      items.push(pass('verbatim', n, c.id, text.includes(squash(c.quote)), cut(c.quote)))
+      items.push(pass('verbatim', n, c.id, text.includes(squash(normalize(c.quote))), cut(c.quote), [{ s: squash(normalize(c.quote)), exact: true }]))
     // A reversal: its new form held, and after the last place the stale form is (the context reads oldest first).
+    // A line quoting the user's own words for either form counts too: a short reply ("no its 001.41") is not prose.
     for (const c of spec.constraints.filter((c) => c.reversal && c.reversal.in < n)) {
-      const now = Math.max(...c.reversal!.held.map((p) => lastMatch(pr, p)))
-      const stale = Math.max(...c.held.map((p) => lastMatch(pr, p)))
-      items.push(pass('reversals', n, c.id, now >= 0 && now > stale, now < 0 ? (stale >= 0 ? 'stale form only' : 'neither form') : now > stale ? 'new form last' : 'stale form after the new'))
-      items.push(pass('verbatim', n, `${c.id}:reversal`, text.includes(squash(c.reversal!.quote)), cut(c.reversal!.quote)))
+      const quotes = [c.quote, c.reversal!.quote].map((q) => squash(normalize(q)))
+      const rv = proseContext(context, before, (l) => quotes.some((q) => squash(l).includes(q)))
+      const now = Math.max(...c.reversal!.held.map((p) => lastMatch(rv, p)))
+      const stale = Math.max(...c.held.map((p) => lastMatch(rv, p)))
+      items.push(pass('reversals', n, c.id, now >= 0 && now > stale, now < 0 ? (stale >= 0 ? 'stale form only' : 'neither form') : now > stale ? 'new form last' : 'stale form after the new', [{ re: c.reversal!.held }]))
+      items.push(pass('verbatim', n, `${c.id}:reversal`, text.includes(squash(normalize(c.reversal!.quote))), cut(c.reversal!.quote), [{ s: squash(normalize(c.reversal!.quote)), exact: true }]))
     }
     for (const q of spec.questions.filter((q) => q.expect?.length && q.from <= n && (q.to === undefined || n <= q.to)))
-      items.push(pass(q.to === undefined ? 'facts' : 'handoff', n, q.id, expectAll(q.expect!, q.id), `${q.expect!.length} tokens`))
+      items.push(pass(q.to === undefined ? 'facts' : 'handoff', n, q.id, expectAll(q.expect!, q.id), `${q.expect!.length} tokens`, q.expect!.filter((e) => !hasExpect(ptext, pnorm, e, isExact(q.id))).map((e) => ({ s: e, exact: isExact(q.id) }))))
   }
 
   // The user's corrections and standing rules, verbatim, for the rest of the session.
@@ -344,7 +346,7 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
     const k = quoteKey(r.text)
     if (r.text.length > 400 || k.length < 12 || seen.has(k)) continue
     seen.add(k)
-    if (CORRECTION.test(r.text.trim())) items.push(pass('corrections', n, `line ${r.line}`, text.includes(k), cut(k)))
+    if (CORRECTION.test(r.text.trim())) items.push(pass('corrections', n, `line ${r.line}`, text.includes(k), cut(k), [{ s: k, exact: true }]))
   }
 
   // Approvals in the last two spans: what the user said yes to, by the identifiers of the assistant's proposal before it;
@@ -356,7 +358,7 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
       const keys = [...identifiersIn(proposal)].filter(([, kind]) => kind !== 'usd').slice(0, 4)
       if (!keys.length) continue
       const held = keys.filter(([k, kind]) => has(k, kind))
-      items.push(pass('approvals', n, `line ${r.line}`, held.length * 2 >= keys.length, `"${cut(r.text, 30)}" to ${keys.map(([k]) => k).join(', ')}`))
+      items.push(pass('approvals', n, `line ${r.line}`, held.length * 2 >= keys.length, `"${cut(r.text, 30)}" to ${keys.map(([k]) => k).join(', ')}`, keys.filter((k) => !held.includes(k)).map(([k]) => ({ s: k, exact: true }))))
     }
   }
   const allCalls = new Map(before.flatMap((r) => r.toolUses.map((u) => [u.tool_use_id, u] as const)))
@@ -366,11 +368,11 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
     const call = allCalls.get(x.tool_use_id)
     const keys = [...identifiersIn(JSON.stringify(call?.input ?? {}))].slice(0, 3)
     const ok = /\b(?:reject|refus|denied|declin|stopp?ed|interrupt)/i.test(raw) && (!keys.length || keys.some(([k, kind]) => has(k, kind)))
-    items.push(pass('approvals', n, `denied line ${x.row.line}`, ok, `refused ${call?.tool ?? '?'} ${keys.map(([k]) => k).join(', ')}`))
+    items.push(pass('approvals', n, `denied line ${x.row.line}`, ok, `refused ${call?.tool ?? '?'} ${keys.map(([k]) => k).join(', ')}`, [{ re: ['\\b(?:reject|refus|denied|declin|stopp?ed|interrupt)'] }, ...keys.map(([k]) => ({ s: k, exact: true }))]))
   }
 
   // The user's last three requests, verbatim: the raw tail usually holds only the newest.
-  for (const r of typed.slice(-3)) items.push(pass('asks', n, `line ${r.line}`, text.includes(quoteKey(r.text)), cut(quoteKey(r.text))))
+  for (const r of typed.slice(-3)) items.push(pass('asks', n, `line ${r.line}`, text.includes(quoteKey(r.text)), cut(quoteKey(r.text)), [{ s: quoteKey(r.text), exact: true }]))
 
   // What was in progress: the files of the last three distinct file tool calls before the cut.
   const recent: string[] = []
@@ -381,13 +383,13 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
     }
     if (recent.length >= 3) break
   }
-  for (const p of recent.slice(0, 3)) items.push(pass('in-progress', n, home(p), has(home(p), 'path'), 'recent file'))
+  for (const p of recent.slice(0, 3)) items.push(pass('in-progress', n, home(p), has(home(p), 'path'), 'recent file', [{ s: home(p), exact: true }]))
 
   // Completed work: files edited in the last three spans, commits and PRs made, failures in the last three spans.
   const edited = new Set<string>()
   for (const r of lastThree)
     for (const u of r.toolUses) if (EDIT_TOOLS.has(u.tool) && typeof (u.input as { file_path?: unknown }).file_path === 'string') edited.add(home((u.input as { file_path: string }).file_path))
-  for (const p of edited) items.push(pass('files-edited', n, p, has(p, 'path'), 'edited'))
+  for (const p of edited) items.push(pass('files-edited', n, p, has(p, 'path'), 'edited', [{ s: p, exact: true }]))
   const made = new Map<string, string>()
   for (const x of results(before)) for (const m of x.text.matchAll(COMMIT)) made.set(`commit:${m[2]!.slice(0, 7)}`, m[1]!)
   // PRs the assistant reported to the user (not every PR a listing printed).
@@ -395,7 +397,7 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
   for (const [id, branch] of made) {
     const key = id.slice(id.indexOf(':') + 1)
     const ok = id.startsWith('commit:') ? has(key, 'commit') : hasExtra(`PR ${key}`, 'pr')
-    items.push(pass('commits', n, id, ok, branch ? `on ${branch}` : 'pull request'))
+    items.push(pass('commits', n, id, ok, branch ? `on ${branch}` : 'pull request', [{ s: key, exact: true }]))
   }
   // A failure is a lesson, not noise: a policy failure (a block, a hook, a missing tool), one that recurs (its key in
   // two spans, or again after the cut), or one still unresolved at the cut (no later success of the same target).
@@ -428,23 +430,23 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
     const unresolved = !allBefore.slice(at + 1).some((y) => !y.isError && target(y.tool_use_id) === tg)
     if (!policy && !recurs && !unresolved) continue
     failed.add(keys.join('|'))
-    items.push(pass('failures', n, `line ${x.row.line}`, keys.every((k) => ptext.includes(squash(k))), `${cut(keys.join(' + '))} (${policy ? 'policy' : recurs ? 'recurs' : 'unresolved'})`))
+    items.push(pass('failures', n, `line ${x.row.line}`, keys.every((k) => ptext.includes(squash(normalize(k)))), `${cut(keys.join(' + '))} (${policy ? 'policy' : recurs ? 'recurs' : 'unresolved'})`, keys.filter((k) => !ptext.includes(squash(normalize(k)))).map((k) => ({ s: squash(normalize(k)), exact: true }))))
   }
 
   // Chronology: identifiers from before boundary 1 that some later boundary needs, still held from boundary 3 on.
-  if (n >= 3) for (const x of earlyNeeded(t)) items.push(pass('chronology', n, `${x.kind}:${x.key}`, has(x.key, x.kind), 'span 0'))
+  if (n >= 3) for (const x of earlyNeeded(t)) items.push(pass('chronology', n, `${x.kind}:${x.key}`, has(x.key, x.kind), 'span 0', [{ s: x.key, exact: true }]))
 
   // Hallucination: a commit hash in the summary that the transcript never showed.
   const source = before.map(messageText).join('\n')
   const invented = [...identifiersIn(context.summary)].filter(([key, kind]) => kind === 'commit' && !holds(source, key, 'commit')).map(([key]) => key)
   items.push(pass('absent', n, 'invented-hashes', !invented.length, invented.length ? invented.join(', ') : 'none'))
 
-  for (const f of rubric?.facts ?? []) if (inSpan(f, n)) items.push(pass(itemGate(f.id, f.gate, 'facts'), n, f.id, factHolds(f, ptext, pnorm), `${f.expect.length} tokens`))
+  for (const f of rubric?.facts ?? []) if (inSpan(f, n)) items.push(pass(itemGate(f.id, f.gate, 'facts'), n, f.id, factHolds(f, ptext, pnorm, pr), `${f.expect.length} tokens`, f.expect.filter((e) => !hasExpect(ptext, pnorm, e, isExact(f.id))).map((e) => ({ s: e, exact: isExact(f.id) }))))
   for (const a of rubric?.absent ?? []) if (inSpan(a, n)) items.push(pass('absent', n, a.id, !statedAsCurrent(raw, a.pattern), 'stale or false claim'))
   for (const l of rubric?.latest ?? [])
     if (inSpan(l, n)) {
       const now = lastMatch(pr, l.current)
-      items.push(pass(itemGate(l.id, l.gate, 'reversals'), n, l.id, latestHolds(l, pr), now < 0 ? 'current form missing' : latestHolds(l, pr) ? 'current form last' : 'stale form after the current'))
+      items.push(pass(itemGate(l.id, l.gate, 'reversals'), n, l.id, latestHolds(l, pr), now < 0 ? 'current form missing' : latestHolds(l, pr) ? 'current form last' : 'stale form after the current', [{ re: [l.current] }]))
     }
   for (const r of rubric?.recall ?? [])
     if (inSpan(r, n)) {
@@ -473,4 +475,61 @@ export function score(items: readonly Item[]): Scores {
   // An over-budget context buys its recall with room it does not have: the total is scaled by the budget gate's mean fit.
   const fit = gates.budget ? gates.budget.score / 100 : 1
   return { total: w ? (fit * used.reduce((s, g) => s + WEIGHTS[g] * gates[g]!.score, 0)) / w : 0, gates }
+}
+
+const SOURCE = /\(source:? (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d) to (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d)\)/
+// A day header of grouped observations ("@ 2026-09-10"): a source range of times alone is on that day.
+const DAY = /^@ (\d{4}-\d\d-\d\d)\s*$/
+export type Pointed = { boundary: number; id: string; held: boolean; pointed: boolean; evidence: string }
+/**
+ * Recall-aware credit, apart from the total: each hand-authored fact at cut n is held (as grade scores it) or, when missed,
+ * pointed: a summary line on its subject (holding one of its expects, or two words of its ask) sits in a run of
+ * observations whose "(source A to B)" om_recall takes as from and to, and the transcript's rows in that range hold every
+ * expect. Stamps are read in the process's time zone, as the plugin writes them.
+ */
+export function pointed(t: Transcript, n: number, context: Context, rubric: RubricSpec | undefined): Pointed[] {
+  const facts = (rubric?.facts ?? []).filter((f) => inSpan(f, n))
+  if (!facts.length) return []
+  const before = t.spans.slice(0, n).flat()
+  const pr = proseContext(context, before)
+  const [ptext, pnorm] = [squash(pr), norm(pr)]
+  const runs: { line: string; key: string; from: number; to: number }[] = []
+  let open: string[] = []
+  let day: string | undefined
+  const at = (d: string, h: string, m: string) => {
+    const [y, mo, dd] = d.split('-').map(Number)
+    return new Date(y!, mo! - 1, dd!, +h, +m).getTime()
+  }
+  for (const line of context.summary.split('\n')) {
+    day = DAY.exec(line)?.[1] ?? day
+    open.push(line)
+    const m = SOURCE.exec(line)
+    const d1 = m?.[1] ?? day
+    if (!m || !d1) continue
+    const [from, to] = [at(d1, m[2]!, m[3]!), at(m[4] ?? (m[1] && day && day > m[1] ? day : d1), m[5]!, m[6]!) + 60_000]
+    for (const l of open) runs.push({ line: l, key: `${d1} ${m[0]}`, from, to })
+    open = []
+  }
+  const ranges = new Map<string, { sq: string; nm: string }>()
+  const range = (r: (typeof runs)[number]) => {
+    let x = ranges.get(r.key)
+    if (!x) {
+      const text = before.filter((row) => row.at >= r.from && row.at < r.to).map(messageText).join('\n')
+      ranges.set(r.key, (x = { sq: squash(text), nm: norm(text) }))
+    }
+    return x
+  }
+  return facts.map((f) => {
+    if (factHolds(f, ptext, pnorm)) return { boundary: n, id: f.id, held: true, pointed: false, evidence: '' }
+    const exact = isExact(f.id)
+    const ask = f.ask ? contentWords(f.ask) : new Set<string>()
+    const hit = runs.find((r) => {
+      const [sq, nm] = [squash(r.line), norm(r.line)]
+      const onSubject = f.expect.some((e) => hasExpect(sq, nm, e, exact)) || [...contentWords(r.line)].filter((w) => ask.has(w)).length >= 2
+      if (!onSubject) return false
+      const src = range(r)
+      return f.expect.every((e) => hasExpect(src.sq, src.nm, e, exact))
+    })
+    return { boundary: n, id: f.id, held: false, pointed: !!hit, evidence: hit ? cut(hit.line) : '' }
+  })
 }
