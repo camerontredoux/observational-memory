@@ -147,7 +147,7 @@ export const ran = (r: Run): ProcessRunResult => ({ ...r, isStdoutTruncated: fal
 export const NOT_A_REPO: Run = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
 
 // pi on the host, as `$.process.spawn` runs it: it observes by naming the prompts of its chunk, each at the time
-// its block shows; the reflector answers `reflect(n, prompt)` for its nth call, by default a reflection near its target. `hold` delays the nth call's answer, `fail`
+// its block shows; the reflector answers `reflect(n, prompt)` for its nth call, by default deleting nothing. `hold` delays the nth call's answer, `fail`
 // answers it with a failed run instead; `stopped` counts the calls killed before they answered. git, through
 // `$.process.run`, is answered by `git`, else as outside a repository, and is no pi call.
 // `$.model.complete` is counted, and answers nothing.
@@ -208,7 +208,7 @@ export function pi(
     let text: string
     if (prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
       reflections++
-      text = options.reflect?.(reflections, prompt) ?? nearTarget(prompt, '* 🟡 2026-09-22 14:30 Reflected')
+      text = options.reflect?.(reflections, prompt) ?? '<delete>\n</delete>'
     } else
       text =
         options.reply?.(prompt) ??
@@ -221,17 +221,6 @@ export function pi(
   return seen
 }
 
-// A Reflector's reply to `prompt` that lands near the size target the prompt gives: `head`, then filler lines at
-// the first observation's time, up to about 70% of the target. `isFiller` tells those lines apart.
-export function nearTarget(prompt: string, head = '') {
-  const target = Number(prompt.match(/Size target: at most ~(\d+) tokens/)![1])
-  const time = prompt.match(/^\* \S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /m)?.[1] ?? ''
-  const filler = (i: number) => `* 🟢 ${time} filler detail ${i}`
-  const lines = head ? [head] : []
-  for (let i = 0, chars = head.length; chars < 0.7 * target * 4; i++) lines.push(filler(i)), (chars += filler(i).length + 1)
-  return `<observations>\n${lines.join('\n')}\n</observations>`
-}
-export const isFiller = (line: string) => / filler detail \d+$/.test(line)
 // The size of entries as the memory renders them, each with its source range, as hooks/memory.ts estimates it.
 export const stampAt = (ms: number) => stampOf(new Date(ms).toISOString())
 export const tokensOf = (entries: readonly { line: string; source?: { from: number; to: number } }[]) =>

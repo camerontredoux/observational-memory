@@ -1,7 +1,7 @@
 // The memory message: the page a compaction leaves at the head of the context, rendered from the ledger and read back
 // from the context at the next compaction (memoryMessage, parseMemory), with the cuts that fit its sections to their
-// caps (capUserMessages, capReplies, slimmed) and the line, source and constraint formats its sections share with the
-// Observer's and Reflector's replies. No `$` here: the engine never lets it cross an import.
+// caps (capUserMessages, capReplies, slimmed), the line, source and constraint formats its sections share with the
+// Observer's replies, and the checks on the Reflector's deletions. No `$` here: the engine never lets it cross an import.
 import type { SessionMessage } from 'claude-code'
 import {
   COMPACT_RECENT,
@@ -16,6 +16,7 @@ import {
   MEMORY_RECALL,
   MEMORY_RESUME,
   MEMORY_RESUME_END,
+  REFLECTION_CATEGORIES,
 } from './prompts'
 import { parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
@@ -42,7 +43,7 @@ export type Skill = { skill: string; text: string; at?: number } // `at`: when i
 // The first and last times of the transcript rows an observation was drawn from: bounds om_recall takes, which
 // stay true as the live context shifts. Absent when no row was timed, or the memory it came from had none: unknown.
 export type Source = { from: number; to: number }
-export type Entry = { id: string; line: string; source?: Source; r?: true } // line: `🔴 2026-09-23 14:30 User asked …`; r: the Reflector wrote it
+export type Entry = { id: string; line: string; source?: Source; r?: true } // line: `🔴 2026-09-23 14:30 User asked …`; r: a condensing Reflector (before v1.12.0) wrote it
 export type UserMessage = { at?: string; text: string; omitted?: number } // `omitted`: a line standing for that many dropped
 export type Memory = {
   corrections: string[]
@@ -237,6 +238,57 @@ const openQuote = (line: string) => {
 // Without `sources`, the lines alone: what a memory over its budget sheds first.
 export const renderLines = (entries: readonly Entry[], sources = true) =>
   entries.map((e) => `* ${e.line}${sources && e.source ? ` ${renderSource(e.source)}` : ''}`).join('\n')
+
+// The reflector's deletions (prompts.ts REFLECTOR_SYSTEM_PROMPT) that its reply names and the checks pass, each with
+// its category, the line it cites and why; and the reply lines refused, each with the check it failed. A deletion
+// must name a known, unprotected line by a known category, never a line giving a reason, lesson or dead end, or one
+// recording the user: the audit's and the benchmark's wrong deletions were mostly these (docs/plans/reflection-filter.md).
+// Deleted in favour of a later line, it must cite one. A deletion whose cited line is also deleted, or holding an
+// identifier (backticked text, a SHA or #number) no kept line holds, is refused until none is left: keeping one
+// line can make another's deletion sound.
+export function reflectionDeletions(entries: readonly Entry[], protectedIds: ReadonlySet<string>, reply: string) {
+  const byId = new Map(entries.map((e, i) => [e.id, { e, i }]))
+  // A bare number is the id with its prefix left off, as the reflector often writes it.
+  const idOf = (t: string) => (byId.has(t) ? t : (entries.find((e) => e.id.replace(/^\D+/, '') === t)?.id ?? t))
+  const deleted = new Map<string, { category: string; cited?: string; why: string }>()
+  const refused: string[] = []
+  const body = reply.match(/<delete>([\s\S]*?)<\/delete>/)?.[1] ?? ''
+  for (const raw of body.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const m = raw.match(/^\[?(\w+)\]?\s+([\w-]+)\s+\[?(\w+|-)\]?:?\s*(.*)$/)
+    const [id, category, cited, why] = m ? [idOf(m[1]!), m[2]!, m[3] === '-' ? undefined : idOf(m[3]!), m[4]!] : []
+    const at = id === undefined ? undefined : byId.get(id)
+    if (!at || !(category! in REFLECTION_CATEGORIES)) refused.push(`${raw} (malformed)`)
+    else if (protectedIds.has(id!)) refused.push(`${raw} (protected)`)
+    else if (REASON.test(at.e.line)) refused.push(`${raw} (gives a reason)`)
+    else if (USER.test(at.e.line)) refused.push(`${raw} (records the user)`)
+    else if (cited !== undefined && (cited === id || !byId.has(cited))) refused.push(`${raw} (cites no other line)`)
+    else if (CITES.has(category!) && cited === undefined) refused.push(`${raw} (cites no line)`)
+    else if (LATER.has(category!) && byId.get(cited!)!.i < at.i) refused.push(`${raw} (cites an earlier line)`)
+    else deleted.set(id!, { category: category!, ...(cited === undefined ? {} : { cited }), why: why! })
+  }
+  for (let changed = true; changed; ) {
+    changed = false
+    const kept = entries.filter((e) => !deleted.has(e.id)).map((e) => e.line)
+    for (const [id, d] of deleted) {
+      const lacks = [...identifiers(byId.get(id)!.e.line)].filter((t) => !kept.some((k) => k.includes(t)))
+      if ((d.cited !== undefined && deleted.has(d.cited)) || lacks.length) {
+        deleted.delete(id)
+        refused.push(`${id} ${d.category} ${d.cited ?? '-'}: ${d.why} (${lacks.length ? `no kept line holds ${lacks.join(', ')}` : 'cites a deleted line'})`)
+        changed = true
+      }
+    }
+  }
+  return { deleted, refused }
+}
+// Categories that delete a line in favour of another, which the deletion cites; of those, the ones a later line supersedes.
+const CITES = new Set(['superseded-check', 'transient'])
+const LATER = CITES
+const REASON = /\b(because|so that|cannot|can't|only (way|fix)|root cause|caused by|reason|lesson|must|never|rule|why|instead|rather than|dead end|failed \d+ times?|didn't work|did not work|doesn't work|does not work)\b/i
+// What the user said, asked, approved or chose: kept, the audit's wrong deletions held some (docs/plans/reflection-filter.md).
+const USER = /\bUser (said|asked|approved|rejected|declined|preferred|prefers|decided|chose|wants|wanted|told|confirmed|agreed|clarified|reported)\b/
+// The identifiers in a line: backticked text, hex SHAs and #numbers. Bare numbers are left out: a superseded check's
+// counts ("61 passed") are the noise it is deleted as.
+const identifiers = (line: string) => new Set([...line.matchAll(/`([^`]+)`|\b([0-9a-f]{7,40})\b|#(\d+)/g)].map((m) => m[1] ?? m[2] ?? m[3]!))
 // The memory's form: a run of lines drawn from the same source range gives it once, after its last line, and each
 // day's date is written once, on an `@ YYYY-MM-DD` line before its first line; a line and a source then give the time alone.
 // A run of lines with no source that a run with one follows ends on NO_SOURCE, so it is not read back as part of it.

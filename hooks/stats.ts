@@ -56,7 +56,7 @@ export type Compaction = {
 // What the first main request after a compaction cost in input tokens: what the prompt cache served, what it wrote,
 // and the rest. The context the compaction installed is written afresh; the prefix before it may be read.
 export type CacheUse = { uncached: number; cacheRead: number; cacheWrite: number }
-export type Reflection = { ms: number; tokensBefore: number; tokensAfter: number; level: number }
+export type Reflection = { ms: number; tokensBefore: number; tokensAfter: number; deleted: number } // deleted: lines
 
 export const emptyStats = (sessionId: string, now: number, cwd?: string): SessionStats => ({
   version: 1,
@@ -150,7 +150,7 @@ export function addReflection(s: SessionStats, r: Reflection, at: number) {
   add(s, 'reflection.ms', r.ms, at)
   add(s, 'reflection.tokensBefore', r.tokensBefore, at)
   add(s, 'reflection.tokensAfter', r.tokensAfter, at)
-  add(s, 'reflection.level', r.level, at)
+  add(s, 'reflection.deleted', r.deleted, at)
 }
 
 export function addRecall(s: SessionStats, matches: number, fromFile: boolean, at: number) {
