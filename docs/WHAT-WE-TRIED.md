@@ -80,7 +80,7 @@ Scores are from `scripts/bench-compact.ts` unless the row says otherwise. "Main"
 | I4 thinking: Observer reads the assistant's reasoning | parked | PR #27 closed unmerged. | I4; branch `issue-22` |
 | I5 observer-tool: Observer records through a schema-checked tool | parked | PR #26 closed unmerged. | I5; branch `issue-19` |
 | I7 tasks, I12 contrast, I32 threads, I40 users-first, I43 file-ledger | parked | Not built or not measured. | I7, I12, I32, I40, I43 |
-| **Before Phase 2 (v1.0.0 to v1.3.0, live benchmark)** | | | |
+| **Before Phase 2 (v1.0.0 to v1.3.0, live benchmark, retired in `9c171a7`)** | | | |
 | `om_recall` visible after compaction without ToolSearch | landed | v1.1.0. recall-required success 1/3 → 6/6. | `docs/archive/bench/2026-09-24-v1.1.0-recall-required.md` |
 | Whole-term ranking in `om_recall` | landed | v1.2.0. Fixed `shard-101` losing to lines holding `101`. | `docs/plans/om-direction.md` |
 | Model-free brief as the fallback | landed | v1.2.0. Fallbacks: 7 of 42 om runs on v1.0.0, 0 of 33 compactions on v1.2.0. | `docs/archive/bench/2026-09-24-v1.2.0.md` |

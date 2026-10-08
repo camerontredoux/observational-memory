@@ -1,23 +1,13 @@
 # Benchmark baselines
 
-Each baseline is one run of the continuation-quality benchmark (`scripts/bench-live.ts`). It has two files:
+Each baseline is one run of the continuation-quality benchmark (`scripts/bench-live.ts`). That benchmark was retired
+in `9c171a7`; see git history for its scripts and usage. The files here are historical baselines. Each has two files:
 
 - `<date>-<version>.jsonl`: one scored record per live run.
 - `<date>-<version>.md`: the report made from those records.
 
 The reports of the superseded v1.0.0, v1.1.0 recall-required and v1.2.0 baselines are in `docs/archive/bench/`.
 Their `.jsonl` records stay here, because `scripts/bench-bm25.ts` reads every `docs/bench/*.jsonl`.
-
-To compare a change against a baseline:
-
-1. Run the benchmark on the change with its own version label, so its runs stay apart from the baseline's `new`:
-   `bun scripts/bench-live.ts run --version candidate --plugin-root <worktree> ...`
-2. Put both result files into one file, and render one report from it:
-
-```sh
-cat docs/bench/2026-09-24-v1.0.0.jsonl /tmp/om-bench/results.jsonl > /tmp/om-bench/compare.jsonl
-bun scripts/bench-live.ts report --results /tmp/om-bench/compare.jsonl --versions new,candidate
-```
 
 ## The recall-required scenario
 
@@ -37,14 +27,7 @@ threshold above that, no compaction happens and the run stops as incomplete.
 
 Each run cost $1.40–$1.67 at a 190k threshold (9 growth prompts, compaction at about 155k tokens). The scenario's per-run ceiling is $5, and the budget reserves it
 before each run. Give these runs their own results file (`--results`), so that the baseline's runs do not use the
-budget:
-
-```sh
-bun scripts/bench-live.ts run --config om+recall --version new --scenario recall-required --run 1 --pane <pane> \
-  --budget-usd 50 --results /tmp/om-bench/recall-required.jsonl --dry-run
-```
-
-Remove `--dry-run` to start the run. The report shows honest abstention ("I cannot find it") in its own table. It is
+budget. The report shows honest abstention ("I cannot find it") in its own table. It is
 not task success.
 
 ## Record paths
