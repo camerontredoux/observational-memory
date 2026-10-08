@@ -7,6 +7,8 @@ import { hasExpect, itemGate, itemTier, norm } from './rubric'
 
 export type BGate = 'rule' | 'permission' | 'done' | 'next' | 'value' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale' | 'purpose' | 'dropped' | 'false'
 export const BGATES: BGate[] = ['rule', 'permission', 'done', 'next', 'value', 'lessons', 'file-state', 'multi-hop', 'rationale', 'purpose', 'dropped', 'false']
+/** The reader's samples per probe: a probe passes by their majority. */
+export const BSAMPLES = 3
 /** A rubric item's probe gate: the hard types keep their retention gate's name; constraints and reversals are rules. */
 const bgate = (g: Gate): BGate => (g === 'constraints' || g === 'reversals' ? 'rule' : g === 'lessons' || g === 'file-state' || g === 'multi-hop' || g === 'rationale' || g === 'purpose' ? g : 'value')
 /** `answer`: a pattern (case-insensitive) for rule/value/next, the word for permission, the short SHA for done. */
