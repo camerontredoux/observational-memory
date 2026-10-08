@@ -43,8 +43,6 @@ export const MEMORY_MARK = 'The following observations block is your memory of t
 // The first words of the session brief's note when the floor made the memory message (hooks/prompts.ts FLOOR_NOTE).
 export const FLOOR_MARK = 'At the latest compaction the Observer had not observed'
 export const RECALL_TOOL = 'mcp__observational-memory__om_recall'
-// The tag `pi.ts` puts around the memory of a compaction pi's observational-memory extension made.
-export const PI_MEMORY_MARK = '<pi-om-memory>'
 
 // ---- Transcript ----
 
@@ -321,7 +319,7 @@ export function scoreRun(s: Scenario, config: Configuration, t: Transcript, stat
     const next = t.entries.slice(i + 1).find((x) => x.kind === 'summary' || x.kind === 'boundary')
     const text = next?.kind === 'summary' ? next.text : ''
     const brief = text.match(/<session-brief>\n([\s\S]*?)<\/session-brief>/)?.[1] ?? ''
-    const path: CompactionPath = !text.includes(MEMORY_MARK) && !text.includes(PI_MEMORY_MARK) ? 'built-in' : brief.includes(FLOOR_MARK) ? 'floor' : 'observational'
+    const path: CompactionPath = !text.includes(MEMORY_MARK) ? 'built-in' : brief.includes(FLOOR_MARK) ? 'floor' : 'observational'
     const parts = sections(text, path)
     const b = e as Extract<Entry, { kind: 'boundary' }>
     return {
