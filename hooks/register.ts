@@ -1840,6 +1840,149 @@ async function observeOnTheSpot($: EngineInterface, loop: Loop, life: string, v:
   return { chunks, failures, sync, deadlineHit }
 }
 
+// What the memory message carries beside the ledger: the memory message the context starts with, the session's
+// skills, Session line, turns and transcript, and the prompts and replies leaving context.
+async function memoryInputs($: EngineInterface, main: boolean, sessionId: string, v: View, messages: readonly SessionMessage[]) {
+  const base = v.base
+  const priorMemory = base ? parseMemory(messages[0]!) : undefined
+  const prior = priorMemory?.skills ?? []
+  // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
+  // A subagent's memory names no file, but om_recall reaches its thread through the session's.
+  const [skills, stored, turns, transcriptPath] = (await Promise.all([
+    main ? $.store.get(skillsKey(sessionId)) : undefined,
+    main ? $.store.get(goalKey(sessionId)) : undefined,
+    main ? loadTurns($, sessionId) : undefined,
+    $.store.get(transcriptKey(sessionId)),
+  ])) as [Skill[] | undefined, Goal | undefined, number[] | undefined, string | undefined]
+  const recorded = skills ?? []
+  const goal = main ? (stored?.line ?? priorMemory?.session) : undefined
+  const transcript = main ? transcriptPath : undefined
+  const known = mergeSkills(prior, recorded)
+  // A row of the live context as the memory message quotes it, with the time it was written where that is known.
+  const stamped = (i: number, text: string): UserMessage => ({ ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text })
+  // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
+  const prompts = messages.flatMap((m, i) => {
+    const text = i < base ? undefined : typed(m, known)
+    return text === undefined ? [] : [{ i, message: stamped(i, text) }]
+  })
+  if (!base && prompts[0]?.i === 0) prompts[0].message.text = withFilesRead(prompts[0].message.text, messages.slice(1, prompts[1]?.i))
+  // The reply ending each turn: the last assistant text before the next prompt, from rows past the memory message.
+  const replyRows = prompts.flatMap((p, k) => {
+    const lo = k ? prompts[k - 1]!.i : base - 1
+    for (let j = p.i - 1; j > lo; j--) {
+      const m = messages[j]!
+      if (m.role === 'assistant' && m.text.trim()) return [{ i: j, message: stamped(j, m.text.trim()) }]
+    }
+    return []
+  })
+  // An omitted-count line stands for dropped prompts, never for the latest one.
+  // A prompt cut to its note alone quotes nothing.
+  const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
+  return { priorMemory, prior, recorded, goal, turns, transcript, transcriptPath, prompts, replyRows, typedSoFar }
+}
+
+// What buildMemory builds from, the same at every cut it tries: the context, the memory's inputs, the budget, and
+// how the rows leaving context compile into the session brief (see compact).
+type MemorySources = Awaited<ReturnType<typeof memoryInputs>> & {
+  messages: readonly SessionMessage[]
+  v: View
+  environment: Awaited<ReturnType<typeof environmentOf>>
+  recall: boolean
+  resumeDirectly: boolean
+  budget: number
+  density: number
+  tailTokens: (cut: number) => number
+  compile: (from: number, to: number) => Promise<ReturnType<typeof compileBrief>>
+  dirs: () => Promise<[string, string | undefined]>
+}
+
+// The memory message from the ledger once this compaction's chunks commit: cut at the watermark, as observed.
+// Where that cannot stand (nothing observed, the Observer failed, or over the budget), the floor: the same memory
+// with the raw tail cut later, the rows between the watermark and the cut compiled by code into the session brief.
+// Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for a context that
+// is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
+// `kept`: the ledger is stored with the memory message, so a line the message leaves out (see unsaid) comes back.
+async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, sources: MemorySources) {
+  const { messages, v, priorMemory, prior, recorded, goal, turns, transcript, transcriptPath, prompts, replyRows, typedSoFar, environment, recall, resumeDirectly, budget, density, tailTokens, compile, dirs } = sources
+  const base = v.base
+  const observed = ledger.watermark.to
+  const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
+  // The files the observed rows changed: they leave context at every cut, and an observation may not name each file.
+  const observedFiles = observed > base ? compile(base, observed) : undefined
+  const attempt = async (cut: number, floor: boolean) => {
+    const tail = messages.slice(cut)
+    // The brief carried from the memory message, with the rows leaving context merged in: of the observed rows their
+    // files alone, the rest of the brief being the observations' to hold; the rows the floor compiles whole. A brief
+    // is carried even where the Observer's memory stands again: it holds rows the Observer never observed, which no
+    // observation covers.
+    const from = floor ? observed : cut
+    let brief = priorMemory?.brief
+    const files = await observedFiles
+    if (files?.modified.length || files?.created.length) brief = mergeBriefs(brief, { ...emptyBrief(), modified: files.modified, created: files.created, outstanding: brief?.outstanding ?? [] })
+    if (from < cut) brief = mergeBriefs(brief, await compile(from, cut))
+    const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs()))
+    let memory: Memory = {
+      corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
+        estimateTokens(renderCorrections(l)),
+      ),
+      observations: renderGrouped(ledger.entries),
+      currentTask: ledger.currentTask,
+      ...(goal ? { session: goal } : {}),
+      ...(covered ? { stateAt: stamp(covered.to) } : {}),
+      skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
+      userMessages: capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)]),
+      // The session's first prompt, a crewmate's whole brief, is quoted above; quoted again as the latest request it
+      // would send the agent back to the top of its brief.
+      // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
+      nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
+      ...(environment ? { environment } : {}),
+      ...(failures.length ? { failures } : {}),
+      ...(brief ? { brief } : {}),
+      ...(floor ? { floor } : {}),
+      transcript,
+      recoverable: transcriptPath !== undefined,
+      recall,
+      recentKept: tail.length > 0,
+      resumeDirectly,
+    }
+    // The compacted context: the memory message with its margin, and the raw tail at its density.
+    const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
+    // The replies fill what room is left below REPLIES_ROOM_TOKENS, at most REPLIES_MAX_TOKENS.
+    const room = REPLIES_ROOM_TOKENS - contextTokens(memoryMessage(memory))
+    memory.replies = capReplies([...(priorMemory?.replies ?? []), ...replyRows.filter((r) => r.i < cut).map((r) => r.message)], Math.min(REPLIES_MAX_TOKENS, Math.floor(room / MEMORY_HEADROOM)))
+    // The observations as shown beside the replies: where the ledger keeps every line, one quoting a reply is left out.
+    let sources = true
+    const shown = (m: Memory): Memory => ({ ...m, observations: renderGrouped(kept ? unsaid(ledger.entries, m.replies) : ledger.entries, sources) })
+    memory = shown(memory)
+    let message = memoryMessage(memory)
+    // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
+    // compaction), then the skills become lines and the user messages the first alone, which om_recall can still
+    // find; the corrections (within their cap), observations and continuation record stay whole.
+    const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(slimmed(m))]]
+    if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
+    const over = contextTokens(message)
+    let tokens = over
+    const made: string[] = []
+    for (const [what, shorten] of cuts) {
+      if (tokens <= budget) break
+      memory = shorten(memory)
+      message = memoryMessage(memory)
+      tokens = contextTokens(message)
+      made.push(what)
+    }
+    return { ledger, cut, memory, message, tokens, over, made, floor, briefed: floor ? cut - observed : 0 } // rows the Observer had not observed
+  }
+  const stands = (a: Awaited<ReturnType<typeof attempt>>) => {
+    if (a.made.length) log($, `over the ~${budget}-token budget at ~${a.over} tokens: ${a.made.join('; ')}`)
+    return a
+  }
+  let last
+  if (observed > base && (last = await attempt(observed, false)).tokens <= budget) return stands(last)
+  for (const cut of floorCuts(v, observed)) if ((last = await attempt(cut, true)).tokens <= budget) return stands(last)
+  if (!last) throw new Error(MEMORY_ALONE)
+  throw new Error(overLimit(OVER_BUDGET, last.tokens, budget))
+}
+
 // The compaction from the ledger: what the session.compact hook runs.
 // The ordering it relies on, against the background observation sharing this process's state:
 // - The loop's life (`life`) is taken before the first await past the nothing-new check. Once it moves on, the
@@ -1911,40 +2054,8 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     !briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to
       ? await observeOnTheSpot($, loop, life, v, initial, start, history !== undefined, next.signal)
       : { chunks: [], failures: [], sync: { calls: 0, ms: 0 }, deadlineHit: false }
-  const priorMemory = base ? parseMemory(messages[0]!) : undefined
-  const prior = priorMemory?.skills ?? []
-  // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
-  // A subagent's memory names no file, but om_recall reaches its thread through the session's.
-  const [skills, stored, turns, transcriptPath] = (await Promise.all([
-    main ? $.store.get(skillsKey(sessionId)) : undefined,
-    main ? $.store.get(goalKey(sessionId)) : undefined,
-    main ? loadTurns($, sessionId) : undefined,
-    $.store.get(transcriptKey(sessionId)),
-  ])) as [Skill[] | undefined, Goal | undefined, number[] | undefined, string | undefined]
-  const recorded = skills ?? []
-  const goal = main ? (stored?.line ?? priorMemory?.session) : undefined
-  const transcript = main ? transcriptPath : undefined
-  const known = mergeSkills(prior, recorded)
-  // A row of the live context as the memory message quotes it, with the time it was written where that is known.
-  const stamped = (i: number, text: string): UserMessage => ({ ...(v.at[i] === undefined ? {} : { at: stamp(v.at[i]!) }), text })
-  // The prompts leaving context join those the memory message carried; the newest prompt is the next step when it leaves context too.
-  const prompts = messages.flatMap((m, i) => {
-    const text = i < base ? undefined : typed(m, known)
-    return text === undefined ? [] : [{ i, message: stamped(i, text) }]
-  })
-  if (!base && prompts[0]?.i === 0) prompts[0].message.text = withFilesRead(prompts[0].message.text, messages.slice(1, prompts[1]?.i))
-  // The reply ending each turn: the last assistant text before the next prompt, from rows past the memory message.
-  const replyRows = prompts.flatMap((p, k) => {
-    const lo = k ? prompts[k - 1]!.i : base - 1
-    for (let j = p.i - 1; j > lo; j--) {
-      const m = messages[j]!
-      if (m.role === 'assistant' && m.text.trim()) return [{ i: j, message: stamped(j, m.text.trim()) }]
-    }
-    return []
-  })
-  // An omitted-count line stands for dropped prompts, never for the latest one.
-  // A prompt cut to its note alone quotes nothing.
-  const typedSoFar = [...(priorMemory?.userMessages ?? []).filter((m) => !m.omitted && !isStub(m.text)), ...prompts.map((p) => p.message)]
+  const carried = await memoryInputs($, main, sessionId, v, messages)
+  const { transcriptPath } = carried
   const { budget, density, overhead } = planBudget(usage, main, tokensBetween(v, 0, messages.length))
 
   // Rows [from, to) as the session brief compiles them, each line with its om_recall reference when the model can
@@ -1964,91 +2075,8 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     const [cwd, home] = await dirs()
     return compileBrief(rows, v.at.slice(from, to), cwd, home, refOf)
   }
+  const sources: MemorySources = { ...carried, messages, v, environment, recall, resumeDirectly: e.trigger === 'auto', budget, density, tailTokens, compile, dirs }
 
-  // The memory message from the ledger once this compaction's chunks commit: cut at the watermark, as observed.
-  // Where that cannot stand (nothing observed, the Observer failed, or over the budget), the floor: the same memory
-  // with the raw tail cut later, the rows between the watermark and the cut compiled by code into the session brief.
-  // Still over the budget at every cut the floor tries, the built-in compaction runs; so it does for a context that
-  // is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
-  // `kept`: the ledger is stored with the memory message, so a line the message leaves out (see unsaid) comes back.
-  const build = async (ledger: Ledger, kept: boolean) => {
-    const observed = ledger.watermark.to
-    const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
-    // The files the observed rows changed: they leave context at every cut, and an observation may not name each file.
-    const observedFiles = observed > base ? compile(base, observed) : undefined
-    const attempt = async (cut: number, floor: boolean) => {
-      const tail = messages.slice(cut)
-      // The brief carried from the memory message, with the rows leaving context merged in: of the observed rows their
-      // files alone, the rest of the brief being the observations' to hold; the rows the floor compiles whole. A brief
-      // is carried even where the Observer's memory stands again: it holds rows the Observer never observed, which no
-      // observation covers.
-      const from = floor ? observed : cut
-      let brief = priorMemory?.brief
-      const files = await observedFiles
-      if (files?.modified.length || files?.created.length) brief = mergeBriefs(brief, { ...emptyBrief(), modified: files.modified, created: files.created, outstanding: brief?.outstanding ?? [] })
-      if (from < cut) brief = mergeBriefs(brief, await compile(from, cut))
-      const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs()))
-      let memory: Memory = {
-        corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
-          estimateTokens(renderCorrections(l)),
-        ),
-        observations: renderGrouped(ledger.entries),
-        currentTask: ledger.currentTask,
-        ...(goal ? { session: goal } : {}),
-        ...(covered ? { stateAt: stamp(covered.to) } : {}),
-        skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),
-        userMessages: capUserMessages([...(priorMemory?.userMessages ?? []), ...prompts.filter((p) => p.i < cut).map((p) => p.message)]),
-        // The session's first prompt, a crewmate's whole brief, is quoted above; quoted again as the latest request it
-        // would send the agent back to the top of its brief.
-        // A newest prompt the raw tail keeps is already in view; quoting it again would repeat it.
-        nextStep: typedSoFar.length > 1 && !((prompts.at(-1)?.i ?? -1) >= cut) ? typedSoFar.at(-1)!.text : undefined,
-        ...(environment ? { environment } : {}),
-        ...(failures.length ? { failures } : {}),
-        ...(brief ? { brief } : {}),
-        ...(floor ? { floor } : {}),
-        transcript,
-        recoverable: transcriptPath !== undefined,
-        recall,
-        recentKept: tail.length > 0,
-        resumeDirectly: e.trigger === 'auto',
-      }
-      // The compacted context: the memory message with its margin, and the raw tail at its density.
-      const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
-      // The replies fill what room is left below REPLIES_ROOM_TOKENS, at most REPLIES_MAX_TOKENS.
-      const room = REPLIES_ROOM_TOKENS - contextTokens(memoryMessage(memory))
-      memory.replies = capReplies([...(priorMemory?.replies ?? []), ...replyRows.filter((r) => r.i < cut).map((r) => r.message)], Math.min(REPLIES_MAX_TOKENS, Math.floor(room / MEMORY_HEADROOM)))
-      // The observations as shown beside the replies: where the ledger keeps every line, one quoting a reply is left out.
-      let sources = true
-      const shown = (m: Memory): Memory => ({ ...m, observations: renderGrouped(kept ? unsaid(ledger.entries, m.replies) : ledger.entries, sources) })
-      memory = shown(memory)
-      let message = memoryMessage(memory)
-      // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
-      // compaction), then the skills become lines and the user messages the first alone, which om_recall can still
-      // find; the corrections (within their cap), observations and continuation record stay whole.
-      const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(slimmed(m))]]
-      if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
-      const over = contextTokens(message)
-      let tokens = over
-      const made: string[] = []
-      for (const [what, shorten] of cuts) {
-        if (tokens <= budget) break
-        memory = shorten(memory)
-        message = memoryMessage(memory)
-        tokens = contextTokens(message)
-        made.push(what)
-      }
-      return { ledger, cut, memory, message, tokens, over, made, floor, briefed: floor ? cut - observed : 0 } // rows the Observer had not observed
-    }
-    const stands = (a: Awaited<ReturnType<typeof attempt>>) => {
-      if (a.made.length) log($, `over the ~${budget}-token budget at ~${a.over} tokens: ${a.made.join('; ')}`)
-      return a
-    }
-    let last
-    if (observed > base && (last = await attempt(observed, false)).tokens <= budget) return stands(last)
-    for (const cut of floorCuts(v, observed)) if ((last = await attempt(cut, true)).tokens <= budget) return stands(last)
-    if (!last) throw new Error(MEMORY_ALONE)
-    throw new Error(overLimit(OVER_BUDGET, last.tokens, budget))
-  }
   // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
   // message that stands; once installed, the watermark restarts after the memory message, and the chunks past
   // it are found again there. One that does not stand leaves the chunks committed, not installed.
@@ -2060,7 +2088,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     const stores = persistent && ledger.watermark.to > base && isLive(loop, life) // under the lock, as a loop's end deletes
     let built
     try {
-      built = await build(ledger, stores && installs)
+      built = await buildMemory($, ledger, stores && installs, sources)
     } catch (error) {
       if (stores && chunks.length) await saveLedger($, loop, ledger)
       throw error
