@@ -1883,7 +1883,7 @@ function linesUp(messages: readonly SessionMessage[], rows: readonly SessionMess
 // in the stats by trigger, by how the first differing row differs (`short`: the context is longer than the history;
 // `extra`: it reads as a later history row, so the history holds rows the context lacks; `missing`: an earlier one;
 // `changed`: none nearby) and by the two rows' kinds, with how far from the end it sits and the observed rows kept.
-function notPersistent($: EngineInterface, sessionId: string, trigger: string, agentId: string | undefined, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number, kept: number) {
+function notPersistent($: EngineInterface, sessionId: string, trigger: string, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number, kept: number) {
   const shape = (m: SessionMessage) => `${m.role}, ${rowText(m).length} chars, ${m.toolUses.length} tool uses, ${m.toolResults?.length ?? 0} tool results`
   const { differs, i, seen } = firstDiffering(messages, rows, offset)
   const differing = offset < 0 ? messages.length : messages.filter(differs).length
@@ -1904,27 +1904,7 @@ function notPersistent($: EngineInterface, sessionId: string, trigger: string, a
     add(s, 'compaction.notPersistent.differing', differing, at)
     add(s, 'compaction.notPersistent.rowsKept', kept, at)
   })
-  void captureMismatch($, sessionId, trigger, agentId, messages, rows, offset).catch((error) => log($, `mismatch capture not saved (${errorText(error)})`))
 }
-
-// [DEBUG-np01] Temporary, until the subagent mismatches are explained: each side's rows by shape, kind, a short hash
-// and their first words, written beside the stats folder (`mismatches/<session>-<time>-<n>.json`). The history from the
-// context's offset (all of it when shorter), so row i of each side is the pair `align` compared.
-async function captureMismatch($: EngineInterface, sessionId: string, trigger: string, agentId: string | undefined, messages: readonly SessionMessage[], rows: readonly SessionMessage[], offset: number) {
-  const row = (m: SessionMessage) => ({
-    kind: kindOf(m),
-    hash: rowHash(m).slice(0, 8),
-    chars: rowText(m).length,
-    tools: m.toolUses.map((u) => u.tool),
-    results: m.toolResults?.length ?? 0,
-    head: rowText(m).slice(0, 80),
-  })
-  const [dir, at] = await Promise.all([statsDir(statsIo($)), $.clock.now()])
-  const historyFrom = Math.max(offset, 0)
-  const capture = { sessionId, agentId, trigger, at: new Date(at).toISOString(), offset, historyFrom, historyRows: rows.length, context: messages.map(row), history: rows.slice(historyFrom).map(row) }
-  await $.fs.write(`${dir.replace(/[^/]*$/, 'mismatches')}/${sessionId}-${at}-${captures++}.json`, JSON.stringify(capture))
-}
-let captures = 0 // subagents compact in the same millisecond
 
 // Delegates this compaction to the built-in compactor unchanged (`e` passed on as received), and records the live
 // key so a compaction after it can still find the context it kept (see `arrange`). Every delegation is recorded as
@@ -2014,7 +1994,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const v = view(lined ? rows.slice(offset, offset + messages.length) : messages, await loadMarks($, loop), persistent || lined ? offset : undefined)
   const base = v.base
   const initial = await locked(() => loadLedger($, loop.key, v))
-  if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', e.agentId, messages, rows, offset, initial.watermark.to - base)
+  if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)
   const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
   // What the raw tail from `cut` takes in the compacted context, its old results cut (maskTail).
   const tailTokens = (cut: number) => maskTail(messages.slice(cut)).reduce((n, m) => n + estimateTokens(rowText(m)), 0)
