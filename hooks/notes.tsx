@@ -1,4 +1,5 @@
 import type { EngineInterface, On } from 'claude-code'
+import { TIMED_LINE } from './lines'
 import type { Entry } from './memory'
 import { errorText, key } from './prune'
 
@@ -12,9 +13,6 @@ const POLL_MS = 3_000
 
 // The part of register.ts's Ledger the pane draws.
 type Ledger = { entries: Entry[]; corrections: string[]; chunks: { lines: string[] }[]; currentTask?: string; seq: number }
-
-// `🔴 2026-09-23 14:30 User asked …`: the marker, the day, the time and the text.
-const LINE = /^(\S+)\s+(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})\s+([\s\S]*)$/
 
 const isUp = async ($: EngineInterface) => (await $.ui.panes()).some((pane) => pane.id === PANE)
 
@@ -76,7 +74,7 @@ export const registerNotes = (on: On) => {
 
     let day = ''
     const line = (text: string, reflected = false) => {
-      const m = text.match(LINE)
+      const m = text.match(TIMED_LINE)
       if (!m) return <Text wrap="wrap">{text}</Text>
       const head = m[2] !== day ? ((day = m[2]!), <Text bold>{day}</Text>) : null
       return (

@@ -36,13 +36,13 @@ import {
   renderLines,
   REPLACES,
   SESSION_LABEL,
-  splitSource,
-  stamp,
   tag,
   truncate,
   WHERE,
 } from './memory'
-import type { Bounds, Entry, Memory, Skill, Source, Unmarked, UserMessage } from './memory'
+import type { Bounds, Entry, Memory, Skill, Unmarked, UserMessage } from './memory'
+import { splitSource, stamp, timeOf } from './lines'
+import type { Source } from './lines'
 
 // Every model call: pi with GPT-6 Luna, the prompt on stdin, run from a neutral directory.
 const PI = ['pi', '-p', '--model', 'openai-codex/gpt-6-luna', '--thinking', 'low']
@@ -684,10 +684,9 @@ function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
     for (const [q] of text.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g)) named.add(q.split('/').filter(Boolean).at(-1)!.toLowerCase())
     cues.push({ line, r: true })
   }
-  const timeOf = (l: { line: string }) => l.line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? ''
   const merged = [...lines]
   for (const c of cues) {
-    const i = merged.findIndex((l) => timeOf(l) > timeOf(c))
+    const i = merged.findIndex((l) => (timeOf(l.line) ?? '') > (timeOf(c.line) ?? ''))
     merged.splice(i < 0 ? merged.length : i, 0, c)
   }
   return merged
@@ -696,13 +695,12 @@ function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
 // `red` placed among `lines` in time order, each before the first line later than it; one without a time goes where
 // the one before it did.
 function interleave(lines: Omit<Entry, 'id'>[], red: Entry[]) {
-  const timeOf = (e: { line: string }) => e.line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1]
   const out: Omit<Entry, 'id'>[] = []
   let i = 0
   let t = ''
   for (const r of red) {
-    t = timeOf(r) ?? t
-    while (i < lines.length && (timeOf(lines[i]!) ?? '') <= t) out.push(lines[i++]!)
+    t = timeOf(r.line) ?? t
+    while (i < lines.length && (timeOf(lines[i]!.line) ?? '') <= t) out.push(lines[i++]!)
     out.push(r)
   }
   return [...out, ...lines.slice(i)]
@@ -1066,7 +1064,7 @@ function carryClauses(v: View, from: number, to: number, lines: string[]) {
   for (const f of best.slice(0, CARRIED_CLAUSES)) {
     const t = v.at[f.at] === undefined ? undefined : stamp(v.at[f.at]!)
     const line = `🟡 ${t ? `${t} ` : ''}Assistant said: "${f.clause}"`
-    const k = t ? out.findIndex((l) => (l.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? '') > t) : -1
+    const k = t ? out.findIndex((l) => (timeOf(l) ?? '') > t) : -1
     out.splice(k < 0 ? out.length : k, 0, line)
   }
   return out
@@ -1189,7 +1187,7 @@ function fresh(v: View, seq = 0): Ledger {
 // time stays after the line before it.
 function byTime(lines: readonly string[]) {
   let last = ''
-  const timed = lines.map((line, k) => ({ line, k, t: (last = line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? last) }))
+  const timed = lines.map((line, k) => ({ line, k, t: (last = timeOf(line) ?? last) }))
   return timed.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : a.k - b.k)).map((x) => x.line)
 }
 

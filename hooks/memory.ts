@@ -1,7 +1,8 @@
 // The memory message: the page a compaction leaves at the head of the context, rendered from the ledger and read back
 // from the context at the next compaction (memoryMessage, parseMemory), with the cuts that fit its sections to their
-// caps (capUserMessages, capReplies, slimmed) and the line, source and constraint formats its sections share with the
-// Observer's and Reflector's replies. No `$` here: the engine never lets it cross an import.
+// caps (capUserMessages, capReplies, slimmed), the reading of the Observer's and Reflector's replies into lines
+// (parseLines) and the constraint format its sections share with them; the line and source formats are lines.ts's.
+// No `$` here: the engine never lets it cross an import.
 import type { SessionMessage } from 'claude-code'
 import {
   COMPACT_RECENT,
@@ -18,6 +19,8 @@ import {
   MEMORY_RESUME,
   MEMORY_RESUME_END,
 } from './prompts'
+import { realTime, renderLine, renderSource, SOURCE_TRAILER, splitSource, stamp, unstamp } from './lines'
+import type { Source } from './lines'
 import { parseBrief, parseFailures, renderBrief, renderFailure } from './vcc'
 import type { Brief, OpenFailure } from './vcc'
 
@@ -39,9 +42,6 @@ const SKILL_FINISHED = '(finished; invoke it again to reread its text, or om_rec
 const SKILL_BLOCK = /<skill name="([^"]*)"(?: invoked="([\d-]+ [\d:]+)")?>(?:\n([\s\S]*?)\n<\/skill>|\(finished;[^\n]*<\/skill>)(?=\n<skill name="|\n<\/skills-in-use>)/g
 
 export type Skill = { skill: string; text: string; at?: number } // `at`: when it was invoked; no text: finished, kept as a line
-// The first and last times of the transcript rows an observation was drawn from: bounds om_recall takes, which
-// stay true as the live context shifts. Absent when no row was timed, or the memory it came from had none: unknown.
-export type Source = { from: number; to: number }
 export type Entry = { id: string; line: string; source?: Source; r?: true } // line: `🔴 2026-09-23 14:30 User asked …`; r: the Reflector wrote it
 export type UserMessage = { at?: string; text: string; omitted?: number } // `omitted`: a line standing for that many dropped
 export type Memory = {
@@ -101,28 +101,6 @@ export function hash(text: string) {
   return (h >>> 0).toString(16)
 }
 
-const pad = (n: number) => String(n).padStart(2, '0')
-export const stamp = (ms: number) => {
-  const d = new Date(ms)
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-// A line's source, rendered after it: both ends as om_recall's `from` and `to` take them, an end on `day` without its date.
-const SOURCE_TRAILER = /\s*\(source:? ([^()]*)\)$/
-const dayless = (at: number, day: string) => (day && stamp(at).startsWith(`${day} `) ? stamp(at).slice(day.length + 1) : stamp(at))
-const renderSource = (s: Source, day = '') => `(source ${dayless(s.from, day)} to ${dayless(s.to, day)})`
-
-// A line and the source range it ends with. A trailer that is not a range of times is part of the line; a range
-// that runs backwards is cut off and gives no source.
-export function splitSource(text: string): { line: string; source?: Source } {
-  const m = text.match(SOURCE_TRAILER)
-  if (!m) return { line: text }
-  const [a, b = a] = m[1]!.split(' to ').map((t) => unstamp(t.trim()))
-  if (a === undefined || b === undefined) return { line: text }
-  const line = text.slice(0, m.index).trimEnd()
-  return b < a ? { line } : { line, source: { from: a, to: b } }
-}
-
 // The tag must start a line.
 export const tag = (text: string, name: string) =>
   text.match(new RegExp(`^[ \\t]*<${name}>([\\s\\S]*?)^[ \\t]*</${name}>`, 'im'))?.[1]?.trim() || undefined
@@ -169,13 +147,6 @@ export function applyConstraints(active: readonly string[], lines: readonly stri
   return [...out.values()]
 }
 
-function realTime(y: number, mo: number, d: number, h: number, mi: number) {
-  const date = new Date(y, mo - 1, d, h, mi)
-  return date.getFullYear() === y && date.getMonth() === mo - 1 && date.getDate() === d && date.getHours() === h && date.getMinutes() === mi
-    ? date.getTime()
-    : undefined
-}
-
 // Observation lines as `<marker> YYYY-MM-DD HH:MM <text>`: the timestamp read from the line, or from an older
 // reply's `Date:` header and `(HH:MM)`; checked against `bounds` and clamped into them, a line without a real one given
 // the latest time the source shows. Without bounds a time is kept only if real, and never invented. An unmarked line
@@ -220,7 +191,7 @@ export function parseLines(text: string, bounds: Bounds, stripTimes = false, unm
     if (!line) continue
     if (stripTimes) at = undefined
     else if (bounds) at = Math.min(Math.max(at ?? bounds.latest, bounds.lo), bounds.hi)
-    lines.push(at === undefined ? `${marker} ${line}` : `${marker} ${stamp(at)} ${line}`)
+    lines.push(renderLine(marker, at, line))
     if (own) unmarked?.(said, { own: lines.at(-1) })
   }
   return lines
@@ -484,11 +455,6 @@ export function slimmed(memory: Memory): Memory {
 const renderSkill = (s: Skill) => {
   const head = `<skill name="${s.skill}"${s.at === undefined ? '' : ` invoked="${stamp(s.at)}"`}>`
   return s.text ? `${head}\n${s.text}\n</skill>` : `${head}${SKILL_FINISHED}</skill>`
-}
-
-function unstamp(text: string) {
-  const m = text.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/)
-  return m ? realTime(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])) : undefined
 }
 
 // The session brief sits after the skills, before the user's messages: every line of it starts with `>`, `[`, `-`

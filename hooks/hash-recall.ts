@@ -2,6 +2,7 @@
 // for a `#` token then a letter (queryOf). The index (indexOf) holds each line's row and words, ranked once, so a
 // keystroke only filters it (suggest). Pure: no `$` and no I/O; register.ts keeps the index per session and feeds it.
 import type { PromptAutocompleteSuggestion } from 'claude-code'
+import { partsOf } from './lines'
 import { baseOf } from './memory'
 import type { Entry } from './memory'
 import { MARKERS } from './prompts'
@@ -9,7 +10,6 @@ import { MARKERS } from './prompts'
 const MAX_ROWS = 8
 const TRIGGER = /^#\p{L}/u // `#` alone (a heading), `##`, `#!` and `#123` (an issue reference) are not asked
 const SPLIT = /[^\p{L}\p{N}]+/u
-const HEAD = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})(?:\s+|$)/
 
 export type Row = { suggestion: PromptAutocompleteSuggestion; words: string[] }
 export type Index = readonly Row[]
@@ -19,16 +19,6 @@ const wordsOf = (text: string) => text.toLowerCase().split(SPLIT).filter(Boolean
 // The query words of a token, or none for a token that is not a trigger.
 export const queryOf = (token: string): string[] => (TRIGGER.test(token) ? wordsOf(token.slice(1)) : [])
 
-// One line's marker, time and words as they read, without the replaced-constraint note.
-function partsOf(line: string) {
-  let rest = baseOf(line).trim()
-  const marker = MARKERS.find((m) => rest.startsWith(m))
-  if (marker) rest = rest.slice(marker.length).trim()
-  const time = rest.match(HEAD)?.[1]
-  if (time) rest = rest.slice(time.length).trim()
-  return { marker, time, text: rest }
-}
-
 // The ledger's lines as rows, ranked: constraints first, then by marker, then newest (time, then ledger place).
 export function indexOf(ledger: { entries?: readonly Entry[]; corrections?: readonly string[] }): Index {
   const lines = [
@@ -36,7 +26,7 @@ export function indexOf(ledger: { entries?: readonly Entry[]; corrections?: read
     ...(ledger.entries ?? []).map((e, place) => ({ line: e.line, place, tag: e.r ? 'condensed' : undefined, constraint: false })),
   ]
   const ranked = lines
-    .map((l) => ({ ...l, ...partsOf(l.line) }))
+    .map((l) => ({ ...l, ...partsOf(baseOf(l.line)) }))
     .filter((l) => l.text)
     .map((l) => ({ ...l, rank: l.marker ? MARKERS.indexOf(l.marker) : MARKERS.length })) // a line with no marker ranks after them
     .sort((a, b) => Number(b.constraint) - Number(a.constraint) || a.rank - b.rank || (b.time ?? '').localeCompare(a.time ?? '') || b.place - a.place)
