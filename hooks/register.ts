@@ -1983,6 +1983,68 @@ async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, so
   throw new Error(overLimit(OVER_BUDGET, last.tokens, budget))
 }
 
+// Says how a compaction that stands went: each failed chunk on screen, the rest in the debug log and the stats.
+// `tooLittle`: a manual compaction observed nothing, there being less than a chunk before the raw tail.
+async function reportCompaction(
+  $: EngineInterface,
+  e: SessionCompactInput,
+  { ledger, cut, memory, message, floor, briefed, observedNow }: Awaited<ReturnType<typeof buildMemory>> & { observedNow: number },
+  c: {
+    sessionId: string
+    started: number
+    usage: SessionUsage | undefined
+    base: number
+    rows: number
+    tailTokens: (cut: number) => number
+    failures: { rows: number; why: string }[]
+    sync: { calls: number; ms: number }
+    deadlineHit: boolean
+    unreadable: boolean
+    tooLittle: boolean
+  },
+) {
+  const { sessionId, started, usage, base, tailTokens, failures, sync, deadlineHit } = c
+  const main = e.agentId === undefined
+  // Failed rows the floor compiled into the brief are not kept.
+  for (const f of failures) show($, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
+  const observed = ledger.watermark.to
+  // Why the floor ran, as buildMemory found it.
+  const why = observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : c.tooLittle ? 'too little to observe yet' : 'nothing was observed yet'
+  const briefTokens = memory.brief ? estimateTokens(renderBrief(memory.brief, memory.recall)) : 0
+  log(
+    $,
+    (observedNow ? `observed ${observedNow} rows now, ` : floor ? '' : 'cut at the background watermark with no Observer call, ') +
+      (floor ? `the floor (${why}): ${briefed} rows compiled into the session brief, ` : '') +
+      `kept ${c.rows - cut} raw messages (~${tailTokens(cut)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
+      `${ledger.entries.length} observations, ${memory.skills.length} skill(s)${memory.brief ? `, brief ~${briefTokens} tokens` : ''}`,
+  )
+  // The debug log only: the memory row in the chat marks the compaction.
+  log(
+    $,
+    `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
+      `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}` +
+      (floor ? ` · ${plural(briefed, 'message')} in a brief compiled by code (${why})` : ''),
+  )
+  const compaction = {
+    trigger: main ? e.trigger : 'subagent',
+    fellBack: false,
+    floor,
+    tokensBefore: main ? usage?.context.tokens : undefined, // the last response's input: system prompt and tools included
+    estTokensAfter: estimateTokens(message.text) + tailTokens(cut), // messages only
+    syncCalls: sync.calls,
+    syncMs: sync.ms,
+    rowsObservedNow: observedNow,
+    rowsObservedBefore: observed - base - observedNow,
+    ...(deadlineHit ? { deadlineHit } : {}),
+    ...(c.unreadable ? { unreadable: true } : {}), // a history the session cannot read: a workflow agent's, a fork's
+    ...(briefed ? { rowsBriefed: briefed } : {}),
+    memoryTokens: estimateTokens(message.text),
+    ...(memory.brief ? { briefTokens } : {}),
+    observations: ledger.entries.length,
+  }
+  record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
+}
+
 // The compaction from the ledger: what the session.compact hook runs.
 // The ordering it relies on, against the background observation sharing this process's state:
 // - The loop's life (`life`) is taken before the first await past the nothing-new check. Once it moves on, the
@@ -2045,7 +2107,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
 
   // The cut is the watermark when what follows it fits; otherwise everything before the raw tail not yet
   // observed is observed now, in chunks, all at once. A chunk pi fails on stays raw: the cut is wherever the rest
-  // reaches, and with nothing observed at all the floor compiles a brief of the rest (see `build`).
+  // reaches, and with nothing observed at all the floor compiles a brief of the rest (see buildMemory).
   // A manual compaction with nothing observed since the last one, and less before the raw tail than the whole chunk
   // the background waits for, observes nothing: the person waits on it, so the floor's brief stands for those rows.
   const start = tailStart(v, base)
@@ -2099,47 +2161,10 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     if (stores && installs) await saveLedger($, loop, { ...ledger, anchor: hash(built.memory.observations), watermark: { from: 1, to: 1, hash: hash(''), head: '' } })
     return { ...built, observedNow }
   }
-  const { ledger, cut, memory, message, floor, briefed, observedNow } = await locked(async () => settle(await loadLedger($, loop.key, v)))
-  // Failed rows the floor compiled into the brief are not kept.
-  for (const f of failures) show($, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
+  const settled = await locked(async () => settle(await loadLedger($, loop.key, v)))
+  const { cut, message } = settled
+  await reportCompaction($, e, settled, { sessionId, started, usage, base, rows: messages.length, tailTokens, failures, sync, deadlineHit, unreadable: !history, tooLittle: briefOnly && start > base })
   const kept = new Set(order.slice(cut))
-  const observed = ledger.watermark.to
-  // Why the floor ran, as `build` found it.
-  const why =
-    observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : briefOnly && start > base ? 'too little to observe yet' : 'nothing was observed yet'
-  const briefTokens = memory.brief ? estimateTokens(renderBrief(memory.brief, memory.recall)) : 0
-  log(
-    $,
-    (observedNow ? `observed ${observedNow} rows now, ` : floor ? '' : 'cut at the background watermark with no Observer call, ') +
-      (floor ? `the floor (${why}): ${briefed} rows compiled into the session brief, ` : '') +
-      `kept ${messages.length - cut} raw messages (~${tailTokens(cut)} tokens); memory ~${estimateTokens(message.text)} tokens, ` +
-      `${ledger.entries.length} observations, ${memory.skills.length} skill(s)${memory.brief ? `, brief ~${briefTokens} tokens` : ''}`,
-  )
-  // The debug log only: the memory row in the chat marks the compaction.
-  log(
-    $,
-    `Compacted${main ? '' : ' subagent'} in ${duration((await $.clock.now()) - started)}` +
-      `${observedNow ? ` · observed ${plural(observedNow, 'message')} on the spot` : ''} · memory ${plural(ledger.entries.length, 'note')}` +
-      (floor ? ` · ${plural(briefed, 'message')} in a brief compiled by code (${why})` : ''),
-  )
-  const compaction = {
-    trigger: main ? e.trigger : 'subagent',
-    fellBack: false,
-    floor,
-    tokensBefore: main ? usage?.context.tokens : undefined, // the last response's input: system prompt and tools included
-    estTokensAfter: estimateTokens(message.text) + tailTokens(cut), // messages only
-    syncCalls: sync.calls,
-    syncMs: sync.ms,
-    rowsObservedNow: observedNow,
-    rowsObservedBefore: observed - base - observedNow,
-    ...(deadlineHit ? { deadlineHit } : {}),
-    ...(history ? {} : { unreadable: true }), // a history the session cannot read: a workflow agent's, a fork's
-    ...(briefed ? { rowsBriefed: briefed } : {}),
-    memoryTokens: estimateTokens(message.text),
-    ...(memory.brief ? { briefTokens } : {}),
-    observations: ledger.entries.length,
-  }
-  record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
   if (persistent && installs) void maybeReflect($, loop, life).catch((error) => log($, errorText(error)))
   // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
   // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
