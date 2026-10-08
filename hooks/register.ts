@@ -45,6 +45,8 @@ const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so th
 // The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
 // whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
 const REFLECT_KEEP_TOKENS = 12_000
+const REFLECT_CUE_TOKENS = 300 // the paths a reflection dropped, each with its clause, up to this
+const REFLECT_TIER_TOKENS = 6_000 // earlier reflections' lines kept as they were, up to this: condensing a line twice loses it
 const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
 const REFLECT_ATTEMPTS = 4
 const SKILLS_MAX_TOKENS = 15_000
@@ -86,7 +88,7 @@ type Source = { from: number; to: number }
 // `currentTask`: where the work stands, in the Observer's <continuation> fields (an older reply's Primary/Secondary).
 type Observed = { lines: string[]; corrections: string[]; currentTask?: string; source?: Source }
 type Chunk = Range & Observed
-type Entry = { id: string; line: string; source?: Source } // line: `🔴 2026-09-23 14:30 User asked …`
+type Entry = { id: string; line: string; source?: Source; r?: true } // line: `🔴 2026-09-23 14:30 User asked …`; r: the Reflector wrote it
 type Ledger = {
   anchor?: string // the observations of the memory message the live context starts with, hashed
   watermark: Range // rows [base, to), observed and committed to `entries`
@@ -377,6 +379,42 @@ function reflectedSource(given: Source | undefined, span: Source | undefined, al
   if (!allKnown) return minute(given.from) >= minute(span.from) && minute(given.to) <= minute(span.to) ? given : undefined
   const cut = { from: Math.max(given.from, span.from), to: Math.min(given.to, span.to) }
   return minute(cut.from) <= minute(cut.to) ? cut : undefined
+}
+
+// The Reflector drops paths it cannot fit. Each path the condensed notes name and its reply does not (by last
+// segment) comes back as the clause of its latest note that names it, at that note's time, most-named first, up to
+// REFLECT_CUE_TOKENS: the file stays findable, with what was done to it.
+function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
+  const out = lines.map((l) => l.line.toLowerCase()).join('\n')
+  const count = new Map<string, number>()
+  const latest = new Map<string, Entry>()
+  for (const e of sent)
+    for (const [p] of e.line.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g))
+      if (/^[~./]/.test(p) || /\.\w+$/.test(p) || p.split('/').length > 2) count.set(p, (count.get(p) ?? 0) + 1), latest.set(p, e)
+  const named = new Set<string>()
+  const cues: Omit<Entry, 'id'>[] = []
+  let chars = 0
+  for (const [p] of [...count].sort((a, b) => b[1] - a[1])) {
+    const base = p.split('/').filter(Boolean).at(-1)!.toLowerCase()
+    if (!base || out.includes(base) || named.has(base)) continue
+    const m = latest.get(p)!.line.match(/^(\S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}) (.*)$/)
+    if (!m) continue
+    const clause = m[2]!.split(/(?<=[.;])\s+/).find((c) => c.includes(p)) ?? m[2]!
+    const at = clause.indexOf(p)
+    const text = clause.length <= 220 ? clause : `…${clause.slice(Math.max(0, at - 100), at + p.length + 100).trim()}…`
+    const line = `${m[1]} ${text}`
+    if (chars + line.length + 3 > REFLECT_CUE_TOKENS * 4) continue
+    chars += line.length + 3
+    for (const [q] of text.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g)) named.add(q.split('/').filter(Boolean).at(-1)!.toLowerCase())
+    cues.push({ line, r: true })
+  }
+  const timeOf = (l: { line: string }) => l.line.match(/^\S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /)?.[1] ?? ''
+  const merged = [...lines]
+  for (const c of cues) {
+    const i = merged.findIndex((l) => timeOf(l) > timeOf(c))
+    merged.splice(i < 0 ? merged.length : i, 0, c)
+  }
+  return merged
 }
 
 // `red` placed among `lines` in time order, each before the first line later than it; one without a time goes where
@@ -708,6 +746,15 @@ async function observe($: EngineInterface, v: View, from: number, to: number, ph
 // Without `sources`, the lines alone: what a memory over its budget sheds first.
 const renderLines = (entries: readonly Entry[], sources = true) =>
   entries.map((e) => `* ${e.line}${sources && e.source ? ` ${renderSource(e.source)}` : ''}`).join('\n')
+// The memory's form: a run of lines drawn from the same source range gives it once, after its last line.
+const renderGrouped = (entries: readonly Entry[]) =>
+  entries
+    .map((e, i) => {
+      const next = entries[i + 1]?.source
+      const last = !next || next.from !== e.source?.from || next.to !== e.source?.to
+      return `* ${e.line}${e.source && last ? ` ${renderSource(e.source)}` : ''}`
+    })
+    .join('\n')
 const renderCorrections = (lines: readonly string[]) => (lines.length ? `<corrections>\n${lines.map((l) => `* ${l}`).join('\n')}\n</corrections>\n\n` : '')
 const section = (name: string, value?: string) => (value ? `\n\n<${name}>\n${value}\n</${name}>` : '')
 
@@ -864,7 +911,9 @@ function parseMemory(first: SessionMessage) {
     corrections: applyConstraints([], start < 0 ? [] : parseLines(tag(head.slice(0, start), 'corrections') ?? '', undefined).filter((l) => l.startsWith('🔴'))),
     observations,
     anchor: hash(observations),
-    entries: parseLines(observations, undefined).map(splitSource),
+    entries: parseLines(observations, undefined)
+      .map(splitSource)
+      .reduceRight<ReturnType<typeof splitSource>[]>((out, e) => [e.source || !out[0]?.source ? e : { ...e, source: out[0].source }, ...out], []),
     currentTask: parseContinuation(first.text, user.end || own.length) ?? tag(head.slice(end), 'current-task'),
     skills,
     userMessages: user.messages,
@@ -1120,7 +1169,8 @@ async function runJob($: EngineInterface, job: Job, v: View) {
 }
 
 // The Reflector over a snapshot of the entries, in the background. The newest, up to REFLECT_KEEP_TOKENS, and every
-// 🔴 line (exact repeats once) pass through unchanged; the Reflector condenses the rest into what is left of
+// 🔴 line (exact repeats once) pass through unchanged, as do the lines earlier reflections wrote while they fit
+// REFLECT_TIER_TOKENS (condensing a line twice loses it); the Reflector condenses the rest into what is left of
 // REFLECT_TARGET_TOKENS, and a 🔴 line it writes is kept as 🟡. A result over that target is tried again with stronger
 // compression, one under REFLECT_FLOOR of it with a request for more detail, up to REFLECT_ATTEMPTS; with none in
 // range, nothing changes. The replaced entries are then replaced in place, so entries committed while it ran survive.
@@ -1146,7 +1196,11 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
       const kept = snapshot.slice(recent)
       const isRed = (e: Entry) => e.line.startsWith('🔴')
       const red = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
-      const sent = older.filter((e) => !isRed(e))
+      // Lines an earlier reflection wrote pass through while they fit REFLECT_TIER_TOKENS; past it they are condensed again.
+      const tier = estimateTokens(renderLines(older.filter((e) => e.r && !isRed(e)))) <= REFLECT_TIER_TOKENS
+      const through = older.filter((e) => red.includes(e) || (tier && e.r && !isRed(e)))
+      const sent = older.filter((e) => !isRed(e) && !(tier && e.r))
+      if (!sent.length) throw new Error('nothing to condense but earlier reflections')
       const target = REFLECT_TARGET_TOKENS - estimateTokens(renderLines([...red, ...kept]))
       const floor = Math.ceil(REFLECT_FLOOR * target)
       if (target < 1_000) throw new Error(`the 🔴 lines and the newest observations leave ~${target} tokens of the ~${REFLECT_TARGET_TOKENS}-token target`)
@@ -1169,13 +1223,14 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
         const parsed = parseLines(observationsOf(reply), bounds, false, noteUnmarked($, 'reflector.background', `reflector reply at level ${level}`)).map((l) => {
           const { line, source } = splitSource(l)
           const kept = reflectedSource(source, span, sources.length === sent.length)
-          return { line: isRed({ id: '', line }) ? `🟡${line.slice('🔴'.length)}` : line, ...(kept ? { source: kept } : {}) }
+          return { line: isRed({ id: '', line }) ? `🟡${line.slice('🔴'.length)}` : line, ...(kept ? { source: kept } : {}), r: true as const }
         })
         const tokens = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
         if (tokens !== undefined && tokens <= target && tokens >= floor) lines = parsed
         retry = { tokens }
       }
       if (!lines.length) throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
+      lines = withDroppedPaths(lines, sent)
       await locked(async () => {
         const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
         if (!isLive(loop, stamp)) throw new LoopEnded()
@@ -1186,7 +1241,7 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
           return
         }
         let seq = ledger.seq
-        const reflected = interleave(lines, red).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
+        const reflected = interleave(lines, through).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
         const rest = ledger.entries.filter((e) => !ids.has(e.id))
         const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
         const after = estimateTokens(renderLines([...reflected, ...kept]))
@@ -1453,7 +1508,7 @@ export const register: Register = (on) => {
         const brief = from < cut ? mergeBriefs(priorMemory?.brief, await compile(from, cut)) : priorMemory?.brief
         let memory: Memory = {
           corrections: ledger.corrections,
-          observations: renderLines(ledger.entries),
+          observations: renderGrouped(ledger.entries),
           currentTask: ledger.currentTask,
           ...(covered ? { stateAt: stamp(covered.to) } : {}),
           skills: skillsInUse($, mergeSkills([...prior].reverse(), recorded), tail, turns),

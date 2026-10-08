@@ -934,6 +934,51 @@ describe('register', () => {
     expect(lines).toContain('🟡 2026-09-22 14:30 Read the auth module')
   })
 
+  test("a later reflection passes an earlier reflection's lines through as they were, and condenses only the notes", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const notes = (time: string) => `<observations>\n${`* 🟡 ${time} read a file with a long name\n`.repeat(4_000)}</observations>`
+    const seen = pi(on, {
+      reply: (prompt) => notes(prompt.includes('[User @ 2026-09-22 14:30]: a') ? '2026-09-22 14:30' : '2026-09-22 15:00'),
+      reflect: (n, prompt) => nearTarget(prompt, `* 🟡 ${n === 1 ? '2026-09-22 14:30 First condensed' : '2026-09-22 15:00 Second condensed'}`),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle()
+
+    const reflections = seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
+    expect(reflections).toHaveLength(2)
+    expect(reflections[1]).not.toContain('First condensed')
+    expect(reflections[1]).not.toContain(' filler detail ')
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    expect(lines).toContain('🟡 2026-09-22 14:30 First condensed')
+    expect(lines).toContain('🟡 2026-09-22 15:00 Second condensed')
+    expect(lines.indexOf('🟡 2026-09-22 14:30 First condensed')).toBeLessThan(lines.indexOf('🟡 2026-09-22 15:00 Second condensed'))
+  })
+
+  test('a path the condensed notes name and the reflection drops comes back as the clause that named it, at its time', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored } = world(on)
+    const pi_ = pi(on, {
+      reply: () =>
+        `<observations>\n* 🟡 2026-09-22 14:30 Assistant read the plan. Assistant fixed the totals in \`hooks/stats.ts\`.\n* 🟡 2026-09-22 14:30 Assistant pruned \`hooks/prune.ts\`.\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
+      reflect: (_n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Assistant pruned sessions in `hooks/prune.ts`'),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await clock.settle()
+
+    expect(pi_.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
+    const lines = (stored['ledger:session-1'] as Ledger).entries.map((e) => e.line)
+    expect(lines).toContain('🟡 2026-09-22 14:30 Assistant fixed the totals in `hooks/stats.ts`.')
+    expect(lines.filter((l) => l.includes('prune.ts'))).toHaveLength(1)
+    expect(lines.some((l) => l.includes('read the plan'))).toBe(false)
+  })
+
   test('a reflection that stays far under its target at every attempt leaves the observations as they were', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
