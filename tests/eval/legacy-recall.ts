@@ -4,10 +4,13 @@
 // `tests/recall.test.ts` use it.
 
 import type { SessionMessage } from 'claude-code'
-import { COMPACT_WRAPPER, MEMORY_MARK } from '../../hooks/prompts'
-import { SEARCH_MAX_HITS } from '../../hooks/recall'
 
 const RECALL_TOOL = 'om_recall'
+const RECALL_MAX_HITS = 20
+const COMPACT_WRAPPER =
+  'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.'
+const MEMORY_HEADER =
+  'The following observations block is your memory of this session: what happened in it before the messages that follow, recorded as it happened and removed from context to save space.'
 type Row = {
   type?: string
   isSidechain?: boolean
@@ -16,7 +19,7 @@ type Row = {
 }
 type Content = { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean }
 
-const isMemoryText = (text: string) => text.startsWith(MEMORY_MARK) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_MARK}`)
+const isMemoryText = (text: string) => text.startsWith(MEMORY_HEADER) || text.startsWith(`${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}`)
 function typedText(text: string) {
   const t = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
   return !t || /^<[a-z][a-z-]*>/.test(t) || t.startsWith('[Image') ? undefined : t
@@ -29,7 +32,7 @@ const stamp = (ms: number) => {
 
 // v0.4.9's om_recall over one transcript file, kept to compare against: every row part that holds all the query's
 // words (any, when none holds all), newest last, each as a 400-character snippet.
-export function legacyRecall(jsonl: string, query: string, limit = SEARCH_MAX_HITS) {
+export function legacyRecall(jsonl: string, query: string, limit = RECALL_MAX_HITS) {
   const rows: SessionMessage[] = []
   const times: (number | undefined)[] = []
   for (const line of jsonl.split('\n')) {
