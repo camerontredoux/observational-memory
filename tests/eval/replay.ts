@@ -207,7 +207,7 @@ const SYSTEM_PATH = /^\/(?:dev|usr|bin|sbin|proc|etc|lib)\//
 const PATH_LIKE = /\.\w+$|[-_.]/
 
 /** Text as the scorer reads it: a home directory as `~`. */
-const normalize = (text: string) => text.replace(HOME, '~')
+export const normalize = (text: string) => text.replace(HOME, '~')
 
 /**
  * The identifiers a text names, each by its key: a commit hash (7 to 40 hex digits with a letter and a digit) by

@@ -18,25 +18,25 @@
 // one but the last shifted back to end an hour before the next starts, and each one's spec shifted to its boundaries
 // with its ids prefixed by its name (chainSpec), plus the chain's own spec, if it has one, at the chain's boundaries
 // (tests/fixtures/a+b+c.replay.local.ts for a chain with a private member). No single real session grows the memory to the Reflector's
-// threshold; a chain of them does. Its results go under /tmp/om-replay/a+b+c/.
+// threshold; a chain of them does. Its results go under <main checkout>/.scratch/om-replay/a+b+c/.
 //
 // The transcripts are private copies, gitignored, in the main checkout's tests/fixtures/replay/ (--dir overrides).
 // Each transcript's constraint list and questions: tests/eval/replay-specs/<name>.ts, or, for a transcript whose
 // content may not be committed (firstmate-11), tests/fixtures/<name>.replay.local.ts (gitignored); without one only
-// identifiers are scored. Results go under /tmp/om-replay/<transcript>/<configuration>/.
+// identifiers are scored. Results go under <main checkout>/.scratch/om-replay/<transcript>/<configuration>/.
 //
 // dry-run: parses each transcript, checks its spec against the user's own messages, and prints every model call a
 //   full run would make (om's Observer and Reflector calls, the built-in chain's /compact calls, the question
 //   stage's headless Sonnet sessions) with estimated tokens and cost per configuration. It spends nothing.
 // om: replays the transcript through the checkout's (or --src's) hooks/register.ts with a hand-built `$` on a
 //   virtual clock, and compacts where the session compacted, each compaction on the previous one's output. Observer
-//   and Reflector calls go to pi through a response cache (/tmp/om-replay/luna-cache; the earlier prior-art
-//   replay's /tmp/om-vcc/luna-cache is read too when this machine still has it): --pi stub answers every call with
+//   and Reflector calls go to pi through a response cache (<main checkout>/.scratch/om-replay/luna-cache; the earlier prior-art
+//   replay's luna-cache under .scratch/om-vcc is read too when this machine still has it): --pi stub answers every call with
 //   a canned reply built from its prompt (free; checks the chain, not a measurement), --pi strict (the default)
 //   fails on a call not cached, --pi live runs pi on a miss, at most --max-calls times (default 0), and caches it.
 //   --cache DIR reads and writes that cache alone: a new one makes every pi call again, a second sample of the
 //   Observer and Reflector rather than a replay of the first. Writes compaction-N.md (the memory message), kept-N.json (the rows
-//   kept raw), calls.json, log.txt and summary.json to /tmp/om-replay/<name>/om-<pi>, and for each reflection
+//   kept raw), calls.json, log.txt and summary.json to <main checkout>/.scratch/om-replay/<name>/om-<pi>, and for each reflection
 //   reflection-N.json (the ledger just before and just after it) and each Reflector reply, reflector-C-level-L.txt.
 //   `$.session.messages()` answers the newest 4096 rows, as the engine's does.
 // builtin: the live built-in chain (planBuiltinChain): seeds a sandbox session with span 0's raw rows, resumes it in
@@ -62,18 +62,18 @@
 //   <out>/recall-plugin, and its om_recall calls after the seed are counted; its answers are read from every reply
 //   it wrote, a later one's replacing an earlier one's, not from the last alone. Exact-string answers are checked; the
 //   others are recorded unscored (no model grader). Each session's result is appended to <out>/results.jsonl
-//   (default /tmp/om-replay/<name>/questions); a (configuration, boundary, group) already there without an error is
+//   (default <main checkout>/.scratch/om-replay/<name>/questions); a (configuration, boundary, group) already there without an error is
 //   not run again. The budget is this invocation's.
-// reflections: scores each reflection of an om replay (--run, default /tmp/om-replay/<name>/om-live) with no model:
+// reflections: scores each reflection of an om replay (--run, default <main checkout>/.scratch/om-replay/<name>/om-live) with no model:
 //   the memory just before against just after (scoreReflection), and lists the Reflector's calls.
 // report: scores, per transcript, the session's own compactions ("recorded") and every configuration with results
-//   under /tmp/om-replay (--configs: only these), and prints the report (or writes it to --out). --om-run scores that
+//   under <main checkout>/.scratch/om-replay (--configs: only these), and prints the report (or writes it to --out). --om-run scores that
 //   om run (om-v130, say) as om in place of om-live and om-strict; the question stage is read from
-//   /tmp/om-replay/<name>/questions, or the directory there --questions names. A private transcript gets aggregate
+//   <main checkout>/.scratch/om-replay/<name>/questions, or the directory there --questions names. A private transcript gets aggregate
 //   numbers only.
 import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { dirname, resolve } from 'path'
 import type { SessionMessage } from 'claude-code'
 import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
@@ -114,9 +114,9 @@ import { fail, findTranscripts, mainCheckout, num, options, projectsDir, send, s
 import type { Options } from './cli'
 
 const HERE = resolve(import.meta.dir, '..')
-const OUT_ROOT = '/tmp/om-replay'
+const OUT_ROOT = `${mainCheckout()}/.scratch/om-replay`
 const CACHE = `${OUT_ROOT}/luna-cache`
-const OLD_CACHE = '/tmp/om-vcc/luna-cache'
+const OLD_CACHE = `${mainCheckout()}/.scratch/om-vcc/luna-cache`
 const TRANSCRIPTS = ['om-orchestration', 'om-v04', 'firstmate-11']
 // Transcripts whose content (memories, questions, answers, excerpts) never leaves this machine: aggregate numbers only.
 const PRIVATE = new Set(['firstmate-11', 'firstmate-6', 'crew-uspa-4', 'crew-opie-4'])
@@ -256,20 +256,54 @@ async function om(o: Options) {
   async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
     if (piMode === 'stub') return { r: stub(stdin), hit: false }
     const hash = piKey(argv, stdin)
-    for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
-      if (existsSync(`${dir}/${hash}.json`)) {
-        const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
-        return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
-      }
+    const cached = () => {
+      for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
+        if (existsSync(`${dir}/${hash}.json`)) {
+          const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
+          return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
+        }
+    }
+    const hit = cached()
+    if (hit) return hit
     if (piMode === 'strict') throw new Error(`strict: no cached pi reply for ${hash}`)
-    if (liveLeft <= 0) throw new Error(`--max-calls reached: no live pi call for ${hash}`)
-    liveLeft--
-    const started = Date.now()
-    const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
-    const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
-    const ms = Date.now() - started
-    if (exitCode === 0) writeFileSync(`${cache}/${hash}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
-    return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
+    // One pi call per key across concurrent replays (bench-compact --jobs): the first takes the lock, the others wait
+    // for its reply. A lock whose process is gone is taken over.
+    const lock = `${cache}/${hash}.lock`
+    for (;;) {
+      try {
+        writeFileSync(lock, String(process.pid), { flag: 'wx' })
+        break
+      } catch {}
+      const after = cached()
+      if (after) return after
+      let owner = 0
+      try {
+        owner = Number(readFileSync(lock, 'utf8'))
+        process.kill(owner, 0)
+      } catch {
+        if (owner) rmSync(lock, { force: true })
+        continue
+      }
+      await Bun.sleep(1000)
+    }
+    try {
+      const after = cached()
+      if (after) return after
+      if (liveLeft <= 0) throw new Error(`--max-calls reached: no live pi call for ${hash}`)
+      liveLeft--
+      const started = Date.now()
+      const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
+      const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
+      const ms = Date.now() - started
+      // Written whole, then renamed, so a concurrent replay never reads half a reply.
+      if (exitCode === 0) {
+        writeFileSync(`${lock}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
+        renameSync(`${lock}.json`, `${cache}/${hash}.json`)
+      }
+      return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
+    } finally {
+      unlinkSync(lock)
+    }
   }
 
   const inOut = (p: string) => p === out || p.startsWith(`${out}/`)
@@ -549,7 +583,7 @@ const readContexts = (dir: string, n: number): (Context | undefined)[] =>
   Array.from({ length: n }, (_, i) =>
     existsSync(`${dir}/compaction-${i + 1}.md`) ? { summary: readFileSync(`${dir}/compaction-${i + 1}.md`, 'utf8'), kept: existsSync(`${dir}/kept-${i + 1}.json`) ? JSON.parse(readFileSync(`${dir}/kept-${i + 1}.json`, 'utf8')) : [] } : undefined,
   )
-// Each result directory under /tmp/om-replay/<transcript>/ the report reads, as the configuration it stands for.
+// Each result directory under <main checkout>/.scratch/om-replay/<transcript>/ the report reads, as the configuration it stands for.
 const SOURCES: { dir: string; config: string; source: string }[] = [
   { dir: 'om-live', config: 'om', source: 'om replay of this checkout, Luna through pi (cached)' },
   { dir: 'om-strict', config: 'om', source: 'om replay of this checkout, Luna through pi (cached)' },
