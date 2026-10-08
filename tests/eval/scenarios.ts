@@ -310,7 +310,7 @@ export const SCENARIOS: readonly Scenario[] = [
     ],
     facts: ['ff_invoice_v2', 'BILL-4821', 'type hints'],
     limits:
-      'Three compactions of a short session: the plugin reflects only when its memory passes its reflection threshold, which a sub-$1 run does not reach. The report gives the reflections the plugin recorded (from its stats file) rather than assuming one ran; deterministic reflection coverage is in tests/register.test.ts.',
+      'Three compactions of a short session: the plugin reflects only when its memory passes its reflection threshold, which a sub-$1 run does not reach. The report gives the reflections the plugin recorded (from its stats file) rather than assuming one ran; deterministic reflection coverage is in tests/register-reflect.test.ts.',
   },
   {
     // A large session that Claude Code compacts on its own, and a detail no summary keeps: only om_recall gives the
