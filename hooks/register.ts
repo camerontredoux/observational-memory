@@ -1,4 +1,4 @@
-import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, ToolSpec, TurnUsage } from 'claude-code'
+import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
 import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, plural, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
@@ -197,6 +197,12 @@ function locked<T>(fn: () => Promise<T>): Promise<T> {
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
 // A subagent's lines go to the debug log only: the main chat shows the main conversation's.
 const show = ($: EngineInterface, text: string, agentId?: string) => (agentId === undefined ? $.ui.log(text) : $.ui.log(text, { to: 'debug' }))
+// A setup failure that leaves a tool unavailable for the session also raises a native notification, as the line
+// alone scrolls past at the start.
+const showUnavailable = ($: EngineInterface, text: string) => {
+  show($, text)
+  void $.ui.notify(text).catch((error) => log($, `could not notify (${errorText(error)})`))
+}
 // The band above the prompt (workers.ts draws it; the scan wants the reference spelled in the file that writes it).
 // It shows the main conversation's calls alone, as `show` does its lines. A failed write leaves the band as it was,
 // and the call it tracks goes on.
@@ -2354,8 +2360,7 @@ export const register: Register = (on) => {
       .register({
         name: RECALL_TOOL,
         // In the tool list from the start, not behind ToolSearch: listing it at the first compaction would change the
-        // tool list, which heads the prompt, and write the whole prompt cache again. The engine takes `isDeferred`; the
-        // copy of its types in .claude/types predates it, hence the cast.
+        // tool list, which heads the prompt, and write the whole prompt cache again.
         isDeferred: false,
         description:
           "Use it before telling the user you no longer have a detail from earlier in this session, or that it was never " +
@@ -2382,10 +2387,10 @@ export const register: Register = (on) => {
             subagents: { type: 'boolean', description: "Search the subagents' transcripts too (default false)" },
           },
         },
-      } as ToolSpec)
+      })
       .catch((error) => {
         log($, `could not register ${RECALL_TOOL} (${errorText(error)})`)
-        show($, `Setup failed (${clipLine(errorText(error))}). ${RECALL_TOOL} is unavailable this session`)
+        showUnavailable($, `Setup failed (${clipLine(errorText(error))}). ${RECALL_TOOL} is unavailable this session`)
       })
     await Promise.all([
       $.tool.register({
@@ -2409,7 +2414,7 @@ export const register: Register = (on) => {
       $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|<session id>] [full|cost] [7d|<ISO date>]' }),
     ]).catch((error) => {
       log($, `could not register the stats tool and command (${errorText(error)})`)
-      show($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
+      showUnavailable($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
     })
     // The footer's gauges from the start, rather than once the first turn ends.
     void showGauges($, loopOf(await $.session.id()))

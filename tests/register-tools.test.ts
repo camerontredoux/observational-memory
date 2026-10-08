@@ -107,6 +107,22 @@ describe('register: tools', () => {
     expect(registered.find((r) => r.name === 'om_recall')).toHaveProperty('isDeferred', false)
   })
 
+  test('a tool that fails to register is named on screen and in a native notification', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const screen: string[] = []
+    const notified: string[] = []
+    on('tool.register', () => ({ deny: 'no room' }))
+    on('ui.log', ($, e) => (e.to === 'debug' || screen.push(e.text), { value: undefined }))
+    on('ui.notify', ($, e) => (notified.push(e.text), { value: { isSent: true as const, channel: 'kitty' as const } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+
+    expect(screen).toEqual([expect.stringMatching(/^Setup failed \(.*no room.*\)\. om_recall is unavailable this session$/), expect.stringMatching(/^Setup failed \(.*no room.*\)\. om_stats and \/om-stats are unavailable this session$/)])
+    expect(notified).toEqual(screen)
+  })
+
   test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
@@ -251,5 +267,21 @@ describe('register: tools', () => {
     on('session.start', ($, e) => ({ cwd: e.cwd }))
     await $.session.start({ cwd: '/tmp', surface: null, isInteractive: true })
     expect(workers).toEqual([])
+  })
+
+  // 2.1.295 refuses a call a plugin makes while the hooks worker restarts: the band's read must not throw out of render.
+  test("the band draws the engine's own when its state read is refused", async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const logs: string[] = []
+    on('state.get', ($, e, next) => (e.key === 'workers' ? { deny: 'the hooks worker is restarting' } : next(e)))
+    on('ui.log', ($, e) => (logs.push(e.text), { value: undefined }))
+    on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', children: ['engine band'] }))
+
+    const props = { hasSurvey: false, isWorking: true, maxRows: 10, columns: 120 } as never
+    const band = await $.ui.render({ surface: 'terminal', component: 'AbovePrompt', requestId: 'band', props })
+
+    expect(band).toEqual({ type: 'Text', children: ['engine band'] })
+    expect(logs).toEqual([expect.stringMatching(/^the workers band could not draw \(.*the hooks worker is restarting.*\)$/)])
   })
 })

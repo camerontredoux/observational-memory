@@ -53,10 +53,14 @@ export const registerWorkers = (on: On) => {
     return next(e)
   })
 
+  // A read the engine refuses (one made while the hooks worker restarts) leaves the engine's own band for that draw.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const ws = await read($, workers)
+    const ws = await read($, workers).catch((error) => {
+      $.ui.log(`the workers band could not draw (${errorText(error)})`, { to: 'debug' })
+      return [] as Worker[]
+    })
     if (!ws.length || e.props.hasSurvey) return next(e)
-    const spinner = FRAMES[await read($, frame)] ?? FRAMES[0]
+    const spinner = FRAMES[await read($, frame).catch(() => 0)] ?? FRAMES[0]
     const { Box, Text } = $.ui.resolve(e)
     const segment = (w: Worker) => {
       const label = `[${w.kind}]`
