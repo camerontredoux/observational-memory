@@ -2,7 +2,7 @@
 // against at every cut point. Mechanical gates are derived from the transcript; the rest come from the transcript's
 // ReplaySpec and its local RubricSpec. Pure: no file system or model.
 import type { Context, ReplaySpec, Row, Transcript } from './replay'
-import { contextText, earlyNeeded, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, scoreConstraints } from './replay'
+import { contextText, earlyNeeded, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, normalize, scoreConstraints } from './replay'
 
 export type Gate =
   | 'identifiers' | 'constraints' | 'verbatim' | 'corrections' | 'reversals' | 'approvals' | 'asks' | 'in-progress' | 'handoff'
@@ -155,7 +155,7 @@ export const isList = (line: string) => {
   const ids = idCount(line)
   return ids >= 3 && ids > line.split(/\s+/).filter(Boolean).length * LIST_DENSITY
 }
-const proseOnly = (text: string) => text.split('\n').filter((l) => isProse(l) && !isList(l)).join('\n')
+const proseOnly = (text: string, keep?: (line: string) => boolean) => text.split('\n').filter((l) => keep?.(l) || (isProse(l) && !isList(l))).join('\n')
 
 // ---- Grounding: an identifier counts where its context line says what the transcript said about it ----
 
@@ -206,13 +206,13 @@ const probeOf = (key: string, kind: string) => (kind === 'path' ? key.split('/')
  * The context as the token gates read it: the summary's prose lines, and the raw tail's rows whole when they are the
  * transcript's own rows (anything else in the tail, prose lines only). A list of bare identifiers counts for nothing.
  */
-export function proseContext(context: Context, before: readonly Row[]): string {
+export function proseContext(context: Context, before: readonly Row[], keep?: (line: string) => boolean): string {
   const genuine = new Set(before.map(messageText))
   const kept = context.kept.map((m) => {
     const s = messageText(m)
-    return { text: genuine.has(s) ? s : proseOnly(s), toolUses: [], toolResults: undefined }
+    return { text: genuine.has(s) ? s : proseOnly(s, keep), toolUses: [], toolResults: undefined }
   })
-  return contextText({ summary: proseOnly(context.summary), kept })
+  return contextText({ summary: proseOnly(context.summary, keep), kept })
 }
 
 // A line that reports a claim as gone ("the $30 cap was dropped") does not state it as current.
@@ -221,7 +221,7 @@ const SUPERSEDED = /\b(?:dropped|no longer|replaced|superseded|revers|reverted|r
 const statedAsCurrent = (text: string, pattern: string) => text.split('\n').some((l) => new RegExp(pattern, 'i').test(l) && !SUPERSEDED.test(l))
 
 /** A user message's verbatim key: its first 100 characters, squashed. */
-const quoteKey = (text: string) => squash(text).slice(0, 100)
+const quoteKey = (text: string) => squash(normalize(text)).slice(0, 100)
 
 // ---- Identifiers beyond replay.ts's kinds: branch names, config constants, PR numbers, numbers the assistant quoted ----
 
@@ -315,13 +315,16 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
     const s = scoreConstraints(spec.constraints, n, context)
     for (const c of s.inForce) items.push(pass('constraints', n, c.id, c.held, 'pattern'))
     for (const c of spec.constraints.filter((c) => c.setIn < n && !(c.reversal && c.reversal.in < n)))
-      items.push(pass('verbatim', n, c.id, text.includes(squash(c.quote)), cut(c.quote)))
+      items.push(pass('verbatim', n, c.id, text.includes(squash(normalize(c.quote))), cut(c.quote)))
     // A reversal: its new form held, and after the last place the stale form is (the context reads oldest first).
+    // A line quoting the user's own words for either form counts too: a short reply ("no its 001.41") is not prose.
     for (const c of spec.constraints.filter((c) => c.reversal && c.reversal.in < n)) {
-      const now = Math.max(...c.reversal!.held.map((p) => lastMatch(pr, p)))
-      const stale = Math.max(...c.held.map((p) => lastMatch(pr, p)))
+      const quotes = [c.quote, c.reversal!.quote].map((q) => squash(normalize(q)))
+      const rv = proseContext(context, before, (l) => quotes.some((q) => squash(l).includes(q)))
+      const now = Math.max(...c.reversal!.held.map((p) => lastMatch(rv, p)))
+      const stale = Math.max(...c.held.map((p) => lastMatch(rv, p)))
       items.push(pass('reversals', n, c.id, now >= 0 && now > stale, now < 0 ? (stale >= 0 ? 'stale form only' : 'neither form') : now > stale ? 'new form last' : 'stale form after the new'))
-      items.push(pass('verbatim', n, `${c.id}:reversal`, text.includes(squash(c.reversal!.quote)), cut(c.reversal!.quote)))
+      items.push(pass('verbatim', n, `${c.id}:reversal`, text.includes(squash(normalize(c.reversal!.quote))), cut(c.reversal!.quote)))
     }
     for (const q of spec.questions.filter((q) => q.expect?.length && q.from <= n && (q.to === undefined || n <= q.to)))
       items.push(pass(q.to === undefined ? 'facts' : 'handoff', n, q.id, expectAll(q.expect!, q.id), `${q.expect!.length} tokens`))
@@ -417,7 +420,7 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
     const unresolved = !allBefore.slice(at + 1).some((y) => !y.isError && target(y.tool_use_id) === tg)
     if (!policy && !recurs && !unresolved) continue
     failed.add(keys.join('|'))
-    items.push(pass('failures', n, `line ${x.row.line}`, keys.every((k) => ptext.includes(squash(k))), `${cut(keys.join(' + '))} (${policy ? 'policy' : recurs ? 'recurs' : 'unresolved'})`))
+    items.push(pass('failures', n, `line ${x.row.line}`, keys.every((k) => ptext.includes(squash(normalize(k)))), `${cut(keys.join(' + '))} (${policy ? 'policy' : recurs ? 'recurs' : 'unresolved'})`))
   }
 
   // Chronology: identifiers from before boundary 1 that some later boundary needs, still held from boundary 3 on.
@@ -462,4 +465,61 @@ export function score(items: readonly Item[]): Scores {
   // An over-budget context buys its recall with room it does not have: the total is scaled by the budget gate's mean fit.
   const fit = gates.budget ? gates.budget.score / 100 : 1
   return { total: w ? (fit * used.reduce((s, g) => s + WEIGHTS[g] * gates[g]!.score, 0)) / w : 0, gates }
+}
+
+const SOURCE = /\(source:? (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d) to (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d)\)/
+// A day header of grouped observations ("@ 2026-09-10"): a source range of times alone is on that day.
+const DAY = /^@ (\d{4}-\d\d-\d\d)\s*$/
+export type Pointed = { boundary: number; id: string; held: boolean; pointed: boolean; evidence: string }
+/**
+ * Recall-aware credit, apart from the total: each hand-authored fact at cut n is held (as grade scores it) or, when missed,
+ * pointed: a summary line on its subject (holding one of its expects, or two words of its ask) sits in a run of
+ * observations whose "(source A to B)" om_recall takes as from and to, and the transcript's rows in that range hold every
+ * expect. Stamps are read in the process's time zone, as the plugin writes them.
+ */
+export function pointed(t: Transcript, n: number, context: Context, rubric: RubricSpec | undefined): Pointed[] {
+  const facts = (rubric?.facts ?? []).filter((f) => inSpan(f, n))
+  if (!facts.length) return []
+  const before = t.spans.slice(0, n).flat()
+  const pr = proseContext(context, before)
+  const [ptext, pnorm] = [squash(pr), norm(pr)]
+  const runs: { line: string; key: string; from: number; to: number }[] = []
+  let open: string[] = []
+  let day: string | undefined
+  const at = (d: string, h: string, m: string) => {
+    const [y, mo, dd] = d.split('-').map(Number)
+    return new Date(y!, mo! - 1, dd!, +h, +m).getTime()
+  }
+  for (const line of context.summary.split('\n')) {
+    day = DAY.exec(line)?.[1] ?? day
+    open.push(line)
+    const m = SOURCE.exec(line)
+    const d1 = m?.[1] ?? day
+    if (!m || !d1) continue
+    const [from, to] = [at(d1, m[2]!, m[3]!), at(m[4] ?? d1, m[5]!, m[6]!) + 60_000]
+    for (const l of open) runs.push({ line: l, key: `${d1} ${m[0]}`, from, to })
+    open = []
+  }
+  const ranges = new Map<string, { sq: string; nm: string }>()
+  const range = (r: (typeof runs)[number]) => {
+    let x = ranges.get(r.key)
+    if (!x) {
+      const text = before.filter((row) => row.at >= r.from && row.at < r.to).map(messageText).join('\n')
+      ranges.set(r.key, (x = { sq: squash(text), nm: norm(text) }))
+    }
+    return x
+  }
+  return facts.map((f) => {
+    if (factHolds(f, ptext, pnorm)) return { boundary: n, id: f.id, held: true, pointed: false, evidence: '' }
+    const exact = isExact(f.id)
+    const ask = f.ask ? contentWords(f.ask) : new Set<string>()
+    const hit = runs.find((r) => {
+      const [sq, nm] = [squash(r.line), norm(r.line)]
+      const onSubject = f.expect.some((e) => hasExpect(sq, nm, e, exact)) || [...contentWords(r.line)].filter((w) => ask.has(w)).length >= 2
+      if (!onSubject) return false
+      const src = range(r)
+      return f.expect.every((e) => hasExpect(src.sq, src.nm, e, exact))
+    })
+    return { boundary: n, id: f.id, held: false, pointed: !!hit, evidence: hit ? cut(hit.line) : '' }
+  })
 }

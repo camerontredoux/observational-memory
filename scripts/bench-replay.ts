@@ -6,7 +6,8 @@
 //
 //   bun scripts/bench-replay.ts dry-run [--transcripts om-orchestration,om-v04,firstmate-11] [--dir DIR]
 //   bun scripts/bench-replay.ts om --transcript NAME [--pi stub|strict|live] [--max-calls N] [--boundaries N]
-//     [--src DIR] [--cache DIR] [--out DIR]
+//     [--src DIR] [--cache DIR] [--out DIR] [--gap-hours N (a chain's gap, default 1)] [--fallback recorded (a fallback
+//     compaction takes the source session's own, logged in summary.json fallbacks, instead of failing)]
 //   bun scripts/bench-replay.ts builtin --transcript NAME --pane w1:p2 --budget-usd N [--live] [--out DIR]
 //   bun scripts/bench-replay.ts questions --transcript NAME --budget-usd N [--configs om,om+recall,builtin,builtin+recall]
 //     [--boundaries 1,3,5] [--only REGEX] [--om-run om-live] [--live] [--out DIR]
@@ -139,7 +140,8 @@ function load(o: Options, name: string) {
   const paths = members(name).map((m) => `${transcriptDir(o)}/${m}.jsonl`)
   for (const path of paths) if (!existsSync(path)) fail(`${path}: no such transcript`)
   const texts = paths.map((p) => readFileSync(p, 'utf8'))
-  const { text, offsets } = texts.length > 1 ? chainTranscripts(texts) : { text: texts[0]!, offsets: [0] }
+  const gap = num(o, 'gap-hours')
+  const { text, offsets } = texts.length > 1 ? chainTranscripts(texts, gap === undefined ? undefined : gap * 3_600_000) : { text: texts[0]!, offsets: [0] }
   return { path: paths[0]!, text, offsets, bytes: paths.reduce((n, p) => n + statSync(p).size, 0), t: parseTranscript(text) }
 }
 async function memberSpec(name: string): Promise<ReplaySpec | undefined> {
@@ -430,7 +432,10 @@ async function om(o: Options) {
     }
     now = Math.max(now, to)
   }
-  // The compaction, and its fallback: with no built-in compaction to fall back to, a fallback is an error.
+  // The compaction, and its fallback: with no built-in compaction to fall back to, a fallback is an error; with
+  // --fallback recorded, the source session's own compaction at that boundary stands in for the built-in one.
+  const recordedFallback = str(o, 'fallback') === 'recorded'
+  const fallbacks: { n: number; reason: string }[] = []
   async function compact(live: readonly SessionMessage[], boundary: Boundary) {
     compacting = true
     let done = false
@@ -442,8 +447,13 @@ async function om(o: Options) {
       try {
         return await hooks['session.compact']($, input, builtin)
       } catch (error) {
-        const next = { called: false, error }
+        const recorded = async () => ({ messages: [{ role: 'user', text: boundary.summary, toolUses: [] }, ...boundary.kept] })
+        const next = Object.assign(recordedFallback ? recorded : builtin, { called: false, error })
         const fallback = await hooks['session.compact:catch']?.($, input, next)
+        if (recordedFallback) {
+          fallbacks.push({ n: boundary.n, reason: (error as Error).message.slice(0, 200) })
+          return fallback && 'messages' in fallback ? fallback : await recorded()
+        }
         throw new Error(`compaction ${boundary.n} fell back (${(error as Error).message}): ${JSON.stringify(fallback)?.slice(0, 200)}`)
       }
     })().finally(() => (done = true))
@@ -511,6 +521,7 @@ async function om(o: Options) {
       tokensOut: sum((c) => c.out),
       cost: +sum((c) => c.cost).toFixed(5),
     },
+    fallbacks,
     wallMs: Math.round(performance.now() - wall0),
   }
   writeFileSync(`${out}/summary.json`, JSON.stringify(summary, null, 1))
