@@ -35,6 +35,14 @@
 //     --b-reader-sample K (ab, with --behavior): B's reader answers are cached apart, under sample K: with B = A's plugin,
 //     fresh reader draws on the same contexts, the noise floor of the behavior total.
 //     --behavior-sample K: read sample K's contexts instead of the first sample's (with --samples K or more).
+//   --next (run, ab): also the next-action check (tests/eval/next.ts): at each cut where the real agent went on with tool
+//     calls, Luna reads the context and proposes its next actions; code matches them with the real agent's next ones
+//     (first: the first action matches; recall: the share of the real next actions proposed), 3 samples, averaged. The
+//     same cuts are run on reference contexts that no plugin changes: kept (the kept rows alone, the floor), builtin (the
+//     session's own compaction) and raw (the newest raw rows before the cut, no compaction, near the ceiling); the card
+//     gives each plugin's effect retention, (plugin − kept) / (raw − kept). Cached in NCACHE like --behavior's answers.
+//   --next-memory-only (run, ab): --next with the kept rows taken out of every context, which otherwise settle the next
+//     actions on their own: kept becomes an empty context, builtin the summary alone, raw the history before the kept rows
 //   bun scripts/bench-compact.ts run --contexts DIR          # grade ready-made contexts: DIR/<name>/compaction-N.md
 //   --continuation (run, ab): also print the continuation score (tests/eval/continuation.ts): the same retention items
 //     and behavior probes regrouped by what continuing the work needs (goal, status, rules, decisions, lessons, state,
@@ -73,6 +81,8 @@ import type { BGate, Probe } from '../tests/eval/behavior'
 import { BGATES, contextSquashed, gradeAnswer, input, isUnknown, parse, probes, PROMPT } from '../tests/eval/behavior'
 import type { Category, ContinuationScore } from '../tests/eval/continuation'
 import { CATEGORIES, CATEGORY_WEIGHTS, continuation, continuationBehavior } from '../tests/eval/continuation'
+import type { Act } from '../tests/eval/next'
+import { gold, gradeActs, memoryOnly, NEXT_K, NEXT_PROMPT, nextInput, parseActs, references } from '../tests/eval/next'
 import { fail, mainCheckout, num, options, str } from './cli'
 import { wireFixtures } from './wire-fixtures'
 
@@ -243,7 +253,7 @@ function effOf(t: Transcript, contexts: (Context | undefined)[], calls: Call[]):
   }
 }
 type Sample = { replays: Replay[]; items: Item[]; scores: Scores; perTranscript: Record<string, Scores>; pointed?: Pointed[] }
-type Run = { label: string; dir?: string; behavior?: BItem[]; samples: Sample[]; holdout?: Sample[]; chain?: Sample[]; long?: Sample[]; noise?: Run }
+type Run = { label: string; dir?: string; behavior?: BItem[]; next?: NItem[]; samples: Sample[]; holdout?: Sample[]; chain?: Sample[]; long?: Sample[]; noise?: Run }
 
 // At most JOBS replays run at once (--jobs, default 3): the transcripts are independent, and each replay stays sequential
 // inside. Each call's cache key is its own, so the replies and the scores do not depend on the order.
@@ -311,9 +321,9 @@ const BSAMPLES = 3
 const PARALLEL = 20
 type BItem = { gate: BGate; boundary: number; id: string; pass: boolean; votes: number; why: string; tier?: 'core' | 'lookup' }
 
-async function ask(inp: string, file: string): Promise<boolean> {
+async function ask(inp: string, file: string, argv = READER): Promise<boolean> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const p = Bun.spawn(READER, { cwd: '/tmp', stdin: new TextEncoder().encode(inp), stdout: 'pipe', stderr: 'pipe' })
+    const p = Bun.spawn(argv, { cwd: '/tmp', stdin: new TextEncoder().encode(inp), stdout: 'pipe', stderr: 'pipe' })
     const timer = setTimeout(() => p.kill(), 20 * 60_000)
     const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()])
     clearTimeout(timer)
@@ -321,6 +331,22 @@ async function ask(inp: string, file: string): Promise<boolean> {
     console.error(`reader call failed (${attempt + 1}/2): ${err.slice(-300) || out.slice(-300)}`)
   }
   return false
+}
+
+/** Calls the reader for each (input, file) not yet cached, PARALLEL at a time. */
+async function callAll(misses: readonly (readonly [string, string])[], argv = READER) {
+  const t0 = Date.now()
+  let next = 0
+  let done = 0
+  await Promise.all(
+    Array.from({ length: PARALLEL }, async () => {
+      while (next < misses.length) {
+        const [inp, f] = misses[next++]!
+        await ask(inp, f, argv)
+        if (++done % 10 === 0 || done === misses.length) console.error(`  ${done}/${misses.length} calls, ${Math.round((Date.now() - t0) / 1000)} s`)
+      }
+    }),
+  )
 }
 
 async function behavior(label: string, dir: string, replays: Replay[], readerSample?: number): Promise<BItem[]> {
@@ -346,18 +372,7 @@ async function behavior(label: string, dir: string, replays: Replay[], readerSam
   const misses = jobs.flatMap((j) => j.files.filter((f) => !existsSync(f)).map((f) => [j, f] as const))
   const n = jobs.reduce((s, j) => s + j.ps.length, 0)
   console.error(`[${label}] behavior: ${n} probes at ${jobs.length} cuts, ${jobs.length * BSAMPLES} reader calls, ${misses.length} not cached: calling Luna for them now`)
-  const t0 = Date.now()
-  let next = 0
-  let done = 0
-  await Promise.all(
-    Array.from({ length: PARALLEL }, async () => {
-      while (next < misses.length) {
-        const [j, f] = misses[next++]!
-        await ask(j.inp, f)
-        if (++done % 10 === 0 || done === misses.length) console.error(`  ${done}/${misses.length} calls, ${Math.round((Date.now() - t0) / 1000)} s`)
-      }
-    }),
-  )
+  await callAll(misses.map(([j, f]) => [j.inp, f] as const))
   const lost = misses.filter(([, f]) => !existsSync(f)).length
   if (lost) console.error(`[${label}] behavior: ${lost} reader calls failed; their answers count as wrong (rerun to retry them)`)
   const items: BItem[] = []
@@ -380,8 +395,85 @@ async function behavior(label: string, dir: string, replays: Replay[], readerSam
   return items
 }
 
+// ---- The next-action check (--next): Luna proposes the next actions on each context; code matches the real agent's ----
+
+const NCACHE = `${process.env.HOME}/.cache/om-bench-compact/next`
+const NEXT_READER = READER.map((x) => (x === PROMPT ? NEXT_PROMPT : x))
+// The raw reference: the newest rows before the cut up to this many tokens (about what an uncompacted window still holds).
+const RAW_TOKENS = 120_000
+const ARMS = ['kept', 'builtin', 'raw'] as const
+type Arm = 'plugin' | (typeof ARMS)[number]
+/** One cut on one context: `first` and `recall` are the mean over the samples that answered; `got`, sample 1's actions. */
+type NItem = { name: string; boundary: number; arm: Arm; first: number; recall: number; answered: number; gold: string[]; got: string[] }
+
+async function nextCheck(label: string, replays: readonly Replay[], refs: boolean, readerSample?: number, bare = false): Promise<NItem[]> {
+  mkdirSync(NCACHE, { recursive: true })
+  type Job = { name: string; n: number; arm: Arm; g: Act[]; inp: string; files: string[] }
+  const jobs: Job[] = []
+  for (const r of replays) {
+    const t = parsedOf(r.name)
+    for (const [i, b] of t.boundaries.entries()) {
+      const g = gold(t, b.n)
+      if (!g) continue
+      const own = r.contexts[i]
+      const arms: [Arm, Context | undefined][] = [['plugin', own && bare ? memoryOnly(own) : own], ...(refs ? Object.entries(references(t, b.n, RAW_TOKENS, bare)) as [Arm, Context][] : [])]
+      for (const [arm, ctx] of arms) {
+        if (!ctx) continue
+        const inp = nextInput(ctx)
+        const h = createHash('sha256').update([inp, ...NEXT_READER, ...(readerSample ? [`reader-sample ${readerSample}`] : [])].join('\0')).digest('hex').slice(0, 24)
+        jobs.push({ name: r.name, n: b.n, arm, g, inp, files: Array.from({ length: BSAMPLES }, (_, k) => `${NCACHE}/${h}-s${k + 1}.txt`) })
+      }
+    }
+  }
+  const misses = jobs.flatMap((j) => j.files.filter((f) => !existsSync(f)).map((f) => [j.inp, f] as const))
+  console.error(`[${label}] next: ${jobs.length} contexts, ${jobs.length * BSAMPLES} reader calls, ${misses.length} not cached: calling Luna for them now`)
+  await callAll(misses, NEXT_READER)
+  const lost = misses.filter(([, f]) => !existsSync(f)).length
+  if (lost) console.error(`[${label}] next: ${lost} reader calls failed; those samples are left out (rerun to retry them)`)
+  return jobs.map((j) => {
+    const replies = j.files.filter(existsSync).map((f) => parseActs(readFileSync(f, 'utf8')))
+    const grades = replies.map((p) => gradeActs(p, j.g))
+    const avg = (k: 'first' | 'recall') => (grades.length ? mean(grades.map((x) => Number(x[k]))) : 0)
+    return { name: j.name, boundary: j.n, arm: j.arm, first: avg('first'), recall: avg('recall'), answered: grades.length, gold: j.g.map((x) => x.text.slice(0, 120)), got: (replies[0] ?? []).map((x) => x.text.slice(0, 120)) }
+  })
+}
+
+const pc = (x: number) => (Number.isNaN(x) ? '–' : f1(100 * x))
+const nMean = (xs: readonly NItem[], k: 'first' | 'recall') => mean(xs.map((x) => x[k]))
+const nKey = (x: NItem) => `${x.name}@${x.boundary}`
+/** Effect retention: where the plugin's recall sits between the kept-rows floor and the raw ceiling, over the same cuts. */
+function retention(xs: readonly NItem[], refs: readonly NItem[]) {
+  const at = (arm: Arm) => new Map(refs.filter((x) => x.arm === arm).map((x) => [nKey(x), x.recall]))
+  const [lo, hi] = [at('kept'), at('raw')]
+  const cuts = xs.filter((x) => lo.has(nKey(x)) && hi.has(nKey(x)))
+  const span = mean(cuts.map((x) => hi.get(nKey(x))!)) - mean(cuts.map((x) => lo.get(nKey(x))!))
+  return span > 0 ? (mean(cuts.map((x) => x.recall)) - mean(cuts.map((x) => lo.get(nKey(x))!))) / span : NaN
+}
+
+function nextCard(runs: readonly Run[], items: boolean) {
+  const plugin = (r: Run) => r.next!.filter((x) => x.arm === 'plugin')
+  const refs = runs[0]!.next!.filter((x) => x.arm !== 'plugin')
+  const rows: [string, NItem[]][] = [...runs.map((r) => [r.label, plugin(r)] as [string, NItem[]]), ...ARMS.map((a) => [`(${a})`, refs.filter((x) => x.arm === a)] as [string, NItem[]])]
+  const names = CORPUS.map((c) => c.name)
+  const out = [`## Next-action check (Luna proposes the next ${NEXT_K} actions; not blended into retention)`, '', `| context | cuts | first % | recall % | effect retention | ${names.map((n) => `recall ${n}`).join(' | ')} |`, `|---|---:|---:|---:|---:|${names.map(() => '---:|').join('')}`]
+  for (const [label, xs] of rows)
+    out.push(`| ${label} | ${xs.length} | ${pc(nMean(xs, 'first'))} | ${pc(nMean(xs, 'recall'))} | ${label.startsWith('(') ? '' : pc(retention(xs, refs))} | ${names.map((n) => pc(nMean(xs.filter((x) => x.name === n), 'recall'))).join(' | ')} |`)
+  out.push('', `first: the first proposed action matches the real one (same kind of action, and the same file when both name one). recall: the share of the real next actions proposed. Each the mean of ${BSAMPLES} samples. Effect retention: (context − kept) / (raw − kept) on recall.`, '')
+  if (runs.length === 2) {
+    const am = new Map(plugin(runs[0]!).map((x) => [nKey(x), x]))
+    const pairs = plugin(runs[1]!).flatMap((y) => (am.has(nKey(y)) ? [[am.get(nKey(y))!, y] as const] : []))
+    const up = pairs.filter(([x, y]) => y.recall > x.recall)
+    const down = pairs.filter(([x, y]) => y.recall < x.recall)
+    out.push(`Paired by cut: B better at ${up.length}, worse at ${down.length}, same at ${pairs.length - up.length - down.length} (sign test p=${signTest(up.length, down.length).toFixed(4)}).`, '')
+    const line = ([x, y]: readonly [NItem, NItem]) => `- ${nKey(x)}: recall A ${pc(x.recall)} → B ${pc(y.recall)}; real: ${x.gold.join(' ; ')}`
+    if (items) out.push(`Worse in B:`, '', ...down.map(line), '', `Better in B:`, '', ...up.map(line), '')
+  } else if (items)
+    for (const x of plugin(runs[0]!)) out.push(`- ${nKey(x)} first ${pc(x.first)} recall ${pc(x.recall)}`, `  real: ${x.gold.join(' ; ')}`, `  got:  ${x.got.join(' ; ')}`)
+  return out.join('\n')
+}
+
 /** `first`: the first sample's number (default 1). `lenient`: a cache miss throws instead of ending the run. */
-async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; reflectorSample?: number; readerSample?: number }): Promise<Run> {
+async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; next?: boolean; refs?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; reflectorSample?: number; readerSample?: number }): Promise<Run> {
   if (o.record && o.dir) {
     const model = /'--model', '([^']+)'/.exec(readFileSync(`${o.dir}/hooks/register.ts`, 'utf8'))?.[1] ?? ''
     if (!model.startsWith('openai-codex/')) fail(`--record: ${o.dir}'s pi model is "${model}"; only openai-codex models may be called`)
@@ -429,6 +521,7 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
     if (run.long) run.long.push(await gradeAll([LONG], s.k, 'long', s.long))
   }
   if (o.behavior) run.behavior = await behavior(label, o.dir ?? HERE, (run.samples[behaviorSample - (o.first ?? 1)] ?? fail(`--behavior-sample ${behaviorSample}: no such sample`)).replays, o.readerSample)
+  if (o.next) run.next = await nextCheck(label, (run.samples[behaviorSample - (o.first ?? 1)] ?? fail(`--behavior-sample ${behaviorSample}: no such sample`)).replays, !!o.refs, o.readerSample, nextBare)
   return run
 }
 /** The holdout as a run of its own, for the scorecard and the A/B table. */
@@ -801,6 +894,8 @@ const o = options(rest)
 const record = !!o.record
 const samples = num(o, 'samples', 1)!
 const withBehavior = !!o.behavior
+const nextBare = !!o['next-memory-only']
+const withNext = !!o.next || nextBare
 const behaviorSample = num(o, 'behavior-sample', 1)!
 mkdirSync(OUT, { recursive: true })
 const json = (x: unknown, name: string) => {
@@ -814,12 +909,13 @@ if (command === 'corpus') await corpus()
 else if (command === 'run') {
   const ctx = str(o, 'contexts')
   const src = source(ctx ? `contexts:${ctx}` : (str(o, 'plugin') ?? fail('--plugin <ref|dir> or --contexts DIR')))
-  const r = await evaluate(src.label, { dir: src.dir, contexts: src.contexts, record, samples, behavior: withBehavior, holdout: !!o.holdout && !src.contexts, chain: !!o.chain && !src.contexts, long: !!o.long })
+  const r = await evaluate(src.label, { dir: src.dir, contexts: src.contexts, record, samples, behavior: withBehavior, next: withNext, refs: true, holdout: !!o.holdout && !src.contexts, chain: !!o.chain && !src.contexts, long: !!o.long })
   console.log(scorecard(r, !!o.items))
   if (r.holdout) console.log(scorecard(holdoutOf(r), !!o.items))
   if (r.chain) console.log(scorecard(chainOf(r), !!o.items))
   if (r.long) console.log(longCard(r, !!o.items))
   if (r.behavior) console.log(behaviorCard(r, !!o.items))
+  if (r.next) console.log(nextCard([r], !!o.items))
   const cc = o.continuation ? continuationCards([r]) : []
   for (const c of cc) console.log(c.text)
   json({ ...(strip(r) as object), ...(cc.length ? { continuation: cc.map((c) => c.json) } : {}) }, 'run')
@@ -832,8 +928,8 @@ else if (command === 'run') {
   const from = (x: ReturnType<typeof source>) => (x.contexts ? { contexts: x.contexts, holdout: false, long: !!o.long } : { dir: x.dir, holdout, chain, long: !!o.long })
   // A and every B at once: their replays share the JOBS slots.
   const [a, ...bs] = await Promise.all([
-    evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior }),
-    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, reflectorSample: num(o, 'b-reflector-sample'), readerSample: num(o, 'b-reader-sample') })),
+    evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior, next: withNext, refs: true }),
+    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, next: withNext, reflectorSample: num(o, 'b-reflector-sample'), readerSample: num(o, 'b-reader-sample') })),
   ])
   // A Reflector change that nothing reflects on ties exactly and says nothing: refuse to call it a tie.
   for (const [sb, b] of sbs.map((x, i) => [x, bs[i]!] as const))
@@ -886,7 +982,7 @@ else if (command === 'run') {
   ]
   const cards = (r: Run) => [scorecard(r, false), ...(r.holdout ? [scorecard(holdoutOf(r), false)] : []), ...(r.chain ? [scorecard(chainOf(r), false)] : []), ...(r.long ? [longCard(r, false)] : [])]
   const cc = o.continuation ? bs.map((b) => continuationCards([a, b])) : []
-  console.log([summary.join('\n'), ...cc.flatMap((x) => x.map((c) => c.text)), ...rs.flatMap((r, i) => [r.text, ...(a.behavior ? [behaviorAb(a, bs[i]!)] : [])]), ...cards(a), ...bs.flatMap(cards)].join('\n'))
+  console.log([summary.join('\n'), ...cc.flatMap((x) => x.map((c) => c.text)), ...rs.flatMap((r, i) => [r.text, ...(a.behavior ? [behaviorAb(a, bs[i]!)] : []), ...(a.next ? [nextCard([a, bs[i]!], !!o.items)] : [])]), ...cards(a), ...bs.flatMap(cards)].join('\n'))
   json({ a: strip(a), b: bs.map(strip), ...(a.long ? { long: longs.map((x) => x?.json ?? null) } : {}), ...(cc.length ? { continuation: cc.map((x) => x.map((c) => c.json)) } : {}) }, 'ab')
 } else if (command === 'controls') {
   // The negative-control fixture (tests/replay.test.ts): each transcript's fact and latest items, and a plugin's prose

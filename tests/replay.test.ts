@@ -40,6 +40,7 @@ import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } 
 import type { Configuration } from './eval/runner'
 import { factHolds, grade, norm, score } from './eval/rubric'
 import { gradeAnswer, parse as parseReply } from './eval/behavior'
+import { actOf, gold, gradeActs, parseActs } from './eval/next'
 import { categoryOf, continuation, continuationBehavior, probeCategory } from './eval/continuation'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 
@@ -952,5 +953,32 @@ describe('the compaction rubric', () => {
     const stitched = { answer: '~/work/mods/app/tests/register.test.ts', evidence: '~/work/mods/app; tests/register.test.ts' }
     expect(gradeAnswer({ gate: 'value', id: 'path', ask: 'Which test file?', answer: 'register\\.test' }, stitched, tree).pass).toBe(false)
     expect(gradeAnswer({ ...hop, answer: 'register\\.test' }, stitched, tree).pass).toBe(true)
+  })
+})
+
+describe('the next-action check', () => {
+  test("the gold is the agent's tool calls after the cut, up to the user's next message", () => {
+    const t = parseTranscript(
+      session()
+        .user('fix it')
+        .compact('S')
+        .tool('Read', { file_path: '/w/hooks/a.ts' }, 'x')
+        .tool('Bash', { command: 'bun test' }, 'ok')
+        .user('now commit')
+        .tool('Bash', { command: 'git commit -m x' }, 'done')
+        .compact('S2')
+        .reply('All done.')
+        .text(),
+    )
+    expect(gold(t, 1)!.map((a) => a.family)).toEqual(['read', 'bun test'])
+    // A reply before any tool call is the whole gold.
+    expect(gold(t, 2)!.map((a) => a.family)).toEqual(['reply'])
+  })
+
+  test('an action matches by kind and file, whatever the directory and wrappers', () => {
+    const real = [actOf('Bash', { command: 'cd ~/work/om-v044 && rtk sed -n 1,40p hooks/register.ts' }), actOf('Bash', { command: 'git commit -m "x"' })]
+    const proposed = parseActs('[{"tool": "Read", "input": {"file_path": "/home/c/work/om/hooks/register.ts"}}, {"tool": "Bash", "input": {"command": "git status"}}]')
+    expect(gradeActs(proposed, real)).toEqual({ first: true, recall: 0.5 })
+    expect(gradeActs([actOf('Read', { file_path: 'hooks/memory.ts' })], real).first).toBe(false)
   })
 })
