@@ -1780,6 +1780,66 @@ export function planBudget(usage: SessionUsage | undefined, main: boolean, total
   return { budget, density, overhead }
 }
 
+// Observes at compaction everything before the raw tail (`start`) that the ledger has not, in chunks, all at once.
+// `failures` are shown once the compaction stands: a fallback says so instead.
+async function observeOnTheSpot($: EngineInterface, loop: Loop, life: string, v: View, initial: Ledger, start: number, readable: boolean, abandoned: AbortSignal) {
+  const chunks: Chunk[] = []
+  const failures: { rows: number; why: string }[] = []
+  // The loop's background calls in flight over rows it must observe are made again here, and the first to end
+  // stands: a background call that lands first stops this one. The hook's budget (HookBudget) runs on through any
+  // wait that is not a `$` call, so a wait on a background call alone would outrun it and lose the compaction.
+  const inFlight = running.flatMap((job) => {
+    const at = job.loop.key === loop.key && job.stamp === life ? locate(v, job.range, initial.watermark.to) : undefined
+    return at ? [{ from: at.from, to: at.to, landed: job.landed }] : []
+  })
+  const gaps: { from: number; to: number; landed?: Promise<boolean> }[] = [...inFlight]
+  let from = initial.watermark.to
+  for (const c of [...initial.chunks, ...inFlight, { from: start, to: start }].sort((a, b) => a.from - b.from)) {
+    for (let to; from < Math.min(c.from, start); from = to) gaps.push({ from, to: (to = chunkEnd(v, from, Math.min(c.from, start), false)!) })
+    from = Math.max(from, c.to)
+  }
+  // Every call ends by the deadline or when the compaction is abandoned: the calls still running are killed, and
+  // their rows left unobserved as a failed chunk's.
+  const deadline = new AbortController()
+  const signal = AbortSignal.any([deadline.signal, abandoned])
+  // A chunk that failed fast (a bad reply, a pi error) is observed again once: a chunk left raw holds back every
+  // chunk after it. A timeout is not, as it would hold the compaction for another timeout; nor is one with less
+  // time left than a call takes, nor an unreadable history's, which gets one round of calls.
+  let retries = 0
+  const once = ({ from, to, landed }: (typeof gaps)[number]) => {
+    const before = beforeRows(initial, from)
+    const beaten = new AbortController()
+    void landed?.then((l) => l && beaten.abort(new Error('the background call landed first')))
+    const stop = AbortSignal.any([signal, beaten.signal])
+    const call = () => observe($, loop.sessionId, v, from, to, 'compaction', before, stop)
+    return call()
+      .catch(async (error) => {
+        if (!readable || stop.aborted || failureClass(errorText(error)) === 'timeout') throw error
+        if ((await $.clock.now()) - syncStarted > COMPACTION_DEADLINE_MS - OBSERVER_CALL_MS) throw error
+        retries++
+        log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
+        return call()
+      })
+      .catch((error) => {
+        if (beaten.signal.aborted && !signal.aborted) return undefined // its chunk is in the ledger
+        throw error
+      })
+  }
+  const syncStarted = await $.clock.now()
+  if (!isLive(loop, life)) throw new LoopEnded()
+  const timer = $.clock.after(COMPACTION_DEADLINE_MS, () => deadline.abort(new Error(DEADLINE_PASSED)))
+  const settled = await Promise.allSettled(gaps.map(once))
+  timer.cancel()
+  const deadlineHit = deadline.signal.aborted
+  const sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - syncStarted }
+  settled.forEach((r, i) => {
+    if (r.status === 'fulfilled') return void (r.value && (chunks.push(r.value), noteObservations($, loop.sessionId, 'compaction', r.value.lines.length)))
+    log($, `observation of rows ${gaps[i]!.from}-${gaps[i]!.to} at compaction failed (${errorText(r.reason)}); left unobserved`)
+    failures.push({ rows: gaps[i]!.to - gaps[i]!.from, why: reason(r.reason, OBSERVER_TIMEOUT_MS) })
+  })
+  return { chunks, failures, sync, deadlineHit }
+}
+
 // The compaction from the ledger: what the session.compact hook runs.
 // The ordering it relies on, against the background observation sharing this process's state:
 // - The loop's life (`life`) is taken before the first await past the nothing-new check. Once it moves on, the
@@ -1845,66 +1905,12 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // reaches, and with nothing observed at all the floor compiles a brief of the rest (see `build`).
   // A manual compaction with nothing observed since the last one, and less before the raw tail than the whole chunk
   // the background waits for, observes nothing: the person waits on it, so the floor's brief stands for those rows.
-  const chunks: Chunk[] = []
-  const failures: { rows: number; why: string }[] = [] // shown once the compaction stands: a fallback says so instead
-  let sync = { calls: 0, ms: 0 }
-  let deadlineHit = false
   const start = tailStart(v, base)
   const briefOnly = main && (e.trigger === 'manual' || e.trigger === 'plugin') && initial.watermark.to === base && chunkEnd(v, base, start, true) === undefined
-  if (!briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to) {
-    // The loop's background calls in flight over rows it must observe are made again here, and the first to end
-    // stands: a background call that lands first stops this one. The hook's budget (HookBudget) runs on through any
-    // wait that is not a `$` call, so a wait on a background call alone would outrun it and lose the compaction.
-    const inFlight = running.flatMap((job) => {
-      const at = job.loop.key === loop.key && job.stamp === life ? locate(v, job.range, initial.watermark.to) : undefined
-      return at ? [{ from: at.from, to: at.to, landed: job.landed }] : []
-    })
-    const gaps: { from: number; to: number; landed?: Promise<boolean> }[] = [...inFlight]
-    let from = initial.watermark.to
-    for (const c of [...initial.chunks, ...inFlight, { from: start, to: start }].sort((a, b) => a.from - b.from)) {
-      for (let to; from < Math.min(c.from, start); from = to) gaps.push({ from, to: (to = chunkEnd(v, from, Math.min(c.from, start), false)!) })
-      from = Math.max(from, c.to)
-    }
-    // Every call ends by the deadline or when the compaction is abandoned: the calls still running are killed, and
-    // their rows left unobserved as a failed chunk's.
-    const deadline = new AbortController()
-    const signal = AbortSignal.any([deadline.signal, next.signal])
-    // A chunk that failed fast (a bad reply, a pi error) is observed again once: a chunk left raw holds back every
-    // chunk after it. A timeout is not, as it would hold the compaction for another timeout; nor is one with less
-    // time left than a call takes, nor an unreadable history's, which gets one round of calls.
-    let retries = 0
-    const once = ({ from, to, landed }: (typeof gaps)[number]) => {
-      const before = beforeRows(initial, from)
-      const beaten = new AbortController()
-      void landed?.then((l) => l && beaten.abort(new Error('the background call landed first')))
-      const stop = AbortSignal.any([signal, beaten.signal])
-      const call = () => observe($, loop.sessionId, v, from, to, 'compaction', before, stop)
-      return call()
-        .catch(async (error) => {
-          if (!history || stop.aborted || failureClass(errorText(error)) === 'timeout') throw error
-          if ((await $.clock.now()) - syncStarted > COMPACTION_DEADLINE_MS - OBSERVER_CALL_MS) throw error
-          retries++
-          log($, `retrying rows ${from}-${to} at compaction once (${errorText(error)})`)
-          return call()
-        })
-        .catch((error) => {
-          if (beaten.signal.aborted && !signal.aborted) return undefined // its chunk is in the ledger
-          throw error
-        })
-    }
-    const syncStarted = await $.clock.now()
-    if (!isLive(loop, life)) throw new LoopEnded()
-    const timer = $.clock.after(COMPACTION_DEADLINE_MS, () => deadline.abort(new Error(DEADLINE_PASSED)))
-    const settled = await Promise.allSettled(gaps.map(once))
-    timer.cancel()
-    deadlineHit = deadline.signal.aborted
-    sync = { calls: gaps.length + retries, ms: (await $.clock.now()) - syncStarted }
-    settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') return void (r.value && (chunks.push(r.value), noteObservations($, sessionId, 'compaction', r.value.lines.length)))
-      log($, `observation of rows ${gaps[i]!.from}-${gaps[i]!.to} at compaction failed (${errorText(r.reason)}); left unobserved`)
-      failures.push({ rows: gaps[i]!.to - gaps[i]!.from, why: reason(r.reason, OBSERVER_TIMEOUT_MS) })
-    })
-  }
+  const { chunks, failures, sync, deadlineHit } =
+    !briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to
+      ? await observeOnTheSpot($, loop, life, v, initial, start, history !== undefined, next.signal)
+      : { chunks: [], failures: [], sync: { calls: 0, ms: 0 }, deadlineHit: false }
   const priorMemory = base ? parseMemory(messages[0]!) : undefined
   const prior = priorMemory?.skills ?? []
   // A subagent's compaction carries only its own skills forward: the store holds the main conversation's.
