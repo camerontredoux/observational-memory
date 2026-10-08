@@ -12,10 +12,8 @@
 // boundary row: they are the compaction's output, not new rows. Boundary n's context is what a configuration's
 // compaction n left: its summary (or memory message) and the rows it kept raw.
 import type { SessionMessage } from 'claude-code'
-import { PRICES_USD_PER_MTOK, RECALL_TOOL } from './bench'
-import { MODEL } from './live'
-import { CONFIGURATIONS, recallAvailable } from './runner'
-import type { Configuration } from './runner'
+import { CONFIGURATIONS, MODEL, PRICES_USD_PER_MTOK, RECALL_TOOL, recallAvailable } from './config'
+import type { Configuration } from './config'
 
 // ---- The transcript ----
 

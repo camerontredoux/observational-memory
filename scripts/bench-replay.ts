@@ -110,10 +110,8 @@ import {
   seedRows,
   uncompacted,
 } from '../tests/eval/replay'
-import { RECALL_TOOL } from '../tests/eval/bench'
-import { checkPluginList, checkRecallOnly, shellLine } from '../tests/eval/live'
-import { CONFIGURATIONS } from '../tests/eval/runner'
-import type { Configuration } from '../tests/eval/runner'
+import { checkPluginList, checkRecallOnly, CONFIGURATIONS, RECALL_TOOL, shellLine } from '../tests/eval/config'
+import type { Configuration } from '../tests/eval/config'
 import { fail, findTranscripts, mainCheckout, num, options, projectsDir, send, str } from './cli'
 import type { Options } from './cli'
 

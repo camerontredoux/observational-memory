@@ -37,7 +37,8 @@ import {
   uncompacted,
 } from './eval/replay'
 import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } from './eval/replay'
-import type { Configuration } from './eval/runner'
+import { checkPluginList, checkRecallOnly, RECALL_TOOL } from './eval/config'
+import type { Configuration } from './eval/config'
 import { factHolds, grade, norm, score } from './eval/rubric'
 import { gradeAnswer, parse as parseReply } from './eval/behavior'
 import { categoryOf, continuation, continuationBehavior, probeCategory } from './eval/continuation'
@@ -451,6 +452,35 @@ describe('the question stage', () => {
     expect(rows.every((r) => r.sessionId === 'new' && r.cwd === '/sandbox')).toBe(true)
     expect(rows.at(-2)!.logicalParentUuid).toBe(rows.at(-3)!.uuid)
     expect(rows.at(-1)).toMatchObject({ parentUuid: 'B', isCompactSummary: true, uuid: 'S' })
+  })
+})
+
+describe('checking what a question session will load', () => {
+  const list = (entries: object[]) => JSON.stringify(entries)
+  const om = { id: 'observational-memory@inline', enabled: true, installPath: '/repo', errors: [] }
+
+  test('passes when exactly the expected plugin is loaded without errors, or none for built-in', () => {
+    expect(checkPluginList(list([om, { id: 'vercel@x', enabled: false }]), { expectedPlugin: '/repo' })).toEqual([])
+    expect(checkPluginList(list([{ id: 'vercel@x', enabled: false }]), {})).toEqual([])
+  })
+
+  test("fails when the user's inline plugin, another copy, or a plugin with errors is loaded", () => {
+    expect(checkPluginList(list([om]), {}).join()).toMatch(/expected no observational-memory/)
+    expect(checkPluginList(list([{ ...om, installPath: '/elsewhere' }]), { expectedPlugin: '/repo' }).join()).toMatch(/\/elsewhere/)
+    expect(checkPluginList(list([{ ...om, errors: ['Path not found'] }]), { expectedPlugin: '/repo' }).join()).toMatch(/Path not found/)
+    expect(checkPluginList('not json', { expectedPlugin: '/repo' }).join()).toMatch(/JSON/)
+  })
+
+  // As `claude plugin validate` prints it.
+  const validated = (hooks: string) => `Validating hooks: /tmp/p/hooks/hooks.json\n\n  ❯ ./register.ts hooks: ${hooks}\n  ❯ ./register.ts calls: $.tool.register\n\n✔ Validation passed\n`
+
+  test('passes a recall-only plugin that handles om_recall, describes it, and records the transcript path, nothing else', () => {
+    expect(checkRecallOnly(validated(`session.start, tool.call{tool=${RECALL_TOOL}}, tool.describe{tool=${RECALL_TOOL}}, classic.SessionStart, classic.Stop`))).toEqual([])
+  })
+
+  test('fails a recall-only plugin that would also compact, or does not pass validation', () => {
+    expect(checkRecallOnly(validated(`session.start, session.compact, tool.call{tool=${RECALL_TOOL}}`)).join()).toMatch(/more than om_recall: session\.compact/)
+    expect(checkRecallOnly('✘ register.ts: cannot resolve ./recall').join()).toMatch(/did not pass/)
   })
 })
 

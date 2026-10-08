@@ -4,7 +4,7 @@
 import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
-import { shellLine } from '../tests/eval/live'
+import { shellLine } from '../tests/eval/config'
 
 const HERE = resolve(import.meta.dir, '..')
 
