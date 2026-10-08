@@ -180,7 +180,7 @@ export const messageText = (m: Pick<SessionMessage, 'text' | 'toolUses' | 'toolR
 // Text Claude Code or a hook writes as a user row: not the user's own words.
 const NOT_TYPED = /^\s*(?:<(?:task-notification|command-name|command-message|command-args|local-command-\w+|system-reminder|bash-\w+)>|\[Request interrupted|Caveat: )/
 /** Whether a row is a message the user typed. */
-const isTyped = (row: SessionMessage) => row.role === 'user' && !row.toolResults && !!row.text.trim() && !NOT_TYPED.test(row.text)
+export const isTyped = (row: SessionMessage) => row.role === 'user' && !row.toolResults && !!row.text.trim() && !NOT_TYPED.test(row.text)
 
 // ---- Identifiers ----
 
@@ -207,7 +207,7 @@ const SYSTEM_PATH = /^\/(?:dev|usr|bin|sbin|proc|etc|lib)\//
 const PATH_LIKE = /\.\w+$|[-_.]/
 
 /** Text as the scorer reads it: a home directory as `~`. */
-const normalize = (text: string) => text.replace(HOME, '~')
+export const normalize = (text: string) => text.replace(HOME, '~')
 
 /**
  * The identifiers a text names, each by its key: a commit hash (7 to 40 hex digits with a letter and a digit) by
@@ -401,7 +401,7 @@ export function drift(t: Transcript, specs: readonly ConstraintSpec[], contexts:
 }
 
 /** The identifiers first seen in span 0 that some later boundary needs, each once: what drift tracks. */
-function earlyNeeded(t: Transcript): Needed[] {
+export function earlyNeeded(t: Transcript): Needed[] {
   const early = new Set<string>()
   for (const row of t.spans[0] ?? []) for (const key of identifiersIn(messageText(row)).keys()) early.add(key)
   const tracked = new Map<string, Needed>()
