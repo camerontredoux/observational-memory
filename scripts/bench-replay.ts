@@ -119,7 +119,7 @@ const CACHE = `${OUT_ROOT}/luna-cache`
 const OLD_CACHE = '/tmp/om-vcc/luna-cache'
 const TRANSCRIPTS = ['om-orchestration', 'om-v04', 'firstmate-11']
 // Transcripts whose content (memories, questions, answers, excerpts) never leaves this machine: aggregate numbers only.
-const PRIVATE = new Set(['firstmate-11', 'firstmate-6'])
+const PRIVATE = new Set(['firstmate-11', 'firstmate-6', 'crew-uspa-4', 'crew-opie-4'])
 // A chain of transcripts (`a+b+c`, see chainTranscripts) is one long session: private when any of them is.
 const members = (name: string) => name.split('+')
 const isPrivate = (name: string) => members(name).some((m) => PRIVATE.has(m))
@@ -193,7 +193,7 @@ async function dryRun(o: Options) {
 type PiResult = { exitCode: number; stdout: string; stderr: string }
 // `inTokens` is the prompt's size estimated before the call; `in`, `out` and `cost` are pi's own usage record.
 // `level`: a Reflector call's compression level, read from its prompt.
-type Call = { kind: 'observer' | 'reflector'; level?: number; atCompaction: boolean; start: number; prompt: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
+type Call = { kind: 'observer' | 'reflector' | 'handoff'; level?: number; atCompaction: boolean; start: number; prompt: string; key?: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
 const LEVELS = ['## COMPRESSION REQUIRED', '## AGGRESSIVE COMPRESSION REQUIRED', '## CRITICAL COMPRESSION REQUIRED', '## EXTREME COMPRESSION REQUIRED']
 const REFLECTED = /reflected \d+ observations \(~(\d+) tokens\) into \d+ \(~(\d+) tokens\) at compression level (\d+)/
 
@@ -251,9 +251,11 @@ async function om(o: Options) {
   const reflections: Reflection[] = []
   let compacted = 0
 
+  // The cache key: the whole argv (the system prompt with it) and stdin. calls.json records it per call.
+  const piKey = (argv: string[], stdin: string) => createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
   async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
     if (piMode === 'stub') return { r: stub(stdin), hit: false }
-    const hash = createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
+    const hash = piKey(argv, stdin)
     for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
       if (existsSync(`${dir}/${hash}.json`)) {
         const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
@@ -335,9 +337,9 @@ async function om(o: Options) {
       run: (argv: string[], init: { cwd?: string; stdin?: string } = {}) => {
         if (argv[0] !== 'pi') return Promise.reject(new Error(`the replay runs pi alone, not ${argv[0]}`))
         const stdin = init.stdin ?? ''
-        const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : 'observer'
+        const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : stdin.startsWith('## CONVERSATION TO HAND OFF') ? 'handoff' : 'observer'
         const level = kind === 'reflector' ? LEVELS.findLastIndex((l) => stdin.includes(`\n${l}\n`)) + 1 : 0
-        const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
+        const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
         calls.push(call)
         const result = runPi(argv, stdin, init).then(
           ({ r, hit, realMs }) => {
