@@ -1781,6 +1781,20 @@ export function planBudget(usage: SessionUsage | undefined, main: boolean, total
 }
 
 // The compaction from the ledger: what the session.compact hook runs.
+// The ordering it relies on, against the background observation sharing this process's state:
+// - The loop's life (`life`) is taken before the first await past the nothing-new check. Once it moves on, the
+//   observation on the spot does not start (LoopEnded) and the settle stores nothing.
+// - Held marks are written, and the loop's mark count forgotten, before the history and marks are read, so the view
+//   has every time marked so far.
+// - The ledger is read twice under `locked`: once to reconcile it with the view, and again to settle. The Observer
+//   calls run between the two, outside the lock, so a background chunk can land meanwhile; the settle reads it.
+//   The settle commits this compaction's chunks, builds the memory and saves the ledger in one hold of the lock, so
+//   no landing is written between that read and that write.
+// - A background call in flight over rows observed here is observed again here (`running`, this life's alone),
+//   outside MAX_PARALLEL; whichever lands first stands.
+// - An abandoned compaction (`next.signal`) stores its chunks committed and throws only after `build`. Only an
+//   installed one (`installs`) resets the watermark, marks the context installed and starts a reflection, once the
+//   lock is released and off the hook's result.
 async function compact($: EngineInterface, e: SessionCompactInput, next: Parameters<Hook<'session.compact'>>[2]): Promise<SessionCompactResult> {
   // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
   // compactor honors them, background observation cannot. Ordinary compaction stays available without them.
