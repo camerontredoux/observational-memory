@@ -4,6 +4,23 @@ import type { Ledger } from './harness'
 
 // Reflection.
 describe('register: reflect', () => {
+  // With no background call landing, only the compaction can start the reflection.
+  for (const [trigger, reflects] of [['auto', true], ['precompute', false]] as const)
+    test(`${trigger}: a compaction that observes past REFLECT_AT_TOKENS on the spot ${reflects ? 'starts a reflection once it installs' : 'installs nothing and starts no reflection'}`, async ($, on) => {
+      const clock = mock.clock(on)
+      const { history } = world(on)
+      const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(6_000)}</observations>`
+      const seen = pi(on, { reply: () => big, reflect: (n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module') })
+      history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000))
+
+      const result = await $.session.compact({ trigger, messages: [...history] })
+      await clock.settle()
+
+      expect(seen.prompts[0]).toContain('[User]: a')
+      expect(result.messages?.[0]?.text).toContain('read a file with a long name')
+      expect(seen.prompts.some((p) => p.startsWith('## OBSERVATIONS'))).toBe(reflects)
+    })
+
   test('past REFLECT_AT_TOKENS the reflector condenses a snapshot in the background, escalating compression, and entries committed meanwhile survive', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)

@@ -75,6 +75,32 @@ describe('register: observe', () => {
     expect(seen.screen).toEqual([])
   })
 
+  test('a precompute compaction observes on the spot and stores its chunks committed, not installed; the compaction after it cuts there with no Observer call', async ($, on) => {
+    const clock = mock.clock(on, { now: at(23, 12, 0) })
+    const { history, stored, files } = world(on)
+    const seen = pi(on)
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
+
+    const pre = await $.session.compact({ trigger: 'precompute', messages: [...history] })
+
+    expect(seen.prompts).toHaveLength(2)
+    expect(observationsIn(pre.messages?.[0]?.text ?? '')).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
+    const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
+    expect([ledger.watermark.to, ledger.entries.length, ledger.anchor]).toEqual([7, 2, undefined])
+    expect([stored['compactions:session-1'], stored['size:session-1']]).toEqual([undefined, undefined])
+
+    // Not installed: the same context compacts again rather than being skipped, from the committed ledger.
+    const auto = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    expect(observationsIn(auto.messages?.[0]?.text ?? '')).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
+    expect(originals(auto.messages?.slice(1))).toEqual(originals(pre.messages?.slice(1)))
+    expect(seen.prompts).toHaveLength(2)
+    expect((stored['ledger:session-1'] as Ledger & { anchor?: string }).anchor).toEqual(expect.any(String))
+    expect(stored['compactions:session-1']).toBe(1)
+    await clock.advance(5_000)
+    const metrics = JSON.parse(files['/stats/session-1.json']!).metrics
+    expect([metrics['compaction.precompute.rowsObservedNow'].sum, metrics['compaction.auto.rowsObservedNow'].sum, metrics['compaction.auto.rowsObservedBefore'].sum]).toEqual([7, 0, 7])
+  })
+
   test('the Observer records what happened, never what a chunk lacks', async ($, on) => {
     mock.clock(on)
     world(on)
