@@ -9,6 +9,7 @@ import {
   COMPACT_TRANSCRIPT,
   COMPACT_WRAPPER,
   FLOOR_NOTE,
+  MARKERS,
   MEMORY_GUIDE,
   MEMORY_GUIDE_RECALL,
   MEMORY_GUIDE_SOURCES,
@@ -32,7 +33,6 @@ const USER_SHORT_CHARS = 400
 const USER_SHORT_TOKENS = 8_000
 const NEWEST_RESERVE_TOKENS = 2_000 // the least the newest prompt keeps, whatever the first message takes
 const NEXT_STEP_MAX_TOKENS = 2_000 // the latest request the continuation record quotes
-const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const SKILL_FINISHED = '(finished; invoke it again to reread its text, or om_recall to find where it loaded)'
 // A skill in full, or finished: one line, its text gone. An old memory message gives no time.

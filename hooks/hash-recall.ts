@@ -4,9 +4,9 @@
 import type { PromptAutocompleteSuggestion } from 'claude-code'
 import { baseOf } from './memory'
 import type { Entry } from './memory'
+import { MARKERS } from './prompts'
 
 const MAX_ROWS = 8
-const MARKERS = ['🔴', '🟡', '🟢', '✅'] // in rank order; a line with none ranks after them
 const TRIGGER = /^#\p{L}/u // `#` alone (a heading), `##`, `#!` and `#123` (an issue reference) are not asked
 const SPLIT = /[^\p{L}\p{N}]+/u
 const HEAD = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})(?:\s+|$)/
@@ -38,7 +38,7 @@ export function indexOf(ledger: { entries?: readonly Entry[]; corrections?: read
   const ranked = lines
     .map((l) => ({ ...l, ...partsOf(l.line) }))
     .filter((l) => l.text)
-    .map((l) => ({ ...l, rank: l.marker ? MARKERS.indexOf(l.marker) : MARKERS.length }))
+    .map((l) => ({ ...l, rank: l.marker ? MARKERS.indexOf(l.marker) : MARKERS.length })) // a line with no marker ranks after them
     .sort((a, b) => Number(b.constraint) - Number(a.constraint) || a.rank - b.rank || (b.time ?? '').localeCompare(a.time ?? '') || b.place - a.place)
   return ranked.map((l) => {
     // All on the label, with no description: the typeahead cuts a described row's label to 40% of the width and wraps

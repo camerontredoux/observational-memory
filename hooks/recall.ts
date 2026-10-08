@@ -6,6 +6,7 @@
 // what reads files as `RecallIo`.
 import type { SessionMessage } from 'claude-code'
 import { COMPACT_WRAPPER, MEMORY_MARK } from './prompts'
+import { grouped, plural } from './stats'
 
 const RECALL_TOOL = 'om_recall'
 export const SEARCH_MAX_HITS = 20
@@ -112,8 +113,6 @@ const oneLine = (text: string, max: number) => {
   const t = text.replace(/\s+/g, ' ').trim()
   return t.length > max ? `${t.slice(0, max)}…` : t
 }
-const grouped = (n: number) => n.toLocaleString('en-US')
-const plural = (n: number, noun: string, nouns = `${noun}s`) => `${grouped(n)} ${n === 1 ? noun : nouns}`
 const stem = (path: string) => path.slice(path.lastIndexOf('/') + 1).replace(/\.jsonl$/, '')
 // A file's name in a reference: the first 8 characters of a session or agent id, else its whole name.
 const tagFor = (id: string) => (/^[0-9a-f]{8}[0-9a-f-]{8,}$/i.test(id) ? id.slice(0, TAG) : id)
@@ -759,7 +758,7 @@ function spanning(b: Block, starts: readonly number[], heldPerLine: readonly Hel
 // cut around its rarest term. A compound's parts count on a line only when no line holds it whole: `101` inside
 // `101047290` is not `shard-101`. `whole` and `best`, the most terms one line holds whole and at all, rank the hit;
 // `lead` is the line taken first.
-function excerpt(b: Block, m: Matcher): Excerpt {
+function blockExcerpt(b: Block, m: Matcher): Excerpt {
   const { lines, starts } = splitLines(b.text)
   const lowers = lines.map((l) => l.toLowerCase())
   const atoms = [...new Set(m.terms.flatMap((t) => [t.word, ...t.parts]))]
@@ -845,7 +844,7 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
   const excerptBy = await deadline()
   for (const [n, h] of [...hits].reverse().entries()) {
     if (n && (await past(excerptBy))) break
-    h.x = excerpt(h.b, m)
+    h.x = blockExcerpt(h.b, m)
     h.score = h.held.reduce((s, x, k) => s + (x ? weight[k]! : 0), 0)
   }
   const byTime = (a: Hit, b: Hit) => a.time - b.time || (a.t === b.t ? a.i - b.i : 0)
@@ -906,7 +905,7 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
 
 // ---- Read -------------------------------------------------------------------------------------------------------
 
-function parseLines(spec: string | undefined, total: number): [number, number] | string {
+function lineRange(spec: string | undefined, total: number): [number, number] | string {
   if (!spec) return [1, total]
   const m = spec.trim().match(/^(\d*)\s*(?:(-)\s*(\d*))?$/)
   if (!m || (!m[1] && !m[3])) return `om_recall: lines is "A-B", "A-", "-B" or "A".`
@@ -917,7 +916,7 @@ function parseLines(spec: string | undefined, total: number): [number, number] |
 
 function page(b: Block, spec: string | undefined, maxChars = READ_MAX_CHARS) {
   const lines = linesOf(b.text)
-  const r = parseLines(spec, lines.length)
+  const r = lineRange(spec, lines.length)
   if (typeof r === 'string') return r
   const [a, want] = r
   if (a > lines.length) return `om_recall: ${b.ref} has ${plural(lines.length, 'line')}.`

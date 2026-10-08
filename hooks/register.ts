@@ -1,6 +1,6 @@
 import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, ToolSpec, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
-import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, record, report, statsDir } from './stats'
+import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, plural, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { registerNotes } from './notes'
@@ -434,7 +434,6 @@ function sizesOf($: EngineInterface, sessionId: string) {
   if (!sizes) contextSizes.set(sessionId, (sizes = $.store.get(sizeKey(sessionId)).then((v) => (v ?? {}) as Record<string, number>, () => ({}))))
   return sizes
 }
-const plural = (n: number, noun: string) => `${grouped(n)} ${noun}${n === 1 ? '' : 's'}`
 // A pi failure in a few words for the screen: how it ended, never what it printed.
 function reason(error: unknown, timeoutMs: number) {
   const text = errorText(error)
@@ -2602,6 +2601,7 @@ export const register: Register = (on) => {
     pendingTokens.delete(e.sessionId)
     uncarried.delete(e.sessionId)
     installed.delete(e.sessionId)
+    staleSpinners.clear() // keyed by request, not session: the ended session's requests draw no more spinners
     contextSizes.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     await flushHeld($) // and so does the held times' timer

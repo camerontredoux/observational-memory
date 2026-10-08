@@ -5,7 +5,8 @@
 // (the function that frames the built-in summary), except COMPACT_RESUME: its auto-compaction line, edited so it no
 // longer forbids questions to the user or sends the assistant back to the last task.
 
-// The four priority markers both prompts write and read, 🔴 reserved for the user's constraints.
+// The four priority markers both prompts write and read, in rank order, 🔴 reserved for the user's constraints.
+export const MARKERS = ['🔴', '🟡', '🟢', '✅']
 const PRIORITY_MARKERS = `  🔴 The user's standing constraints: a rule, preference, prohibition or scope limit the user set that stays in force, or the user's correction of their own earlier instruction. A one-time go-ahead for one action is not one, nor a report that something does not work, nor a correction of a fact the assistant got wrong.
   🟡 What else is worth keeping: the user's requests, questions and one-time approvals, what the assistant proposed, did or found, tool results, project facts, unresolved work
   🟢 Minor details

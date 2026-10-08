@@ -203,6 +203,7 @@ export function merge(files: readonly SessionStats[], since?: number) {
 }
 
 export const grouped = (n: number) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+export const plural = (n: number, one: string, many = `${one}s`) => `${grouped(n)} ${n === 1 ? one : many}`
 const num = (n: number) => (Math.abs(n) >= 100 || Number.isInteger(n) ? grouped(n) : n >= 1 ? n.toFixed(1) : n.toFixed(2))
 // A failure's message cut to a short line for the screen.
 export const clipLine = (text: string) => (text.length > 60 ? `${text.slice(0, 59)}…` : text)
@@ -250,7 +251,6 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   return lines.join('\n')
 }
 
-const plural = (n: number, one: string, many = `${one}s`) => `${grouped(n)} ${n === 1 ? one : many}`
 const values = (m: Metric | undefined) => m?.recent.map(([, v]) => v) ?? []
 const median = (vs: readonly number[]) => percentile([...vs].sort((a, b) => a - b), 50)
 
