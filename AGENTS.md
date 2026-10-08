@@ -38,7 +38,7 @@ This repo is the source. Claude Code loads the installed copy at `~/.claude/skil
 
 A user-visible change bumps `version` in `.claude-plugin/plugin.json`. The commit subject is `observational-memory vX.Y.Z: <change>`. Keep the `description` in `plugin.json` a short summary of the plugin. The `description` in `hooks/hooks.json` lists the behaviour per hook event, one short clause each, without constants. When a change adds or changes what a hook does, update its clause there.
 
-Known issues that are not tracked on GitHub live in `TODO.md`.
+Known issues that are not tracked on GitHub live in `TODO.md`. Every idea tried so far, with its verdict and evidence, is in `docs/WHAT-WE-TRIED.md`; read it before proposing a change.
 
 ## Agent skills
 
