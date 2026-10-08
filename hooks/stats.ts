@@ -312,6 +312,7 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const [from, to] = [when(s.firstSeen), when(s.lastSeen)]
   const lines = [`observational-memory · ${head} · ${from.slice(0, 10) === to.slice(0, 10) ? `${from}–${to.slice(11)}` : `${from} – ${to}`} UTC`, '']
   const row = (label: string, text: string) => lines.push(`${label.padEnd(13)}${text}`)
+  // Successful calls alone, unlike formatReport's total: a failed call records no cost, and the failures get their own row.
   const calls = countOf(s, /^(observer|reflector)\.\w+\.ms$/)
   const cost = sumOf(s, '.cost')
   if (calls) {
