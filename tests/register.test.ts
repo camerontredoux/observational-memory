@@ -2933,7 +2933,9 @@ describe('register', () => {
 
     expect(result.messages?.[0]?.text).toContain('<corrections>\n* 🔴 User: "use pnpm, never npm"\n</corrections>')
     expect(result.messages?.[0]?.text).not.toContain('I meant the other file')
-    expect(seen.systems[0]).toContain("🔴 The user's constraints: what the user decided, required, forbade or set as a rule or preference that stays in force.")
+    expect(seen.systems[0]).toContain("🔴 The user's standing constraints: a rule, preference, prohibition or scope limit the user set that stays in force, or the user's correction of something said earlier. A one-time go-ahead for one action is not one.")
+    expect(seen.systems[0]).toContain('A one-time go-ahead or approval of one action ("go for it", "yes do it", "ok", "push it", "run the tests", "kill those processes") is not a correction')
+    expect(seen.systems[0]).toContain('* 🟡 2026-09-23 14:36 User approved adding the expiry check the assistant proposed for refreshToken()')
     expect(seen.systems[0]).not.toContain('suggested-response')
   })
 
