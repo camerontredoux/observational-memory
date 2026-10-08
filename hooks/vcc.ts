@@ -1,4 +1,4 @@
-// The session brief: a deterministic, model-free record of the compacted transcript (files changed, commits,
+// The session brief: a deterministic, model-free record of the compacted transcript (the manifest of files touched and key commands, commits,
 // failures left open at its end, and a ranked transcript of its high-value tool events), merged across compactions
 // by code and never read by the Reflector.
 //
@@ -13,7 +13,10 @@ import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE } from './prompts'
 export const BRIEF_MAX_TOKENS = 3_000 // the whole section, a hard cap
 const TRANSCRIPT_MAX_TOKENS = 2_000 // pi-vcc's ranked-transcript ceiling (briefBudgetCeilingTokens), across compactions
 const TRANSCRIPT_FRESH_TOKENS = 1_400 // of it, the newest span's; the rest keeps the tail of earlier spans
-const FILES_SHOWN = 15 // per category, newest kept; the rest counted
+// The manifest: the files the session touched and the key commands it ran, within MANIFEST_MAX_TOKENS of the whole
+// cap; over it, the oldest file only read goes first, then the oldest file, then the oldest command.
+const MANIFEST_MAX_TOKENS = 1_500
+const COMMANDS_KEPT = 12
 const COMMITS_KEPT = 8 // pi-vcc's formatCommits limit
 const OUTSTANDING_MAX = 5
 const OUTSTANDING_TAIL = 30 // blocks at the end of the span read for open failures
@@ -22,17 +25,23 @@ const LINE_CHARS = 200 // one transcript or outstanding line at most
 const BASH_CAP = 160
 const HEREDOC_BODY_CAP = 60
 
+// What was done to a file, in the order a manifest line names it, each with how many times.
+export const FILE_OPS = ['created', 'written', 'edited', 'read'] as const
+export type FileOp = (typeof FILE_OPS)[number]
+// One file of the manifest: what was done to it and when it was last touched; `ref`, the om_recall block of that touch.
+export type FileEntry = { path: string; ops: Partial<Record<FileOp, number>>; at?: number; ref?: string }
+// One key command (a test, build or check, or a git or gh step), at its newest run: `text`, the command and how it ended.
+export type CommandEntry = { text: string; n: number; at?: number; ref?: string }
 export type Brief = {
-  modified: string[] // oldest first, newest last
-  created: string[]
-  earlierModified: number // paths dropped past FILES_SHOWN, counted
-  earlierCreated: number
+  files: FileEntry[] // newest first
+  earlierFiles: number // files dropped for the cap, counted
+  commands: CommandEntry[] // newest first
   commits: string[]
   outstanding: string[] // replaced at every compaction, never merged
   transcript: string[] // `@ YYYY-MM-DD` day lines and `- HH:MM ...` event lines
   omitted: number // transcript lines dropped for the cap, counted
 }
-export const emptyBrief = (): Brief => ({ modified: [], created: [], earlierModified: 0, earlierCreated: 0, commits: [], outstanding: [], transcript: [], omitted: 0 })
+export const emptyBrief = (): Brief => ({ files: [], earlierFiles: 0, commands: [], commits: [], outstanding: [], transcript: [], omitted: 0 })
 
 // ---- Normalization ----------------------------------------------------------------------------------------------
 
@@ -362,30 +371,51 @@ function displayPath(path: string, cwd: string, home?: string) {
   return path
 }
 
-// Files written, by the edit tools (a Write that answered "File created" created it) or by a Bash command that
-// succeeded; oldest first, each at its latest touch. A file created in the span is listed as created only.
-// Each path is followed by the reference of the block that touched it last.
-function extractFiles(blocks: readonly Block[], cwd: string, home?: string) {
-  const touched = new Map<string, { kind: 'modified' | 'created'; b: Block }>()
-  const touch = (path: string, kind: 'modified' | 'created', b: Block) => {
+// The files the span touched: written by the edit tools (a Write that answered "File created" created it, any other
+// Write wrote it whole) or by a Bash command that succeeded, or read by Read; failed calls left out. Newest first,
+// each with how many times each was done, its last touch's time and reference.
+function extractFiles(blocks: readonly Block[], cwd: string, home?: string): FileEntry[] {
+  const touched = new Map<string, FileEntry>()
+  const touch = (path: string, op: FileOp, b: Block) => {
     const was = touched.get(path)
     touched.delete(path)
-    touched.set(path, { kind: was?.kind === 'created' ? 'created' : kind, b })
+    const ops = { ...was?.ops, [op]: (was?.ops[op] ?? 0) + 1 }
+    touched.set(path, { path, ops, ...(b.at === undefined ? {} : { at: b.at }), ...(b.ref ? { ref: b.ref } : {}) })
   }
   for (const b of blocks) {
     if (b.kind !== 'tool' || b.result?.isError) continue
-    if (EDIT_TOOLS.has(b.name)) {
-      const p = pathOf(b.input)
-      if (p) touch(displayPath(resolvePath(p, cwd, home), cwd, home), b.name === 'Write' && /^File created/.test(b.result?.text ?? '') ? 'created' : 'modified', b)
+    const p = pathOf(b.input)
+    if (p && (EDIT_TOOLS.has(b.name) || b.name === 'Read')) {
+      const op = b.name === 'Read' ? 'read' : b.name !== 'Write' ? 'edited' : /^File created/.test(b.result?.text ?? '') ? 'created' : 'written'
+      touch(displayPath(resolvePath(p, cwd, home), cwd, home), op, b)
     }
     const command = commandOf(b)
-    if (command && b.result) for (const p of bashWrites(command, cwd, home)) touch(displayPath(p, cwd, home), 'modified', b)
+    if (command && b.result) for (const w of bashWrites(command, cwd, home)) touch(displayPath(w, cwd, home), 'written', b)
   }
-  const modified: string[] = []
-  const created: string[] = []
-  for (const [p, { kind, b }] of touched) (kind === 'created' ? created : modified).push(withRef(p, b))
-  return { modified, created }
+  return [...touched.values()].reverse()
 }
+const edits = (f: FileEntry) => FILE_OPS.some((op) => op !== 'read' && f.ops[op])
+
+// The key commands the span ran: tests, builds and checks, and git and gh steps other than a commit that succeeded
+// (the commits list holds those); each at its newest run, with how it ended and how many times it ran. Newest first.
+function extractCommands(blocks: readonly Block[], cwd: string, home?: string): CommandEntry[] {
+  const runs = new Map<string, CommandEntry>()
+  for (const b of blocks) {
+    const command = commandOf(b)
+    if (b.kind !== 'tool' || !command || !b.result || DECLINED.test(b.result.text)) continue
+    if (!TEST_COMMAND.test(command) && !WORKFLOW_COMMAND.test(command)) continue
+    if (!b.result.isError && /\bgit\s+commit\b/.test(command)) continue
+    let text = eventText(b, cwd, home).replace(/^Bash /, '')
+    if (!b.result.isError && TEST_COMMAND.test(command) && !text.includes(' → ')) text += ' → ok'
+    const key = keyOfText(text)
+    const n = (runs.get(key)?.n ?? 0) + 1
+    runs.delete(key)
+    runs.set(key, { text: clip(text, LINE_CHARS), n, ...(b.at === undefined ? {} : { at: b.at }), ...(b.ref ? { ref: b.ref } : {}) })
+  }
+  return [...runs.values()].reverse()
+}
+// A command's key: the command as eventText quotes it, without how it ended.
+const keyOfText = (text: string) => text.replace(/" (?:→ |✗)[\s\S]*$/, '"')
 
 // `git commit -m "..."`, `-m '...'`, and the `-m "$(cat <<'EOF' ... EOF)"` form, with the hash its result prints.
 function extractCommits(blocks: readonly Block[]) {
@@ -619,14 +649,14 @@ function selectTranscript(blocks: readonly Block[], modified: ReadonlySet<string
 // The brief of rows [0, n) of a compaction's span: `rows` in call order, `at` each row's time.
 export function compileBrief(rows: readonly SessionMessage[], at: readonly (number | undefined)[], cwd: string, home?: string, refOf?: RefOf): Brief {
   const blocks = normalize(rows, at, refOf)
-  const { modified, created } = extractFiles(blocks, cwd, home)
+  const files = extractFiles(blocks, cwd, home)
   return {
     ...emptyBrief(),
-    modified,
-    created,
+    files,
+    commands: extractCommands(blocks, cwd, home).slice(0, COMMANDS_KEPT),
     commits: extractCommits(blocks).slice(-COMMITS_KEPT),
     outstanding: extractOutstanding(blocks, cwd, home),
-    transcript: selectTranscript(blocks, new Set(modified.map(unref)), TRANSCRIPT_FRESH_TOKENS * 4, cwd, home),
+    transcript: selectTranscript(blocks, new Set(files.filter(edits).map((f) => f.path)), TRANSCRIPT_FRESH_TOKENS * 4, cwd, home),
   }
 }
 
@@ -644,18 +674,29 @@ function transcriptTail(lines: readonly string[], maxChars: number) {
   return { lines: [...lead, ...kept], dropped }
 }
 
-// pi-vcc's mergePrevious: paths deduplicated per category (a path touched again moves to the newest end), the last
-// COMMITS_KEPT commits, Outstanding Context fresh, and the transcript tail-budgeted with the fresh span first.
-// The result is capped at BRIEF_MAX_TOKENS.
+// pi-vcc's mergePrevious, with the manifest: a file touched again sums its counts and moves to the newest end, a
+// command run again takes its newest outcome and adds its runs; the last COMMITS_KEPT commits, Outstanding Context
+// fresh, and the transcript tail-budgeted with the fresh span first. The result is capped at BRIEF_MAX_TOKENS.
 export function mergeBriefs(prev: Brief | undefined, fresh: Brief): Brief {
   const p = prev ?? emptyBrief()
   // A path or commit is the same without its reference; the fresh one's is newer.
   const newer = (old: string[], fresh: string[]) => [...old.filter((x) => !fresh.some((y) => unref(y) === unref(x))), ...fresh]
-  const createdAll = newer(p.created, fresh.created)
-  const modifiedAll = newer(p.modified, fresh.modified).filter((x) => !createdAll.some((y) => unref(y) === unref(x)))
-  const shown = (all: string[]) => ({ list: all.slice(-FILES_SHOWN), over: Math.max(0, all.length - FILES_SHOWN) })
-  const m = shown(modifiedAll)
-  const c = shown(createdAll)
+  // Both maps run oldest first, as do the fresh entries merged in.
+  const files = new Map([...p.files].reverse().map((f) => [f.path, f]))
+  for (const f of [...fresh.files].reverse()) {
+    const was = files.get(f.path)
+    files.delete(f.path)
+    const ops = { ...was?.ops }
+    for (const op of FILE_OPS) if (f.ops[op]) ops[op] = (ops[op] ?? 0) + f.ops[op]
+    files.set(f.path, { ...f, ops, ...(f.ref || !was?.ref ? {} : { ref: was.ref }) })
+  }
+  const commands = new Map([...p.commands].reverse().map((c) => [keyOfText(c.text), c]))
+  for (const c of [...fresh.commands].reverse()) {
+    const key = keyOfText(c.text)
+    const n = (commands.get(key)?.n ?? 0) + c.n
+    commands.delete(key)
+    commands.set(key, { ...c, n })
+  }
   const commits = newer(p.commits, fresh.commits).slice(-COMMITS_KEPT)
   let transcript = fresh.transcript
   let omitted = p.omitted + fresh.omitted
@@ -668,10 +709,9 @@ export function mergeBriefs(prev: Brief | undefined, fresh: Brief): Brief {
     transcript = [...tail.lines, ...(fresh.transcript[0] === lastDay ? fresh.transcript.slice(1) : fresh.transcript)]
   }
   const merged: Brief = {
-    modified: m.list,
-    created: c.list,
-    earlierModified: p.earlierModified + m.over,
-    earlierCreated: p.earlierCreated + c.over,
+    files: [...files.values()].reverse(),
+    earlierFiles: p.earlierFiles + fresh.earlierFiles,
+    commands: [...commands.values()].reverse().slice(0, COMMANDS_KEPT),
     commits,
     outstanding: fresh.outstanding,
     transcript,
@@ -680,9 +720,18 @@ export function mergeBriefs(prev: Brief | undefined, fresh: Brief): Brief {
   return capBrief(merged)
 }
 
-// Over the cap, the oldest transcript lines go first, then the oldest paths, then the oldest commits.
+// The manifest over MANIFEST_MAX_TOKENS sheds the oldest file only read, then the oldest file, then the oldest command.
+// The whole brief over its cap sheds the oldest transcript lines, then the oldest files, commits and commands.
 export function capBrief(brief: Brief): Brief {
-  const b = { ...brief, transcript: [...brief.transcript], modified: [...brief.modified], created: [...brief.created], commits: [...brief.commits], outstanding: [...brief.outstanding] }
+  const b = { ...brief, transcript: [...brief.transcript], files: [...brief.files], commands: [...brief.commands], commits: [...brief.commits], outstanding: [...brief.outstanding] }
+  const dropFile = (readOnly: boolean) => {
+    const i = b.files.findLastIndex((f) => !readOnly || !edits(f))
+    if (i < 0) return false
+    b.files.splice(i, 1)
+    b.earlierFiles++
+    return true
+  }
+  while (tokens(renderManifest(b)) > MANIFEST_MAX_TOKENS && (dropFile(true) || dropFile(false) || b.commands.pop()));
   while (tokens(renderBrief(b)) > BRIEF_MAX_TOKENS) {
     const firstEvent = b.transcript.findIndex((l) => l.startsWith('- '))
     if (firstEvent >= 0) {
@@ -691,9 +740,9 @@ export function capBrief(brief: Brief): Brief {
       if (lead && b.transcript.length && !b.transcript[0]!.startsWith('@ ')) b.transcript.unshift(lead)
       if (!b.transcript.some((l) => l.startsWith('- '))) b.transcript = []
       b.omitted++
-    } else if (b.modified.length) b.modified.shift(), b.earlierModified++
-    else if (b.created.length) b.created.shift(), b.earlierCreated++
+    } else if (dropFile(true) || dropFile(false)) continue
     else if (b.commits.length) b.commits.shift()
+    else if (b.commands.length) b.commands.pop()
     else if (b.outstanding.length) b.outstanding.shift()
     else break
   }
@@ -702,44 +751,96 @@ export function capBrief(brief: Brief): Brief {
 
 // ---- Render and parse -------------------------------------------------------------------------------------------
 
-const FILES = '[Files And Changes]'
+const FILES = '[Files Touched, newest first]'
+const OLD_FILES = '[Files And Changes]' // an older brief's: read back as edited and created files
+const COMMANDS = '[Key Commands, newest first]'
 const COMMITS = '[Commits]'
 const OUTSTANDING = '[Outstanding Context]'
 const TRANSCRIPT = '[Brief Transcript]'
-const earlierNote = (n: number) => (n ? ` (+${n} earlier)` : '')
+const earlierFilesLine = (n: number) => `> ${n} earlier files omitted`
+
+// Lines newest first, each day's date on an `@ YYYY-MM-DD` line before its first line, then `- HH:MM <text>`.
+function dated<T extends { at?: number; ref?: string }>(xs: readonly T[], text: (x: T) => string) {
+  let last = ''
+  return xs.flatMap((x) => {
+    const d = x.at === undefined ? last : day(x.at)
+    const line = withRef(`- ${x.at === undefined ? '' : `${hhmm(x.at)} `}${text(x)}`, x)
+    return d === last ? [line] : [`@ ${(last = d)}`, line]
+  })
+}
+const opsText = (f: FileEntry) =>
+  FILE_OPS.filter((op) => f.ops[op])
+    .map((op) => `${op}${f.ops[op]! > 1 ? ` x${f.ops[op]}` : ''}`)
+    .join(', ')
+const fileText = (f: FileEntry) => `${sanitize(f.path)}: ${opsText(f)}`
+const commandText = (c: CommandEntry) => `${c.text}${c.n > 1 ? ` (x${c.n})` : ''}`
+
+// The manifest: the files the session touched, then its key commands.
+function renderManifest(b: Brief) {
+  const parts: string[] = []
+  if (b.files.length) parts.push(FILES, ...dated(b.files, fileText), ...(b.earlierFiles ? [earlierFilesLine(b.earlierFiles)] : []))
+  if (b.commands.length) parts.push(COMMANDS, ...dated(b.commands, commandText))
+  return parts.join('\n')
+}
 
 // The section's body; every line starts with `>`, `[`, `-` or `@`, so no line inside it can open or close a tag.
 // Without `recall`, the model has no om_recall: the note does not send it there.
 export function renderBrief(b: Brief, recall = true) {
   const parts: string[] = []
-  if (b.modified.length || b.created.length) {
-    parts.push(FILES)
-    if (b.modified.length) parts.push(`- Modified: ${b.modified.join(', ')}${earlierNote(b.earlierModified)}`)
-    if (b.created.length) parts.push(`- Created: ${b.created.join(', ')}${earlierNote(b.earlierCreated)}`)
-  }
+  const manifest = renderManifest(b)
+  if (manifest) parts.push(manifest)
   if (b.commits.length) parts.push(COMMITS, ...b.commits.map((c) => `- ${c}`))
   if (b.outstanding.length) parts.push(OUTSTANDING, ...b.outstanding)
   if (b.transcript.length) parts.push(TRANSCRIPT, ...(b.omitted ? [`> ${b.omitted} earlier lines omitted`] : []), ...b.transcript)
-  const refs = parts.some((l) => REF_TAIL.test(l) || / \((?:#|[\w.-]+:)\d+(?:\.\d+)?\),/.test(l))
+  const refs = parts.some((l) => l.split('\n').some((x) => REF_TAIL.test(x)))
   return parts.length ? [`${BRIEF_NOTE}${recall ? BRIEF_RECALL_NOTE : ''}`, ...(refs && recall ? [BRIEF_REF_NOTE] : []), ...parts].join('\n') : ''
 }
 
+const OPS_TEXT = new RegExp(`^(.*): ((?:${FILE_OPS.join('|')})(?: x\\d+)?(?:, (?:${FILE_OPS.join('|')})(?: x\\d+)?)*)$`)
 export function parseBrief(body: string): Brief {
   const b = emptyBrief()
   let at = ''
-  const files = (line: string, prefix: string) => {
-    const rest = line.slice(prefix.length)
-    const over = rest.match(/ \(\+(\d+) earlier\)$/)
-    return { list: rest.replace(/ \(\+\d+ earlier\)$/, '').split(', ').filter(Boolean), over: Number(over?.[1] ?? 0) }
+  let date = ''
+  // A dated line's time, its text and its reference.
+  const entry = (line: string) => {
+    const ref = refTail(line)
+    const rest = line.slice(2, line.length - ref.length)
+    const m = rest.match(/^(\d\d:\d\d) /)
+    const when = m && date ? new Date(`${date}T${m[1]}:00`).getTime() : undefined
+    return { text: m ? rest.slice(m[0].length) : rest, ...(when === undefined || Number.isNaN(when) ? {} : { at: when }), ...(ref ? { ref: ref.slice(2, -1) } : {}) }
   }
   for (const line of body.split('\n')) {
-    if ([FILES, COMMITS, OUTSTANDING, TRANSCRIPT].includes(line)) {
+    if ([FILES, OLD_FILES, COMMANDS, COMMITS, OUTSTANDING, TRANSCRIPT].includes(line)) {
       at = line
+      date = ''
       continue
     }
-    if (at === FILES && line.startsWith('- Modified: ')) ({ list: b.modified, over: b.earlierModified } = files(line, '- Modified: '))
-    else if (at === FILES && line.startsWith('- Created: ')) ({ list: b.created, over: b.earlierCreated } = files(line, '- Created: '))
-    else if (at === COMMITS && line.startsWith('- ')) b.commits.push(line.slice(2))
+    if ((at === FILES || at === COMMANDS) && line.startsWith('@ ')) date = line.slice(2)
+    else if (at === FILES && /^> \d+ earlier files omitted$/.test(line)) b.earlierFiles = Number(line.match(/\d+/)![0])
+    else if (at === FILES && line.startsWith('- ')) {
+      const { text, ...e } = entry(line)
+      const m = text.match(OPS_TEXT)
+      if (!m) continue
+      const ops: FileEntry['ops'] = {}
+      for (const part of m[2]!.split(', ')) {
+        const [op, n] = part.split(' x')
+        ops[op as FileOp] = Number(n ?? 1)
+      }
+      b.files.push({ path: m[1]!, ops, ...e })
+    } else if (at === COMMANDS && line.startsWith('- ')) {
+      const { text, ...e } = entry(line)
+      const n = text.match(/ \(x(\d+)\)$/)
+      b.commands.push({ text: n ? text.slice(0, n.index) : text, n: Number(n?.[1] ?? 1), ...e })
+    }
+    // An older brief's files, each line oldest first: read back newest first, with no time.
+    else if (at === OLD_FILES && /^- (?:Modified|Created): /.test(line)) {
+      const op: FileOp = line.startsWith('- Created: ') ? 'created' : 'edited'
+      const rest = line.slice(line.indexOf(': ') + 2).replace(/ \(\+(\d+) earlier\)$/, (_, n: string) => ((b.earlierFiles += Number(n)), ''))
+      for (const p of rest.split(', ').filter(Boolean).reverse()) {
+        const ref = refTail(p)
+        b.files.push({ path: p.slice(0, p.length - ref.length), ops: { [op]: 1 }, ...(ref ? { ref: ref.slice(2, -1) } : {}) })
+      }
+    } else if (at === COMMITS && line.startsWith('- ')) b.commits.push(line.slice(2))
     else if (at === OUTSTANDING && line.startsWith('- ')) b.outstanding.push(line)
     else if (at === TRANSCRIPT && /^> \d+ earlier lines omitted$/.test(line)) b.omitted = Number(line.match(/\d+/)![0])
     else if (at === TRANSCRIPT && (line.startsWith('- ') || line.startsWith('@ '))) b.transcript.push(line)

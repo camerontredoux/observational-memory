@@ -56,7 +56,7 @@ export type Memory = {
   nextStep?: string // the user's latest request, verbatim
   environment?: string // the working directory and git state at compaction (see environmentOf)
   failures?: OpenFailure[] // tool failures still open when their rows left context, found by code (see openFailures)
-  brief?: Brief // the session brief, compiled by code (see vcc.ts): where the floor ran
+  brief?: Brief // the session brief, compiled by code (see vcc.ts): the session's file and command manifest, and where the floor ran, its rows
   floor?: boolean // this compaction's brief stands in for rows the Observer had not observed
   transcript?: string
   recoverable: boolean // the session's transcript is known: om_recall can find what the memory leaves out

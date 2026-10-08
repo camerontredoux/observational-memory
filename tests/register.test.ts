@@ -71,7 +71,7 @@ describe('register', () => {
     expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
     expect(text).toContain(`${MEMORY_HEADER}\n\n<memory-guide>\n- The observations are this session's own earlier history`)
     expect(text).not.toContain('only as background')
-    expect(seen.logs.at(-2)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\)$/)
+    expect(seen.logs.at(-2)).toMatch(/^observed 7 rows now, kept 5 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 2 observations, 0 skill\(s\), brief ~\d+ tokens$/)
     expect(seen.logs).toContain('Compacted in 0 ms · observed 7 messages on the spot · memory 2 notes')
     expect(seen.screen).toEqual([])
   })
@@ -178,6 +178,9 @@ describe('register', () => {
       [
         FLOOR_NOTE,
         BRIEF_NOTE + BRIEF_RECALL_NOTE,
+        '[Files Touched, newest first]',
+        '- /src/b.ts: read',
+        '- /src/a.ts: read',
         '[Brief Transcript]',
         '- said: a',
         '- said: a done',
@@ -4200,7 +4203,7 @@ describe('active constraints and the continuation record', () => {
         'Tool failures no later call of the same command or file cleared, found by code:\n' +
         '- At 2026-09-22 14:30 the Bash command `make build` failed: `make: *** No rule to make target build`.',
     )
-    expect(text).not.toContain('still open')
+    expect(text).not.toContain('Tool failures still open')
     expect(text).not.toContain('no later call of it succeeded')
   })
 
@@ -4276,7 +4279,7 @@ describe('the floor', () => {
     await clock.advance(5_000)
 
     expect(seen.prompts).toEqual([])
-    expect(briefIn(result.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
+    expect(briefIn(result.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Files Touched, newest first]', '- /src/b.ts: read', '- /src/a.ts: read', '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
     expect(userMessagesIn(result.messages![0]!.text)).toEqual(['a', 'b'])
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(8)) // the newest turn stays raw
     expect(seen.logs).toContainEqual(expect.stringMatching(/^Compacted in 0 ms · memory 0 notes · 8 messages in a brief compiled by code \(nothing was observed yet\)$/))
@@ -4348,7 +4351,7 @@ describe('the floor', () => {
 
     expect(seen.prompts).toHaveLength(1)
     expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
-    expect(briefIn(result.messages![0]!.text)).toBeUndefined()
+    expect(briefIn(result.messages![0]!.text)).toBe([NOTE, '[Files Touched, newest first]', '- /src/a.ts: read'].join('\n')) // the manifest alone: no floor
   })
 
   test('a manual compaction with background observations since the last one cuts at the watermark, as before', async ($, on) => {
@@ -4366,7 +4369,7 @@ describe('the floor', () => {
 
     expect(seen.prompts).toHaveLength(before)
     expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
-    expect(briefIn(result.messages![0]!.text)).toBeUndefined()
+    expect(briefIn(result.messages![0]!.text)).toBe([NOTE, '[Files Touched, newest first]', '@ 2026-09-22', '- 14:30 /src/a.ts: read'].join('\n')) // the manifest alone: no floor
     expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call/)
   })
 
@@ -4393,23 +4396,23 @@ describe('the floor', () => {
     const briefed = briefIn(second.messages![0]!.text)
     const third = await $.session.compact({ trigger: 'manual', messages: [...second.messages!, ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
 
-    expect(briefIn(first.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done'].join('\n'))
-    expect(briefed).toBe([FLOOR_NOTE, NOTE, '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
-    expect(seen.prompts.length).toBeGreaterThan(0) // d was observed: no floor, the brief carried as it was
+    expect(briefIn(first.messages![0]!.text)).toBe([FLOOR_NOTE, NOTE, '[Files Touched, newest first]', '- /src/a.ts: read', '[Brief Transcript]', '- said: a', '- said: a done'].join('\n'))
+    expect(briefed).toBe([FLOOR_NOTE, NOTE, '[Files Touched, newest first]', '- /src/b.ts: read', '- /src/a.ts: read', '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
+    expect(seen.prompts.length).toBeGreaterThan(0) // d was observed: no floor, the brief carried with d's manifest merged in
     expect(observationsIn(third.messages![0]!.text)).toContain('User: "d"')
-    expect(briefIn(third.messages![0]!.text)).toBe(briefed!.slice(FLOOR_NOTE.length + 1))
+    expect(briefIn(third.messages![0]!.text)).toBe([NOTE, '[Files Touched, newest first]', '- /src/d.ts: read', '- /src/c.ts: read', '- /src/b.ts: read', '- /src/a.ts: read', '[Brief Transcript]', '- said: a', '- said: a done', '- said: b', '- said: b done'].join('\n'))
   })
 
-  test('an observed memory has no session brief', async ($, on) => {
+  test("an observed memory's session brief is the manifest alone", async ($, on) => {
     mock.clock(on)
     world(on)
     pi(on)
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
     expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
-    expect(result.messages![0]!.text).not.toContain('<session-brief>')
+    expect(briefIn(result.messages![0]!.text)).toBe([NOTE, '[Files Touched, newest first]', '- /src/a.ts: read'].join('\n'))
   })
 
-  test('the files the observed rows changed are listed in the brief, and nothing else of those rows', async ($, on) => {
+  test("the observed rows' manifest is listed in the brief, and nothing else of those rows", async ($, on) => {
     mock.clock(on)
     world(on)
     pi(on)
@@ -4420,7 +4423,7 @@ describe('the floor', () => {
     const text = (await $.session.compact({ trigger: 'manual', messages })).messages![0]!.text
 
     expect(observationsIn(text)).toContain('User: "a"')
-    expect(briefIn(text)).toBe([NOTE, '[Files And Changes]', '- Modified: /src/a.ts'].join('\n'))
+    expect(briefIn(text)).toBe([NOTE, '[Files Touched, newest first]', '- /src/a.ts: edited'].join('\n'))
   })
 
   test("the brief's lines name the om_recall block they came from when the transcript is known and the model can call om_recall", async ($, on) => {
@@ -4450,12 +4453,14 @@ describe('the floor', () => {
         FLOOR_NOTE,
         NOTE,
         BRIEF_REF_NOTE,
+        '[Files Touched, newest first]',
+        '- /src/a.ts: read (session-1:2.2)',
         '[Brief Transcript]',
         '- said: a (session-1:2.1)',
         '- said: a done (session-1:4)',
       ].join('\n'),
     )
-    expect(unoffered).toBe([FLOOR_NOTE, BRIEF_NOTE, '[Brief Transcript]', '- said: a', '- said: a done'].join('\n'))
+    expect(unoffered).toBe([FLOOR_NOTE, BRIEF_NOTE, '[Files Touched, newest first]', '- /src/a.ts: read', '[Brief Transcript]', '- said: a', '- said: a done'].join('\n'))
   })
 })
 

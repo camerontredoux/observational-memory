@@ -40,7 +40,7 @@ describe('memory message', () => {
       nextStep: 'Run the tests again',
       environment: 'Working directory: /work/project\nBranch: main',
       failures: [{ at: at(23, 9, 6), tool: 'Bash', target: 'bun test', error: '3 fail', policy: false }],
-      brief: mergeBriefs(undefined, { ...emptyBrief(), modified: ['hooks/stats.ts'], commits: ['1a2b3c4 Fix the totals'], transcript: ['@ 2026-09-22', '- 14:30 Edit hooks/stats.ts'] }),
+      brief: mergeBriefs(undefined, { ...emptyBrief(), files: [{ path: 'hooks/stats.ts', ops: { edited: 2, read: 1 }, at: at(22, 14, 30) }], commands: [{ text: '"bun test" → 3 fail', n: 2, at: at(22, 14, 31) }], commits: ['1a2b3c4 Fix the totals'], transcript: ['@ 2026-09-22', '- 14:30 Edit hooks/stats.ts'] }),
       floor: true,
       transcript: '/home/u/.claude/projects/p/s.jsonl',
       recoverable: true,

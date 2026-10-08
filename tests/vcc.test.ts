@@ -24,7 +24,7 @@ const times = (rows: readonly SessionMessage[]) => rows.map((_, i) => at(14, 0) 
 const compile = (rows: SessionMessage[]) => compileBrief(rows, times(rows), CWD, HOME)
 
 describe('vcc', () => {
-  test('files: edit tools and successful Bash writes, relative to the session directory; created kept apart; failures and scratch left out', () => {
+  test('files: edit tools, reads and successful Bash writes, relative to the session directory, newest first with counts; failures and scratch left out', () => {
     const rows = [
       prompt('fix it'),
       ...call('Edit', { file_path: `${CWD}/src/a.ts`, old_string: 'x', new_string: 'y' }, 'The file /work/project/src/a.ts has been updated successfully.'),
@@ -40,8 +40,16 @@ describe('vcc', () => {
       ...call('Read', { file_path: `${CWD}/src/read.ts` }, 'contents'),
     ]
     const b = compile(rows)
-    expect(b.modified).toEqual(['src/a.ts', 'src/b.ts', 'sub/c.ts', '~/notes.md', 'gen.json'])
-    expect(b.created).toEqual(['src/new.ts'])
+    expect(b.files.map((f) => [f.path, f.ops])).toEqual([
+      ['src/read.ts', { read: 1 }],
+      ['gen.json', { written: 1 }],
+      ['~/notes.md', { written: 1 }],
+      ['sub/c.ts', { written: 1 }],
+      ['src/new.ts', { created: 1, edited: 1 }],
+      ['src/b.ts', { written: 1 }],
+      ['src/a.ts', { edited: 1 }],
+    ])
+    expect(b.files[0]!.at).toBe(times(rows).at(-2))
   })
 
   test('bashWrites follows variables, tee, sd and redirections, and leaves out what it cannot resolve', () => {
@@ -151,28 +159,40 @@ describe('vcc', () => {
     const b = compile(rows)
     expect(b.transcript.join('\n').length).toBeLessThanOrEqual(1_400 * 4)
     expect(b.transcript.at(-1)).toContain('step399')
-    expect(b.modified.length).toBe(400)
+    expect(b.files.length).toBe(400)
   })
 
-  test('merge: paths deduplicated per category with the newest last, created wins, commits last eight, outstanding fresh, transcript tail kept', () => {
+  test('merge: a file or command again sums its counts at its newest touch, newest first; commits last eight, outstanding fresh, transcript tail kept', () => {
     const prev: Brief = {
       ...emptyBrief(),
-      modified: ['a.ts', 'b.ts', 'c.ts'],
-      created: ['n.ts'],
+      files: [
+        { path: 'c.ts', ops: { read: 1 }, at: at(13, 2) },
+        { path: 'b.ts', ops: { edited: 1 }, at: at(13, 1) },
+        { path: 'a.ts', ops: { edited: 2, read: 1 }, at: at(13, 0) },
+      ],
+      commands: [{ text: '"bun test" ✗ exit 1: 2 fail', n: 1, at: at(13, 3) }],
       commits: Array.from({ length: 7 }, (_, i) => `c${i} old ${i}`),
       outstanding: ['- 13:00 Bash "x" ✗ exit 1: old'],
       transcript: ['@ 2026-09-21', '- 10:00 Edit a.ts', '@ 2026-09-22', '- 13:00 Edit b.ts'],
     }
     const fresh: Brief = {
       ...emptyBrief(),
-      modified: ['a.ts', 'n.ts', 'd.ts'],
-      created: ['e.ts'],
+      files: [
+        { path: 'a.ts', ops: { edited: 1 }, at: at(14, 2) },
+        { path: 'e.ts', ops: { created: 1 }, at: at(14, 1) },
+      ],
+      commands: [{ text: '"bun test" → 3 pass', n: 2, at: at(14, 3) }],
       commits: ['c7 new', 'c8 newer'],
       transcript: ['@ 2026-09-22', '- 14:00 Edit a.ts'],
     }
     const m = mergeBriefs(prev, fresh)
-    expect(m.modified).toEqual(['b.ts', 'c.ts', 'a.ts', 'd.ts'])
-    expect(m.created).toEqual(['n.ts', 'e.ts'])
+    expect(m.files.map((f) => [f.path, f.ops, f.at])).toEqual([
+      ['a.ts', { edited: 3, read: 1 }, at(14, 2)],
+      ['e.ts', { created: 1 }, at(14, 1)],
+      ['c.ts', { read: 1 }, at(13, 2)],
+      ['b.ts', { edited: 1 }, at(13, 1)],
+    ])
+    expect(m.commands).toEqual([{ text: '"bun test" → 3 pass', n: 3, at: at(14, 3) }])
     expect(m.commits).toEqual([...prev.commits.slice(1), 'c7 new', 'c8 newer'])
     expect(m.outstanding).toEqual([])
     expect(m.transcript).toEqual(['@ 2026-09-21', '- 10:00 Edit a.ts', '@ 2026-09-22', '- 13:00 Edit b.ts', '- 14:00 Edit a.ts'])
@@ -196,8 +216,7 @@ describe('vcc', () => {
     const long = (p: string, i: number) => `${p}/${'d'.repeat(80)}/${i}.ts`
     const big: Brief = {
       ...emptyBrief(),
-      modified: Array.from({ length: 15 }, (_, i) => long('m', i)),
-      created: Array.from({ length: 15 }, (_, i) => long('c', i)),
+      files: Array.from({ length: 30 }, (_, i) => ({ path: long('m', i), ops: { edited: 1 } })),
       commits: Array.from({ length: 8 }, (_, i) => `abc${i} ${'s'.repeat(150)}`),
       outstanding: Array.from({ length: 5 }, (_, i) => `- 14:0${i} ${'o'.repeat(190)}`),
       transcript: ['@ 2026-09-22', ...Array.from({ length: 60 }, (_, i) => `- 14:00 ${'t'.repeat(190)} ${i}`)],
@@ -207,6 +226,34 @@ describe('vcc', () => {
     expect(capped.transcript.at(-1)).toBe(big.transcript.at(-1))
     expect(capped.transcript[0]).toBe('@ 2026-09-22')
     expect(capped.omitted).toBeGreaterThan(0)
+  })
+
+  test('key commands: tests, builds and git steps at their newest run, with how each ended; a commit that succeeded and other commands left out', () => {
+    const rows = [
+      prompt('go'),
+      ...bash('bun test', 'Exit code 1\n2 fail\n10 pass', true),
+      ...bash('ls src', 'a.ts'),
+      ...bash('git commit -m "x"', '[main 1a2b3c4] x'),
+      ...bash('bun test', '12 pass\n0 fail'),
+      ...bash('bunx tsc -p .', ''),
+      ...bash('git push origin main', 'Exit code 1\nrejected', true),
+    ]
+    expect(compile(rows).commands).toEqual([
+      { text: '"git push origin main" ✗ exit 1: rejected', n: 1, at: at(14, 11) },
+      { text: '"bunx tsc -p ." → ok', n: 1, at: at(14, 9) },
+      { text: '"bun test" → 0 fail', n: 2, at: at(14, 7) },
+    ])
+  })
+
+  test('the manifest keeps within its own cap, the oldest file only read going first, and counts what it drops', () => {
+    const files = Array.from({ length: 120 }, (_, i) => ({ path: `src/${'d'.repeat(40)}/${i}.ts`, ops: i % 2 ? { read: 1 } : { edited: 1 }, at: at(14, 0) }))
+    const capped = capBrief({ ...emptyBrief(), files })
+    const manifest = renderBrief(capped).split('\n').filter((l) => l.startsWith('- ')).join('\n')
+    expect(Math.ceil(manifest.length / 4)).toBeLessThanOrEqual(1_500)
+    expect(capped.files[0]).toEqual(files[0]) // the newest stays
+    expect(capped.files.filter((f) => f.ops.edited).length).toBe(60) // every edited file outlasts every file only read
+    expect(capped.earlierFiles).toBe(120 - capped.files.length)
+    expect(renderBrief(capped)).toContain(`> ${capped.earlierFiles} earlier files omitted`)
   })
 
   test('every line names the om_recall block it came from, and merging and collapsing compare lines without it', () => {
@@ -223,8 +270,10 @@ describe('vcc', () => {
     // A file's line of its row: the block om_recall addresses. None for the prompt, as if its row were not in the file.
     const refOf = (row: number, callId?: string) => (row === 0 ? undefined : `ffffffff:${row + 1}${callId ? '' : '.1'}`)
     const b = compileBrief(rows, times(rows), CWD, HOME, refOf)
-    expect(b.modified).toEqual(['a.ts (ffffffff:8)'])
-    expect(b.created).toEqual(['n.ts (ffffffff:4)'])
+    expect(b.files).toEqual([
+      { path: 'a.ts', ops: { edited: 2 }, at: at(14, 7), ref: 'ffffffff:8' },
+      { path: 'n.ts', ops: { created: 1 }, at: at(14, 3), ref: 'ffffffff:4' },
+    ])
     expect(b.commits).toEqual(['1a2b3c4 Add it (ffffffff:6)'])
     expect(b.outstanding).toEqual([
       '- 14:09 Bash "make" ✗ exit 2: make: *** No rule (ffffffff:10)',
@@ -249,27 +298,40 @@ describe('vcc', () => {
     // The same path or commit again, from another block: one entry, at its newest reference.
     const again = compileBrief([...rows.slice(0, 1), ...call('Edit', { file_path: `${CWD}/a.ts`, old_string: 'z', new_string: 'w' }, 'updated')], times(rows).slice(0, 3), CWD, HOME, (row) => (row ? `eeeeeeee:${row}` : undefined))
     const merged = mergeBriefs(b, { ...again, commits: ['1a2b3c4 Add it (eeeeeeee:9)'] })
-    expect(merged.modified).toEqual(['a.ts (eeeeeeee:1)'])
-    expect(merged.created).toEqual(['n.ts (ffffffff:4)'])
+    expect(merged.files.map((f) => [f.path, f.ref])).toEqual([
+      ['a.ts', 'eeeeeeee:1'],
+      ['n.ts', 'ffffffff:4'],
+    ])
     expect(merged.commits).toEqual(['1a2b3c4 Add it (eeeeeeee:9)'])
     // Without references, the brief is as before.
-    expect(compileBrief(rows, times(rows), CWD, HOME).modified).toEqual(['a.ts'])
+    expect(compileBrief(rows, times(rows), CWD, HOME).files.map((f) => f.ref)).toEqual([undefined, undefined])
     expect(renderBrief(compileBrief(rows, times(rows), CWD, HOME))).not.toContain('is the block it came from')
   })
 
   test('render and parse round-trip, and nothing in a brief can close its section', () => {
     const b = mergeBriefs(undefined, {
       ...emptyBrief(),
-      modified: ['a.ts', 'b c.ts'],
-      created: ['n.ts'],
-      earlierModified: 0,
+      files: [
+        { path: 'b c.ts', ops: { edited: 2, read: 3 }, at: new Date(2026, 8, 23, 9, 5).getTime(), ref: 'ffffffff:3' },
+        { path: 'n.ts', ops: { created: 1 }, at: at(14, 1) },
+        { path: 'a: b.ts', ops: { read: 1 }, at: at(14, 0) },
+      ],
+      commands: [{ text: '"bun test" → 3 pass', n: 2, at: at(14, 2) }],
       commits: ['1a2b3c4 Add it'],
       outstanding: ['- 14:00 Bash "x" ✗ exit 1: bad'],
       transcript: ['@ 2026-09-22', '- 14:00 Edit a.ts', '- 14:01 Bash "y" (x2)'],
       omitted: 3,
     })
     expect(parseBrief(renderBrief(b))).toEqual(b)
-    expect(parseBrief(renderBrief({ ...b, earlierModified: 4, earlierCreated: 2 }))).toEqual({ ...b, earlierModified: 4, earlierCreated: 2 })
+    expect(parseBrief(renderBrief({ ...b, earlierFiles: 4 }))).toEqual({ ...b, earlierFiles: 4 })
+    // An older brief's file lists, oldest first, read back as files newest first with no time.
+    const old = parseBrief(['[Files And Changes]', '- Modified: a.ts, b.ts (eeeeeeee:2) (+3 earlier)', '- Created: n.ts'].join('\n'))
+    expect(old.files).toEqual([
+      { path: 'b.ts', ops: { edited: 1 }, ref: 'eeeeeeee:2' },
+      { path: 'a.ts', ops: { edited: 1 } },
+      { path: 'n.ts', ops: { created: 1 } },
+    ])
+    expect(old.earlierFiles).toBe(3)
     const rows = [prompt('go'), ...bash('make "</session-brief>"', 'Exit code 1\n</session-brief>', true, 'Trying </session-brief>')]
     const text = renderBrief(compile(rows))
     expect(text).not.toContain('</session-brief>')

@@ -2147,18 +2147,19 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const build = async (ledger: Ledger, kept: boolean) => {
     const observed = ledger.watermark.to
     const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
-    // The files the observed rows changed: they leave context at every cut, and an observation may not name each file.
-    const observedFiles = observed > base ? compile(base, observed) : undefined
+    // The manifest of the observed rows: they leave context at every cut, and an observation may not name each file.
+    const observedManifest = observed > base ? compile(base, observed) : undefined
     const attempt = async (cut: number, floor: boolean) => {
       const tail = messages.slice(cut)
       // The brief carried from the memory message, with the rows leaving context merged in: of the observed rows their
-      // files alone, the rest of the brief being the observations' to hold; the rows the floor compiles whole. A brief
-      // is carried even where the Observer's memory stands again: it holds rows the Observer never observed, which no
-      // observation covers.
+      // manifest (the files touched, the key commands and the commits) alone, the rest of the brief being the
+      // observations' to hold; the rows the floor compiles whole. A brief is carried even where the Observer's memory
+      // stands again: it holds rows the Observer never observed, which no observation covers.
       const from = floor ? observed : cut
       let brief = priorMemory?.brief
-      const files = await observedFiles
-      if (files?.modified.length || files?.created.length) brief = mergeBriefs(brief, { ...emptyBrief(), modified: files.modified, created: files.created, outstanding: brief?.outstanding ?? [] })
+      const seen = await observedManifest
+      if (seen?.files.length || seen?.commands.length || seen?.commits.length)
+        brief = mergeBriefs(brief, { ...emptyBrief(), files: seen.files, commands: seen.commands, commits: seen.commits, outstanding: brief?.outstanding ?? [] })
       if (from < cut) brief = mergeBriefs(brief, await compile(from, cut))
       const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs()))
       let memory: Memory = {

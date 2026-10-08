@@ -231,7 +231,7 @@ export const FLOOR_NOTE =
 // The session brief's own notes (hooks/vcc.ts renderBrief): what compiled it; where the model can call om_recall,
 // that om_recall finds the full text; and, where its lines carry references, what they are.
 export const BRIEF_NOTE =
-  '> Compiled by code from the compacted transcript, not by a model: the files it changed, its commits, failures still open at its end, and its key tool events, oldest first.'
+  '> Compiled by code from the compacted transcript, not by a model: the files it touched and its key commands, newest first; its commits, failures still open at its end, and its key tool events, oldest first.'
 export const BRIEF_RECALL_NOTE = ' om_recall finds the full text.'
 export const BRIEF_REF_NOTE = '> The reference in parentheses at the end of a line or path, like (a79f045b:12), is the block it came from: om_recall reads it whole.'
 
