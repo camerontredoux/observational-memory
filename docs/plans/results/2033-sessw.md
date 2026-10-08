@@ -4,7 +4,7 @@
 
 ## Build
 
-- `.scratch/omv-sess2/sessw` = `.scratch/omv-code/base8` + a Session writer. The Observer and Reflector prompts, and their inputs, are byte-identical to base8's. Diff: `diffs/sessw.diff` (hooks and tests).
+- `.scratch/omv-sess2/sessw` = `.scratch/omv-code/base8` + a Session writer. The Observer and Reflector prompts, and their inputs, are byte-identical to base8's. Diff: `docs/archive/plans/results/diffs/sessw.diff` (hooks and tests).
 - `hooks/prompts.ts`: `SESSION_SYSTEM_PROMPT`, placed after `COMPACT_WRAPPER`. With the prompt placed earlier in the file, the bench's Reflector-code check flagged a Reflector change and refused the comparison, although nothing in the Reflector had changed.
 - `hooks/register.ts` `writeSession()`: one `pi` / Luna call, with the same model, flags and transport as the Observer, of kind `session`. It is main loop only and runs in the background (`phase: 'background'`). Its input:
   - the user's messages: the first one (the brief) cut to 1,000 tokens, then the newest messages within 3,000 tokens, each cut to 300, with a "(N messages left out)" line;

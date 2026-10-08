@@ -5,6 +5,9 @@ Each baseline is one run of the continuation-quality benchmark (`scripts/bench-l
 - `<date>-<version>.jsonl`: one scored record per live run.
 - `<date>-<version>.md`: the report made from those records.
 
+The reports of the superseded v1.0.0, v1.1.0 recall-required and v1.2.0 baselines are in `docs/archive/bench/`.
+Their `.jsonl` records stay here, because `scripts/bench-bm25.ts` reads every `docs/bench/*.jsonl`.
+
 To compare a change against a baseline:
 
 1. Run the benchmark on the change with its own version label, so its runs stay apart from the baseline's `new`:

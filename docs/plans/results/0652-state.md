@@ -1,6 +1,6 @@
 # state: a background-written `<state>` status page leads the memory, and the observations it covers are trimmed
 
-Branch `exp-state` on v151 (f2afcdf), worktree `.scratch/par/state`. The commits are f9e3a98 (a cherry-pick of exp-grader's 86c97db: core/lookup tiers), 9dc89ed (the state page) and 0c2fbab (`--continuation`). The diff against v151 is in `diffs/state.diff`.
+Branch `exp-state` on v151 (f2afcdf), worktree `.scratch/par/state`. The commits are f9e3a98 (a cherry-pick of exp-grader's 86c97db: core/lookup tiers), 9dc89ed (the state page) and 0c2fbab (`--continuation`). The diff against v151 is in `docs/archive/plans/results/diffs/state.diff`.
 
 **Verdict: do not land.** Under the current benchmark it is clearly worse: retention drops 8.8 points, 128 unique items go down and 3 go up, and all 3 transcripts agree. Under the continuation score it is also worse: retention -6.2 and behavior -13.2, both well beyond the ≈±2.5 behavior noise. Rules and permissions hold, context is 19% smaller, and there is no new critical-path call. But it misses the bar on the continuation score, and the writer costs about 3× the Session writer.
 

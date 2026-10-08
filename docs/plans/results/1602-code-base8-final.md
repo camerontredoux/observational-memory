@@ -4,7 +4,7 @@
 
 - **Plugin dir:** `/home/cameron/work/mods/observational-memory/.scratch/omv-code/base8` (also `/tmp/omv-code/base8`).
 - **Contents:** base7 + I55 lookup-fail + I54 rowcap + I56 align + I53 carry5f.
-- **How carry5f went in:** `docs/plans/results/diffs/carry5f.diff`, applied with `patch -p1`.
+- **How carry5f went in:** `docs/archive/plans/results/diffs/carry5f.diff`, applied with `patch -p1`.
   - Both hunks applied cleanly, 21 lines further down than in base7.
   - The change it makes is identical to `.scratch/omv/carry5f` vs base7; only line offsets differ.
   - carry5f touches only `hooks/register.ts`.

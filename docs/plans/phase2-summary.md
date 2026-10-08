@@ -1,13 +1,13 @@
 # Phase 2 summary: compaction quality and speed (2026-09-25)
 
-This is the closing record of Phase 1 (the A/B benchmark) and Phase 2 (improving compaction with it). Every idea, number and verdict is in `compaction-ideas.md`. Every worker report is in `results/`, and the code for each idea is in `results/diffs/`. The goals are in `compaction-goals.md`.
+This is the closing record of Phase 1 (the A/B benchmark) and Phase 2 (improving compaction with it). Every idea, number and verdict is in `compaction-ideas.md`. Every worker report is in `results/`, and the code for each idea is in `docs/archive/plans/results/diffs/`. The goals are in `compaction-goals.md`.
 
 ## Where we are
 
 **base8** is HEAD `af0940d` plus 22 kept changes. It landed as observational-memory v1.4.0 (commit `8003175`).
 
 - Plugin copy as tested: `.scratch/omv-code/base8`
-- The patch as applied: `results/diffs/base8.diff`
+- The patch as applied: `docs/archive/plans/results/diffs/base8.diff`
 - On landing, one fixture-only replay test (`replays a firstmate transcript`) expected 1 observation per chunk; carry5f makes it 2 and 6, and the test now says so. 373/0 tests.
 
 ### Scores

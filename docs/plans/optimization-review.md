@@ -4,7 +4,7 @@ This is a review of v1.5.3 at commit `1722564`. The goal is to make the plugin f
 
 Five reviewers each covered one area: compaction, codebase design, tokens and speed, the plugin API, and prompts. Five checkers then re-read the code and tried to disprove each finding. There were 42 findings. The checkers confirmed 15, found 25 partly right and corrected their size or scope, and refuted 2. The user asked for all 38 fixes below.
 
-Line numbers refer to `1722564`. The folder `optimization-review/` keeps each reviewer's text and each checker's verdict, one file per area. The IDs in brackets, such as `[T3]`, name the finding in those files. Some IDs appear in two files. A bare `[C1]` or `[D2]`–`[D4]` under Compaction is from `compaction.txt`. Elsewhere, the ID has its area, such as `[D2, design]`.
+Line numbers refer to `1722564`. The folder `docs/archive/plans/optimization-review/` keeps each reviewer's text and each checker's verdict, one file per area. The IDs in brackets, such as `[T3]`, name the finding in those files. Some IDs appear in two files. A bare `[C1]` or `[D2]`–`[D4]` under Compaction is from `compaction.txt`. Elsewhere, the ID has its area, such as `[D2, design]`.
 
 The short version: the compaction core is sound, and the main conversation already uses few tokens. The real problems are the store, and two paths where compaction still waits on the Observer.
 
@@ -299,7 +299,7 @@ What is new is the size and a concrete fix. In the bench reply cache, the Reflec
 
 **Fix.** When `nextStep` equals the newest message and fits within `NEXT_STEP_MAX_TOKENS` (2,000, `:93`), write that entry in `<all-user-messages>` as a pointer, such as "quoted in the continuation below". `parseUserMessages` then recovers the text from the latest-request block by its length header. The length check matters because the two copies have different caps: `<all-user-messages>` keeps more (`capUserMessages`, `:1306`, `:1318`), so a pointer is lossless only when the continuation copy is whole.
 
-**Caution.** Efficiency idea E4 (`docs/plans/ideas/efficiency.md:59`) kept this duplicate on purpose. Screen the change at E4's no-model tier first. Tests at `tests/register.test.ts:3820` and `:3954` cover the current layout.
+**Caution.** Efficiency idea E4 (`docs/archive/plans/ideas/efficiency.md:59`) kept this duplicate on purpose. Screen the change at E4's no-model tier first. Tests at `tests/register.test.ts:3820` and `:3954` cover the current layout.
 
 **Sources.** [T5] partly.
 
@@ -441,7 +441,7 @@ Keep `hooks.json` as one short clause per hook event, without constants. Change 
 
 ### 33. Share `typedText` and `isMemoryText` instead of copying them
 
-**Problem.** `typed()` (`register.ts:423-429`) repeats `typedText` (`recall.ts:90-94`) line for line, and `isMemory` (`register.ts:411-412`) repeats `isMemoryText` (`recall.ts:76`). A bug already had to be fixed in both (`docs/plans/ideas/code-only.md:27-30`).
+**Problem.** `typed()` (`register.ts:423-429`) repeats `typedText` (`recall.ts:90-94`) line for line, and `isMemory` (`register.ts:411-412`) repeats `isMemoryText` (`recall.ts:76`). A bug already had to be fixed in both (`docs/archive/plans/ideas/code-only.md:27-30`).
 
 **Fix.** Export `typedText` and `isMemoryText` from `recall.ts`. Reduce `typed` to `isPrompt(m) && !isMemory(m) && !isSummary(m) ? typedText(m.text)` plus the skills filter. Leave `vcc.ts`'s turn-closure rule alone, since changing it would change brief ranking. Only fix its comment at `vcc.ts:69` to say it marks any user row that is not a tool result.
 
@@ -459,7 +459,7 @@ Keep `hooks.json` as one short clause per hook event, without constants. Change 
 
 **Problem.** `OM_BRIEF=always` (`register.ts:182-184`, read at `:2044`, used at `:2173`) makes every memory carry the code-compiled brief. `docs/plans/om-direction.md:23` lists it as rejected: no measured gain.
 
-**Fix.** Remove the flag, the `always` branch, the `--brief` bench option and their tests: `tests/eval/live.ts:52-55`, `:65`, `:108`, `:179`, `tests/bench-live.test.ts:88-100`, `tests/register.test.ts:4192`, `:4210`, and `scripts/bench-live.ts:43`, `:118-119`. Add a note to X5 in `docs/plans/ideas/outside.md:44` that the cliff arm would need its own switch.
+**Fix.** Remove the flag, the `always` branch, the `--brief` bench option and their tests: `tests/eval/live.ts:52-55`, `:65`, `:108`, `:179`, `tests/bench-live.test.ts:88-100`, `tests/register.test.ts:4192`, `:4210`, and `scripts/bench-live.ts:43`, `:118-119`. Add a note to X5 in `docs/archive/plans/ideas/outside.md:44` that the cliff arm would need its own switch.
 
 **Sources.** [D11, design] partly.
 

@@ -1,6 +1,6 @@
 # rules: only standing constraints are 🔴 corrections; one-time approvals are 🟡
 
-A is HEAD (55c17a7, v1.5.0). B is HEAD plus the Observer prompt change in `diffs/rules.diff`. The change:
+A is HEAD (55c17a7, v1.5.0). B is HEAD plus the Observer prompt change in `docs/archive/plans/results/diffs/rules.diff`. The change:
 
 - `PRIORITY_MARKERS` 🔴 now means a standing constraint: a rule, preference, prohibition or scope limit that stays in force, or a correction of something said earlier. A one-time go-ahead for one action is not one. The 🟡 line now lists one-time approvals.
 - The Corrections paragraph lists standing constraints and corrections only. A new paragraph says that a one-time approval ("go for it", "push it", "kill those processes") is a 🟡 observation ("User approved pushing the fix to main"), and that when an approval also sets a standing rule, only that sentence is a correction.
@@ -149,6 +149,6 @@ Land. The constraint gates are not lower, except 3 long-chain `corrections` item
 
 The known weak spot is a standing rule inside an approval ("go ahead, but keep X"). The Observer often records it as 🟡 and not as 🔴.
 
-Land the rules3 sentence with it only after a fresh long draw shows the recall-aware drop is noise. The sentence stops the one failure seen in B, an approval that dissolves a standing prohibition. The rules3 sentence is in the follow-up section above; `diffs/rules.diff` is B without it.
+Land the rules3 sentence with it only after a fresh long draw shows the recall-aware drop is noise. The sentence stops the one failure seen in B, an approval that dissolves a standing prohibition. The rules3 sentence is in the follow-up section above; `docs/archive/plans/results/diffs/rules.diff` is B without it.
 
 Spend: about 2,070 fresh Observer and Reflector calls (about $6.6 at Luna's logged prices), plus 150 behavior reader calls (their cost is not logged). Reports: `.scratch/omv-rules/{screen,screen2,full,beh2}.md`.

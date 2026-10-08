@@ -2,7 +2,7 @@
 
 Question: can one merged, shorter set of instructions in the compacted memory message keep the model's behavior while it uses fewer tokens?
 
-A: main `HEAD@bca4b4a` (v1.4.1). B1: `.scratch/omv-guide/guide`, the first draft. B2: `.scratch/omv-guide/guide2`, B1 with two dropped rules put back (the one fix attempt). The diff in `diffs/memory-guide.diff` is B2 against HEAD.
+A: main `HEAD@bca4b4a` (v1.4.1). B1: `.scratch/omv-guide/guide`, the first draft. B2: `.scratch/omv-guide/guide2`, B1 with two dropped rules put back (the one fix attempt). The diff in `docs/archive/plans/results/diffs/memory-guide.diff` is B2 against HEAD.
 
 ## Result
 

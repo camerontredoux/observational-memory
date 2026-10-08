@@ -4,7 +4,7 @@
 
 ## Build
 
-- `.scratch/omv-sess/session8` = `.scratch/omv-code/base8` + the I26 part of `session-ctx-a.diff` only: the Observer prompt's `Session:` field and example, "keep its Session line…", `session` in `FIELD`, and `carry()` keeping the previous Session line when a newer record leaves it out, placing it first and capping it at 100 tokens. I27a is not included. Diff: `diffs/session8.diff`.
+- `.scratch/omv-sess/session8` = `.scratch/omv-code/base8` + the I26 part of `session-ctx-a.diff` only: the Observer prompt's `Session:` field and example, "keep its Session line…", `session` in `FIELD`, and `carry()` keeping the previous Session line when a newer record leaves it out, placing it first and capping it at 100 tokens. I27a is not included. Diff: `docs/archive/plans/results/diffs/session8.diff`.
 - One new test covers the Session line leading the record, carrying, being replaced, and being bounded. `claude plugin test`: 369 pass, 0 fail. `tsc`: only the missing `tests/fixtures/*.local.ts` errors.
 - A = the `base8` dir: 0 fresh main or holdout calls in both samples, and chain sample 1 is cached. main HEAD (v1.4.1) was not used, because base8 has the cache.
 - session8-sticky was not built. Every B compaction in both samples has a Session line (main 25/25 cuts per sample, holdout too). `carry()` already keeps the old line when the Observer drops it, so the sticky variant would behave the same.

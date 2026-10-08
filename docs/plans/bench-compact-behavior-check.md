@@ -1,6 +1,6 @@
 # bench-compact: the Luna behavior check
 
-Status: approved by the user on 2026-09-25. Not built yet.
+Status: approved by the user on 2026-09-25. Built: `tests/eval/behavior.ts` grades the reader's answers, and `scripts/bench-compact.ts --behavior` runs it. The sections below record the plan as approved; the code is the current reference.
 
 ## Where this stands
 
