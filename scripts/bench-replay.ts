@@ -73,7 +73,7 @@
 //   numbers only.
 import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { dirname, resolve } from 'path'
 import type { SessionMessage } from 'claude-code'
 import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
@@ -119,7 +119,7 @@ const CACHE = `${OUT_ROOT}/luna-cache`
 const OLD_CACHE = '/tmp/om-vcc/luna-cache'
 const TRANSCRIPTS = ['om-orchestration', 'om-v04', 'firstmate-11']
 // Transcripts whose content (memories, questions, answers, excerpts) never leaves this machine: aggregate numbers only.
-const PRIVATE = new Set(['firstmate-11', 'firstmate-6'])
+const PRIVATE = new Set(['firstmate-11', 'firstmate-6', 'crew-uspa-4', 'crew-opie-4'])
 // A chain of transcripts (`a+b+c`, see chainTranscripts) is one long session: private when any of them is.
 const members = (name: string) => name.split('+')
 const isPrivate = (name: string) => members(name).some((m) => PRIVATE.has(m))
@@ -193,7 +193,7 @@ async function dryRun(o: Options) {
 type PiResult = { exitCode: number; stdout: string; stderr: string }
 // `inTokens` is the prompt's size estimated before the call; `in`, `out` and `cost` are pi's own usage record.
 // `level`: a Reflector call's compression level, read from its prompt.
-type Call = { kind: 'observer' | 'reflector'; level?: number; atCompaction: boolean; start: number; prompt: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
+type Call = { kind: 'observer' | 'reflector'; level?: number; atCompaction: boolean; start: number; prompt: string; key?: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
 const LEVELS = ['## COMPRESSION REQUIRED', '## AGGRESSIVE COMPRESSION REQUIRED', '## CRITICAL COMPRESSION REQUIRED', '## EXTREME COMPRESSION REQUIRED']
 const REFLECTED = /reflected \d+ observations \(~(\d+) tokens\) into \d+ \(~(\d+) tokens\) at compression level (\d+)/
 
@@ -251,23 +251,59 @@ async function om(o: Options) {
   const reflections: Reflection[] = []
   let compacted = 0
 
+  // The cache key: the whole argv (the system prompt with it) and stdin. calls.json records it per call.
+  const piKey = (argv: string[], stdin: string) => createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
   async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
     if (piMode === 'stub') return { r: stub(stdin), hit: false }
-    const hash = createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
-    for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
-      if (existsSync(`${dir}/${hash}.json`)) {
-        const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
-        return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
-      }
+    const hash = piKey(argv, stdin)
+    const cached = () => {
+      for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
+        if (existsSync(`${dir}/${hash}.json`)) {
+          const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
+          return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
+        }
+    }
+    const hit = cached()
+    if (hit) return hit
     if (piMode === 'strict') throw new Error(`strict: no cached pi reply for ${hash}`)
-    if (liveLeft <= 0) throw new Error(`--max-calls reached: no live pi call for ${hash}`)
-    liveLeft--
-    const started = Date.now()
-    const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
-    const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
-    const ms = Date.now() - started
-    if (exitCode === 0) writeFileSync(`${cache}/${hash}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
-    return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
+    // One pi call per key across concurrent replays (bench-compact --jobs): the first takes the lock, the others wait
+    // for its reply. A lock whose process is gone is taken over.
+    const lock = `${cache}/${hash}.lock`
+    for (;;) {
+      try {
+        writeFileSync(lock, String(process.pid), { flag: 'wx' })
+        break
+      } catch {}
+      const after = cached()
+      if (after) return after
+      let owner = 0
+      try {
+        owner = Number(readFileSync(lock, 'utf8'))
+        process.kill(owner, 0)
+      } catch {
+        if (owner) rmSync(lock, { force: true })
+        continue
+      }
+      await Bun.sleep(1000)
+    }
+    try {
+      const after = cached()
+      if (after) return after
+      if (liveLeft <= 0) throw new Error(`--max-calls reached: no live pi call for ${hash}`)
+      liveLeft--
+      const started = Date.now()
+      const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
+      const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
+      const ms = Date.now() - started
+      // Written whole, then renamed, so a concurrent replay never reads half a reply.
+      if (exitCode === 0) {
+        writeFileSync(`${lock}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
+        renameSync(`${lock}.json`, `${cache}/${hash}.json`)
+      }
+      return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
+    } finally {
+      unlinkSync(lock)
+    }
   }
 
   const inOut = (p: string) => p === out || p.startsWith(`${out}/`)
@@ -337,7 +373,7 @@ async function om(o: Options) {
         const stdin = init.stdin ?? ''
         const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : 'observer'
         const level = kind === 'reflector' ? LEVELS.findLastIndex((l) => stdin.includes(`\n${l}\n`)) + 1 : 0
-        const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
+        const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
         calls.push(call)
         const result = runPi(argv, stdin, init).then(
           ({ r, hit, realMs }) => {
