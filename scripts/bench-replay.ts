@@ -776,7 +776,7 @@ async function questions(o: Options) {
 
   mkdirSync(out, { recursive: true })
   if (planned.some((p) => p.plan.seed)) {
-    // As scripts/bench-live.ts assembles it: the recall-only plugin with this checkout's recall.ts and prompts.ts.
+    // The recall-only plugin with this checkout's recall.ts and prompts.ts.
     cpSync(`${HERE}/tests/eval/recall-plugin`, recallPluginDir, { recursive: true })
     for (const f of ['recall.ts', 'prompts.ts']) cpSync(`${HERE}/hooks/${f}`, `${recallPluginDir}/hooks/${f}`)
     const v = spawnSync('claude', ['plugin', 'validate', recallPluginDir], { encoding: 'utf8' })

@@ -1,4 +1,4 @@
-// What the benchmark scripts (bench-live.ts, bench-replay.ts) share: their options, failing, the main checkout, a
+// What the benchmark scripts (bench-replay.ts and others) share: their options, failing, the main checkout, a
 // session's transcripts under ~/.claude/projects, and a herdr step in a live pane. Not a script of its own. Not
 // typechecked by `tsc -p .` (Bun's Node APIs).
 import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'

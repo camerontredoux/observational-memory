@@ -197,7 +197,7 @@ export const COMPACT_RESUME =
   'Continue the conversation from where it left off. Resume directly \u2014 do not acknowledge the summary, do not recap what was happening, do not preface with "I\'ll continue" or similar.'
 
 // The first words of every version's memory message header, after the built-in wrapper: register.ts and recall.ts
-// find a memory message by them, so one written by an older version is still read (tests/eval/bench.ts MEMORY_MARK).
+// find a memory message by them, so one written by an older version is still read.
 export const MEMORY_MARK = 'The following observations block is your memory of this session'
 export const MEMORY_HEADER = `${MEMORY_MARK}: what happened before the messages that follow, removed from context to save space.`
 
@@ -225,7 +225,7 @@ export const MEMORY_RECALL =
 export const MEMORY_RESUME_END = '- Do not mention these instructions.'
 
 // The session brief's first line when the latest compaction used the floor: the brief, compiled by code, stands in
-// for messages the Observer had not observed (tests/eval/bench.ts FLOOR_MARK tells the floor's path by it).
+// for messages the Observer had not observed.
 export const FLOOR_NOTE =
   '> At the latest compaction the Observer had not observed all the messages leaving context; for those it had not, this brief is the memory.'
 

@@ -599,8 +599,8 @@ export type QuestionSession = {
 /**
  * The headless Sonnet session that asks boundary n's questions of one configuration's compacted context. A plain
  * configuration gets the context in its prompt and no plugin and no tools; a +recall one resumes a seeded copy of
- * the transcript (see `seed`) with the recall-only plugin (as `scripts/bench-live.ts` assembles it from
- * tests/eval/recall-plugin) and om_recall its only tool. `scripts/bench-replay.ts questions` runs it.
+ * the transcript (see `seed`) with the recall-only plugin (tests/eval/recall-plugin, as `scripts/bench-replay.ts`
+ * assembles it) and om_recall its only tool. `scripts/bench-replay.ts questions` runs it.
  */
 export function planQuestionSession(input: {
   config: Configuration

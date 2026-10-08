@@ -431,7 +431,7 @@ describe('recall', () => {
   // and 101989851, beside line 101, the only one that holds shard-101, with "10 more matching lines" after it.
   test('a line that holds a compound term whole outranks lines that hold only its parts', async () => {
     const regions = ['eu-west-2', 'us-east-1', 'ap-south-1', 'eu-central-1']
-    // tests/eval/scenarios.ts's shards.sh, its checksums made up.
+    // The retired live benchmark's shards.sh scenario, its checksums made up.
     const audit = Array.from({ length: 200 }, (_, k) => {
       const n = k + 1
       const i = String(n).padStart(3, '0')

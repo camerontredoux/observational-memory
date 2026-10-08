@@ -1,6 +1,6 @@
-// Evaluation only: issue #9's builtin+recall configuration. The om_recall tool of hooks/register.ts and nothing else:
+// Evaluation only: the builtin+recall configuration of `scripts/bench-replay.ts questions`. The om_recall tool of hooks/register.ts and nothing else:
 // no compaction, observation, stats or pruning hook, so the host's built-in compaction runs as with no plugin.
-// scripts/bench-live.ts copies this directory into a run's sandbox with the plugin version's own recall.ts and
+// scripts/bench-replay.ts copies this directory into a run's sandbox with the checkout's own recall.ts and
 // prompts.ts beside it. Kept in step with hooks/register.ts's `session.start` registration (tests/register-tools.test.ts checks
 // they register the same om_recall), its `tool.call` handler, and its om_recall `tool.describe` and
 // `classic.SessionStart` handlers (tests/register-tools.test.ts checks both pin om_recall after a compaction).
