@@ -1,6 +1,6 @@
 {
   "name": "observational-memory",
-  "version": "1.14.0",
+  "version": "1.14.1",
   "description": "Replaces compaction with observational memory: a background Observer (GPT-6 Luna via pi) turns each ~10k-token chunk into prioritized, attributed observations and a Reflector condenses them, so compaction cuts at the observed point with no model call. It keeps the user's constraints verbatim, a continuation record and a code-compiled brief where observation lags; om_recall searches the full transcript; om_stats and /om-stats report usage; /notes shows the observations in a pane; # and a word in the prompt box offers the matching memory lines.",
   "author": {
     "name": "Cameron Tredoux"

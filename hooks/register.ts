@@ -104,6 +104,7 @@ const SESSION_MAX_CHARS = 300 // the line as stored, whatever the writer returns
 const SESSION_TIMEOUT_MS = 60_000
 const REGISTER_WAIT_MS = 1_000 // how long session.start waits for om_recall to list; it takes ~50 ms
 const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
+const GAUGES_RM_TIMEOUT_MS = 5_000 // the `rm` of an ended session's footer files, which session.end waits on
 const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the rest counted
 const ENV_LINE_MAX_CHARS = 200 // each line of the environment
 const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force shown whole; past it the oldest shorten (boundPins)
@@ -210,6 +211,24 @@ const track = async ($: EngineInterface, loop: Loop, change: (ws: Worker[]) => W
   if (loop.agentId !== undefined) return
   await update($, workers, change).catch((error) => log($, `could not update the workers band (${errorText(error)})`))
 }
+// A session's footer files, `gauges/<sessionId>.json` and `gauges/<sessionId>.cache.json`, beside the stats: the two
+// writers below and dropGauges build their paths here alone.
+const gaugesPath = async ($: EngineInterface, sessionId: string, suffix: '.json' | '.cache.json') =>
+  `${(await statsDir(statsIo($))).replace(/[^/]*$/, 'gauges')}/${sessionId}${suffix}`
+// Sessions whose footer files session.end deletes: a gauge write that started before the end, or a hook that runs
+// after it, writes nothing for them, so it cannot leave the files behind. Its session.start lifts it, on a resume.
+const gaugesOff = new Set<string>()
+// Deletes the session's footer files once it ends, as no status line draws them after. `$.fs` has no delete, so `rm
+// -f`, which a missing file does not fail. Best effort: a failure is logged, and the end goes on.
+async function dropGauges($: EngineInterface, sessionId: string) {
+  try {
+    const paths = await Promise.all([gaugesPath($, sessionId, '.json'), gaugesPath($, sessionId, '.cache.json')])
+    const r = await $.process.run(['rm', '-f', '--', ...paths], { timeoutMs: GAUGES_RM_TIMEOUT_MS })
+    if (r.exitCode !== 0) log($, `could not delete the gauges (rm exited ${r.exitCode}: ${clipLine(r.stderr.trim())})`)
+  } catch (error) {
+    log($, `could not delete the gauges (${errorText(error)})`)
+  }
+}
 // The footer's gauges, for the main conversation only: written to `gauges/<sessionId>.json` beside the stats for a
 // status line script to draw, since `$.ui.status` puts the plugin's name before its line. `pending` is the history
 // no Observer call covers yet, as the last scheduling pass counted it; `cost` is what Luna has cost the session, as
@@ -218,10 +237,10 @@ const pendingTokens = new Map<string, number>()
 async function showGauges($: EngineInterface, loop: Loop) {
   if (loop.agentId !== undefined) return
   try {
-    const [stored, usage, dir, cost, compactions] = await Promise.all([
+    const [stored, usage, path, cost, compactions] = await Promise.all([
       $.store.get(ledgerKey(loop.key)) as Promise<Ledger | undefined>,
       $.session.usage({ breakdown: 'summary' }).catch(() => undefined),
-      statsDir(statsIo($)),
+      gaugesPath($, loop.sessionId, '.json'),
       costOf(statsIo($), loop.sessionId),
       $.store.get(compactionsKey(loop.sessionId)).then((n) => (typeof n === 'number' ? n : 0)),
     ])
@@ -236,7 +255,8 @@ async function showGauges($: EngineInterface, loop: Loop) {
       cost,
       compactions,
     }
-    await $.fs.write(`${dir.replace(/[^/]*$/, 'gauges')}/${loop.sessionId}.json`, JSON.stringify(gauges))
+    if (gaugesOff.has(loop.sessionId)) return
+    await $.fs.write(path, JSON.stringify(gauges))
   } catch (error) {
     log($, `could not write the gauges (${errorText(error)})`)
   }
@@ -257,8 +277,10 @@ async function countCompaction($: EngineInterface, sessionId: string) {
 // once a compaction installs, since the next request matches none of the cached conversation.
 async function noteCacheAt($: EngineInterface, at: number | null) {
   try {
-    const [dir, sessionId] = await Promise.all([statsDir(statsIo($)), $.session.id()])
-    await $.fs.write(`${dir.replace(/[^/]*$/, 'gauges')}/${sessionId}.cache.json`, JSON.stringify({ at }))
+    const sessionId = await $.session.id()
+    const path = await gaugesPath($, sessionId, '.cache.json')
+    if (gaugesOff.has(sessionId)) return
+    await $.fs.write(path, JSON.stringify({ at }))
   } catch (error) {
     log($, `could not write the cache time (${errorText(error)})`)
   }
@@ -2422,6 +2444,7 @@ export const register: Register = (on) => {
       showUnavailable($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
     })
     // The footer's gauges from the start, rather than once the first turn ends.
+    gaugesOff.delete(await $.session.id())
     void showGauges($, loopOf(await $.session.id()))
     // A resumed session's memory rows, for ui-extension.
     void sizesOf($, await $.session.id()).then((sizes) => publishRows($, sizes))
@@ -2504,6 +2527,7 @@ export const register: Register = (on) => {
   // drops the main conversation's too. An ordinary end keeps the main conversation's, and its work in flight, for a
   // resume. The lives end at once; the keys go under the lock, after any ledger write already under way.
   on('session.end', async ($, e, next) => {
+    gaugesOff.add(e.sessionId) // before any await, so no gauge write lands after its files go
     const cleared = e.reason === 'clear'
     if (cleared) (recallIndexes.delete(e.sessionId), recallLoads.delete(e.sessionId))
     end(`${e.sessionId}/`)
@@ -2516,6 +2540,7 @@ export const register: Register = (on) => {
     contextSizes.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session
     await flushHeld($) // and so does the held times' timer
+    await dropGauges($, e.sessionId)
     const kinds = cleared ? KINDS.map((kind) => key(kind, e.sessionId)) : []
     await locked(async () => {
       const subagents = (await $.store.keys()).filter((k) => LOOP_KEYS.some((kind) => k.startsWith(kind(`${e.sessionId}/`))))

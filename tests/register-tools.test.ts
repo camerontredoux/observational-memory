@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import { FLOOR_NOTE } from '../hooks/prompts'
-import { originals, turn, CHUNK, at, world, pi, live, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, observationsIn, briefIn, steps, SUMMARY, USAGE } from './harness'
+import { originals, turn, CHUNK, at, world, pi, live, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, observationsIn, briefIn, steps, SUMMARY, USAGE, ran } from './harness'
 
 // Om_recall registration, gauges, /clear and subagent windows.
 describe('register: tools', () => {
@@ -101,6 +101,59 @@ describe('register: tools', () => {
     await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK)] })
     await clock.settle()
     expect(cacheAt()).toBeNull()
+  })
+
+  test('session.end deletes the gauges and the cache time, and a write that lands after it writes nothing', async ($, on) => {
+    const clock = mock.clock(on)
+    const { files, stored } = world(on)
+    const removed: (readonly string[])[] = []
+    on('process.run', ($, e) => {
+      if (e.argv[0] !== 'rm') return { value: ran({ exitCode: 127, stdout: '', stderr: '' }) }
+      removed.push(e.argv)
+      for (const path of e.argv.slice(3)) delete files[path]
+      return { value: ran({ exitCode: 0, stdout: '', stderr: '' }) }
+    })
+    on('tool.register', ($, e) => ({ value: { tool: `mcp__observational-memory__${e.name}` } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+    on('turn.step', async function* ($, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { ...USAGE, model: 'claude' } }
+    })
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+    for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude', messageCount: 1 }));
+    await clock.settle()
+    expect(Object.keys(files).filter((p) => p.startsWith('/gauges/')).sort()).toEqual(['/gauges/session-1.cache.json', '/gauges/session-1.json'])
+    stored['ledger:session-1/agent-1'] = { entries: [] }
+
+    // A request that starts as the session ends: its cache time is written once the end has run.
+    for await (const _ of $.turn.step({ turnId: 'u', index: 0, model: 'claude', messageCount: 1 }));
+    await $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await clock.settle()
+
+    expect(removed).toEqual([['rm', '-f', '--', '/gauges/session-1.json', '/gauges/session-1.cache.json']])
+    expect(Object.keys(files).filter((p) => p.startsWith('/gauges/'))).toEqual([])
+    expect(stored).not.toHaveProperty(['ledger:session-1/agent-1'])
+  })
+
+  test('session.end goes on when the gauges are missing or rm fails', async ($, on) => {
+    mock.clock(on)
+    const { stored } = world(on)
+    const logs: string[] = []
+    on('ui.log', ($, e) => (logs.push(e.text), { value: undefined }))
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+    let fail = false
+    on('process.run', () => (fail ? { value: ran({ exitCode: 1, stdout: '', stderr: 'rm: cannot remove: Permission denied\n' }) } : { value: ran({ exitCode: 0, stdout: '', stderr: '' }) }))
+
+    // No gauge file was ever written: `rm -f` passes over them.
+    stored['ledger:session-1/agent-1'] = { entries: [] }
+    await $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
+    expect(stored).not.toHaveProperty(['ledger:session-1/agent-1'])
+
+    fail = true
+    stored['ledger:session-1/agent-2'] = { entries: [] }
+    await $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
+    expect(stored).not.toHaveProperty(['ledger:session-1/agent-2'])
+    expect(logs).toContain('could not delete the gauges (rm exited 1: rm: cannot remove: Permission denied)')
   })
 
   test('the recall-only eval plugin registers om_recall exactly as the plugin does, so built-in+recall is offered the same tool', async ($, on) => {
