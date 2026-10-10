@@ -37,6 +37,7 @@ import {
   tag,
   truncate,
   WHERE,
+  REFLECT_AT_TOKENS,
 } from './memory'
 import type { Bounds, Entry, Memory, Skill, Unmarked, UserMessage } from './memory'
 import { splitSource, stamp, timeOf } from './lines'
@@ -63,9 +64,6 @@ const RETRY_MAX_MS = 300_000
 const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
 const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
 const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
-// The observations alone, as the memory renders them. The memory message also holds the corrections, skills, user
-// messages and continuation record, which a reflection does not condense, so it passes this size sooner.
-const REFLECT_AT_TOKENS = 40_000
 const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so the next chunk does not reflect again
 // The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
 // whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.

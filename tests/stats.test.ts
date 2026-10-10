@@ -135,6 +135,7 @@ describe('stats', () => {
         '  Subagent   2 of 2 instant (median 50 ms)',
         '  Fallbacks  1 used the built-in compaction',
         'Context      after a main compaction: ~27,000 tokens (median), ~236 notes',
+        'Memory       largest message ~5,000 tokens; the Reflector condenses the observations at 40,000: never run',
         'Background   3 calls, median 20.0 s each, ~9 notes each',
         'Problems     2 observer replies had no notes; 1 context/history mismatch; 4 unmarked lines joined the line before; 1 unmarked line after a 🔴 line kept as its own 🟡 line',
         'Recall       2 searches',
@@ -148,7 +149,7 @@ describe('stats', () => {
     const text = formatSummary('all sessions', merge([session('a', T0, [[10_000, 0.002]])]), 'all')
     expect(text).toContain('Cost         $0.0020 across 1 observer call (about $0.0020 each)')
     expect(text).toContain('Background   1 call, median 10.0 s each')
-    for (const word of ['Compactions', 'Main', 'Subagent', 'Fallbacks', 'Context', 'Problems', 'Recall', 'notes', 'approximate', 'NaN']) expect(text).not.toContain(word)
+    for (const word of ['Compactions', 'Main', 'Subagent', 'Fallbacks', 'Context', 'Memory', 'Problems', 'Recall', 'notes', 'approximate', 'NaN']) expect(text).not.toContain(word)
     expect(text).toContain('/om-stats all full for every metric')
     expect(formatSummary('this session', merge([]), '')).toBe('observational-memory · this session: no stats recorded yet.')
   })

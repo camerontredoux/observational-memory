@@ -1,5 +1,7 @@
 // Usage statistics: one JSON file per session, written only by that session, debounced off every hook. Global
 // figures are merged from the files when asked for. A stats failure is logged once and never breaks anything.
+import { REFLECT_AT_TOKENS } from './memory'
+
 const SAMPLES = 200 // raw samples kept per metric, newest, for medians and p90
 const WRITE_DELAY_MS = 2_000
 // What the prompt cache charges per token against plain input: a read, and a write with Claude Code's one-hour TTL.
@@ -337,6 +339,10 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   if (floor) row('  Floor', `${grouped(floor)} compiled a brief by code of ${plural(briefed, 'message')} the Observer had not observed`)
   if (main.context.length)
     row('Context', `after a main compaction: ~${grouped(median(main.context))} tokens (median)${main.notes.length ? `, ~${plural(median(main.notes), 'note')}` : ''}`)
+  const largest = Math.max(0, ...Object.entries(s.metrics).flatMap(([k, m]) => (/^compaction\.[\w-]+\.memoryTokens$/.test(k) ? m.max : [])))
+  const reflections = s.metrics['reflection.ms']?.count ?? 0
+  if (largest)
+    row('Memory', `largest message ~${grouped(largest)} tokens; the Reflector condenses the observations at ${grouped(REFLECT_AT_TOKENS)}: ${reflections ? plural(reflections, 'reflection') : 'never run'}`)
   const cache = (['om', 'builtin'] as const).flatMap((c) => {
     const [read, wrote] = [s.metrics[`afterCompaction.${c}.cacheReadTokens`], s.metrics[`afterCompaction.${c}.cacheWriteTokens`]]
     if (!read || !wrote) return []

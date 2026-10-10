@@ -68,6 +68,10 @@ export type Memory = {
 export type Bounds = { lo: number; hi: number; latest: number } | undefined
 
 export const estimateTokens = (text: string) => Math.ceil(text.length / 4)
+// The observations alone, as the memory renders them, at which the Reflector condenses them. The memory message also
+// holds the corrections, skills, user messages and continuation record, which a reflection does not condense, so it
+// passes this size sooner.
+export const REFLECT_AT_TOKENS = 40_000
 // The regex source that finds a note written with a count of 0 (its first 0), whatever its count: each note's regex
 // is built from the function that writes the note, so the two cannot drift apart.
 export const noteSource = (note: string) => note.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('0', '\\d+')
