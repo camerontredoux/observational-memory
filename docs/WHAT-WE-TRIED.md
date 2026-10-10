@@ -26,6 +26,7 @@ Scores are from `scripts/bench-compact.ts` unless the row says otherwise. "Main"
 | Idea | Verdict | Result | Evidence |
 |---|---|---|---|
 | **This week (2026-10-07/08)** | | | |
+| Truncation pass before an auto compaction: stub observed tool results outside the newest 10 calls, and images, instead of compacting | parked | Clears 37–39% of a tool-heavy context and defers compaction 40–70 requests, but costs ~$2 more per pass in prompt cache (cold rewrite of ~95k, then larger reads) and cannot fire in reasoning-heavy sessions, where kept thinking would matter. | `docs/plans/tool-output-truncation.md`; tag `archive/truncation-pass` |
 | Delete-only reflection filter at 15k, in place of the Reflector | parked | Long 62.5 → 42.9 without the 40k Reflector to bound the ledger. Main flat, 1–4% context saved for 8% more model tokens. | `docs/plans/reflection-filter.md`; tag `archive/reflection-filter` (`5642a87`) |
 | Observer writes each event once, on its outcome line | parked | Observation bytes −4%, retention within noise, lessons down about 7 points in every draw. | tag `archive/observer-one-line` (`305de0a`) |
 | Next-action continuation check (`bench-compact --next`) | parked | Memory, no memory, built-in and raw history all scored alike (20–24% with kept rows), so the check cannot separate contexts. | `docs/plans/web-research-2026-10.md`; tag `archive/next-action-check` (`37d3fe7`) |
