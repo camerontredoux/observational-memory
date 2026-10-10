@@ -41,7 +41,7 @@ import {
 import type { Bounds, Entry, Memory, Skill, Unmarked, UserMessage } from './memory'
 import { splitSource, stamp, timeOf } from './lines'
 import type { Source } from './lines'
-import { contextHash, dedupWrappers, isEmptyReply, isPrompt, maskTail, rowHash, rowText, unmask, withoutLocalCommands } from './rows'
+import { clearedResult, contextHash, dedupWrappers, imageTokens, isCleared, isEmptyReply, isImageResult, isPrompt, maskTail, rowHash, rowText, unmask, withoutLocalCommands } from './rows'
 import { boundPins, rowTerms } from './pins'
 
 // Every model call: pi with GPT-6 Luna, the prompt on stdin, run from a neutral directory.
@@ -63,6 +63,8 @@ const RETRY_MAX_MS = 300_000
 const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
 const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
 const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
+const KEEP_RECENT_CALLS = 10 // an auto compaction's truncation pass leaves the newest calls' results whole
+const TRUNCATE_MIN_SHARE = 0.25 // the share of the context a truncation pass must clear, or the compaction runs
 // The observations alone, as the memory renders them. The memory message also holds the corrections, skills, user
 // messages and continuation record, which a reflection does not condense, so it passes this size sooner.
 const REFLECT_AT_TOKENS = 40_000
@@ -391,6 +393,10 @@ const rowLabel = (sizes: Record<string, number>, h: string) => {
   if (n === undefined) return undefined
   return `to ${sizes[h] === undefined ? '~' : ''}${n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n} tokens`
 }
+// The line a truncation pass shows (truncateResults), `· 61.2k tokens` after it: what it cleared. A `$.ui.log` line,
+// which the engine draws as a system row of its own that no `ui.render` component reaches, so ui-extension cannot
+// draw it as it draws MEMORY_ROW.
+export const TRUNCATED_ROW = 'tool calls truncated'
 const memoryRow = (sizes: Record<string, number>, h: string) => {
   const label = rowLabel(sizes, h)
   return label ? `${MEMORY_ROW} · ${label}` : MEMORY_ROW
@@ -2052,6 +2058,68 @@ async function reportCompaction(
   record(statsIo($), sessionId, (s, at) => addCompaction(s, { ...compaction, ms: at - started }, at))
 }
 
+// The truncation pass ahead of an `auto` compaction: each tool result memory has observed (its row under the
+// watermark) outside the newest KEEP_RECENT_CALLS calls, and every image wherever it sits, becomes a stub
+// (clearedResult). The rows it changed go back without their handle, so the engine rebuilds them; every other row
+// keeps its handle and stays as the engine has it, thinking included. It stands only when it clears
+// TRUNCATE_MIN_SHARE of the context; otherwise, and once nothing is left to clear, the compaction runs as before.
+// It installs nothing: the ledger, `installed` and `uncarried` stay as they were, and unmask reads the cleared
+// results whole again for the next compaction's hashes.
+async function truncateResults(
+  $: EngineInterface,
+  e: SessionCompactInput,
+  c: { sessionId: string; started: number; usage: SessionUsage | undefined; v: View; order: number[]; watermark: number },
+): Promise<SessionCompactResult | undefined> {
+  const rows = e.messages // the context as it stands: a result cleared before reads as its stub
+  const uses = new Map(rows.flatMap((m) => m.toolUses.map((u) => [u.tool_use_id, u] as const)))
+  const recent = new Set(rows.flatMap((m) => m.toolUses.map((u) => u.tool_use_id)).slice(-KEEP_RECENT_CALLS))
+  // The watermark counts rows in call order (`order`); these are the context's own.
+  const observed = new Set(c.order.slice(c.v.base, c.watermark))
+  const latest = rows.findLastIndex((m) => m.role === 'user')
+  let cleared = 0
+  let images = 0
+  let saved = 0
+  const messages = rows.map((m, j) => {
+    if (m.role !== 'user' || j === latest || !m.toolResults?.length) return m
+    const toolResults = m.toolResults.map((r) => {
+      const image = isImageResult(r)
+      if (isCleared(r.text) || !(image || (observed.has(j) && !recent.has(r.tool_use_id)))) return r
+      const tokens = estimateTokens(r.text) + (image ? imageTokens(r) : 0)
+      const stub = clearedResult(r, uses.get(r.tool_use_id), tokens)
+      if (tokens <= estimateTokens(stub.text)) return r
+      cleared++
+      if (image) images++
+      saved += tokens - estimateTokens(stub.text)
+      return stub
+    })
+    if (toolResults.every((r, i) => r === m.toolResults![i])) return m
+    const { handle: _, ...rebuilt } = m
+    return { ...rebuilt, toolResults }
+  })
+  const estimated = tokensBetween(c.v, 0, c.v.messages.length)
+  // The whole context as the session measured it, the main loop's alone; a subagent's, as its rows read.
+  const context = (e.agentId === undefined ? (c.usage?.context.breakdown?.totalTokens ?? c.usage?.context.tokens) : undefined) ?? estimated
+  const share = context > 0 ? saved / context : 0
+  const truncates = cleared > 0 && share >= TRUNCATE_MIN_SHARE
+  const why = !cleared ? 'nothing to clear' : truncates ? `clears ≥ ${TRUNCATE_MIN_SHARE} of the context` : `clears < ${TRUNCATE_MIN_SHARE} of the context`
+  log(
+    $,
+    `truncation pass: ${rows.length} rows, base ${c.v.base}, watermark ${c.watermark}, ${cleared} results to clear (${images} images), ` +
+      `${recent.size} recent calls kept, context ~${context} → ~${context - saved} tokens (${saved} cleared, share ${share.toFixed(3)}), ` +
+      `${truncates ? 'truncates' : 'compacts'}: ${why}, ${(await $.clock.now()) - c.started} ms`,
+  )
+  if (!truncates) return undefined
+  show($, `${TRUNCATED_ROW} · ${saved >= 1000 ? `${(saved / 1000).toFixed(1)}k` : saved} tokens`, e.agentId)
+  // For a later look at how the passes pay off; pruned with the session (KINDS).
+  const entry = { at: c.started, cleared, images, tokensSaved: saved, contextBefore: context, ...(e.agentId === undefined ? {} : { agentId: e.agentId }) }
+  await locked(async () => {
+    const k = key('truncations', c.sessionId)
+    const passes = ((await $.store.get(k)) as (typeof entry)[] | undefined) ?? []
+    await $.store.set(k, [...passes, entry])
+  }).catch((error) => log($, `could not record the truncation pass (${errorText(error)})`))
+  return { messages }
+}
+
 // The compaction from the ledger: what the session.compact hook runs.
 // The ordering it relies on, against the background observation sharing this process's state:
 // - The loop's life (`life`) is taken before the first await past the nothing-new check. Once it moves on, the
@@ -2108,6 +2176,10 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const base = v.base
   const initial = await locked(() => loadLedger($, loop.key, v))
   if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)
+  if (e.trigger === 'auto') {
+    const truncated = await truncateResults($, e, { sessionId, started, usage, v, order, watermark: initial.watermark.to })
+    if (truncated) return truncated
+  }
   const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
   // What the raw tail from `cut` takes in the compacted context, its old results cut (maskTail).
   const tailTokens = (cut: number) => maskTail(messages.slice(cut)).reduce((n, m) => n + estimateTokens(rowText(m)), 0)

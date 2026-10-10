@@ -58,6 +58,36 @@ export function maskTail(rows: readonly SessionMessage[]) {
     .toReversed()
 }
 const MASKED = new RegExp(noteSource(omissionMarker(0, 'result')))
+
+type ToolResult = NonNullable<SessionMessage['toolResults']>[number]
+type ToolUse = SessionMessage['toolUses'][number]
+// The text blocks alone are `text`: an image shows only in the stored record, a Read's `{ type: 'image' }`, a Bash
+// output's `isImage`.
+export const isImageResult = (r: ToolResult) => {
+  const x = r.result as { type?: unknown; isImage?: unknown } | undefined
+  return x?.type === 'image' || x?.isImage === true
+}
+// An image's tokens, by the API's width × height / 750 over its displayed size; IMAGE_TOKENS, its cap, when unknown.
+const IMAGE_TOKENS = 1_600
+export const imageTokens = (r: ToolResult) => {
+  const d = (r.result as { file?: { dimensions?: { displayWidth?: number; displayHeight?: number } } } | undefined)?.file?.dimensions
+  return d?.displayWidth && d.displayHeight ? Math.min(IMAGE_TOKENS, Math.ceil((d.displayWidth * d.displayHeight) / 750)) : IMAGE_TOKENS
+}
+// A result a truncation pass cleared (see truncateResults in register.ts): maskTail's marker first, so unmask reads
+// it whole again from the history under its id and the row hashes stay the ledger's, then the call's bones: the tool,
+// its command or path, and how it ended. maskTail's own cuts keep a head before the marker, so a marker at the very
+// start tells a cleared result.
+const INPUT_KEYS = ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'description']
+export const isCleared = (text: string) => text.search(MASKED) === 0
+export function clearedResult(r: ToolResult, use: ToolUse | undefined, tokens: number): ToolResult {
+  const arg = INPUT_KEYS.map((k) => use?.input[k]).find((v): v is string => typeof v === 'string')
+  const line = (s: string, n: number) => {
+    const first = s.trim().split('\n')[0]!
+    return first.length > n ? `${first.slice(0, n)}…` : first
+  }
+  const how = isImageResult(r) ? 'screenshot cleared' : r.isError ? `error: ${line(r.text, 120)}` : 'ok'
+  return { tool_use_id: r.tool_use_id, isError: r.isError, text: `${omissionMarker(tokens, 'result')}[${[use?.tool ?? 'tool', arg && line(arg, 80)].filter(Boolean).join(' ')} · ${how}]` }
+}
 // A local slash command's rows (`/compact`, `/effort`): its caveat, its echo and what it printed, all three engine
 // framing. The kept tail leaves them out, as the transcript would draw their copies with no render hook to hide them.
 // An echo with no output after it is a prompt command's (a skill's), whose arguments are the person's request: kept.
@@ -109,14 +139,17 @@ export function unmask(rows: readonly SessionMessage[], history: readonly Sessio
   for (const m of history) {
     for (const r of m.toolResults ?? []) {
       const id = originalId(r.tool_use_id)
-      if (r.text.length > (whole.get(id)?.length ?? -1)) whole.set(id, r.text)
+      // A cleared copy is never the whole: a cleared image's stub outweighs its empty text. A result that quotes the
+      // marker (om_recall's, a Read of a transcript) still is.
+      if (!isCleared(r.text) && r.text.length > (whole.get(id)?.length ?? -1)) whole.set(id, r.text)
     }
     if (isWrapper(m)) wrappers.set(hash(m.text), m.text)
   }
   const original = (r: NonNullable<SessionMessage['toolResults']>[number]) => {
     const at = r.text.search(MASKED)
     const w = at < 0 ? undefined : whole.get(originalId(r.tool_use_id))
-    return w && w.length > r.text.length && w.startsWith(r.text.slice(0, at)) ? w : undefined
+    // A cleared result (isCleared) keeps no head to match: its id alone names it.
+    return w !== undefined && (at === 0 || (w.length > r.text.length && w.startsWith(r.text.slice(0, at)))) ? w : undefined
   }
   const wrapper = (m: SessionMessage) => {
     const id = isPrompt(m) ? m.text.match(REPEATED)?.[1] : undefined
@@ -131,7 +164,7 @@ export function unmask(rows: readonly SessionMessage[], history: readonly Sessio
     .map((m) => {
       const w = wrapper(m)
       if (w) return { ...m, text: w }
-      return m.toolResults?.some(original) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m
+      return m.toolResults?.some((r) => original(r) !== undefined) ? { ...m, toolResults: m.toolResults.map((r) => ({ ...r, text: original(r) ?? r.text })) } : m
     })
 }
 // Found in a call's input as JSON, where the marker's newlines are escaped: the marker without them.

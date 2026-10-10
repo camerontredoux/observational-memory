@@ -354,6 +354,25 @@ export async function fourTurns($: Engine, on: On) {
   return { clock, history, stored, seen, runTurn, first }
 }
 
+// A truncation pass's result: every row back, the first as it was (a memory message the pass kept, or none).
+const truncated = (rows: readonly SessionMessage[], out: readonly SessionMessage[] | undefined) =>
+  out?.length === rows.length && out[0]?.text === rows[0]?.text
+// An auto compaction as the engine runs it: a truncation pass is installed, its rows written after the history's,
+// and the threshold still crossed, so the engine compacts again on what the pass left. `history` is the session's,
+// pushed onto; the last result returns.
+export async function compactAuto($: Engine, history: SessionMessage[], messages: SessionMessage[], agentId?: string) {
+  const compact = (rows: readonly SessionMessage[]) => $.session.compact({ trigger: 'auto', messages: rows, ...(agentId ? { agentId } : {}) })
+  let rows: readonly SessionMessage[] = messages
+  let result = await compact(rows)
+  // Bounded: a second pass has nothing left to clear.
+  for (let pass = 0; pass < 2 && truncated(rows, result.messages); pass++) {
+    history.push(...result.messages!.map(({ handle: _, ...m }) => m))
+    rows = result.messages!
+    result = await compact(rows)
+  }
+  return result
+}
+
 // The engine's model requests inside a turn: each answered at once beneath the plugin, read to its end.
 export function steps(on: On) {
   on('turn.step', async function* ($, e) {

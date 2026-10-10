@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On, Register, SessionMessage } from 'claude-code'
 import { FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES } from '../hooks/prompts'
 import { planBudget } from '../hooks/register'
-import { originals, turn, OBSERVER_SESSION, piSessionOf, CHUNK, at, world, pi, live, gates, work, nextStepIn, recordIn, WHERE, correctionsIn, withObservations, observationsIn, userMessagesIn, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, overloaded } from './harness'
+import { originals, turn, OBSERVER_SESSION, piSessionOf, CHUNK, at, world, pi, live, gates, work, nextStepIn, recordIn, WHERE, correctionsIn, withObservations, observationsIn, userMessagesIn, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, overloaded, compactAuto } from './harness'
 import type { Ledger } from './harness'
 
 // Subagents side by side, the memory budget and the fallbacks.
@@ -533,7 +533,7 @@ describe('register: budget', () => {
     const calls = seen.prompts.length
     expect(calls).toBeGreaterThan(0)
 
-    const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    const second = await compactAuto($, history, [...history])
 
     expect(seen.prompts).toHaveLength(calls)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent') || l.includes('restarting the ledger'))).toEqual([])
@@ -636,7 +636,7 @@ describe('register: budget', () => {
     await run(10, 24)
     const calls = seen.prompts.length
 
-    const second = await $.session.compact({ trigger: 'auto', messages: [...history] })
+    const second = await compactAuto($, history, [...history])
 
     expect(seen.prompts).toHaveLength(calls)
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent') || l.includes('restarting the ledger'))).toEqual([])

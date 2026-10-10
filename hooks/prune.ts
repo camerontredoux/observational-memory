@@ -14,7 +14,7 @@ const DAY = 24 * 60 * 60 * 1000
 const STORE_CAP = 4 * 1024 * 1024
 const PRUNE_TO = 0.6 // the daily run drops the oldest sessions until the store is under this share of its cap
 // Every kind of session key: register.ts builds its keys with `key`, so a kind it stores is one this prunes.
-export const KINDS = ['ledger', 'times', 'live', 'skills', 'turns', 'transcript', 'seen', 'goal', 'size', 'compactions'] as const
+export const KINDS = ['ledger', 'times', 'live', 'skills', 'turns', 'transcript', 'seen', 'goal', 'size', 'compactions', 'truncations'] as const
 export const key = (kind: (typeof KINDS)[number], id: string) => `${kind}:${id}`
 const LAST_RUN = 'prune:last' // outside KINDS: shared by every process, never pruned
 // Kinds v0.3 and v0.4 stored and nothing reads now: the daily run deletes their keys, whatever their session.

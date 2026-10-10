@@ -7,7 +7,7 @@ import type { SessionMessage } from 'claude-code'
 import { FLOOR_NOTE } from '../hooks/prompts'
 import { loadTranscript, recall } from '../hooks/recall'
 import { negativeControl } from './eval/rubric'
-import { briefIn, memoryIo, nextStepIn, overloaded, pi, steps, SUMMARY, userMessagesIn, world } from './harness'
+import { briefIn, memoryIo, nextStepIn, overloaded, pi, steps, SUMMARY, userMessagesIn, world, compactAuto } from './harness'
 import type { Ledger } from './harness'
 
 type Turns = { rows: SessionMessage[]; at: number[]; step: boolean[]; compactions: { at: number; preTokens: number }[]; brief: string }
@@ -36,7 +36,7 @@ export const crewmate = (fx: Turns) =>
       if (fx.compactions.some((c) => c.at === i)) {
         const before = seen.prompts.length
         const landed = seen.logs.filter((l) => l.includes('in the background')).length
-        const result = await $.session.compact({ trigger: 'auto', messages: history.slice(live) })
+        const result = await compactAuto($, history, history.slice(live))
         const text = result.messages?.[0]?.text ?? ''
         const watermark = history.length - (result.messages!.length - 1)
         report.push({
