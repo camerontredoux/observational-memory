@@ -40,6 +40,32 @@ describe('register: tools', () => {
     expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines \(1,031 characters\); only if you still need them: \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
   })
 
+  test('session.start waits at most a second for om_recall to list, and registers om_stats once om_recall settles', async ($, on) => {
+    // An agent whose `tools:` leaves om_recall out never lists it: the engine holds the register call 8 s.
+    const clock = mock.clock(on)
+    world(on)
+    const registered: string[] = []
+    let listed: () => void = () => {}
+    on('tool.register', ($, e) => {
+      registered.push(e.name)
+      const value = { value: { tool: `mcp__observational-memory__${e.name}` } }
+      return e.name === 'om_recall' ? new Promise((resolve) => (listed = () => resolve(value))) : value
+    })
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    let started = false
+
+    void $.session.start({ cwd: '/tmp', surface: null, isInteractive: false }).then(() => (started = true))
+    await clock.advance(999)
+    expect(started).toBe(false)
+    await clock.advance(1)
+    expect(started).toBe(true)
+    expect(registered).toEqual(['om_recall'])
+
+    listed()
+    await clock.settle()
+    expect(registered).toEqual(['om_recall', 'om_stats'])
+  })
+
   test('the gauges are written at session.start, so the status line draws them before the first turn ends', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)

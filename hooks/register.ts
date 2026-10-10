@@ -104,6 +104,7 @@ const SESSION_MESSAGE_TOKENS = 300
 const SESSION_USER_TOKENS = 3_000
 const SESSION_MAX_CHARS = 300 // the line as stored, whatever the writer returns
 const SESSION_TIMEOUT_MS = 60_000
+const REGISTER_WAIT_MS = 1_000 // how long session.start waits for om_recall to list; it takes ~50 ms
 const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
 const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the rest counted
 const ENV_LINE_MAX_CHARS = 200 // each line of the environment
@@ -2356,7 +2357,7 @@ export const register: Register = (on) => {
   })
 
   on('session.start', async ($, e, next) => {
-    await $.tool
+    const recall = $.tool
       .register({
         name: RECALL_TOOL,
         // In the tool list from the start, not behind ToolSearch: listing it at the first compaction would change the
@@ -2392,7 +2393,13 @@ export const register: Register = (on) => {
         log($, `could not register ${RECALL_TOOL} (${errorText(error)})`)
         showUnavailable($, `Setup failed (${clipLine(errorText(error))}). ${RECALL_TOOL} is unavailable this session`)
       })
-    await Promise.all([
+    // The engine lists the tool within ~50 ms, before the first prompt. An agent whose `tools:` leaves it out never
+    // lists it, and the engine holds the register call 8 s for it: the session starts without waiting that out.
+    let waited: { cancel(): void } | undefined
+    await Promise.race([recall, new Promise<void>((resolve) => (waited = $.clock.after(REGISTER_WAIT_MS, resolve)))])
+    waited?.cancel()
+    // Behind ToolSearch, it leaves the prompt's tool list as it is, so the session does not wait for it either.
+    void recall.then(() => Promise.all([
       $.tool.register({
         name: STATS_TOOL,
         description:
@@ -2412,7 +2419,7 @@ export const register: Register = (on) => {
         },
       }),
       $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|<session id>] [full|cost] [7d|<ISO date>]' }),
-    ]).catch((error) => {
+    ])).catch((error) => {
       log($, `could not register the stats tool and command (${errorText(error)})`)
       showUnavailable($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
     })
