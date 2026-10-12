@@ -109,6 +109,7 @@ const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the res
 const ENV_LINE_MAX_CHARS = 200 // each line of the environment
 const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force shown whole; past it the oldest shorten (boundPins)
 const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say, or for a subagent's model: the smallest in use
+const TURN_END_COMPACT_TOKENS = 157_000 // a main turn that ends with more context than this compacts between turns, auto-compaction kept as the hard stop
 const OVERHEAD_TOKENS = 20_000 // the system prompt and built-in tool schemas every request carries beside the messages
 const MEMORY_HEADROOM = 1.25 // the memory message's estimate scaled up: the Observer's prose runs near it, quoted skills and prompts may not
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
@@ -293,9 +294,13 @@ const uncarried = new Map<string, { compactor: 'om' | 'builtin'; memory?: string
 // handed the same context again has nothing new to compact. It reads no command echo either: a local command's whose
 // output was a system row (`/reload-plugins`) looks like a prompt command's, and a prompt command's brings a reply.
 const installed = new Map<string, string>()
+// The context the main conversation's last request was answered over, by session, until a compaction installs: what
+// a turn's end weighs against TURN_END_COMPACT_TOKENS.
+const lastContext = new Map<string, number>()
 async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
   const sessionId = await $.session.id()
   const use = { uncached: usage.input_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens }
+  lastContext.set(sessionId, use.uncached + use.cacheRead + use.cacheWrite)
   record(statsIo($), sessionId, (s, at) => addRequest(s, use, at))
   const last = uncarried.get(sessionId)
   if (last === undefined) return
@@ -1787,6 +1792,7 @@ async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, nex
   if (installs && summary && sessionId !== undefined && e.agentId === undefined) {
     uncarried.set(sessionId, { compactor: 'builtin' })
     installed.set(sessionId, contextHash(r.messages!))
+    lastContext.delete(sessionId)
     void countCompaction($, sessionId)
   }
   if (installs && summary && loop && isLive(loop, stamp!)) {
@@ -2023,6 +2029,7 @@ async function reportCompaction(
   { ledger, cut, memory, message, floor, briefed, observedNow }: Awaited<ReturnType<typeof buildMemory>> & { observedNow: number },
   c: {
     sessionId: string
+    trigger: string // the stats' name for who compacted: `e.trigger`, `turnEnd` or `subagent`
     started: number
     usage: SessionUsage | undefined
     base: number
@@ -2058,7 +2065,7 @@ async function reportCompaction(
       (floor ? ` · ${plural(briefed, 'message')} in a brief compiled by code (${why})` : ''),
   )
   const compaction = {
-    trigger: main ? e.trigger : 'subagent',
+    trigger: c.trigger,
     fellBack: false,
     floor,
     tokensBefore: main ? usage?.context.tokens : undefined, // the last response's input: system prompt and tools included
@@ -2112,6 +2119,10 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // Nothing since the last compaction but local commands (another `/compact`): compacting again would only brief the
   // kept recent messages and, once none were left, hand the memory message to the built-in compactor.
   if (main && installed.get(sessionId) === contextHash(e.messages)) return { skip: 'observational-memory: nothing new to compact since the last compaction' }
+  // This plugin's own compaction at a turn's end (compactAtTurnEnd, a `manual` one) is handled as an auto one, the
+  // turn being over; the person's `/compact` and another plugin's compaction keep their handling.
+  const own = main && isTurnEnd(e, sessionId)
+  const trigger = !main ? 'subagent' : own ? 'turnEnd' : e.trigger
   const loop = loopOf(sessionId, e.agentId)
   const life = stampOf(loop) // a loop that ends while this compaction runs keeps none of its writes
   markedRows.delete(loop.key) // its next mark checks the marks against the rows
@@ -2132,7 +2143,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const v = view(lined ? rows.slice(offset, offset + messages.length) : messages, await loadMarks($, loop), persistent || lined ? offset : undefined)
   const base = v.base
   const initial = await locked(() => loadLedger($, loop.key, v))
-  if (history && !persistent) notPersistent($, sessionId, main ? e.trigger : 'subagent', messages, rows, offset, initial.watermark.to - base)
+  if (history && !persistent) notPersistent($, sessionId, trigger, messages, rows, offset, initial.watermark.to - base)
   const fits = (cut: number) => cut > base && tokensBetween(v, cut, messages.length) <= RAW_MAX_TOKENS
   // What the raw tail from `cut` takes in the compacted context, its old results cut (maskTail).
   const tailTokens = (cut: number) => maskTail(messages.slice(cut)).reduce((n, m) => n + estimateTokens(rowText(m)), 0)
@@ -2142,8 +2153,9 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // reaches, and with nothing observed at all the floor compiles a brief of the rest (see buildMemory).
   // A manual compaction with nothing observed since the last one, and less before the raw tail than the whole chunk
   // the background waits for, observes nothing: the person waits on it, so the floor's brief stands for those rows.
+  // So does another plugin's; this plugin's own at a turn's end, though `manual`, observes as an auto one does.
   const start = tailStart(v, base)
-  const briefOnly = main && (e.trigger === 'manual' || e.trigger === 'plugin') && initial.watermark.to === base && chunkEnd(v, base, start, true) === undefined
+  const briefOnly = main && !own && (e.trigger === 'manual' || e.trigger === 'plugin') && initial.watermark.to === base && chunkEnd(v, base, start, true) === undefined
   const { chunks, failures, sync, deadlineHit } =
     !briefOnly && !fits(initial.watermark.to) && start > initial.watermark.to
       ? await observeOnTheSpot($, loop, life, v, initial, start, history !== undefined, next.signal)
@@ -2169,6 +2181,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     const [cwd, home] = await dirs()
     return compileBrief(rows, v.at.slice(from, to), cwd, home, refOf)
   }
+  // Only an auto compaction cuts a turn that goes on; one at a turn's end has no turn to resume.
   const sources: MemorySources = { ...carried, messages, v, environment, recall, resumeDirectly: e.trigger === 'auto', budget, density, tailTokens, compile, dirs }
 
   // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
@@ -2195,7 +2208,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   }
   const settled = await locked(async () => settle(await loadLedger($, loop.key, v)))
   const { cut, message } = settled
-  await reportCompaction($, e, settled, { sessionId, started, usage, base, rows: messages.length, tailTokens, failures, sync, deadlineHit, unreadable: !history, tooLittle: briefOnly && start > base })
+  await reportCompaction($, e, settled, { sessionId, trigger, started, usage, base, rows: messages.length, tailTokens, failures, sync, deadlineHit, unreadable: !history, tooLittle: briefOnly && start > base })
   const kept = new Set(order.slice(cut))
   if (persistent && installs) void maybeReflect($, loop, life).catch((error) => log($, errorText(error)))
   // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
@@ -2206,6 +2219,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   if (main && installs) {
     uncarried.set(sessionId, { compactor: 'om', memory: hash(message.text) })
     installed.set(sessionId, contextHash(compacted))
+    lastContext.delete(sessionId)
     void countCompaction($, sessionId)
   }
   // A subagent's row too: no request measures its context, so it keeps the estimate, for this process alone, as a
@@ -2311,6 +2325,39 @@ async function onlyCopies(calls: readonly ToolGroupCall[]) {
   return true
 }
 
+// Sessions whose `/compact` under way is this plugin's own, from compactAtTurnEnd: compact() tells it apart from the
+// person's by this alone, as the event does not say who ran the command.
+const turnEndCompactions = new Set<string>()
+const isTurnEnd = (e: SessionCompactInput, sessionId: string) => e.agentId === undefined && e.trigger === 'manual' && turnEndCompactions.has(sessionId)
+// Once a main turn ends with its last request's context past TURN_END_COMPACT_TOKENS, the plugin compacts between
+// turns rather than leave auto-compaction to cut a later turn in the middle; auto-compaction stays the hard stop, and
+// a session whose auto-compaction point is at or below the threshold leaves it to that. One attempt per turn end: a
+// call the engine rejects or a compaction that does not install is logged, and a later turn end tries again. The rows
+// of the turn just ended are not observed yet: the compaction observes them on the spot or keeps them in its raw
+// tail, as an auto one does.
+// It runs `/compact`, queued until the session is idle, not `$.session.compact()`: the engine runs none of a plugin's
+// own hooks on an event its code raised, so that compaction would reach the built-in compactor, never this plugin's.
+// A command a plugin runs is the engine's to raise, and the compaction under it reaches every plugin, as `manual`.
+async function compactAtTurnEnd($: EngineInterface) {
+  const sessionId = await $.session.id()
+  const context = lastContext.get(sessionId)
+  if (context === undefined || context <= TURN_END_COMPACT_TOKENS || turnEndCompactions.has(sessionId)) return
+  const usage = await $.session.usage({ breakdown: 'summary' }).catch(() => undefined)
+  const compactAt = usage?.context.breakdown?.autoCompactThreshold ?? usage?.context.window
+  if (compactAt === undefined || compactAt <= TURN_END_COMPACT_TOKENS) return
+  log($, `the turn ended with ~${context} tokens of context, past ${TURN_END_COMPACT_TOKENS} (auto-compaction at ${compactAt}): compacting between turns`)
+  turnEndCompactions.add(sessionId)
+  try {
+    await $.command.run({ command: 'compact' })
+    // An installed compaction forgets the measured context (compact, delegateToBuiltin); one skipped or vetoed does not.
+    log($, lastContext.has(sessionId) ? 'the turn-end compaction did not install; a later turn end tries again' : 'the turn-end compaction installed')
+  } catch (error) {
+    log($, `the turn-end compaction was not run (${errorText(error)}); a later turn end tries again`)
+  } finally {
+    turnEndCompactions.delete(sessionId)
+  }
+}
+
 export const register: Register = (on) => {
   registerPrune(on)
   registerNotes(on)
@@ -2336,6 +2383,9 @@ export const register: Register = (on) => {
     if (next.error.message === LOOP_ENDED) return log($, 'a compaction outlived its loop; skipped'), { skip: `observational-memory: ${LOOP_ENDED}` }
     const message = next.error.message ?? ''
     const timeout = next.error.kind === 'timeout'
+    // The plugin's own at a turn's end is skipped rather than handed to the built-in compactor: auto-compaction still
+    // catches the session, and a later turn end tries again.
+    if (isTurnEnd(e, await $.session.id().catch(() => ''))) return log($, `${timeout ? 'the hook outran its time budget' : message}; the turn-end compaction is skipped`), { skip: `observational-memory: ${message}` }
     log($, `${timeout ? `the hook outran its time budget${message ? ` (${message})` : ''}` : message}; using the built-in compaction`)
     if (e.trigger === 'plugin') return delegateToBuiltin($, e, next, true)
     const why = timeout ? 'Compaction timed out' : message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'
@@ -2525,6 +2575,8 @@ export const register: Register = (on) => {
     } catch (error) {
       log($, errorText(error))
     }
+    // Off the hook's path, once the turn is done: the compaction runs between turns.
+    if (e.agentId === undefined) $.clock.after(0, () => void compactAtTurnEnd($).catch((error) => log($, `could not compact at the turn's end (${errorText(error)})`)))
     return r
   })
 
@@ -2541,6 +2593,7 @@ export const register: Register = (on) => {
     pendingTokens.delete(e.sessionId)
     uncarried.delete(e.sessionId)
     installed.delete(e.sessionId)
+    lastContext.delete(e.sessionId)
     staleSpinners.clear() // keyed by request, not session: the ended session's requests draw no more spinners
     contextSizes.delete(e.sessionId)
     await flush(statsIo($), e.sessionId) // the write timer dies with the session

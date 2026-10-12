@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { SessionCompactInput, SessionMessage } from 'claude-code'
-import { turn, CHUNK, at, world, pi, nearTarget, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
+import type { Engine } from 'claude-code/testing'
+import type { On, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
+import { turn, COMPOSER, CHUNK, at, world, pi, nearTarget, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
 import type { Ledger } from './harness'
 
 // Delegation, finished subagents and scheduling writes.
@@ -408,5 +409,121 @@ describe('register: lifecycle', () => {
     await stop('/t/other.jsonl')
     expect(writes.filter((k) => k.startsWith('transcript:'))).toEqual(['transcript:session-1', 'transcript:session-1'])
     expect(stored['transcript:session-1']).toBe('/t/other.jsonl')
+  })
+})
+
+// The main conversation's own compaction between turns, once a turn ends past the soft threshold (issue #31). The
+// plugin runs `/compact`; the engine raises the compaction under it as `manual`, which the tests' `command.run` hook
+// stands in for.
+describe('register: compaction at a turn end', () => {
+  // Above the plugin: vetoes every `/compact` compaction, as another plugin may.
+  const vetoes = { name: 'vetoes', tier: 'prepend' as const, register: ((on) => {
+    on('session.compact', ($, e, next) => (e.trigger === 'manual' ? { skip: 'not now' } : next(e)))
+  }) satisfies Register }
+
+  // A live main conversation whose turns each make one request over `tokens` of context before they end; a turn
+  // given `agentId` is that subagent's. The engine's auto-compaction point is its 235k window. `/compact` raises the
+  // compaction over the history, its result in `compactions`; with `rejects`, it is refused, counted in `refused`.
+  function session($: Engine, on: On, rejects = false) {
+    const clock = mock.clock(on)
+    const w = world(on)
+    const seen = pi(on)
+    const compactions: SessionCompactResult[] = []
+    let refused = 0
+    let context = 0
+    on('session.usage', () => ({ value: { context: { window: 235_000 }, rateLimits: [] } }) as never)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+    on('turn.step', async function* ($, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { ...USAGE, cache_read_input_tokens: context, model: 'claude' } }
+    })
+    // The test's `$`, as the engine raises it, not the hook's.
+    on('command.run', { command: 'compact' }, async () => {
+      if (rejects) throw (refused++, new Error('a turn is running'))
+      compactions.push(await $.session.compact({ trigger: 'manual', messages: [...w.history] }))
+      return {}
+    })
+    const runTurn = async (rows: SessionMessage[], tokens: number, startAt: number, agentId?: string) => {
+      const turnId = `turn-${w.history.length}`
+      await clock.set(startAt)
+      if (agentId === undefined) {
+        w.history.push(rows[0]!)
+        await $.turn.start({ text: rows[0]!.text, turnId })
+        w.history.push(...rows.slice(1))
+      } else w.agents[agentId] = rows
+      context = tokens
+      for await (const _ of $.turn.step({ turnId, index: 0, model: 'claude', messageCount: rows.length, ...(agentId ? { agentId } : {}) }));
+      await clock.advance(60_000)
+      await $.turn.complete({ answer: '', durationMs: 60_000, isAborted: false, turnId, reason: 'answer', ...(agentId ? { agentId } : {}) })
+      await clock.settle()
+    }
+    return { clock, ...w, seen, compactions, refused: () => refused, runTurn }
+  }
+  const metrics = (files: Record<string, string>) => (JSON.parse(files['/stats/session-1.json']!) as { metrics: Record<string, { count: number }> }).metrics
+
+  test("a main turn that ends past 157k compacts, observing as an auto one does without the resume-directly wording, counted apart; one under it does not", async ($, on) => {
+    const { clock, files, seen, compactions, runTurn } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 150_000, at(23, 9, 0))
+    expect(compactions).toEqual([])
+
+    await runTurn(turn('b', 'b', 16_000), 160_000, at(23, 9, 5))
+
+    // Less than a chunk before the raw tail: the person's `/compact` briefs it by code (the next test); this one
+    // observes it on the spot.
+    expect(compactions).toHaveLength(1)
+    expect(seen.prompts).toHaveLength(1)
+    const text = compactions[0]!.messages?.[0]?.text ?? ''
+    expect(observationsIn(text)).toBe('* 🔴 2026-09-23 09:00 User: "a" (source 2026-09-23 09:00 to 2026-09-23 09:01)')
+    expect(text).not.toContain('Resume directly')
+    expect(seen.logs).toContain('the turn-end compaction installed')
+    await clock.advance(5_000)
+    expect(metrics(files)['compaction.turnEnd.ms']!.count).toBe(1)
+    expect(metrics(files)['compaction.manual.ms']).toBeUndefined()
+    expect((await $.command.run({ command: 'om-stats', args: '', ...COMPOSER })).text).toContain("1 main (1 at a turn's end)")
+  })
+
+  test("the person's /compact and another plugin's compaction keep their handling: less than a chunk unobserved is briefed by code", async ($, on) => {
+    const { clock, files, history, seen, runTurn } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 150_000, at(23, 9, 0))
+    await runTurn(turn('b', 'b', 16_000), 150_000, at(23, 9, 5))
+
+    const manual = await $.session.compact({ trigger: 'manual', messages: [...history] })
+    history.push(...turn('c', 'c', 100))
+    const plugin = await $.session.compact({ trigger: 'plugin', messages: [...history] })
+
+    expect(seen.prompts).toEqual([])
+    for (const r of [manual, plugin]) expect(r.messages?.[0]?.text).not.toContain('Resume directly')
+    expect(seen.logs.filter((l) => l.endsWith('in a brief compiled by code (too little to observe yet)'))).toHaveLength(2)
+    await clock.advance(5_000)
+    expect(metrics(files)['compaction.manual.ms']!.count).toBe(1)
+    expect(metrics(files)['compaction.plugin.ms']!.count).toBe(1)
+    expect(metrics(files)['compaction.turnEnd.ms']).toBeUndefined()
+  })
+
+  test("a subagent's turn end never compacts, however large the main conversation's context", async ($, on) => {
+    const { compactions, runTurn } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 150_000, at(23, 9, 0))
+    await runTurn(turn('brief', 'r', 100), 170_000, at(23, 9, 5), 'agent-1')
+    expect(compactions).toEqual([])
+  })
+
+  test('a turn-end compaction another plugin vetoes is logged and nothing else happens; the next turn end tries again', { plugins: [vetoes] }, async ($, on) => {
+    const { seen, compactions, runTurn } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 160_000, at(23, 9, 0))
+    expect(compactions).toEqual([{ skip: 'not now' }])
+    expect(seen.logs).toContain('the turn-end compaction did not install; a later turn end tries again')
+    expect(seen.screen).toEqual([])
+
+    await runTurn(turn('b', 'b', 16_000), 161_000, at(23, 9, 5))
+    expect(compactions).toHaveLength(2)
+  })
+
+  test('a turn-end /compact the engine rejects is logged, and the next turn end tries again', async ($, on) => {
+    const { seen, refused, runTurn } = session($, on, true)
+    await runTurn(turn('a', 'a', 16_000), 160_000, at(23, 9, 0))
+    expect(seen.logs.filter((l) => l.startsWith('the turn-end compaction was not run ('))).toHaveLength(1)
+    expect(seen.screen).toEqual([])
+    await runTurn(turn('b', 'b', 16_000), 161_000, at(23, 9, 5))
+    expect(refused()).toBe(2)
   })
 })

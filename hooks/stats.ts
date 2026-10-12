@@ -292,7 +292,8 @@ export function formatCost(head: string, merged: ReturnType<typeof merge>) {
     const vs = values(s.metrics[`afterCompaction.om.${f}`])
     return vs.map((v, i) => (t[i] ?? 0) + v)
   }, []))
-  const at = median(values(s.metrics['compaction.auto.tokensBefore']))
+  // Where the main conversation compacts now: auto compactions and the plugin's own at a turn's end.
+  const at = median([...values(s.metrics['compaction.auto.tokensBefore']), ...values(s.metrics['compaction.turnEnd.tokensBefore'])])
   if (Number.isFinite(g)) row('Growth', `g ~${k(g)} tokens a request (median)`)
   if (!Number.isFinite(g) || !Number.isFinite(c0)) {
     lines.push('', 'The best compaction point needs g and at least one om compaction measured after it.')
@@ -302,7 +303,7 @@ export function formatCost(head: string, merged: ReturnType<typeof merge>) {
   const best = c0 + Math.sqrt((2 * WRITE_COST * c0 * g) / READ_COST)
   row('Compaction', `leaves C0 ~${k(c0)}, ~${k(WRITE_COST * c0)} once to write cold${Number.isFinite(at) ? `, ~${k(WRITE_COST * c0 - READ_COST * at)} more than reading the ~${k(at)} it replaced` : ''}`)
   row('Best T', `~${k(best)} tokens: ~${k(per(best))} a request`)
-  if (Number.isFinite(at) && at > c0) row('Now', `auto compactions at ~${k(at)} (median): ~${k(per(at))} a request, ${((per(at) / per(best) - 1) * 100).toFixed(0)}% over the best`)
+  if (Number.isFinite(at) && at > c0) row('Now', `compactions at ~${k(at)} (median of auto and turn-end): ~${k(per(at))} a request, ${((per(at) / per(best) - 1) * 100).toFixed(0)}% over the best`)
   lines.push('', `Input-token equivalents: uncached ×1, cache read ×${READ_COST}, cache write ×${WRITE_COST} (one-hour TTL); dollars at $${INPUT_DOLLARS_PER_MTOK}/MTok.`)
   return lines.join('\n')
 }
@@ -324,7 +325,10 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const triggers = [...new Set(Object.keys(s.metrics).flatMap((k) => k.match(/^compaction\.([\w-]+)\.ms$/)?.[1] ?? []))]
   const main = compactions(s, triggers.filter((t) => t !== 'subagent'))
   const sub = compactions(s, ['subagent'])
-  if (main.total + sub.total) row('Compactions', `${grouped(main.total + sub.total)}: ${grouped(main.total)} main, ${grouped(sub.total)} subagent`)
+  // The main conversation's own between turns, which the plugin started as a turn ended (`turnEnd`).
+  const turnEnd = s.metrics['compaction.turnEnd.ms']?.count ?? 0
+  if (main.total + sub.total)
+    row('Compactions', `${grouped(main.total + sub.total)}: ${grouped(main.total)} main${turnEnd ? ` (${grouped(turnEnd)} at a turn's end)` : ''}, ${grouped(sub.total)} subagent`)
   for (const [label, c] of [['  Main', main], ['  Subagent', sub]] as const) {
     if (!c.instant.length && !c.waited.length) continue
     const parts = [`${grouped(c.instant.length)} of ${grouped(c.instant.length + c.waited.length)} instant${c.instant.length ? ` (median ${duration(median(c.instant))})` : ''}`]
