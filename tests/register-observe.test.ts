@@ -135,6 +135,29 @@ describe('register: observe', () => {
     expect(seen.prompts[0]).toContain('[Tool result for Bash]: 2 passed, 1 failed')
   })
 
+  // A session's image Reads reached the Observer as "[empty result]", and its memory said the mockups read empty.
+  test('a tool result with no text reaches the Observer as an image when Read stored one, and never as empty', async ($, on) => {
+    mock.clock(on)
+    world(on)
+    const seen = pi(on)
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'look at the mockups', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: '/m/mock.jpg' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: '', isError: false, result: { type: 'image', file: { type: 'image/jpeg' } } }] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't2', tool: 'Read', input: { file_path: '/m/other.jpg' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't2', text: '', isError: false }] },
+      ...turn('a', 'a', CHUNK),
+      ...turn('b', 'b', CHUNK),
+      ...turn('c', 'c', 8_000),
+    ]
+
+    await $.session.compact({ trigger: 'manual', messages })
+
+    expect(seen.prompts[0]).toContain('[Tool result for Read]: [image]')
+    expect(seen.prompts[0]).toContain('[Tool result for Read]: [no text]') // no record, as in a subagent's transcript
+    expect(seen.prompts[0]).not.toContain('empty result')
+  })
+
   // The history holds the host's interruption row, so the chunk carries it and the Observer is told what it means.
   test('an interrupted turn reaches the Observer with its interruption row, which the Observer reads as unfinished work', async ($, on) => {
     mock.clock(on)

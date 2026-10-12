@@ -1,4 +1,4 @@
-import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, TurnUsage } from 'claude-code'
+import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, ToolResultSummary, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
 import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, plural, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
@@ -506,6 +506,9 @@ function chunkEnd(v: View, from: number, end: number, frontier: boolean) {
   return !frontier || tokens >= CHUNK_TOKENS ? end : undefined
 }
 
+// Read stores an image it returned as `{ type: 'image', file }`; a record is absent in a subagent's transcript.
+const noText = (r: ToolResultSummary) => ((r.result as { type?: unknown } | undefined)?.type === 'image' ? '[image]' : '[no text]')
+
 // pi's serialization: one block per row, its time, tool calls inline, results capped.
 function serialize(v: View, from: number, to: number) {
   const names = new Map<string, string>()
@@ -522,8 +525,9 @@ function serialize(v: View, from: number, to: number) {
     if (m.text) blocks.push(`[User${at}]: ${m.text}`)
     for (const r of m.toolResults ?? [])
       // `isError` is the host's own report, never inferred: an absent or successful result never claims failure, and
-      // one truncated for length never claims success it did not report either.
-      blocks.push(`[Tool result for ${names.get(r.tool_use_id) ?? 'tool'}${r.isError ? ' (error)' : ''}${at}]: ${excerpt(r.text, TOOL_RESULT_MAX_TOKENS) || '[empty result]'}`)
+      // one truncated for length never claims success it did not report either. A result with no text is not called
+      // empty: `text` joins only text blocks, so an image Read has none, and the Observer then wrote that it was empty.
+      blocks.push(`[Tool result for ${names.get(r.tool_use_id) ?? 'tool'}${r.isError ? ' (error)' : ''}${at}]: ${excerpt(r.text, TOOL_RESULT_MAX_TOKENS) || noText(r)}`)
   }
   return blocks.join('\n\n')
 }
