@@ -6,9 +6,9 @@ const SAMPLES = 200 // raw samples kept per metric, newest, for medians and p90
 const WRITE_DELAY_MS = 2_000
 // What the prompt cache charges per token against plain input: a read, and a write with Claude Code's one-hour TTL.
 // The usage does not say which TTL a write had; a five-minute write costs 1.25.
-const READ_COST = 0.1
+const READ_COST = 0.05
 const WRITE_COST = 2
-const INPUT_DOLLARS_PER_MTOK = 5 // Opus's input price, for a rough figure in dollars
+const INPUT_DOLLARS_PER_MTOK = 4 // Opus 5.5's input price, for a rough figure in dollars
 const DEFAULT_DIR = '.claude/plugins/data/observational-memory/stats' // under $HOME; OM_STATS_DIR overrides it
 
 export type Sample = [at: number, value: number]

@@ -186,10 +186,10 @@ describe('stats', () => {
     addCacheUse(s, 'om', { uncached: 2, cacheRead: 8_000, cacheWrite: 32_000 }, T0 + 2)
     addCompaction(s, { trigger: 'auto', fellBack: false, ms: 20, tokensBefore: 160_000 }, T0 + 2)
     expect(s.metrics['request.growthTokens']).toMatchObject({ count: 1, sum: 2_000 })
-    expect(s.metrics['request.costTokens']!.recent.at(-1)![1]).toBe(2 + 800 + 64_000)
+    expect(s.metrics['request.costTokens']!.recent.at(-1)![1]).toBe(2 + 400 + 64_000)
     const text = formatCost('this session', merge([s]))
-    // C0 = 40k, g = 2k: T = 40k + √(2·2·40k·2k/0.1) = 40k + 56.6k
-    expect(text).toContain('Best T       ~96.6k tokens')
+    // C0 = 40k, g = 2k: T = 40k + √(2·2·40k·2k/0.05) = 40k + 80k
+    expect(text).toContain('Best T       ~120.0k tokens')
     expect(text).toContain('Now          auto compactions at ~160.0k (median)')
     expect(parseArgs('all cost')).toEqual({ scope: 'all', cost: true })
   })
