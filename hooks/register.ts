@@ -760,6 +760,7 @@ type PiMessage = {
   content?: { type: string; text?: string }[]
   stopReason?: string
   errorMessage?: string
+  durationMs?: number
   usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } }
 }
 
@@ -833,7 +834,7 @@ async function complete($: EngineInterface, role: string, session: string, syste
   log(
     $,
     `Luna ${role}: ${u?.input ?? '?'} in, ${u?.output ?? '?'} out, $${(u?.cost?.total ?? 0).toFixed(4)}, ` +
-      `${((await $.clock.now()) - started) / 1000}s`,
+      `${((await $.clock.now()) - started) / 1000}s${message.durationMs === undefined ? '' : ` (model ${message.durationMs / 1000}s)`}`,
   )
   return (message.content ?? []).flatMap((c) => (c.type === 'text' && c.text ? [c.text] : [])).join('')
 }

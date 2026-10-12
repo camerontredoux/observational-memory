@@ -48,6 +48,7 @@ export function piOutput(prompt: string, text: string, end: { stopReason?: strin
     provider: 'openai-codex',
     model: 'gpt-5.6-luna',
     usage: PI_USAGE,
+    durationMs: 1500,
     ...end,
     timestamp: 0,
   }

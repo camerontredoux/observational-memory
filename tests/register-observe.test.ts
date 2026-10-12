@@ -63,7 +63,7 @@ describe('register: observe', () => {
     expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS, '--session-id', OBSERVER_SESSION], cwd: '/tmp' })
     expect(seen.calls.map((c) => piSessionOf(c.argv))).toEqual([OBSERVER_SESSION, OBSERVER_SESSION]) // the session's Observer calls share one cache key
     expect(seen.modelCalls).toBe(0)
-    expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s')
+    expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s (model 1.5s)')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     const text = result.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"') // untimed history: no invented times
