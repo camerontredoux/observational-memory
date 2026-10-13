@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import { turn, CHUNK, world, pi, work, nextStepIn, observationsIn, userMessagesIn } from './harness'
+import { MEMORY_MAX_TOKENS } from '../hooks/register'
 
 // Prompts and the user messages section.
 describe('register: user-messages', () => {
@@ -275,5 +276,45 @@ describe('register: user-messages', () => {
     expect(seen.systems[0]).toContain('A one-time approval or go-ahead ("yes, push it") never replaces, retracts or relaxes a listed constraint')
     expect(seen.systems[0]).toContain('* 🟡 2026-09-23 14:36 User approved adding the expiry check the assistant proposed for refreshToken()')
     expect(seen.systems[0]).not.toContain('suggested-response')
+  })
+
+  // The open asks: a memory over its cap sheds the oldest observations and the middle prompts, never the session's
+  // task statement or the newest asks, which stay word for word, so the agent does not need them said again.
+  test("over the memory's cap, the first message and the newest asks stay word for word while the oldest observations go, and the header says so", async ($, on) => {
+    mock.clock(on)
+    world(on, { unreadable: ['agent-1'] })
+    // ~12k tokens of observations per chunk, six chunks: well past the cap.
+    const seen = pi(on, { reply: (prompt) => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_500)}* 🟡 saw ${prompt.match(/^\[User[^\]]*\]: (p\d)/m)?.[1]}\n</observations>` })
+    const task = 'p0 Build the parser. Keep the CLI flags exactly as they are.'
+    const asks = ['p3 Force the overlay into dark mode', 'p4 not the issue im encountering: switching platform keeps the old layout', 'p5 now rerun the tests']
+    const prompts = [task, 'p1 also look at the lexer', 'p2 '.padEnd(3_000, 'long paste '), ...asks]
+    const messages = [...prompts.flatMap((p) => turn(p, 'r', CHUNK)), ...work('w', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(Math.ceil(text.length / 4)).toBeLessThanOrEqual(MEMORY_MAX_TOKENS + 200)
+    expect(userMessagesIn(text)).toEqual([task, '(2 omitted)', ...asks])
+    expect(nextStepIn(text)).toBe(asks[2])
+    expect(text).toMatch(/\nTrimmed to the memory's ~24000-token cap: (?:replies left out; )?user messages cut to the first and the open asks; [\d,]+ older observations left out\. The user's first message and newest requests are kept word for word/)
+    // The newest observations stay; the oldest go, counted where they were.
+    const observations = observationsIn(text) ?? ''
+    expect(observations).toMatch(/^\* \([\d,]+ older observations left out to fit the memory's cap; om_recall can find them\)\n/)
+    expect(observations).toContain('saw p5')
+    expect(observations).not.toContain('saw p0')
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the memory message was over its ~24000-token cap: /))
+  })
+
+  test('a memory under its cap is left as it was: no trimmed line, every observation kept', async ($, on) => {
+    mock.clock(on)
+    world(on, { unreadable: ['agent-1'] })
+    pi(on, { reply: () => '<observations>\n* 🟡 read a file\n</observations>' })
+    const messages = [...turn('a', 'r', CHUNK), ...turn('b', 'r', CHUNK), ...work('w', 8_000)]
+
+    const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })
+
+    const text = result.messages?.[0]?.text ?? ''
+    expect(text).not.toContain('Trimmed to')
+    expect(text).not.toContain('older observations left out')
   })
 })

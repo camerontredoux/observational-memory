@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, COMPACT_WRAPPER, FLOOR_NOTE, MEMORY_HEADER } from '../hooks/prompts'
 import { originalId } from '../hooks/recall'
-import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, pi, live, gates, recordIn, WHERE, noReplies, repliesIn, correctionsIn, observationsIn, briefIn, constraining } from './harness'
+import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, pi, live, gates, recordIn, WHERE, noReplies, repliesIn, correctionsIn, observationsIn, briefIn, constraining, work } from './harness'
 import type { Ledger } from './harness'
 
 // Observation at compaction and in the background.
@@ -771,6 +771,8 @@ describe('register: observe', () => {
 
     expect([seen.inFlight, seen.stopped]).toEqual([0, 1])
     expect(seen.logs).toContain('background observation of rows 0-3 failed (pi timed out after 120000 ms); it will be retried')
+    // A timeout goes on screen, not to the debug log alone.
+    expect(seen.screen).toContain('Observation failed (timeout after 2m) and will retry')
     await clock.advance(60_000)
     expect(seen.prompts).toHaveLength(2)
     expect(seen.logs).toContainEqual(expect.stringMatching(/^observed rows 0-3 in the background/))
@@ -968,5 +970,21 @@ describe('register: observe', () => {
     const second = await $.session.compact({ trigger: 'manual', messages: history.slice(history.indexOf(result.messages![0]!)) })
     expect(observationsIn(second.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)\n* 🔴 2026-09-22 15:00 User: "b" (source 2026-09-22 14:31 to 2026-09-22 15:01)')
     expect(second.messages?.[1]?.text).toBe('b done')
+  })
+
+  test("a subagent's Observer timeout at compaction goes on screen, named as the subagent's; its other failures stay in the debug log", async ($, on) => {
+    mock.clock(on)
+    world(on, { unreadable: ['agent-1', 'agent-2'] })
+    const seen = pi(on, {
+      fail: (n, prompt) =>
+        prompt.includes(']: slow') ? { exitCode: 1, stdout: '', stderr: 'request timed out\n' } : prompt.includes(']: bad') ? { exitCode: 1, stdout: '', stderr: 'pi: 401 Unauthorized\n' } : undefined,
+    })
+
+    await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('slow', 'r', CHUNK), ...turn('b', 'r', CHUNK), ...work('w', 8_000)] })
+    await $.session.compact({ trigger: 'auto', agentId: 'agent-2', messages: [...turn('bad', 'r', CHUNK), ...turn('c', 'r', CHUNK), ...work('w', 8_000)] })
+
+    expect(seen.screen.filter((l) => l.startsWith('Subagent: Observation failed (timeout'))).toHaveLength(1)
+    expect(seen.screen.filter((l) => l.includes('pi exited 1'))).toEqual([])
+    expect(seen.logs.filter((l) => l.includes('at compaction failed (pi exited 1: pi: 401 Unauthorized)'))).toHaveLength(1)
   })
 })

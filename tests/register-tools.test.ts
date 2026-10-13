@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import { FLOOR_NOTE } from '../hooks/prompts'
+import { MEMORY_MAX_TOKENS } from '../hooks/register'
 import { originals, turn, CHUNK, at, world, pi, live, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, observationsIn, briefIn, steps, SUMMARY, USAGE, ran } from './harness'
 
 // Om_recall registration, gauges, /clear and subagent windows.
@@ -319,19 +320,22 @@ describe('register: tools', () => {
     expect(stats.counts['compaction.subagent.floor']).toBe(1)
   })
 
-  test("a subagent's budget takes the smallest window, not the main model's million", async ($, on) => {
+  // planBudget's own test gives a subagent's 90k budget under a 1M window; ~100k tokens of observations, once over
+  // it, now come under the memory's cap first, so the memory stands, its oldest observations left out.
+  test("a subagent's memory with ~100k tokens of observations is trimmed to the memory's cap and stands, under the main model's million", async ($, on) => {
     mock.clock(on)
     world(on, { unreadable: ['agent-1'] })
     const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(6_000)}</observations>` })
-    // ~100k tokens of observations: under the main model's (1M - 20k) / 2, over a 200k window's 90k.
     on('session.usage', () => ({ value: { context: { window: 1_000_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000)]
 
     const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })
 
-    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~90000 allowed; using the built-in compaction$/))
-    expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
+    const text = result.messages?.[0]?.text ?? ''
+    expect(Math.ceil(text.length / 4)).toBeLessThanOrEqual(MEMORY_MAX_TOKENS + 200)
+    expect(text).toMatch(/\nTrimmed to the memory's ~24000-token cap: [\d,]+ older observations left out\./)
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the memory message was over its ~24000-token cap: [\d,]+ older observations left out$/))
   })
 
   // A hot reload cancels the old code's pending waits: a worker it started never settles, and spun on.

@@ -53,6 +53,7 @@ export type Compaction = {
   briefTokens?: number
   observations?: number
   deadlineHit?: boolean // observation at compaction was cut off at its deadline
+  capTrimmed?: boolean // the memory message was trimmed to its cap (MEMORY_MAX_TOKENS)
   unreadable?: boolean // the loop's history could not be read: its whole context was observed on the spot
 }
 // What the first main request after a compaction cost in input tokens: what the prompt cache served, what it wrote,
@@ -115,6 +116,7 @@ export function addCompaction(s: SessionStats, c: Compaction, at: number) {
   if (c.fellBack) count(s, `${key}.fellBack`)
   if (c.floor) count(s, `${key}.floor`)
   if (c.deadlineHit) count(s, `${key}.deadlineHit`)
+  if (c.capTrimmed) count(s, `${key}.capTrimmed`)
   if (c.unreadable) count(s, `${key}.unreadable`)
   add(s, `${key}.ms`, c.ms, at)
   add(s, `${key}.tokensBefore`, c.tokensBefore, at)
