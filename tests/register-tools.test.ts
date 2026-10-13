@@ -104,7 +104,21 @@ describe('register: tools', () => {
     expect(cacheAt()).toBeNull()
   })
 
-  test("once a compaction installs, the gauges' context is its estimate, not the usage from before it", async ($, on) => {
+  test("once a compaction installs, the gauges' context is the count of the context the engine swapped in", async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    pi(on)
+    let swapped = false
+    on('session.usage', () => ({ value: { context: swapped ? { window: 200_000, breakdown: { totalTokens: 61_000 } } : { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [SUMMARY] }))
+
+    await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK)] })
+    swapped = true
+    await clock.settle()
+    expect(JSON.parse(files['/gauges/session-1.json']!).context).toBe(61_000)
+  })
+
+  test("once a compaction installs and the engine shows no swap, the gauges' context is its estimate, not the usage from before it", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
     pi(on)

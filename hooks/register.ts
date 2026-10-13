@@ -107,6 +107,8 @@ const SESSION_TIMEOUT_MS = 60_000
 const REGISTER_WAIT_MS = 1_000 // how long session.start waits for om_recall to list; it takes ~50 ms
 const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
 const GAUGES_RM_TIMEOUT_MS = 5_000 // the `rm` of an ended session's footer files, which session.end waits on
+const MEASURE_POLL_MS = 250 // how often, after a compaction installs, the gauges look for the engine's swap; it took under 1 s
+const MEASURE_WAIT_MS = 5_000 // how long they look before keeping the compactor's estimate
 const ENV_FILES_MAX = 20 // the uncommitted files the environment lists, the rest counted
 const ENV_LINE_MAX_CHARS = 200 // each line of the environment
 const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force shown whole; past it the oldest shorten (boundPins)
@@ -299,8 +301,8 @@ async function noteCacheAt($: EngineInterface, at: number | null) {
   }
 }
 // The main conversation's last compaction, by session, until a request carries the context it installed: which
-// compactor made it, the hash of an om compaction's memory message, and the context it left as the compactor
-// estimated it, which the gauges show until then, as `$.session.usage` still has the context from before. That
+// compactor made it, the hash of an om compaction's memory message, and the context it left, as the compactor
+// estimated it and then as measureCompacted counts it, which the gauges show until then. That
 // request's usage says what the compaction cost in prompt cache, and its input is the context the compaction left,
 // which the memory row shows.
 const uncarried = new Map<string, { compactor: 'om' | 'builtin'; memory?: string; tokens?: number }>()
@@ -311,6 +313,25 @@ const installed = new Map<string, string>()
 // The context the main conversation's last request was answered over, by session, until a compaction installs: what
 // a turn's end weighs against TURN_END_COMPACT_TOKENS.
 const lastContext = new Map<string, number>()
+// Counts the context a main compaction left, once the engine has swapped it in, which `$.session.usage` shows by
+// dropping the last reply's tokens, and puts the count in the gauges in place of the compactor's estimate. The
+// summary count, local and free, came within 5% of the next request's input; the full one, with the token-count
+// API, no closer. Where usage fails, as showGauges takes it, the estimate stands.
+async function measureCompacted($: EngineInterface) {
+  try {
+    const sessionId = await $.session.id()
+    for (let waited = 0; waited <= MEASURE_WAIT_MS; waited += MEASURE_POLL_MS) {
+      const { context } = await $.session.usage({ breakdown: 'summary' })
+      const last = uncarried.get(sessionId)
+      if (last === undefined) return // a request measured it first
+      if (context.tokens === undefined && context.breakdown) {
+        last.tokens = context.breakdown.totalTokens
+        return await showGauges($, loopOf(sessionId))
+      }
+      await $.clock.sleep(MEASURE_POLL_MS)
+    }
+  } catch {}
+}
 async function noteCacheUse($: EngineInterface, usage: TurnUsage) {
   const sessionId = await $.session.id()
   const use = { uncached: usage.input_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens }
@@ -2435,7 +2456,10 @@ export const register: Register = (on) => {
   on('session.compact', async ($, e, next) => {
     try {
       const r = await compact($, e, next)
-      if (e.agentId === undefined && e.trigger !== 'precompute' && r.skip === undefined) $.clock.after(0, () => void noteCacheAt($, null))
+      if (e.agentId === undefined && e.trigger !== 'precompute' && r.skip === undefined) {
+        $.clock.after(0, () => void noteCacheAt($, null))
+        $.clock.after(0, () => void measureCompacted($))
+      }
       return r
     } catch (error) {
       // Once the compaction is abandoned, a throw would run the hooks beneath, the built-in compactor's model call
