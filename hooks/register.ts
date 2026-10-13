@@ -263,7 +263,7 @@ async function showGauges($: EngineInterface, loop: Loop) {
       chunk: CHUNK_TOKENS,
       ledger: estimateTokens(renderLines(stored?.entries ?? [])),
       reflectAt: REFLECT_AT_TOKENS,
-      context: context?.tokens,
+      context: uncarried.get(loop.sessionId)?.tokens ?? context?.tokens,
       compactAt: context?.breakdown?.autoCompactThreshold ?? context?.window,
       cost,
       compactions,
@@ -299,9 +299,11 @@ async function noteCacheAt($: EngineInterface, at: number | null) {
   }
 }
 // The main conversation's last compaction, by session, until a request carries the context it installed: which
-// compactor made it, and the hash of an om compaction's memory message. That request's usage says what the
-// compaction cost in prompt cache, and its input is the context the compaction left, which the memory row shows.
-const uncarried = new Map<string, { compactor: 'om' | 'builtin'; memory?: string }>()
+// compactor made it, the hash of an om compaction's memory message, and the context it left as the compactor
+// estimated it, which the gauges show until then, as `$.session.usage` still has the context from before. That
+// request's usage says what the compaction cost in prompt cache, and its input is the context the compaction left,
+// which the memory row shows.
+const uncarried = new Map<string, { compactor: 'om' | 'builtin'; memory?: string; tokens?: number }>()
 // The context the main conversation's last compaction installed, by session, as `contextHash` reads it: a compaction
 // handed the same context again has nothing new to compact. It reads no command echo either: a local command's whose
 // output was a system row (`/reload-plugins`) looks like a prompt command's, and a prompt command's brings a reply.
@@ -1813,7 +1815,7 @@ async function delegateToBuiltin($: EngineInterface, e: SessionCompactInput, nex
     )
   const [summary, ...kept] = r.messages ?? []
   if (installs && summary && sessionId !== undefined && e.agentId === undefined) {
-    uncarried.set(sessionId, { compactor: 'builtin' })
+    uncarried.set(sessionId, { compactor: 'builtin', tokens: r.skip === undefined ? r.tokensAfter : undefined })
     installed.set(sessionId, contextHash(r.messages!))
     lastContext.delete(sessionId)
     void countCompaction($, sessionId)
@@ -2283,15 +2285,16 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   // In the context's own order.
   const tail = dedupWrappers(maskTail(withoutLocalCommands(live.filter((m, i) => kept.has(i) && !isEmptyReply(m))).map(({ handle: _, ...m }) => m)))
   const compacted = [message, ...freshToolIds(tail, started.toString(36))]
+  const estimate = overhead + estimateTokens(message.text) + Math.ceil(tailTokens(cut) * density)
   if (main && installs) {
-    uncarried.set(sessionId, { compactor: 'om', memory: hash(message.text) })
+    uncarried.set(sessionId, { compactor: 'om', memory: hash(message.text), tokens: estimate })
     installed.set(sessionId, contextHash(compacted))
     lastContext.delete(sessionId)
     void countCompaction($, sessionId)
   }
   // A subagent's row too: no request measures its context, so it keeps the estimate, for this process alone, as a
   // subagent's loop stores nothing past its life.
-  if (installs) await noteContextEstimate($, sessionId, hash(message.text), overhead + estimateTokens(message.text) + Math.ceil(tailTokens(cut) * density), main)
+  if (installs) await noteContextEstimate($, sessionId, hash(message.text), estimate, main)
   return { messages: compacted }
 }
 

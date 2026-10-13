@@ -104,6 +104,20 @@ describe('register: tools', () => {
     expect(cacheAt()).toBeNull()
   })
 
+  test("once a compaction installs, the gauges' context is its estimate, not the usage from before it", async ($, on) => {
+    const clock = mock.clock(on)
+    const { files } = world(on)
+    pi(on)
+    on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
+    on('session.compact', () => ({ messages: [SUMMARY] }))
+    const context = () => JSON.parse(files['/gauges/session-1.json'] ?? '{}').context
+
+    await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK)] })
+    await clock.settle()
+    expect(context()).toBeGreaterThan(0)
+    expect(context()).toBeLessThan(150_000)
+  })
+
   test('session.end deletes the gauges and the cache time, and a write that lands after it writes nothing', async ($, on) => {
     const clock = mock.clock(on)
     const { files, stored } = world(on)
