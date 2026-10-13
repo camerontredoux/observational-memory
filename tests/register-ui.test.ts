@@ -154,6 +154,27 @@ describe('the memory row', () => {
     expect(published).toEqual([{ [hash(memory)]: 'to ~22.7k tokens' }, { [hash(memory)]: 'to 48.3k tokens' }])
   })
 
+  test('once the engine swaps the compacted context in, its row shows the count of it, still under ~, until a request measures it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    pi(on)
+    const drawn: string[] = []
+    on('ui.render', { component: 'UserMessage' }, ($, e) => (drawn.push(e.props.text), { type: 'Text', children: [e.props.text] }))
+    let swapped = false
+    on('session.usage', () => ({ value: { context: swapped ? { window: 200_000, breakdown: { totalTokens: 27_400 } } : { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
+    const draw = (text: string) => $.ui.render({ surface: 'terminal', component: 'UserMessage', requestId: 'm1', props: { text, origin: { kind: 'unclassified' }, isExpanded: false } })
+    await clock.set(at(23, 9, 0))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('tail', 'r', 8_000))
+
+    const memory = (await $.session.compact({ trigger: 'auto', messages: [...history] })).messages![0]!.text
+    await draw(memory)
+    swapped = true
+    await clock.settle()
+    await draw(memory)
+
+    expect(drawn).toEqual(['Compacted into observational memory · to ~32.6k tokens', 'Compacted into observational memory · to ~27.4k tokens'])
+  })
+
   test('the rows a compaction kept draw once: the copies it wrote after the memory row draw as nothing, the rows after them as written', async ($, on) => {
     const { stored, files } = world(on)
     on('ui.render', ($, e) => ({ type: 'Text', children: [String(e.requestId)] }))

@@ -314,7 +314,8 @@ const installed = new Map<string, string>()
 // a turn's end weighs against TURN_END_COMPACT_TOKENS.
 const lastContext = new Map<string, number>()
 // Counts the context a main compaction left, once the engine has swapped it in, which `$.session.usage` shows by
-// dropping the last reply's tokens, and puts the count in the gauges in place of the compactor's estimate. The
+// dropping the last reply's tokens, and puts the count in the gauges and an om compaction's row, still under `~`, in
+// place of the compactor's estimate. The
 // summary count, local and free, came within 5% of the next request's input; the full one, with the token-count
 // API, no closer. Where usage fails, as showGauges takes it, the estimate stands.
 async function measureCompacted($: EngineInterface) {
@@ -326,6 +327,10 @@ async function measureCompacted($: EngineInterface) {
       if (last === undefined) return // a request measured it first
       if (context.tokens === undefined && context.breakdown) {
         last.tokens = context.breakdown.totalTokens
+        if (last.memory !== undefined) {
+          await noteContextEstimate($, sessionId, last.memory, last.tokens, true)
+          $.ui.invalidate('ui.render')
+        }
         return await showGauges($, loopOf(sessionId))
       }
       await $.clock.sleep(MEASURE_POLL_MS)
