@@ -1,5 +1,5 @@
 import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, ToolResultSummary, TurnUsage } from 'claude-code'
-import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT } from './prompts'
+import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, observationsTrimmedLine, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT, trimmedNote, TURN_END_NOTE } from './prompts'
 import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addLuna, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, plural, record, report, statsDir } from './stats'
 import type { Io, LunaCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
@@ -16,7 +16,9 @@ import type { Index } from './hash-recall'
 import { compileBrief, emptyBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
   applyConstraints,
+  asksOnly,
   baseOf,
+  skillsAsLines,
   slimmed,
   capReplies,
   capUserMessages,
@@ -111,6 +113,10 @@ const CONSTRAINTS_MAX_TOKENS = 8_000 // the user's constraints in force shown wh
 const WINDOW_TOKENS = 200_000 // the context window assumed when the session cannot say, or for a subagent's model: the smallest in use
 const TURN_END_COMPACT_TOKENS = 157_000 // a main turn that ends with more context than this compacts between turns, auto-compaction kept as the hard stop
 const OVERHEAD_TOKENS = 20_000 // the system prompt and built-in tool schemas every request carries beside the messages
+// The memory message's own cap, whatever the budget leaves: past it the least needed sections go first (see buildMemory),
+// the corrections, the continuation record and the user's first message and open asks kept whole. Real memory
+// messages run a median ~4.5k tokens; reflection lets the observations alone reach REFLECT_AT_TOKENS.
+export const MEMORY_MAX_TOKENS = 24_000
 const MEMORY_HEADROOM = 1.25 // the memory message's estimate scaled up: the Observer's prose runs near it, quoted skills and prompts may not
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
 
@@ -198,6 +204,12 @@ function locked<T>(fn: () => Promise<T>): Promise<T> {
 const log = ($: EngineInterface, text: string) => $.ui.log(text, { to: 'debug' })
 // A subagent's lines go to the debug log only: the main chat shows the main conversation's.
 const show = ($: EngineInterface, text: string, agentId?: string) => (agentId === undefined ? $.ui.log(text) : $.ui.log(text, { to: 'debug' }))
+// A timeout or a deadline hit goes on screen whoever ran into it, a subagent's named as such: these are the failures
+// that hold a compaction or leave history raw, and the debug log alone hid them.
+const showSlow = ($: EngineInterface, text: string, agentId?: string) => $.ui.log(agentId === undefined ? text : `Subagent: ${text}`)
+// A failure on screen: a slow one (isSlow) whoever ran into it, any other a subagent's in the debug log only.
+const showFailure = ($: EngineInterface, why: string, text: string, agentId?: string) => (isSlow(why) ? showSlow($, text, agentId) : show($, text, agentId))
+const isSlow = (why: string) => why.startsWith('timeout') || why.includes('deadline')
 // A setup failure that leaves a tool unavailable for the session also raises a native notification, as the line
 // alone scrolls past at the start.
 const showUnavailable = ($: EngineInterface, text: string) => {
@@ -942,6 +954,15 @@ function carryClauses(v: View, from: number, to: number, lines: string[]) {
 // quote is compared with the reply's shown text, bold and code marks and spacing aside, case ignored.
 const SAID_LINE = /\bAssistant said:? "([^"]{12,})"$/
 const plainOf = (text: string) => text.replace(/\*\*|`/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+// The order the cap leaves observations out in: the oldest first, every 🔴 line after the rest.
+const dropOrder = <T extends { line: string }>(entries: readonly T[]) => [...entries.filter((e) => !e.line.startsWith('🔴')), ...entries.filter((e) => e.line.startsWith('🔴'))]
+// The entries without the first `n` of dropOrder, in their own order.
+function trimmedOldest<T extends { line: string }>(entries: readonly T[], n: number): T[] {
+  if (!n) return [...entries]
+  const gone = new Set(dropOrder(entries).slice(0, n))
+  return entries.filter((e) => !gone.has(e))
+}
+
 function unsaid<T extends { line: string }>(entries: readonly T[], replies: readonly UserMessage[] | undefined): T[] {
   const shown = (replies ?? []).map((r) => plainOf(r.text))
   if (!shown.length) return [...entries]
@@ -1383,7 +1404,8 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
     } catch (error) {
       if (error instanceof LoopEnded) log($, `background observation of rows ${job.range.from}-${job.range.to} stopped: ${LOOP_ENDED}`)
       else log($, `background observation of rows ${job.range.from}-${job.range.to} failed (${errorText(error)}); it will be retried`)
-      if (isLive(loop, stamp)) show($, `Observation failed (${reason(error, OBSERVER_TIMEOUT_MS)}) and will retry`, loop.agentId)
+      const why = reason(error, OBSERVER_TIMEOUT_MS)
+      if (isLive(loop, stamp)) showFailure($, why, `Observation failed (${why}) and will retry`, loop.agentId)
     }
   const ms = (await $.clock.now()) - started
   const ended = () => (chunk && log($, 'a background chunk landed after its loop ended; discarded'), false)
@@ -1620,7 +1642,8 @@ async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
         if (error instanceof LoopEnded) return log($, 'a reflection outlived its loop; discarded')
         failed = true
         log($, `reflection failed (${errorText(error)})`)
-        show($, `Condensing failed (${reason(error, REFLECTOR_TIMEOUT_MS)}) and will retry later`, loop.agentId)
+        const why = reason(error, REFLECTOR_TIMEOUT_MS)
+        showFailure($, why, `Condensing failed (${why}) and will retry later`, loop.agentId)
       })
       .finally(async () => {
         reflecting.delete(key)
@@ -1927,6 +1950,7 @@ type MemorySources = Awaited<ReturnType<typeof memoryInputs>> & {
   environment: Awaited<ReturnType<typeof environmentOf>>
   recall: boolean
   resumeDirectly: boolean
+  turnEnd: boolean // this plugin's own compaction at a turn's end (compactAtTurnEnd), which the memory's header says
   budget: number
   density: number
   tailTokens: (cut: number) => number
@@ -1941,7 +1965,7 @@ type MemorySources = Awaited<ReturnType<typeof memoryInputs>> & {
 // is the memory message alone. Constraints over their cap shorten, the oldest first, to index lines (boundPins).
 // `kept`: the ledger is stored with the memory message, so a line the message leaves out (see unsaid) comes back.
 async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, sources: MemorySources) {
-  const { messages, v, priorMemory, prior, recorded, goal, turns, transcript, transcriptPath, prompts, replyRows, typedSoFar, environment, recall, resumeDirectly, budget, density, tailTokens, compile, dirs } = sources
+  const { messages, v, priorMemory, prior, recorded, goal, turns, transcript, transcriptPath, prompts, replyRows, typedSoFar, environment, recall, resumeDirectly, turnEnd, budget, density, tailTokens, compile, dirs } = sources
   const base = v.base
   const observed = ledger.watermark.to
   const covered = sourceOf(v, 0, observed) // the time the rows it covers were written by, as their source ranges give it
@@ -1982,6 +2006,7 @@ async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, so
       recall,
       recentKept: tail.length > 0,
       resumeDirectly,
+      ...(turnEnd ? { notes: [TURN_END_NOTE] } : {}),
     }
     // The compacted context: the memory message with its margin, and the raw tail at its density.
     const contextTokens = (m: SessionMessage) => Math.ceil(estimateTokens(m.text) * MEMORY_HEADROOM + tailTokens(cut) * density)
@@ -1990,14 +2015,53 @@ async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, so
     memory.replies = capReplies([...(priorMemory?.replies ?? []), ...replyRows.filter((r) => r.i < cut).map((r) => r.message)], Math.min(REPLIES_MAX_TOKENS, Math.floor(room / MEMORY_HEADROOM)))
     // The observations as shown beside the replies: where the ledger keeps every line, one quoting a reply is left out.
     let sources = true
-    const shown = (m: Memory): Memory => ({ ...m, observations: renderGrouped(kept ? unsaid(ledger.entries, m.replies) : ledger.entries, sources) })
+    let dropped = 0 // the oldest observations the cap leaves out (see trimmedOldest)
+    const shown = (m: Memory): Memory => {
+      const all = kept ? unsaid(ledger.entries, m.replies) : ledger.entries
+      const lines = renderGrouped(trimmedOldest(all, dropped), sources)
+      return { ...m, observations: dropped ? `${observationsTrimmedLine(Math.min(dropped, all.length))}\n${lines}` : lines }
+    }
     memory = shown(memory)
     let message = memoryMessage(memory)
+    // Over its own cap, the memory sheds what it can best do without, one section at a time: source ranges, the
+    // assistant's replies, the skills' text, the user messages but the first and the open asks, then the oldest
+    // observations, 🟡 and lower before 🔴. The header says what it shed; om_recall still reaches all of it.
+    const capped: string[] = []
+    const capCuts: [string, (m: Memory) => Memory][] = [
+      ['source ranges left out', (m) => ((sources = false), shown(m))],
+      ['replies left out', (m) => shown({ ...m, replies: [] })],
+      ['skills kept as lines', (m) => shown(skillsAsLines(m))],
+      ['user messages cut to the first and the open asks', (m) => shown({ ...m, userMessages: asksOnly(m.userMessages) })],
+    ]
+    for (const [what, shorten] of capCuts) {
+      if (estimateTokens(message.text) <= MEMORY_MAX_TOKENS) break
+      const next = shorten(memory)
+      const text = memoryMessage(next).text
+      if (text.length < message.text.length) capped.push(what)
+      memory = next
+      message = memoryMessage(memory)
+    }
+    const total = (kept ? unsaid(ledger.entries, memory.replies) : ledger.entries).length
+    while (estimateTokens(message.text) > MEMORY_MAX_TOKENS && dropped < total) {
+      // Enough of the oldest lines to cover what is over, measured as rendered, and at least one.
+      const over = (estimateTokens(message.text) - MEMORY_MAX_TOKENS) * 4
+      const order = dropOrder(kept ? unsaid(ledger.entries, memory.replies) : ledger.entries)
+      let n = dropped
+      for (let chars = 0; n < order.length && chars < over; n++) chars += order[n]!.line.length + 4
+      dropped = Math.max(n, dropped + 1)
+      memory = shown(memory)
+      message = memoryMessage(memory)
+    }
+    if (dropped) capped.push(`${plural(Math.min(dropped, total), 'older observation')} left out`)
+    if (capped.length) {
+      memory = { ...memory, notes: [...(memory.notes ?? []), trimmedNote(MEMORY_MAX_TOKENS, capped)] }
+      message = memoryMessage(memory)
+    }
     // Over the budget, the observations' source ranges are left out (the ledger keeps them for the next
-    // compaction), then the skills become lines and the user messages the first alone, which om_recall can still
+    // compaction), then the skills become lines and the user messages the first and the open asks, the rest of which om_recall can still
     // find; the corrections (within their cap), observations and continuation record stay whole.
-    const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages as the brief', (m) => shown(slimmed(m))]]
-    if (ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
+    const cuts: [string, (m: Memory) => Memory][] = [['skills kept as lines, user messages cut to the first and the open asks', (m) => shown(slimmed(m))]]
+    if (sources && ledger.entries.some((e) => e.source)) cuts.unshift(['source ranges left out', (m) => ((sources = false), shown(m))])
     const over = contextTokens(message)
     let tokens = over
     const made: string[] = []
@@ -2008,9 +2072,10 @@ async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, so
       tokens = contextTokens(message)
       made.push(what)
     }
-    return { ledger, cut, memory, message, tokens, over, made, floor, briefed: floor ? cut - observed : 0 } // rows the Observer had not observed
+    return { ledger, cut, memory, message, tokens, over, made, capped, floor, briefed: floor ? cut - observed : 0 } // rows the Observer had not observed
   }
   const stands = (a: Awaited<ReturnType<typeof attempt>>) => {
+    if (a.capped.length) log($, `the memory message was over its ~${MEMORY_MAX_TOKENS}-token cap: ${a.capped.join('; ')}`)
     if (a.made.length) log($, `over the ~${budget}-token budget at ~${a.over} tokens: ${a.made.join('; ')}`)
     return a
   }
@@ -2026,7 +2091,7 @@ async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, so
 async function reportCompaction(
   $: EngineInterface,
   e: SessionCompactInput,
-  { ledger, cut, memory, message, floor, briefed, observedNow }: Awaited<ReturnType<typeof buildMemory>> & { observedNow: number },
+  { ledger, cut, memory, message, floor, briefed, capped, observedNow }: Awaited<ReturnType<typeof buildMemory>> & { observedNow: number },
   c: {
     sessionId: string
     trigger: string // the stats' name for who compacted: `e.trigger`, `turnEnd` or `subagent`
@@ -2045,7 +2110,8 @@ async function reportCompaction(
   const { sessionId, started, usage, base, tailTokens, failures, sync, deadlineHit } = c
   const main = e.agentId === undefined
   // Failed rows the floor compiled into the brief are not kept.
-  for (const f of failures) show($, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
+  // A chunk the deadline cut off fails with it, so its line says the deadline passed.
+  for (const f of failures) showFailure($, f.why, `Observation failed (${f.why}) and ${floor ? `put ${plural(f.rows, 'message')} in the session brief` : `kept ${plural(f.rows, 'message')} in full`}`, e.agentId)
   const observed = ledger.watermark.to
   // Why the floor ran, as buildMemory found it.
   const why = observed > base ? 'the memory was over its budget' : failures.length ? 'the Observer failed' : c.tooLittle ? 'too little to observe yet' : 'nothing was observed yet'
@@ -2075,6 +2141,7 @@ async function reportCompaction(
     rowsObservedNow: observedNow,
     rowsObservedBefore: observed - base - observedNow,
     ...(deadlineHit ? { deadlineHit } : {}),
+    ...(capped.length ? { capTrimmed: true } : {}),
     ...(c.unreadable ? { unreadable: true } : {}), // a history the session cannot read: a workflow agent's, a fork's
     ...(briefed ? { rowsBriefed: briefed } : {}),
     memoryTokens: estimateTokens(message.text),
@@ -2182,7 +2249,7 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
     return compileBrief(rows, v.at.slice(from, to), cwd, home, refOf)
   }
   // Only an auto compaction cuts a turn that goes on; one at a turn's end has no turn to resume.
-  const sources: MemorySources = { ...carried, messages, v, environment, recall, resumeDirectly: e.trigger === 'auto', budget, density, tailTokens, compile, dirs }
+  const sources: MemorySources = { ...carried, messages, v, environment, recall, resumeDirectly: e.trigger === 'auto', turnEnd: own, budget, density, tailTokens, compile, dirs }
 
   // Read again: chunks that landed meanwhile count too. The ledger is stored as installed only with a memory
   // message that stands; once installed, the watermark restarts after the memory message, and the chunks past
@@ -2385,7 +2452,7 @@ export const register: Register = (on) => {
     const timeout = next.error.kind === 'timeout'
     // The plugin's own at a turn's end is skipped rather than handed to the built-in compactor: auto-compaction still
     // catches the session, and a later turn end tries again.
-    if (isTurnEnd(e, await $.session.id().catch(() => ''))) return log($, `${timeout ? 'the hook outran its time budget' : message}; the turn-end compaction is skipped`), { skip: `observational-memory: ${message}` }
+    if (isTurnEnd(e, await $.session.id().catch(() => ''))) return (timeout ? showSlow($, 'The turn-end compaction outran its time budget and is skipped') : log($, `${message}; the turn-end compaction is skipped`)), { skip: `observational-memory: ${message}` }
     log($, `${timeout ? `the hook outran its time budget${message ? ` (${message})` : ''}` : message}; using the built-in compaction`)
     if (e.trigger === 'plugin') return delegateToBuiltin($, e, next, true)
     const why = timeout ? 'Compaction timed out' : message.startsWith(OVER_BUDGET) ? 'Memory over its budget' : message === MEMORY_ALONE ? 'Nothing to compact' : 'Compaction failed'

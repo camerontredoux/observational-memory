@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { memoryMessage, parseMemory, renderGrouped } from '../hooks/memory'
+import { asksOnly, memoryMessage, parseMemory, renderGrouped, slimmed } from '../hooks/memory'
 import type { Entry, Memory } from '../hooks/memory'
 import { emptyBrief, mergeBriefs } from '../hooks/vcc'
 
@@ -61,5 +61,30 @@ describe('memory message', () => {
       replies: memory.replies,
       brief: memory.brief,
     })
+  })
+
+  test('asksOnly keeps the first message and the newest three asks verbatim, counting the rest; slimmed keeps them too', () => {
+    const m = (text: string) => ({ text })
+    const messages = [m('the task'), m('one'), { text: '', omitted: 4 }, m('two'), m('three'), m('four'), m('five')]
+    expect(asksOnly(messages)).toEqual([m('the task'), { text: '', omitted: 6 }, m('three'), m('four'), m('five')])
+    // A long ask past the room the newest leave stops the run: it and everything older are counted.
+    const long = 'x'.repeat(30_000)
+    expect(asksOnly([m('the task'), m('older'), m(long), m('newest')])).toEqual([m('the task'), { text: '', omitted: 2 }, m('newest')])
+    expect(asksOnly([m('the task')])).toEqual([m('the task')])
+    const memory = { corrections: [], observations: '', skills: [{ skill: 's', text: 'body' }], userMessages: messages, replies: [m('r')], recoverable: true, recall: true, recentKept: false, resumeDirectly: false }
+    const slim = slimmed(memory)
+    expect(slim.userMessages).toEqual(asksOnly(messages))
+    expect(slim.skills).toEqual([{ skill: 's', text: '' }])
+    expect(slim.replies).toEqual([])
+  })
+
+  test("the header's notes sit right after it, before the guide, and parseMemory reads the memory back as without them", () => {
+    const memory: Memory = { corrections: [], observations: '* 🟡 2026-09-22 14:30 Read a', skills: [], userMessages: [{ text: 'task' }], recoverable: true, recall: true, recentKept: false, resumeDirectly: false }
+    const noted = memoryMessage({ ...memory, notes: ['Compacted by the plugin.', 'Trimmed.'] }).text
+    expect(noted).toContain('removed from context to save space.\nCompacted by the plugin.\nTrimmed.\n\n<memory-guide>')
+    const { anchor, ...read } = parseMemory({ role: 'user', text: noted, toolUses: [] })
+    const { anchor: _, ...plain } = parseMemory(memoryMessage(memory))
+    expect(read).toEqual(plain)
+    expect(anchor).toBeDefined()
   })
 })

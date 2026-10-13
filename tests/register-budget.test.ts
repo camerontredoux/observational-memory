@@ -145,7 +145,7 @@ describe('register: budget', () => {
     expect(seen.logs.at(-2)).toMatch(/^observed 6 rows now, kept 0 raw messages/)
   })
 
-  test('a memory message over the budget a small window leaves keeps its skills as lines and its user messages as the brief, and the rest whole', async ($, on) => {
+  test('a memory message over the budget a small window leaves keeps its skills as lines and its user messages as the first and the open asks, and the rest whole', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     world(on)
     const correction = '🔴 User: "Keep the public API unchanged"'
@@ -166,13 +166,13 @@ describe('register: budget', () => {
 
     const text = result.messages?.[0]?.text ?? ''
     expect(skillsIn(text)).toBe(`<skill name="style" invoked="2026-09-22 09:00">${FINISHED}</skill>\n<skill name="plan" invoked="2026-09-22 09:00">${FINISHED}</skill>`)
-    expect(userMessagesIn(text)).toEqual(['a\nKeep the public API unchanged', '(1 omitted)'])
+    expect(userMessagesIn(text)).toEqual(['a\nKeep the public API unchanged', 'b'])
     expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>`)
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
     expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
     expect(nextStepIn(text)).toBe('b')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
-    expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: skills kept as lines, user messages as the brief$/))
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^over the ~15000-token budget at ~\d+ tokens: skills kept as lines, user messages cut to the first and the open asks$/))
   })
 
   test('a memory over its budget with source ranges and within it without leaves them out of that message only, before touching skills or user messages', async ($, on) => {
@@ -241,9 +241,8 @@ describe('register: budget', () => {
     const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
     const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(8_000)}</observations>`
     const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
-    // Dense text: the last response measured 150k tokens where the characters estimate ~15k of messages, so the raw
-    // tail's ~5k count ~43k beside ~100k of memory, and the memory alone, with no raw tail, is over the 90k budget.
-    on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
+    // A 50k window leaves a 15k budget: the memory, even trimmed to its cap, is over it at every cut.
+    on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const runTurn = live(on, clock, history)
 
@@ -257,7 +256,7 @@ describe('register: budget', () => {
     expect(result.messages?.map((m) => m.text)).toEqual(['built-in summary'])
     expect(stored['ledger:session-1']).toEqual(before)
     expect(before.corrections).toEqual([correction])
-    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~90000 allowed; using the built-in compaction$/))
+    expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~15000 allowed; using the built-in compaction$/))
     expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
     open(0)
     await clock.settle()

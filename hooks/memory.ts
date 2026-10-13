@@ -63,6 +63,7 @@ export type Memory = {
   recall: boolean // the model can call om_recall: the message ends by sending it there
   recentKept: boolean
   resumeDirectly: boolean
+  notes?: string[] // lines after the header: who ran the compaction, what the cap trimmed (see compactionNotes)
 }
 // The times an observation may carry (see parseLines); none when no row was timed.
 export type Bounds = { lo: number; hi: number; latest: number } | undefined
@@ -450,10 +451,39 @@ function withOmitted(first: UserMessage, dropped: readonly UserMessage[]): UserM
   return [first, ...(omitted ? [{ text: '', omitted }] : [])]
 }
 
-// A memory with its skills as lines, its user messages the first alone, the rest counted, and no replies.
+// The user's open asks: the newest OPEN_ASKS prompts, within USER_RECENT_TOKENS, the newest always. They are the
+// requests in hand, so every cut keeps them verbatim beside the first message, the session's task statement.
+const OPEN_ASKS = 3
+export function asksOnly(messages: readonly UserMessage[]): UserMessage[] {
+  const [first, ...rest] = messages
+  if (!first) return []
+  const asks = new Set<number>()
+  let left = USER_RECENT_TOKENS
+  for (let i = rest.length - 1; i >= 0 && asks.size < OPEN_ASKS; i--) {
+    const m = rest[i]!
+    if (m.omitted || isStub(m.text)) continue
+    const t = estimateTokens(m.text)
+    if (asks.size && t > left) break
+    asks.add(i)
+    left -= t
+  }
+  if (!asks.size) return withOmitted(first, rest)
+  const out: UserMessage[] = [first]
+  let omitted = 0
+  rest.forEach((m, i) => {
+    if (!asks.has(i)) return void (omitted += m.omitted ?? 1)
+    if (omitted) out.push({ text: '', omitted }), (omitted = 0)
+    out.push(m)
+  })
+  if (omitted) out.push({ text: '', omitted })
+  return out
+}
+
+// A memory with its skills as lines, its skills' text gone.
+export const skillsAsLines = (memory: Memory): Memory => ({ ...memory, skills: memory.skills.map((s) => ({ ...s, text: '' })) })
+// A memory with its skills as lines, its user messages the first and the open asks, the rest counted, and no replies.
 export function slimmed(memory: Memory): Memory {
-  const [first, ...rest] = memory.userMessages
-  return { ...memory, skills: memory.skills.map((s) => ({ ...s, text: '' })), userMessages: first ? withOmitted(first, rest) : [], replies: [] }
+  return { ...skillsAsLines(memory), userMessages: asksOnly(memory.userMessages), replies: [] }
 }
 
 const renderSkill = (s: Skill) => {
@@ -476,7 +506,7 @@ export function memoryMessage(memory: Memory): SessionMessage {
   const guide = `${MEMORY_GUIDE}${sources}`
   const resume = [MEMORY_RESUME, memory.recall ? MEMORY_RECALL : '', MEMORY_RESUME_END].filter(Boolean).join('\n')
   const text =
-    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${guide}\n</memory-guide>\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
+    `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}${memory.notes?.length ? `\n${memory.notes.join('\n')}` : ''}\n\n<memory-guide>\n${guide}\n</memory-guide>\n\n${renderCorrections(memory.corrections)}${renderReplies(memory.replies)}<observations>\n${memory.observations}\n</observations>` +
     section('skills-in-use', memory.skills.map(renderSkill).join('\n')) +
     section('session-brief', [memory.floor ? FLOOR_NOTE : '', memory.brief ? renderBrief(memory.brief, memory.recall) : ''].filter(Boolean).join('\n')) +
     // The text parseMemory reads the section back as: a message is found in the same text it was matched in.

@@ -3,6 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 import { turn, COMPOSER, CHUNK, at, world, pi, nearTarget, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
 import type { Ledger } from './harness'
+import { TURN_END_NOTE } from '../hooks/prompts'
 
 // Delegation, finished subagents and scheduling writes.
 describe('register: lifecycle', () => {
@@ -475,6 +476,8 @@ describe('register: compaction at a turn end', () => {
     const text = compactions[0]!.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 2026-09-23 09:00 User: "a" (source 2026-09-23 09:00 to 2026-09-23 09:01)')
     expect(text).not.toContain('Resume directly')
+    // The memory's header says this plugin ran the /compact, not the person.
+    expect(text).toContain(`save space.\n${TURN_END_NOTE}\n\n<memory-guide>`)
     expect(seen.logs).toContain('the turn-end compaction installed')
     await clock.advance(5_000)
     expect(metrics(files)['compaction.turnEnd.ms']!.count).toBe(1)
@@ -493,6 +496,7 @@ describe('register: compaction at a turn end', () => {
 
     expect(seen.prompts).toEqual([])
     for (const r of [manual, plugin]) expect(r.messages?.[0]?.text).not.toContain('Resume directly')
+    for (const r of [manual, plugin]) expect(r.messages?.[0]?.text).not.toContain(TURN_END_NOTE)
     expect(seen.logs.filter((l) => l.endsWith('in a brief compiled by code (too little to observe yet)'))).toHaveLength(2)
     await clock.advance(5_000)
     expect(metrics(files)['compaction.manual.ms']!.count).toBe(1)
