@@ -1,6 +1,6 @@
 // The session brief: a deterministic, model-free record of the compacted transcript (files changed, commits,
 // failures left open at its end, and a ranked transcript of its high-value tool events), merged across compactions
-// by code and never read by the Reflector.
+// by code.
 //
 // Adapted from pi-vcc v0.7.0 (https://github.com/sting8k/pi-vcc, MIT, Copyright (c) 2026 sting8k and pi-vcc
 // contributors), by way of the pi-observational-memory-vcc adaptation (src/vcc/core/{normalize,filter-noise,brief,

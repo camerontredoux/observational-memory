@@ -73,7 +73,7 @@ export const registerNotes = (on: On) => {
       )
 
     let day = ''
-    const line = (text: string, reflected = false) => {
+    const line = (text: string) => {
       const m = text.match(TIMED_LINE)
       if (!m) return <Text wrap="wrap">{text}</Text>
       const head = m[2] !== day ? ((day = m[2]!), <Text bold>{day}</Text>) : null
@@ -82,7 +82,6 @@ export const registerNotes = (on: On) => {
           {head}
           <Text wrap="wrap">
             {m[1]} <Text dimColor>{m[3]}</Text> {m[4]}
-            {reflected ? <Text dimColor> (condensed)</Text> : null}
           </Text>
         </Box>
       )
@@ -110,7 +109,7 @@ export const registerNotes = (on: On) => {
         ) : null}
         {entries.length ? (
           <Box flexDirection="column" marginTop={1}>
-            {entries.map((entry) => line(entry.line, entry.r))}
+            {entries.map((entry) => line(entry.line))}
           </Box>
         ) : null}
         {pending.length ? (

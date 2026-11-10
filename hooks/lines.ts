@@ -1,5 +1,5 @@
 // The observation line, `🔴 2026-09-23 14:30 User asked … (source 14:00 to 14:30)`: its marker, its time and the
-// source range it may end with, as the ledger, the memory message, the Observer's and Reflector's replies, the /notes
+// source range it may end with, as the ledger, the memory message, the Observer's replies, the /notes
 // pane and `#` recall write and read it. The prompts describe it in words (prompts.ts). No `$` here: the engine never
 // lets it cross an import.
 import { MARKERS } from './prompts'
@@ -57,7 +57,7 @@ export const renderSource = (s: Source, day = '') => `(source ${dayless(s.from, 
 
 // A source range as written, "YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM" or one time alone: null when it is no range of
 // times, undefined when it runs backwards.
-export function rangeOf(text: string): Source | undefined | null {
+function rangeOf(text: string): Source | undefined | null {
   const [a, b = a] = text.split(' to ').map((t) => unstamp(t.trim()))
   if (a === undefined || b === undefined) return null
   return b < a ? undefined : { from: a, to: b }

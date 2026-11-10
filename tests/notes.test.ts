@@ -34,7 +34,7 @@ describe('the notes pane', () => {
         chunks: [],
         entries: [
           { id: 'o0', line: '🔴 2026-09-22 09:01 User asked for a pane' },
-          { id: 'o1', line: '🟡 2026-09-22 09:05 Agent wrote notes.tsx', r: true },
+          { id: 'o1', line: '🟡 2026-09-22 09:05 Agent wrote notes.tsx', r: true }, // `r`: written by the removed Reflector, in a ledger stored while it ran
           { id: 'o2', line: '🟢 2026-09-23 10:00 Tests passed' },
         ],
       },
@@ -47,7 +47,7 @@ describe('the notes pane', () => {
       '🔴 2026-09-22 09:00 User: "use rg"',
       '2026-09-22',
       '🔴 09:01 User asked for a pane',
-      '🟡 09:05 Agent wrote notes.tsx (condensed)',
+      '🟡 09:05 Agent wrote notes.tsx',
       '2026-09-23',
       '🟢 10:00 Tests passed',
     ])

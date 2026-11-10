@@ -1,10 +1,9 @@
-// The Observer's and Reflector's replies as structured output: the JSON schemas Ember answers to (strict, so a reply
-// always parses and always has its fields), each reply read as its fields, and those fields rendered into what the
+// The Observer's replies as structured output: the JSON schema Ember answers to (strict, so a reply always parses
+// and always has its fields), each reply read as its fields, and those fields rendered into what the
 // rest of the plugin keeps: the ledger, the memory message and recall all hold lines such as
 // "🟡 2026-09-23 14:30 User asked …", and the continuation record as "Name: value" lines.
 import type { Bounds } from './memory'
-import { rangeOf, renderLine, splitSource, unstamp } from './lines'
-import type { Source } from './lines'
+import { renderLine, splitSource, unstamp } from './lines'
 
 // A strict schema lists every property as required and allows no others; an optional value is a null.
 const nullable = (type: string) => ({ type: [type, 'null'] })
@@ -52,26 +51,9 @@ export const OBSERVER_FORMAT = {
   }),
 } as const
 
-export const REFLECTOR_FORMAT = {
-  type: 'json_schema',
-  name: 'reflector_reply',
-  strict: true,
-  schema: object({
-    observations: {
-      type: 'array',
-      items: object({
-        priority: PRIORITY,
-        time: time('the latest line it condenses'),
-        text: { type: 'string' },
-        source: { ...nullable('string'), description: 'The source range, as "YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM"; null when the lines it condenses have none' },
-      }),
-    },
-  }),
-} as const
+export type Format = typeof OBSERVER_FORMAT
 
-export type Format = typeof OBSERVER_FORMAT | typeof REFLECTOR_FORMAT
-
-export type Observation = { priority: string; time: string | null; text: string; source?: string | null }
+export type Observation = { priority: string; time: string | null; text: string }
 export type Correction = { time: string | null; quote: string; replaces: string | null; replaces_earlier: string | null }
 // The continuation record's fields: each reply key, and its name in the record the ledger and memory message keep.
 export const RECORD_FIELDS = [
@@ -98,23 +80,19 @@ export function readObserverReply(text: string): ObserverReply {
   const reply = parsed(text)
   return { corrections: list(reply.corrections), observations: list(reply.observations), continuation: (reply.continuation as Continuation | null | undefined) ?? null }
 }
-export const readReflectorReply = (text: string) => list<Observation>(parsed(text).observations)
 
 // One line of text: a reply's string may hold a newline, which would start a line of its own.
 export const flat = (text: string) => text.replace(/\s*\n\s*/g, ' ').trim()
 // A reply's time as its line keeps it. With `bounds`, a real time clamped into them, and the latest for none; without,
-// none, or with `unbounded` a real time as given.
-export function timeIn(given: string | null | undefined, bounds: Bounds, unbounded = false) {
+// none.
+export function timeIn(given: string | null | undefined, bounds: Bounds) {
   const at = given ? unstamp(given.trim()) : undefined
-  if (!bounds) return unbounded ? at : undefined
+  if (!bounds) return undefined
   return Math.min(Math.max(at ?? bounds.latest, bounds.lo), bounds.hi)
 }
 // An observation as its line: marker, time and text. The text without a source range it ends with: the range is
 // added from the transcript itself.
-export const observationLine = (o: Observation, bounds: Bounds, unbounded = false) =>
-  renderLine(o.priority, timeIn(o.time, bounds, unbounded), splitSource(flat(o.text)).line)
-// The Reflector's source range, or none when it gives no range of times.
-export const sourceIn = (o: Observation): Source | undefined => (o.source?.trim() ? (rangeOf(flat(o.source)) ?? undefined) : undefined)
+export const observationLine = (o: Observation, bounds: Bounds) => renderLine(o.priority, timeIn(o.time, bounds), splitSource(flat(o.text)).line)
 // A correction as its 🔴 line, quoting the user, with what it replaces.
 export const correctionLine = (c: Correction, bounds: Bounds) =>
   renderLine('🔴', timeIn(c.time, bounds), `User: "${flat(c.quote)}"`) +

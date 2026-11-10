@@ -21,7 +21,7 @@ function busy() {
   count(s, 'observer.compaction.failed.no-observations', 2)
   count(s, 'compaction.notPersistent')
   count(s, 'observer.background.merged', 3)
-  count(s, 'reflector.background.merged')
+  count(s, 'reflector.background.merged') // as a stats file written while the Reflector ran keeps it
   count(s, 'observer.compaction.orphaned')
   addRecall(s, 3, false, T0 + 600_000)
   addRecall(s, 0, true, T0 + 600_000)
@@ -93,7 +93,7 @@ describe('stats', () => {
     const s = session('a', T0, [[10_000, 0.002], [20_000, 0.003], [30_000, 0.004]])
     addCompaction(s, { trigger: 'manual', ms: 250, fellBack: false, tokensBefore: 120_000, tokensAfter: 14_000, syncCalls: 0, syncMs: 0 }, T0)
     addCompaction(s, { trigger: 'auto', ms: 40_000, fellBack: true }, T0)
-    addCall(s, { kind: 'reflector', phase: 'background', ok: false, failure: 'timeout', ms: 600_000 }, T0)
+    addCall(s, { kind: 'observer', phase: 'compaction', ok: false, failure: 'timeout', ms: 600_000 }, T0)
     const text = formatReport('stats, session a', merge([s]))
     expect(text).toContain('## stats, session a')
     expect(text).toContain(`1 session(s), ${stamp(T0)} to ${stamp(T0)} ${zone(T0)}. 2 compaction(s), 4 model call(s) (1 failed), $0.0090, 30,000 tokens in, 1,500 out.`)
@@ -101,8 +101,8 @@ describe('stats', () => {
     expect(text).toContain('| observer.background.cost | 3 | $0.0090 | $0.0030 | $0.0030 | $0.0040 | $0.0020 | $0.0040 |')
     expect(text).toContain('| compaction.manual.ms | 1 | 250 ms |')
     expect(text).toContain('| compaction.manual.tokensBefore | 1 | 120,000 |')
-    expect(text).toContain('| reflector.background.failed.ms | 1 | 10m 0s |')
-    expect(text).toContain('Counts: compaction.auto.fellBack 1, reflector.background.failed.timeout 1')
+    expect(text).toContain('| observer.compaction.failed.ms | 1 | 10m 0s |')
+    expect(text).toContain('Counts: compaction.auto.fellBack 1, observer.compaction.failed.timeout 1')
     expect(text).not.toContain('approximate')
     expect(formatReport('stats', merge([]))).toBe('stats: no stats recorded yet.')
   })
@@ -138,7 +138,7 @@ describe('stats', () => {
         '  Subagent   2 of 2 instant (median 50 ms)',
         '  Fallbacks  1 used the built-in compaction',
         'Context      after a main compaction: ~27,000 tokens of messages (median; the system prompt and tools come on top), ~236 notes',
-        'Memory       largest message ~5,000 tokens; the Reflector condenses the observations at 40,000: never run',
+        'Memory       largest message ~5,000 tokens',
         'Background   3 calls, median 20.0 s each, ~9 notes each',
         'Problems     2 observer replies had no notes; 1 context/history mismatch; 4 unmarked lines joined the line before; 1 unmarked line after a 🔴 line kept as its own 🟡 line',
         'Recall       2 searches',

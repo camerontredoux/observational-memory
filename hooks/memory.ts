@@ -1,6 +1,6 @@
 // The memory message: the page a compaction leaves at the head of the context, rendered from the ledger and read back
 // from the context at the next compaction (memoryMessage, parseMemory), with the cuts that fit its sections to their
-// caps (capUserMessages, capReplies, slimmed), the reading of the Observer's and Reflector's replies into lines
+// caps (capUserMessages, capReplies, slimmed), the reading of the Observer's replies into lines
 // (parseLines) and the constraint format its sections share with them; the line and source formats are lines.ts's.
 // No `$` here: the engine never lets it cross an import.
 import type { SessionMessage } from 'claude-code'
@@ -42,7 +42,7 @@ const SKILL_FINISHED = '(finished; invoke it again to reread its text, or om_rec
 const SKILL_BLOCK = /<skill name="([^"]*)"(?: invoked="([\d-]+ [\d:]+)")?>(?:\n([\s\S]*?)\n<\/skill>|\(finished;[^\n]*<\/skill>)(?=\n<skill name="|\n<\/skills-in-use>)/g
 
 export type Skill = { skill: string; text: string; at?: number } // `at`: when it was invoked; no text: finished, kept as a line
-export type Entry = { id: string; line: string; source?: Source; r?: true } // line: `🔴 2026-09-23 14:30 User asked …`; r: the Reflector wrote it
+export type Entry = { id: string; line: string; source?: Source } // line: `🔴 2026-09-23 14:30 User asked …`
 export type UserMessage = { at?: string; text: string; omitted?: number } // `omitted`: a line standing for that many dropped
 export type Memory = {
   corrections: string[]
@@ -69,10 +69,6 @@ export type Memory = {
 export type Bounds = { lo: number; hi: number; latest: number } | undefined
 
 export const estimateTokens = (text: string) => Math.ceil(text.length / 4)
-// The observations alone, as the memory renders them, at which the Reflector condenses them. The memory message also
-// holds the corrections, skills, user messages and continuation record, which a reflection does not condense, so it
-// passes this size sooner.
-export const REFLECT_AT_TOKENS = 40_000
 // The regex source that finds a note written with a count of 0 (its first 0), whatever its count: each note's regex
 // is built from the function that writes the note, so the two cannot drift apart.
 export const noteSource = (note: string) => note.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('0', '\\d+')

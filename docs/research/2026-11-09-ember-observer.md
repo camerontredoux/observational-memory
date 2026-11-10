@@ -88,3 +88,13 @@ A code review after the move to Ember found these, all fixed in v1.19.0:
   - Results are ranked by a score that weights rare terms and whole words.
 
 The cache write after a compaction (~47k tokens median) was traced to Claude Code, not the plugin. About 16.5k of it is the session's own system prompt and tools, rewritten after any compaction because plugins can't place a cache marker. About 19.6k is the memory message and raw tail. The plugin injects nothing that misses the cache twice.
+
+## The Reflector removed
+
+After the move to Ember, the Reflector was removed. In 2,046 sessions it ran twice, for $0.01 in all. It ran when the
+ledger's observations reached 40,000 tokens (`REFLECT_AT_TOKENS`). The memory message is capped at 24,000 tokens
+(`MEMORY_MAX_TOKENS`), and the cap drops the oldest observation lines first (🔴 lines last) with a note. So the cap
+almost always bounded the memory message first. The cap is now the only bound. The Reflector's timeout, its
+`om-reflector` cache key and its JSON schema above went with it. Ledgers stored with condensed (`r: true`) entries
+still load, and the flag is ignored. Stats files from before keep their `reflector.*` and `reflection.*` metrics, and
+`/om-stats historical` shows them in its full table.

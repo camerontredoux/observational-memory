@@ -29,7 +29,7 @@ const LEDGER = {
   entries: [
     { id: 'o0', line: '🟢 2026-09-22 10:00 Agent read authentication docs' },
     { id: 'o1', line: '🔴 2026-09-22 09:30 User asked to fix auth token refresh' },
-    { id: 'o2', line: '🟡 2026-09-20 12:00 Auth only flow drafted', r: true },
+    { id: 'o2', line: '🟡 2026-09-20 12:00 Auth only flow drafted', r: true }, // `r`: written by the removed Reflector, in a ledger stored while it ran
     { id: 'o3', line: '🔴 2026-09-23 11:00 User asked to log auth errors' },
     { id: 'o4', line: '✅ 2026-09-23 12:00 Auth tests pass' },
     { id: 'o5', line: 'Auth note with no marker or time' },
@@ -49,7 +49,7 @@ describe('# recall', () => {
       { text: 'User: "auth goes through the proxy" ', label: '🔴 09-21 08:00 [constraint] User: "auth goes through the proxy"' },
       { text: 'User asked to log auth errors ', label: '🔴 09-23 11:00 User asked to log auth errors' },
       { text: 'User asked to fix auth token refresh ', label: '🔴 09-22 09:30 User asked to fix auth token refresh' },
-      { text: 'Auth only flow drafted ', label: '🟡 09-20 12:00 Auth only flow drafted (condensed)' },
+      { text: 'Auth only flow drafted ', label: '🟡 09-20 12:00 Auth only flow drafted' },
       { text: 'Agent read auth config ', label: '🟢 09-22 10:00 Agent read auth config' },
       { text: 'Agent read authentication docs ', label: '🟢 09-22 10:00 Agent read authentication docs' },
       { text: 'Old auth idea ', label: '🟢 09-19 10:00 Old auth idea' },
@@ -68,7 +68,7 @@ describe('# recall', () => {
     world(on, 'hr-bare', { 'ledger:hr-bare': { seq: 2, chunks: [], corrections: [], entries } })
     expect((await ask($, '#auth')).suggestions).toEqual([
       { text: 'Auth tests pass ', label: '✅ 09-23 12:00 Auth tests pass' },
-      { text: 'Auth note with no marker or time ', label: 'Auth note with no marker or time (condensed)' },
+      { text: 'Auth note with no marker or time ', label: 'Auth note with no marker or time' },
     ])
   })
 

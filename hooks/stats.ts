@@ -1,7 +1,6 @@
 // Usage statistics: one JSON file per session, written only by that session, debounced off every hook. Global
 // figures are merged from the files when asked for. A stats failure is logged once and never breaks anything.
 import { stamp, zone } from './lines'
-import { REFLECT_AT_TOKENS } from './memory'
 
 const SAMPLES = 200 // raw samples kept per metric, newest, for medians and p90
 const WRITE_DELAY_MS = 2_000
@@ -27,7 +26,7 @@ export type SessionStats = {
   metrics: Record<string, Metric>
 }
 export type ModelCall = {
-  kind: 'observer' | 'reflector' | 'session'
+  kind: 'observer' | 'session'
   phase: 'background' | 'compaction'
   ok: boolean
   failure?: string
@@ -62,7 +61,6 @@ export type Compaction = {
 // What the first main request after a compaction cost in input tokens: what the prompt cache served, what it wrote,
 // and the rest. The context the compaction installed is written afresh; the prefix before it may be read.
 export type CacheUse = { uncached: number; cacheRead: number; cacheWrite: number }
-export type Reflection = { ms: number; tokensBefore: number; tokensAfter: number; level: number }
 
 export const emptyStats = (sessionId: string, now: number, cwd?: string): SessionStats => ({
   version: 1,
@@ -155,13 +153,6 @@ export function addRequest(s: SessionStats, u: CacheUse, at: number) {
   if (before !== undefined && context >= before) add(s, 'request.growthTokens', context - before, at)
 }
 
-export function addReflection(s: SessionStats, r: Reflection, at: number) {
-  add(s, 'reflection.ms', r.ms, at)
-  add(s, 'reflection.tokensBefore', r.tokensBefore, at)
-  add(s, 'reflection.tokensAfter', r.tokensAfter, at)
-  add(s, 'reflection.level', r.level, at)
-}
-
 export function addRecall(s: SessionStats, matches: number, fromFile: boolean, at: number) {
   add(s, 'recall.matches', matches, at)
   if (fromFile) count(s, 'recall.fromFile')
@@ -240,6 +231,7 @@ const when = (t: number) => (Number.isFinite(t) ? stamp(t) : '-')
 export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const { stats: s, sessions, approximate } = merged
   if (!sessions) return `${title}: no stats recorded yet.`
+  // `reflector`: the removed Reflector's calls, as the stats written while it ran keep them.
   const calls = countOf(s, /^(observer|reflector)\.\w+\.(failed\.)?ms$/)
   const failed = countOf(s, /\.failed\.ms$/)
   const compactions = countOf(s, /^compaction\.[\w-]+\.ms$/)
@@ -355,9 +347,7 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   if (main.context.length)
     row('Context', `after a main compaction: ~${grouped(median(main.context))} tokens of messages (median; the system prompt and tools come on top)${main.notes.length ? `, ~${plural(median(main.notes), 'note')}` : ''}`)
   const largest = Math.max(0, ...Object.entries(s.metrics).flatMap(([k, m]) => (/^compaction\.[\w-]+\.memoryTokens$/.test(k) ? m.max : [])))
-  const reflections = s.metrics['reflection.ms']?.count ?? 0
-  if (largest)
-    row('Memory', `largest message ~${grouped(largest)} tokens; the Reflector condenses the observations at ${grouped(REFLECT_AT_TOKENS)}: ${reflections ? plural(reflections, 'reflection') : 'never run'}`)
+  if (largest) row('Memory', `largest message ~${grouped(largest)} tokens`)
   const cache = (['om', 'builtin'] as const).flatMap((c) => {
     const [read, wrote] = [s.metrics[`afterCompaction.${c}.cacheReadTokens`], s.metrics[`afterCompaction.${c}.cacheWriteTokens`]]
     if (!read || !wrote) return []

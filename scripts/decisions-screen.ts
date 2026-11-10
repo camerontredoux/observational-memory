@@ -9,7 +9,8 @@
 // red: a second check on 🔴 lines. Positives are 🔴 lines in the Observer's replies that match a standing constraint of
 //   the transcript's replay spec (tests/eval/replay-specs/<name>.ts); negatives are 🟡 lines of the same replies that
 //   do not mention the user. 🔴 lines matching no spec constraint are reported apart: the specs list only some.
-// drop: drop-order tags for the Reflector. In each compacted context, an observation line is impactful when removing
+// drop: drop-order tags for shedding observation lines (written for the removed Reflector; the memory message's cap
+//   now drops the oldest lines first). In each compacted context, an observation line is impactful when removing
 //   it makes a rubric fact graded at that cut stop holding; a safe tag never marks an impactful line droppable.
 // Answers are cached by sha256 of the request and the sample, so a rerun costs nothing. Needs OPENAI_API_KEY (Bun
 // reads .env). Per-item detail goes to .scratch/decisions-<screen>.json. Not typechecked by `tsc -p .`.

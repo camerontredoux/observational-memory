@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
-import { turn, COMPOSER, CHUNK, at, world, ember, nearTarget, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
+import { turn, COMPOSER, CHUNK, at, world, ember, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
 import type { Ledger } from './harness'
 import { TURN_END_NOTE } from '../hooks/prompts'
 
@@ -144,58 +144,6 @@ describe('register: lifecycle', () => {
 
     expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
     expect(seen.prompts).toEqual([])
-  })
-
-  test("a reflection whose ledger read is held when its subagent finishes writes nothing back", async ($, on) => {
-    const clock = mock.clock(on)
-    const { gate, open } = gates()
-    let reflected = false // the reflector has answered: the next read of the ledger is the reflection's commit
-    let held = false
-    const { agents, stored } = world(on, {
-      holdGet: (key) => (key === 'ledger:session-1/agent-1' && reflected && !held ? ((held = true), gate(1)) : undefined),
-    })
-    const big = `<observations>\n${'* 🟡 2026-09-23 10:00 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = ember(on, { reply: () => big, reflect: (n, prompt) => ((reflected = true), nearTarget(prompt, '* 🟡 2026-09-23 10:00 Condensed')) })
-    const step = steps(on)
-    on('turn.complete', () => ({ text: '' }))
-    agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
-    for (let n = 0; n < 4; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
-
-    await clock.set(at(23, 10, 0))
-    await step($, 's', 0, agents['agent-1'].length, 'agent-1')
-    await clock.settle()
-    expect(held).toBe(true)
-    const calls = seen.prompts.length
-    const finished = $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
-    await clock.settle()
-    open(1)
-    await finished
-    await clock.settle()
-
-    expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
-    expect(seen.prompts).toHaveLength(calls)
-    expect(seen.logs).toContain('a reflection outlived its loop; discarded')
-  })
-
-  test('/clear while the reflector runs: no further compression level is tried and the cleared ledger stays gone', async ($, on) => {
-    const clock = mock.clock(on)
-    const { history, stored } = world(on)
-    const { gate, open } = gates()
-    const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = ember(on, { hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined), reply: () => big, reflect: () => big })
-    const runTurn = live(on, clock, history)
-
-    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await clock.settle()
-    const reflectAt = seen.prompts.findIndex((p) => p.startsWith('## OBSERVATIONS')) + 1
-    expect(reflectAt).toBeGreaterThan(0)
-    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
-    open(reflectAt)
-    await clock.settle()
-
-    expect(seen.prompts).toHaveLength(reflectAt) // level 1 answered over its target: no level 2
-    expect(stored['ledger:session-1']).toBeUndefined()
-    expect(seen.logs).toContain('a reflection outlived its loop; discarded')
   })
 
   test("subagents never take the main loop's own slots; a finished subagent's calls are stopped, and their slots go to a waiting sibling", async ($, on) => {

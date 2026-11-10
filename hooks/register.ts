@@ -1,6 +1,6 @@
 import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, ToolResultSummary, TurnUsage } from 'claude-code'
-import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, observationsTrimmedLine, REFLECTOR_SYSTEM_PROMPT, reflectionPrompt, SESSION_SYSTEM_PROMPT, trimmedNote, TURN_END_NOTE } from './prompts'
-import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addCall, addRecall, addReflection, duration, failureClass, flush, grouped, parseArgs, plural, record, report, statsDir } from './stats'
+import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, observationsTrimmedLine, SESSION_SYSTEM_PROMPT, trimmedNote, TURN_END_NOTE } from './prompts'
+import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addCall, addRecall, duration, failureClass, flush, parseArgs, plural, record, report, statsDir } from './stats'
 import type { Io, ModelCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { registerNotes } from './notes'
@@ -37,11 +37,10 @@ import {
   tag,
   truncate,
   WHERE,
-  REFLECT_AT_TOKENS,
 } from './memory'
 import type { Bounds, Entry, Memory, Skill, UserMessage } from './memory'
-import { partsOf, stamp, timeOf, unstamp } from './lines'
-import { correctionLine, OBSERVER_FORMAT, observationLine, readObserverReply, readReflectorReply, RECORD_FIELDS, recordOf, REFLECTOR_FORMAT, sourceIn } from './reply'
+import { stamp, timeOf } from './lines'
+import { correctionLine, OBSERVER_FORMAT, observationLine, readObserverReply, RECORD_FIELDS, recordOf } from './reply'
 import type { Format, Observation, ObserverReply } from './reply'
 import type { Source } from './lines'
 import { contextHash, dedupWrappers, isEmptyReply, isPrompt, maskTail, rowHash, rowText, unmask, withoutLocalCommands } from './rows'
@@ -68,16 +67,6 @@ const RETRY_MAX_MS = 300_000
 const KEEP_RAW_TOKENS = 6_000 // the newest history is left for the raw tail, never observed in the background
 const STEP_SCHEDULE_TOKENS = CHUNK_TOKENS / 2 // mid-turn, new history between scheduling passes
 const RAW_MAX_TOKENS = 40_000 // past this much raw history after the watermark, compaction observes the rest itself
-const REFLECT_TARGET_TOKENS = 20_000 // what a reflection must come under, so the next chunk does not reflect again
-// The newest observations a reflection leaves as they are: the work in progress, which the next compactions need
-// whole. 30% of REFLECT_AT_TOKENS: at ~2-4k tokens of observations per compaction, the last three to five.
-const REFLECT_KEEP_TOKENS = 12_000
-const REFLECT_CUE_TOKENS = 300 // the paths a reflection dropped, each with its clause, up to this
-const REFLECT_TIER_TOKENS = 6_000 // earlier reflections' lines kept as they were, up to this: condensing a line twice loses it
-const REFLECT_MIN_TARGET_TOKENS = 2_000 // the least the 🔴 lines and the kept observations leave the Reflector (boundPins)
-const REFLECT_FLOOR = 0.4 // a reflection under this share of its target is over-condensed, and not installed
-const REFLECT_ATTEMPTS = 4
-const REFLECT_NEAR_FLOOR = 0.75 // with no reply in range, the fullest under the floor is installed when at least this share of it
 const SKILLS_MAX_TOKENS = 15_000
 const SKILLS_WHOLE_TURNS = 3 // a skill invoked in the last this many main-thread turns, the running one counted, keeps its text
 const TOOL_ARGS_MAX_TOKENS = 2_000
@@ -92,7 +81,6 @@ const OBSERVER_COMPACTION_TIMEOUT_MS = 10_000 // at compaction: a chunk timed ou
 const OBSERVER_CALL_MS = 5_000
 // Observation at compaction, calls in flight waited on included, ends by this: the rows still unobserved stay raw.
 const COMPACTION_DEADLINE_MS = 30_000
-const REFLECTOR_TIMEOUT_MS = 90_000 // up to ~40k tokens in and ~20k out (Ember writes ~400 tokens/s), in the background
 // A range a background call failed on this many times is not scheduled again: the next compaction observes it.
 const RANGE_ATTEMPTS = 3
 // A subagent's history is observed in the background only once its context is within this much of its own
@@ -131,7 +119,7 @@ const TURN_END_COMPACT_TOKENS = 157_000 // a main turn that ends with more conte
 const OVERHEAD_TOKENS = 20_000 // the system prompt and built-in tool schemas every request carries beside the messages
 // The memory message's own cap, whatever the budget leaves: past it the least needed sections go first (see buildMemory),
 // the corrections, the continuation record and the user's first message and open asks kept whole. Real memory
-// messages run a median ~4.5k tokens; reflection lets the observations alone reach REFLECT_AT_TOKENS.
+// messages run a median ~4.5k tokens; the ledger's observations are never condensed, so this alone bounds them.
 export const MEMORY_MAX_TOKENS = 24_000
 const MEMORY_HEADROOM = 1.25 // the memory message's estimate scaled up: the Observer's prose runs near it, quoted skills and prompts may not
 const ROWS_CAP = 4096 // `$.session.messages()` answers the newest 4096 rows
@@ -147,7 +135,7 @@ type Ledger = {
   anchor?: string // the observations of the memory message the live context starts with, hashed
   watermark: Range // rows [base, to), observed and committed to `entries`
   entries: Entry[]
-  corrections: string[] // the user's constraints in force, quoted (see applyConstraints): never reflected
+  corrections: string[] // the user's constraints in force, quoted (see applyConstraints)
   chunks: Chunk[] // observed past a gap in the watermark, committed once the gap closes
   currentTask?: string
   seq: number
@@ -178,9 +166,6 @@ const onSpot = new Map<string, Range[]>()
 // Per loop, a compaction's ledger stored as installed while its history does not show the memory message yet: the
 // anchor it waits for, and until when (see installPending).
 const pendingInstalls = new Map<string, { anchor: string; until: number }>()
-const reflecting = new Set<string>()
-// Per loop, the Reflector input that last failed at every attempt: the same input is not sent again.
-const failedInput = new Map<string, string>()
 const sinceScheduled = new Map<string, { rows: number; tail: string[]; tokens: number }>() // the history the last step saw (its length and newest rows' hashes), and its growth since a pass
 const waiting = new Map<string, { loop: Loop; stamp: string }>() // loops a pass left short of a slot, first in line when one frees
 const backoff = new Map<string, { failures: number; until: number }>() // loops whose last background call failed
@@ -295,7 +280,6 @@ async function showGauges($: EngineInterface, loop: Loop) {
       pending: pendingTokens.get(loop.key) ?? 0,
       chunk: CHUNK_TOKENS,
       ledger: estimateTokens(renderLines(stored?.entries ?? [])),
-      reflectAt: REFLECT_AT_TOKENS,
       context: uncarried.get(loop.sessionId)?.tokens ?? context?.tokens,
       compactAt: context?.breakdown?.autoCompactThreshold ?? context?.window,
       cost,
@@ -624,65 +608,6 @@ function sourceOf(v: View, from: number, to: number): Source | undefined {
   return times.length ? { from: Math.min(...times), to: Math.max(...times, v.at[to] ?? 0) } : undefined
 }
 
-// The source of a line reflected from lines whose sources span `span`: the one it gives, cut to that span. A line
-// that gives none, or one outside the span, gets none: the whole span would say nothing about where it came from.
-// When some of those lines had no source, what they came from is unknown: a line keeps only a source inside the span.
-function reflectedSource(given: Source | undefined, span: Source | undefined, allKnown: boolean): Source | undefined {
-  if (!span || !given) return undefined
-  if (!allKnown) return minute(given.from) >= minute(span.from) && minute(given.to) <= minute(span.to) ? given : undefined
-  const cut = { from: Math.max(given.from, span.from), to: Math.min(given.to, span.to) }
-  return minute(cut.from) <= minute(cut.to) ? cut : undefined
-}
-
-// The Reflector drops paths it cannot fit. Each path the condensed notes name and its reply does not (by last
-// segment) comes back as the clause of its latest note that names it, at that note's time, most-named first, up to
-// REFLECT_CUE_TOKENS: the file stays findable, with what was done to it.
-function withDroppedPaths(lines: Omit<Entry, 'id'>[], sent: Entry[]) {
-  const out = lines.map((l) => l.line.toLowerCase()).join('\n')
-  const count = new Map<string, number>()
-  const latest = new Map<string, Entry>()
-  for (const e of sent)
-    for (const [p] of e.line.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g))
-      if (/^[~./]/.test(p) || /\.\w+$/.test(p) || p.split('/').length > 2) count.set(p, (count.get(p) ?? 0) + 1), latest.set(p, e)
-  const named = new Set<string>()
-  const cues: Omit<Entry, 'id'>[] = []
-  let chars = 0
-  for (const [p] of [...count].sort((a, b) => b[1] - a[1])) {
-    const base = p.split('/').filter(Boolean).at(-1)!.toLowerCase()
-    if (!base || out.includes(base) || named.has(base)) continue
-    const { marker, time, text: body } = partsOf(latest.get(p)!.line)
-    if (!marker || !time) continue
-    const clause = body.split(/(?<=[.;])\s+/).find((c) => c.includes(p)) ?? body
-    const at = clause.indexOf(p)
-    const text = clause.length <= 220 ? clause : `…${clause.slice(Math.max(0, at - 100), at + p.length + 100).trim()}…`
-    const line = `${marker} ${time} ${text}`
-    if (chars + line.length + 3 > REFLECT_CUE_TOKENS * 4) continue
-    chars += line.length + 3
-    for (const [q] of text.matchAll(/[~.\w@-]*\/[\w@.\/-]*[\w@-]/g)) named.add(q.split('/').filter(Boolean).at(-1)!.toLowerCase())
-    cues.push({ line, r: true })
-  }
-  const merged = [...lines]
-  for (const c of cues) {
-    const i = merged.findIndex((l) => (timeOf(l.line) ?? '') > (timeOf(c.line) ?? ''))
-    merged.splice(i < 0 ? merged.length : i, 0, c)
-  }
-  return merged
-}
-
-// `red` placed among `lines` in time order, each before the first line later than it; one without a time goes where
-// the one before it did.
-function interleave(lines: Omit<Entry, 'id'>[], red: Entry[]) {
-  const out: Omit<Entry, 'id'>[] = []
-  let i = 0
-  let t = ''
-  for (const r of red) {
-    t = timeOf(r.line) ?? t
-    while (i < lines.length && (timeOf(lines[i]!.line) ?? '') <= t) out.push(lines[i++]!)
-    out.push(r)
-  }
-  return [...out, ...lines.slice(i)]
-}
-
 // A stored record's fields, in its order: a line that opens no field continues the one before, or leads the record.
 const FIELD = new RegExp(`^[ \\t]*(?:[-*][ \\t]+)?(${RECORD_FIELDS.map(([, name]) => name).join('|')})[ \\t]*:`, 'i')
 type Field = { name: string; lines: string[] }
@@ -829,7 +754,7 @@ async function complete<T>($: EngineInterface, role: string, system: string, pro
 async function complete<T>($: EngineInterface, role: string, system: string, prompt: string, timeoutMs: number, call: Call, signal?: AbortSignal, structured?: Structured<T>) {
   let sent = 0
   const started = await $.clock.now()
-  const kind = role.startsWith('reflector') ? 'reflector' : role === 'session' ? 'session' : 'observer'
+  const kind = role === 'session' ? 'session' : 'observer'
   const note = (c: Partial<ModelCall>) =>
     recordStat($, (s, at) => addCall(s, { kind, ok: true, ms: at - started, ...call, ...c }, at))
   // Every failure, counted (with what it cost, once Ember answered) and logged, then thrown by the caller.
@@ -902,7 +827,6 @@ async function complete<T>($: EngineInterface, role: string, system: string, pro
 }
 
 const OBSERVER_REPLY: Structured<ObserverReply> = { format: OBSERVER_FORMAT, read: readObserverReply }
-const REFLECTOR_REPLY: Structured<Observation[]> = { format: REFLECTOR_FORMAT, read: readReflectorReply }
 
 type Call = { phase: ModelCall['phase']; chunkTokens?: number }
 
@@ -1531,7 +1455,7 @@ async function runJob($: EngineInterface, job: Job, v: View, done: (landed: bool
   else if (!chunk && isLive(loop, stamp)) await backOff($, loop, stamp)
   // The slot it held goes to a loop waiting for one first, whether this chunk landed or not.
   const next = [...waiting.values(), ...(landed ? [{ loop, stamp }] : [])].filter((l, i, all) => all.findIndex((o) => o.loop.key === l.loop.key) === i)
-  await Promise.all([landed && maybeReflect($, loop, stamp), ...next.map((l) => schedule($, l.loop, l.stamp))]).catch((error) => log($, errorText(error)))
+  await Promise.all(next.map((l) => schedule($, l.loop, l.stamp))).catch((error) => log($, errorText(error)))
 }
 
 // The Session line (SESSION_SYSTEM_PROMPT): what the whole session is about, the main loop's alone. Written by a call
@@ -1599,142 +1523,6 @@ async function backOff($: EngineInterface, loop: Loop, stamp: string) {
   const ms = Math.min(RETRY_MS * 2 ** (failures - 1), RETRY_MAX_MS)
   backoff.set(loop.key, { failures, until: now + ms })
   $.clock.after(ms, () => void schedule($, loop, stamp).catch((error) => log($, errorText(error))))
-}
-
-// The Reflector over a snapshot of the entries, in the background. The newest, up to REFLECT_KEEP_TOKENS, and every
-// 🔴 line (exact repeats once) pass through unchanged, as do the lines earlier reflections wrote while they fit
-// REFLECT_TIER_TOKENS (condensing a line twice loses it); the Reflector condenses the rest into what is left of
-// REFLECT_TARGET_TOKENS; its schema has no 🔴, so a 🔴 line it is shown comes back 🟡. A result over that target is tried again with stronger
-// compression, one under REFLECT_FLOOR of it with a request for more detail, up to REFLECT_ATTEMPTS; with none in
-// range, nothing changes. The replaced entries are then replaced in place, so entries committed while it ran survive.
-// The corrections are never sent: they pass through as quoted. Once the loop ends, no further attempt starts and the
-// result is discarded.
-async function maybeReflect($: EngineInterface, loop: Loop, stamp: string) {
-  const { sessionId, key } = loop
-  if (reflecting.has(key)) return
-  const stored = (await $.store.get(ledgerKey(key))) as Ledger | undefined
-  const snapshot = stored?.entries ?? []
-  const text = renderLines(snapshot)
-  if (estimateTokens(text) < REFLECT_AT_TOKENS || !isLive(loop, stamp) || reflecting.has(key)) return
-  reflecting.add(key)
-  const worker = newWorker('reflector')
-  let installed = false
-  $.clock.after(0, () => {
-    const run = async () => {
-      await track($, loop, startedWorker(worker))
-      const started = await $.clock.now()
-      let recent = snapshot.length
-      for (let chars = -1; recent > 0; recent--) {
-        chars += renderLines([snapshot[recent - 1]!]).length + 1
-        if (Math.ceil(chars / 4) > REFLECT_KEEP_TOKENS) break
-      }
-      const older = snapshot.slice(0, recent)
-      const kept = snapshot.slice(recent)
-      const isRed = (e: Entry) => e.line.startsWith('🔴')
-      const pinned = older.filter((e, i) => isRed(e) && older.findIndex((o) => o.line === e.line) === i)
-      // The 🔴 lines' share is bounded so the Reflector keeps at least REFLECT_MIN_TARGET_TOKENS: past it the oldest
-      // shorten to index lines (boundPins), and still over, the oldest go to the Reflector with the rest.
-      const share = REFLECT_TARGET_TOKENS - REFLECT_MIN_TARGET_TOKENS
-      const measure = (es: readonly Entry[]) => estimateTokens(renderLines([...es, ...kept]))
-      const pins = boundPins(pinned.map((e) => e.line), share, renderLines(kept), '🔴 line', (ls) => measure(pinned.map((e, i) => ({ ...e, line: ls[i]! }))))
-      let red = pinned.map((e, i) => (pins[i] === e.line ? e : { ...e, line: pins[i]! }))
-      const moved = new Set<string>()
-      while (red.length && measure(red) > share) moved.add(red.shift()!.id)
-      if (red.length < pinned.length || pins.some((l, i) => l !== pinned[i]!.line))
-        log($, `the 🔴 lines were over their share of the reflection target: ${pins.filter((l, i) => l !== pinned[i]!.line).length} shortened, ${moved.size} condensed`)
-      // Lines an earlier reflection wrote pass through while they fit REFLECT_TIER_TOKENS; past it they are condensed again.
-      const tier = estimateTokens(renderLines(older.filter((e) => e.r && !isRed(e)))) <= REFLECT_TIER_TOKENS
-      const through = older.flatMap((e) => red.find((r) => r.id === e.id) ?? (tier && e.r && !isRed(e) ? [e] : []))
-      const sent = older.filter((e) => (!isRed(e) || moved.has(e.id)) && !(tier && e.r))
-      if (!sent.length) throw new Error('nothing to condense but earlier reflections')
-      const target = REFLECT_TARGET_TOKENS - measure(red)
-      const floor = Math.ceil(REFLECT_FLOOR * target)
-      if (target < 1_000) throw new Error(`the 🔴 lines and the newest observations leave ~${target} tokens of the ~${REFLECT_TARGET_TOKENS}-token target`)
-      const input = renderLines(sent)
-      if (failedInput.get(key) === input) return log($, 'reflection skipped: the observations to condense are those of the last failed reflection')
-      const times = sent.flatMap((e) => unstamp(timeOf(e.line) ?? '') ?? [])
-      const bounds = times.length ? { lo: Math.min(...times), hi: Math.max(...times), latest: Math.max(...times) } : undefined
-      const sources = sent.flatMap((e) => (e.source ? [e.source] : []))
-      const span = sources.length ? { from: Math.min(...sources.map((s) => s.from)), to: Math.max(...sources.map((s) => s.to)) } : undefined
-      let lines: Omit<Entry, 'id'>[] = []
-      let level = 1
-      let retry: { tokens?: number } | undefined
-      let fullest: { lines: Omit<Entry, 'id'>[]; tokens: number } | undefined // the largest reply under the floor
-      let under = 0 // replies under the floor in a row: after the second, asking again returns the same length
-      const asked = new Set<string>()
-      // Every attempt sends the same observations first, so a retry reads them from the prompt cache.
-      for (let attempt = 1; !lines.length && attempt <= REFLECT_ATTEMPTS && under < 2; attempt++) {
-        if (!isLive(loop, stamp)) throw new LoopEnded()
-        if (retry) level = retry.tokens !== undefined && retry.tokens < floor ? Math.max(1, level - 1) : Math.min(4, level + 1)
-        const prompt = reflectionPrompt(input, level, target, floor, estimateTokens(input), retry)
-        if (asked.has(prompt)) break
-        asked.add(prompt)
-        const reply = await complete($, `reflector level ${level}`, REFLECTOR_SYSTEM_PROMPT, prompt, REFLECTOR_TIMEOUT_MS, { phase: 'background' }, stopOf(loop, stamp), REFLECTOR_REPLY)
-        const parsed = reply.flatMap((o) => {
-          if (!o.text.trim()) return []
-          const kept = reflectedSource(sourceIn(o), span, sources.length === sent.length)
-          return [{ line: observationLine(o, bounds, true), ...(kept ? { source: kept } : {}), r: true as const }]
-        })
-        const tokens = parsed.length ? estimateTokens(renderLines(parsed.map((e) => ({ id: '', ...e })))) : undefined
-        if (tokens !== undefined && tokens <= target && tokens >= floor) lines = parsed
-        under = tokens !== undefined && tokens < floor ? under + 1 : 0
-        if (under && tokens! > (fullest?.tokens ?? 0)) fullest = { lines: parsed, tokens: tokens! }
-        retry = { tokens }
-      }
-      // No reply in range, but one near the floor: the fullest is installed when within REFLECT_NEAR_FLOOR of it, since
-      // asking again returns the same length, and the observations would stay over the trigger meanwhile.
-      if (!lines.length && fullest && fullest.tokens >= REFLECT_NEAR_FLOOR * floor) {
-        log($, `no reflection came between ~${floor} and ~${target} tokens; installing the fullest, ~${fullest.tokens} tokens`)
-        lines = fullest.lines
-      }
-      if (!lines.length) {
-        failedInput.set(key, input)
-        throw new Error(`no reflection came between ~${floor} and ~${target} tokens at any compression level`)
-      }
-      failedInput.delete(key)
-      lines = withDroppedPaths(lines, sent)
-      await locked(key, async () => {
-        const ledger = (await $.store.get(ledgerKey(key))) as Ledger | undefined
-        if (!isLive(loop, stamp)) throw new LoopEnded()
-        const ids = new Set(older.map((e) => e.id))
-        const at = ledger?.entries.findIndex((e) => ids.has(e.id)) ?? -1
-        if (!ledger || at < 0 || ledger.entries.filter((e) => ids.has(e.id)).length !== ids.size) {
-          log($, 'the ledger changed under the reflection; discarded')
-          return
-        }
-        let seq = ledger.seq
-        const reflected = interleave(lines, through).map((e) => ('id' in e ? (e as Entry) : { id: `o${seq++}`, ...e }))
-        const rest = ledger.entries.filter((e) => !ids.has(e.id))
-        const entries = [...rest.slice(0, at), ...reflected, ...rest.slice(at)]
-        const after = estimateTokens(renderLines([...reflected, ...kept]))
-        await saveLedger($, loop, { ...ledger, entries, seq })
-        installed = true
-        record(statsIo($), sessionId, (s, at) => addReflection(s, { ms: at - started, tokensBefore: estimateTokens(text), tokensAfter: after, level }, at))
-        log(
-          $,
-          `reflected ${snapshot.length} observations (~${estimateTokens(text)} tokens) into ${reflected.length + kept.length} ` +
-            `(~${after} tokens) at compression level ${level}; ${sent.length} condensed into ${lines.length}, ` +
-            `${red.length} 🔴 and ${kept.length} recent kept as they were, ${entries.length - reflected.length - kept.length} newer kept`,
-        )
-        show($, `Condensed memory in ${duration((await $.clock.now()) - started)} · ${grouped(ledger.entries.length)} → ${plural(entries.length, 'note')}`, loop.agentId)
-      })
-    }
-    // Installed, a tick; failed, a cross; skipped or discarded, it goes.
-    let failed = false
-    run()
-      .catch((error) => {
-        if (error instanceof LoopEnded) return log($, 'a reflection outlived its loop; discarded')
-        failed = true
-        log($, `reflection failed (${errorText(error)})`)
-        const why = reason(error, REFLECTOR_TIMEOUT_MS)
-        showFailure($, why, `Condensing failed (${why}) and will retry later`, loop.agentId)
-      })
-      .finally(async () => {
-        reflecting.delete(key)
-        await track($, loop, settled(worker, await $.clock.now(), installed ? {} : failed ? 'failed' : undefined))
-        if (installed) await showGauges($, loop)
-      })
-  })
 }
 
 // Skills recorded this session and carried in the memory message, oldest first, the latest of each name.
@@ -2091,7 +1879,7 @@ async function buildMemory($: EngineInterface, ledger: Ledger, kept: boolean, so
     if (from < cut) brief = mergeBriefs(brief, await compile(from, cut))
     const failures = openFailures(priorMemory?.failures ?? [], messages.slice(base), v.at.slice(base), cut - base, ...(await dirs()))
     let memory: Memory = {
-      corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), 'constraint', (l) =>
+      corrections: boundPins(ledger.corrections, CONSTRAINTS_MAX_TOKENS, [ledger.currentTask ?? '', ...tail.map(rowTerms)].join('\n'), (l) =>
         estimateTokens(renderCorrections(l)),
       ),
       observations: renderGrouped(ledger.entries),
@@ -2271,8 +2059,7 @@ async function reportCompaction(
 // - A background call in flight over rows observed here is observed again here (`running`, this life's alone),
 //   outside MAX_PARALLEL; whichever lands first stands.
 // - An abandoned compaction (`next.signal`) stores its chunks committed and throws only after `build`. Only an
-//   installed one (`installs`) resets the watermark, marks the context installed and starts a reflection, once the
-//   lock is released and off the hook's result.
+//   installed one (`installs`) resets the watermark and marks the context installed.
 async function compact($: EngineInterface, e: SessionCompactInput, next: Parameters<Hook<'session.compact'>>[2]): Promise<SessionCompactResult> {
   // Explicit `/compact` (or a plugin's) instructions say what the summary should keep or stress: the built-in
   // compactor honors them, background observation cannot. Ordinary compaction stays available without them.
@@ -2395,7 +2182,6 @@ async function compact($: EngineInterface, e: SessionCompactInput, next: Paramet
   const { cut, message } = settled
   await reportCompaction($, e, settled, { sessionId, trigger, started, usage, base, rows: messages.length, tailTokens, failures, sync, deadlineHit, unreadable: !history, tooLittle: briefOnly && start > base })
   const kept = new Set(order.slice(cut))
-  if (persistent && installs) void maybeReflect($, loop, life).catch((error) => log($, errorText(error)))
   // Handed back without their handles, the kept messages are written afresh after the boundary; with them, the
   // engine keeps its own rows, whose parents point before the boundary, so a resume skips the compaction.
   // In the context's own order.

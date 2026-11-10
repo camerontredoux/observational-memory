@@ -2,7 +2,7 @@
 // after with how it ended (`added` observations, or `failed`).
 export type Worker = {
   id: string
-  kind: 'observer' | 'reflector'
+  kind: 'observer'
   settled?: { at: number; failed?: true; added?: number }
 }
 

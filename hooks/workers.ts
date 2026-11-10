@@ -3,7 +3,7 @@ import type { On } from 'claude-code'
 import type { Worker } from '../types'
 import { errorText } from './prune'
 
-// The band above the prompt while the Observer or the Reflector runs in the background, drawn as
+// The band above the prompt while the Observer runs in the background, drawn as
 // pi-observational-memory draws its widget: `◐ [observer]` spinning while a call runs, then `✓ [observer] +4` or
 // `✗ [observer]` for SETTLED_MS once it ends. register.ts starts and settles the workers; this module draws them, and
 // a tick moves the spinner and drops the settled ones. The values live in $.state so a tick redraws the band alone,
@@ -75,6 +75,6 @@ export const registerWorkers = (on: On) => {
 }
 
 // The footer's figures, which register.ts writes for the status line script: O is the history waiting for an Observer
-// call against a chunk, R the observations against a reflection, C the context against auto-compaction, and the
-// dollars what Ember has cost; compactions counts the main conversation's compactions, om's and the built-in's alike.
-export type Gauges = { pending: number; chunk: number; ledger: number; reflectAt: number; context?: number; compactAt?: number; cost: number; compactions: number }
+// call against a chunk, the ledger's observations in tokens, C the context against auto-compaction, and the dollars
+// what Ember has cost; compactions counts the main conversation's compactions, om's and the built-in's alike.
+export type Gauges = { pending: number; chunk: number; ledger: number; context?: number; compactAt?: number; cost: number; compactions: number }

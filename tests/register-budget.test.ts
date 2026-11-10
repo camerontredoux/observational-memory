@@ -234,13 +234,12 @@ describe('register: budget', () => {
     expect(builtin).toBe(1)
   })
 
-  test('over its budget at every cut the floor tries while a reflection is still running, compaction falls back and leaves the ledger as it was', async ($, on) => {
+  test('over its budget at every cut the floor tries, compaction falls back and leaves the ledger as it was', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const { gate, open } = gates()
     const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
     const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(8_000)}</observations>`
-    const seen = ember(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
+    const seen = ember(on, { reply: () => big })
     // A 50k window leaves a 15k budget: the memory, even trimmed to its cap, is over it at every cut.
     on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
@@ -248,8 +247,7 @@ describe('register: budget', () => {
 
     await runTurn($, turn('a\nKeep the public API unchanged', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', 20_000), at(22, 15, 0))
-    await clock.settle() // [0, 3) observed: its ~102k tokens of observations start a reflection, held
-    expect(seen.prompts.at(-1)).toMatch(/^## OBSERVATIONS/)
+    await clock.settle() // [0, 3) observed
     const before = stored['ledger:session-1'] as Ledger
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
 
@@ -258,8 +256,6 @@ describe('register: budget', () => {
     expect(before.corrections).toEqual([correction])
     expect(seen.logs).toContainEqual(expect.stringMatching(/^the compacted context is over its budget: ~\d+ tokens, ~15000 allowed; using the built-in compaction$/))
     expect(seen.screen.at(-1)).toBe('Memory over its budget. Using built-in compaction')
-    open(0)
-    await clock.settle()
   })
 
   test('a memory over its budget with chunks observed on the spot falls back and stores them committed, not installed', async ($, on) => {

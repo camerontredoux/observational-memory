@@ -1,21 +1,19 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { turn, CHUNK, at, world, ember, nearTarget, live, recordIn, WHERE, noReplies, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, skillsIn, FINISHED, fourTurns } from './harness'
+import { turn, CHUNK, at, world, ember, live, recordIn, WHERE, noReplies, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, skillsIn, FINISHED, fourTurns } from './harness'
 import type { Ledger } from './harness'
 
 // The memory message: corrections, sources, dates and skills.
 describe('register: memory', () => {
-  test("the user's corrections are quoted in their own section above the observations and pass through the Reflector unchanged", async ($, on) => {
+  test("the user's corrections are quoted in their own section above the observations and carried forward from the memory message", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const correction = '🔴 2026-09-22 14:30 User: "Sorry, I meant the refresh endpoint, not login — ignore what I said about login"'
-    const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
     const seen = ember(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
-          ? `<corrections>\n* ${correction}\n</corrections>\n${big}\n<continuation>\nActive: fixing the refresh endpoint\n</continuation>`
+          ? `<corrections>\n* ${correction}\n</corrections>\n<observations>\n* 🟡 2026-09-22 14:30 Explored the auth module\n</observations>\n<continuation>\nActive: fixing the refresh endpoint\n</continuation>`
           : `<observations>\n* 🟡 2026-09-22 15:00 User: "b"\n</observations>`,
-      reflect: (n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)'),
     })
     const runTurn = live(on, clock, history)
 
@@ -23,9 +21,6 @@ describe('register: memory', () => {
     await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
     await clock.settle()
 
-    const reflections = seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
-    expect(reflections).toHaveLength(1)
-    expect(reflections[0]).not.toContain('Sorry, I meant')
     expect((stored['ledger:session-1'] as Ledger).corrections).toEqual([correction])
     const first = await $.session.compact({ trigger: 'manual', messages: [...history] })
     const text = noReplies(first.messages?.[0]?.text)

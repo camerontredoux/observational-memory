@@ -10,8 +10,8 @@ import { BGATES, BSAMPLES } from './behavior'
 import type { Category, ContinuationScore } from './continuation'
 import { CATEGORIES, CATEGORY_WEIGHTS, continuation, continuationBehavior } from './continuation'
 
-/** One transcript's replay: its contexts, and the cache keys of its Observer/Reflector calls (sorted). */
-export type Replay = { name: string; contexts: (Context | undefined)[]; calls: number; fresh: number; failed: number; keys: string[]; eff: Eff; fallbacks: { n: number; reason: string }[]; reflections?: number }
+/** One transcript's replay: its contexts, and the cache keys of its Observer calls (sorted). */
+export type Replay = { name: string; contexts: (Context | undefined)[]; calls: number; fresh: number; failed: number; keys: string[]; eff: Eff; fallbacks: { n: number; reason: string }[] }
 /** Model calls and their tokens in and out (the pi reply's usage; the estimated prompt when it has none). */
 export type Tally = { calls: number; in: number; out: number }
 /**
@@ -20,7 +20,7 @@ export type Tally = { calls: number; in: number; out: number }
  * session.compact hook runs (calls.json atCompaction), which compaction waits for; a background call still in flight that
  * merely finishes during compaction counts as background.
  */
-export type Eff = { tokens: number[]; ratio: number[]; observer: Tally; reflector: Tally; critical: Tally }
+export type Eff = { tokens: number[]; ratio: number[]; observer: Tally; critical: Tally }
 export type Sample = { replays: Replay[]; items: Item[]; scores: Scores; perTranscript: Record<string, Scores>; pointed?: Pointed[] }
 export type Run = { label: string; dir?: string; behavior?: BItem[]; samples: Sample[]; holdout?: Sample[]; chain?: Sample[]; long?: Sample[]; noise?: Run }
 export type BItem = { gate: BGate; boundary: number; id: string; pass: boolean; votes: number; why: string; tier?: 'core' | 'lookup' }
@@ -45,7 +45,7 @@ export function longStats(r: Run) {
   const peak = Math.max(0, ...corrections)
   return {
     held, pointed: ptd, facts: p.length, credit: p.length ? (100 * (held + ptd / 2)) / p.length : 0, tieredCredit: tden ? (100 * tnum) / tden : 0, core: byTier('core'), lookup: byTier('lookup'),
-    reflections: x.reflections ?? 0, reflector: x.eff.reflector.calls, observer: x.eff.observer.calls, peakCorrections: peak, peakAt: corrections.indexOf(peak) + 1, capFallbacks: cap.map((f) => f.n), otherFallbacks: x.fallbacks.filter((f) => !cap.includes(f)),
+    observer: x.eff.observer.calls, peakCorrections: peak, peakAt: corrections.indexOf(peak) + 1, capFallbacks: cap.map((f) => f.n), otherFallbacks: x.fallbacks.filter((f) => !cap.includes(f)),
   }
 }
 /** The long chain's card: `long` is its run as the scorecard reads it (the script's longOf). */
@@ -54,13 +54,12 @@ export function longCard(r: Run, long: Run, items: boolean) {
   const out = [
     `Recall-aware credit (not in any total): **${f1(st.credit)}** — ${st.held} of ${st.facts} hand-authored facts held, ${st.pointed} more pointed to by a source range om_recall can follow (½ each).`,
     `Tiered recall-aware credit: **${f1(st.tieredCredit)}** — core ${st.core.held} of ${st.core.facts} held, ${st.core.pointed} pointed (${TIER.pointed.core} each); lookup ${st.lookup.held} of ${st.lookup.facts} held, ${st.lookup.pointed} pointed (${TIER.pointed.lookup} each), a lookup fact weighing ${TIER.weight.lookup}.`,
-    `Reached: ${st.reflections} reflections (${st.reflector} Reflector calls), ${st.observer} Observer calls; constraint tier peak ~${st.peakCorrections} tokens at cut ${st.peakAt}; constraint-cap fallbacks at ${st.capFallbacks.length ? st.capFallbacks.join(', ') : 'none'}${st.otherFallbacks.length ? `; other fallbacks: ${st.otherFallbacks.map((f) => `${f.n} (${f.reason.slice(0, 80)})`).join('; ')}` : ''}.`,
+    `Reached: ${st.observer} Observer calls; constraint tier peak ~${st.peakCorrections} tokens at cut ${st.peakAt}; constraint-cap fallbacks at ${st.capFallbacks.length ? st.capFallbacks.join(', ') : 'none'}${st.otherFallbacks.length ? `; other fallbacks: ${st.otherFallbacks.map((f) => `${f.n} (${f.reason.slice(0, 80)})`).join('; ')}` : ''}.`,
     '',
   ]
   if (items) for (const x of (r.long![0]!.pointed ?? []).filter((x) => x.pointed)) out.push(`- pointed @${x.boundary} ${x.id}: ${x.evidence}`)
   return [scorecard(long, items), ...out].join('\n')
 }
-export const reflections = (r: Run) => [...r.samples, ...(r.chain ?? []), ...(r.long ?? [])].reduce((n, s) => n + s.replays.reduce((m, x) => m + x.eff.reflector.calls, 0), 0)
 
 export const f1 = (n: number) => n.toFixed(1)
 const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length
@@ -71,19 +70,19 @@ export const tiered = (r: Run, k: 'tiered' | 'core' | 'lookup' = 'tiered') => me
 const tierLine = (r: Run) => `Tiered total: **${f1(tiered(r))}** (core ${f1(tiered(r, 'core'))}, lookup ${f1(tiered(r, 'lookup'))}); flat total ${f1(total(r))}.`
 
 // ---- Efficiency: apart from the quality total (docs/plans/compaction-goals.md).
-type EffRow = { tokens: number; max: number; ratio: number; observer: Tally; reflector: Tally; model: number; critical: Tally }
+type EffRow = { tokens: number; max: number; ratio: number; observer: Tally; model: number; critical: Tally }
 const effOfReplays = (rs: Replay[]): EffRow => {
-  const add = (k: 'observer' | 'reflector' | 'critical') => rs.reduce((a, r) => ({ calls: a.calls + r.eff[k].calls, in: a.in + r.eff[k].in, out: a.out + r.eff[k].out }), { calls: 0, in: 0, out: 0 })
+  const add = (k: 'observer' | 'critical') => rs.reduce((a, r) => ({ calls: a.calls + r.eff[k].calls, in: a.in + r.eff[k].in, out: a.out + r.eff[k].out }), { calls: 0, in: 0, out: 0 })
   const tokens = rs.flatMap((r) => r.eff.tokens)
-  const [observer, reflector] = [add('observer'), add('reflector')]
-  return { tokens: mean(tokens), max: Math.max(...tokens), ratio: mean(rs.flatMap((r) => r.eff.ratio)), observer, reflector, model: observer.in + observer.out + reflector.in + reflector.out, critical: add('critical') }
+  const observer = add('observer')
+  return { tokens: mean(tokens), max: Math.max(...tokens), ratio: mean(rs.flatMap((r) => r.eff.ratio)), observer, model: observer.in + observer.out, critical: add('critical') }
 }
 /** A run's efficiency, over all its transcripts or one, as the mean over its samples. */
 export function effRun(r: Run, name?: string): EffRow {
   const rows = r.samples.map((s) => effOfReplays(s.replays.filter((x) => !name || x.name === name)))
   const m = (f: (e: EffRow) => number) => mean(rows.map(f))
-  const t = (k: 'observer' | 'reflector' | 'critical'): Tally => ({ calls: m((e) => e[k].calls), in: m((e) => e[k].in), out: m((e) => e[k].out) })
-  return { tokens: m((e) => e.tokens), max: m((e) => e.max), ratio: m((e) => e.ratio), observer: t('observer'), reflector: t('reflector'), model: m((e) => e.model), critical: t('critical') }
+  const t = (k: 'observer' | 'critical'): Tally => ({ calls: m((e) => e[k].calls), in: m((e) => e[k].in), out: m((e) => e[k].out) })
+  return { tokens: m((e) => e.tokens), max: m((e) => e.max), ratio: m((e) => e.ratio), observer: t('observer'), model: m((e) => e.model), critical: t('critical') }
 }
 const kt = (n: number) => (n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n)}`)
 const pct = (n: number) => `${(100 * n).toFixed(1)}%`
@@ -92,11 +91,10 @@ const EFF: [string, (e: EffRow) => string][] = [
   ['context tokens per cut, max', (e) => kt(e.max)],
   ['reduction ratio (compacted / replaced), mean', (e) => pct(e.ratio)],
   ['Observer calls (tokens in / out)', (e) => `${Math.round(e.observer.calls)} (${kt(e.observer.in)} / ${kt(e.observer.out)})`],
-  ['Reflector calls (tokens in / out)', (e) => `${Math.round(e.reflector.calls)} (${kt(e.reflector.in)} / ${kt(e.reflector.out)})`],
   ['model tokens in + out', (e) => kt(e.model)],
   ['critical-path calls (tokens in / out)', (e) => `${Math.round(e.critical.calls)} (${kt(e.critical.in)} / ${kt(e.critical.out)})`],
 ]
-const EFF_NOTE = "Critical path: the Observer/Reflector calls started inside register.ts's session.compact hook, which compaction waits for (calls.json atCompaction); a background call that only finishes during compaction counts as background. Ratio: against the source session's preTokens at the cut. Latency is virtual: calls and tokens are measured, time is not (the replay's clock is simulated)."
+const EFF_NOTE = "Critical path: the Observer calls started inside register.ts's session.compact hook, which compaction waits for (calls.json atCompaction); a background call that only finishes during compaction counts as background. Ratio: against the source session's preTokens at the cut. Latency is virtual: calls and tokens are measured, time is not (the replay's clock is simulated)."
 function effTable(r: Run) {
   const names = Object.keys(r.samples[0]!.perTranscript)
   const all = effRun(r)
@@ -154,7 +152,7 @@ export function scorecard(r: Run, items: boolean) {
 type Pair = [Item, Item]
 const itemKey = (i: Item) => `${i.gate}@${i.boundary} ${i.id}`
 const passes = (i: Item) => i.score >= 1
-/** Whether two runs made the same Observer/Reflector calls (sample 1): then their difference is exact, not sampling noise. */
+/** Whether two runs made the same Observer calls (sample 1): then their difference is exact, not sampling noise. */
 export const sameKeys = (a: Sample[], b: Sample[]) => a[0]!.replays.every((x, i) => x.keys.join() === b[0]!.replays[i]?.keys.join())
 
 /**
@@ -194,7 +192,7 @@ const tTotal = (r: Run, name: string) => mean(r.samples.map((s) => s.perTranscri
 
 /**
  * A against B. The verdict needs the weighted Δ, the net flips per unique item and at least 2 of 3 transcripts to agree
- * in sign; when B's Observer/Reflector calls differ from A's it also needs Δ beyond the noise floor (A's sample spread,
+ * in sign; when B's Observer calls differ from A's it also needs Δ beyond the noise floor (A's sample spread,
  * or A against its resample A'), or with several samples B's lowest total above A's highest. `informational`: no verdict.
  */
 export function ab(a: Run, b: Run, o: { informational?: boolean } = {}) {
@@ -255,8 +253,8 @@ export function ab(a: Run, b: Run, o: { informational?: boolean } = {}) {
             ? `tradeoff: B ${signed(d)} quality for ${e.costly.join(', ')} (more than 10% more tokens is never "better")`
             : `${byScore} is better: ${f1(Math.abs(d))} weighted points, ${agree} of ${names.length} transcripts agree, ${Math.max(f.uu, f.ud)} unique items flip to ${byScore} against ${Math.min(f.uu, f.ud)}${f.p < 0.05 ? '' : ' (not significant by the sign test)'}`
   const caveat = exact
-    ? `B's Observer/Reflector calls are the same as A's (same cache keys): the difference is deterministic, not sampling noise.`
-    : `B's Observer/Reflector inputs differ from A's, so its replies are other model draws: part of Δ is sampling noise, and the real unit is one Observer draw per transcript.${[...a.samples, ...b.samples].some((s) => s.replays.some((r) => r.fresh)) ? ' Some replies were fresh calls in this run.' : ''} ${noiseLine || "No resample of A is recorded: the noise floor is unknown."}`
+    ? `B's Observer calls are the same as A's (same cache keys): the difference is deterministic, not sampling noise.`
+    : `B's Observer inputs differ from A's, so its replies are other model draws: part of Δ is sampling noise, and the real unit is one Observer draw per transcript.${[...a.samples, ...b.samples].some((s) => s.replays.some((r) => r.fresh)) ? ' Some replies were fresh calls in this run.' : ''} ${noiseLine || "No resample of A is recorded: the noise floor is unknown."}`
   const effFlag = !o.informational && verdict.startsWith('B is') && e.verdict === 'worse' ? `WARNING: B wins on quality but is worse on efficiency by more than 10% (${e.worse.join(', ')}): a regression by docs/plans/compaction-goals.md.` : ''
   out.push(`Verdict: ${verdict}.`, e.line + '.', ...(effFlag ? [effFlag] : []), '', caveat, '', e.table, EFF_NOTE, '')
   const unitLine = (u: (typeof f.units)[number]) => `- ${u.gate} ${u.id}: ${u.up.length ? `↑ at ${u.up.map((x) => `@${x}`).join(' ')}` : ''}${u.up.length && u.down.length ? '; ' : ''}${u.down.length ? `↓ at ${u.down.map((x) => `@${x}`).join(' ')}` : ''}`

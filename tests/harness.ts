@@ -3,7 +3,7 @@ import { describe, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { HttpResponse, On, ProcessRunResult, SessionMessage } from 'claude-code'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
-import { OBSERVER_FORMAT, REFLECTOR_FORMAT } from '../hooks/reply'
+import { OBSERVER_FORMAT } from '../hooks/reply'
 import { originalId } from '../hooks/recall'
 import type { RecallIo } from '../hooks/recall'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
@@ -69,10 +69,10 @@ function breaks(value: unknown, schema: Record<string, any>, at = 'reply'): stri
   }
   return undefined
 }
-const SCHEMAS: Record<string, Record<string, any>> = { [OBSERVER_FORMAT.name]: OBSERVER_FORMAT.schema, [REFLECTOR_FORMAT.name]: REFLECTOR_FORMAT.schema }
+const SCHEMAS: Record<string, Record<string, any>> = { [OBSERVER_FORMAT.name]: OBSERVER_FORMAT.schema }
 
 // A test's reply written in the line format the plugin renders, as the JSON Ember answers to the request's schema
-// (`observer_reply` or `reflector_reply`), so tests read as the memory they make. A section's unmarked line joins the
+// (`observer_reply`), so tests read as the memory they make. A section's unmarked line joins the
 // line before. A reply with no section tag and no marked line stays as written: text that is not JSON, as a broken
 // reply would be. One already JSON is sent as it is. JSON that breaks the schema (a 🔴 observation, a `replaces` that
 // is no id) throws: the test asks for a reply Ember cannot give.
@@ -113,13 +113,6 @@ function asJson(text: string, schema: string | undefined) {
   }
   const observations = marked(by.observations ?? (by.observations === undefined && !text.match(/<observations>/i) ? by[''] : []))
   if (!tagged && !observations.some((o) => o.priority)) return text
-  if (schema === 'reflector_reply')
-    return JSON.stringify({
-      observations: observations.map(({ text, ...o }) => {
-        const m = text.match(/^(.*?)\s*\(source ([^)]*)\)$/)
-        return { ...o, text: m ? m[1]! : text, source: m ? m[2]! : null }
-      }),
-    })
   const corrections = marked(by.corrections).map((c) => {
     const m = c.text.match(/^User:\s*"(.*)"\s*(?:\(replaces (\S+?)\)|\(this replaces the earlier constraint (.*)\))?$/)
     return { time: c.time, quote: m ? m[1]! : c.text, replaces: m?.[2] ?? null, replaces_earlier: m?.[3] ?? null }
@@ -224,24 +217,22 @@ export const ran = (r: Run): ProcessRunResult => ({ ...r, isStdoutTruncated: fal
 
 export const NOT_A_REPO: Run = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
 
-// Ember through `$.http.fetch`: it observes by naming the prompts of its chunk, each at the time its block shows;
-// the reflector answers `reflect(n, prompt)` for its nth call, by default a reflection near its target. `hold` delays
-// the nth call's answer, `fail` answers it with an error reply, or fails the request with an Error; `stopped` counts the calls the plugin gave up
-// on (a loop that ended, a deadline) before they answered: their answers, once they come, are dropped. git, through
-// `$.process.run`, is answered by `git`, else as outside a repository. `$.model.complete` is counted, and answers nothing.
+// Ember through `$.http.fetch`: it observes by naming the prompts of its chunk, each at the time its block shows.
+// `hold` delays the nth call's answer, `fail` answers it with an error reply, or fails the request with an Error;
+// `stopped` counts the calls the plugin gave up on (a loop that ended, a deadline) before they answered: their
+// answers, once they come, are dropped. git, through `$.process.run`, is answered by `git`, else as outside a
+// repository. `$.model.complete` is counted, and answers nothing.
 export function ember(
   on: On,
   options: {
     hold?: (n: number, prompt: string) => Promise<void> | undefined
     fail?: (n: number, prompt: string) => HttpResponse | Error | undefined
-    reflect?: (n: number, prompt: string) => string
     reply?: (prompt: string) => string | undefined
     git?: (argv: readonly string[]) => Run | undefined | Promise<Run | undefined>
     session?: (prompt: string) => string | HttpResponse
   } = {},
 ) {
   const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as EmberCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], cacheKeys: [] as string[] }
-  let reflections = 0
   on('process.run', ($, e) => {
     if (e.argv[0] !== 'git') return { value: ran({ exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` }) }
     seen.git.push(e.argv)
@@ -291,37 +282,16 @@ export function ember(
     const failed = options.fail?.(n, prompt)
     if (failed instanceof Error) throw failed // the request itself failed: no reply
     if (failed) return failed
-    let text: string
-    if (prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
-      reflections++
-      text = options.reflect?.(reflections, prompt) ?? nearTarget(prompt, '* 🟡 2026-09-22 14:30 Reflected')
-    } else
-      text =
-        options.reply?.(prompt) ??
-        `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🟡 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
-        `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
+    const text =
+      options.reply?.(prompt) ??
+      `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🟡 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
+      `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
     return emberResponse(structured(text, schema))
   }
   on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
   on('ui.log', ($, e) => ((e.to === 'debug' ? (seen.logs.push(e.text), gaveUp(e.text)) : seen.screen.push(e.text)), { value: undefined }))
   return seen
 }
-
-// A Reflector's reply to `prompt` that lands near the size target the prompt gives: `head`, then filler lines at
-// the first observation's time, up to about 70% of the target. `isFiller` tells those lines apart.
-export function nearTarget(prompt: string, head = '') {
-  const target = Number(prompt.match(/Size target: at most ~(\d+) tokens/)![1])
-  const time = prompt.match(/^\* \S+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /m)?.[1] ?? ''
-  const filler = (i: number) => `* 🟢 ${time} filler detail ${i}`
-  const lines = head ? [head] : []
-  for (let i = 0, chars = head.length; chars < 0.7 * target * 4; i++) lines.push(filler(i)), (chars += filler(i).length + 1)
-  return `<observations>\n${lines.join('\n')}\n</observations>`
-}
-export const isFiller = (line: string) => / filler detail \d+$/.test(line)
-// The size of entries as the memory renders them, each with its source range, as hooks/memory.ts estimates it.
-export const stampAt = (ms: number) => stampOf(new Date(ms).toISOString())
-export const tokensOf = (entries: readonly { line: string; source?: { from: number; to: number } }[]) =>
-  Math.ceil(entries.map((e) => `* ${e.line}${e.source ? ` (source ${stampAt(e.source.from)} to ${stampAt(e.source.to)})` : ''}`).join('\n').length / 4)
 
 // A live main conversation: each turn's prompt at `startAt`, the rest of it and turn.complete a minute later.
 export function live(on: On, clock: MockClock, history: SessionMessage[]) {

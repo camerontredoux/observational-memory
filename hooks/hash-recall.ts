@@ -22,8 +22,8 @@ export const queryOf = (token: string): string[] => (TRIGGER.test(token) ? words
 // The ledger's lines as rows, ranked: constraints first, then by marker, then newest (time, then ledger place).
 export function hashIndex(ledger: { entries?: readonly Entry[]; corrections?: readonly string[] }): HashIndex {
   const lines = [
-    ...(ledger.corrections ?? []).map((line, place) => ({ line, place, tag: 'constraint', constraint: true })),
-    ...(ledger.entries ?? []).map((e, place) => ({ line: e.line, place, tag: e.r ? 'condensed' : undefined, constraint: false })),
+    ...(ledger.corrections ?? []).map((line, place) => ({ line, place, constraint: true })),
+    ...(ledger.entries ?? []).map((e, place) => ({ line: e.line, place, constraint: false })),
   ]
   const ranked = lines
     .map((l) => ({ ...l, ...partsOf(baseOf(l.line)) }))
@@ -35,7 +35,7 @@ export function hashIndex(ledger: { entries?: readonly Entry[]; corrections?: re
     // it, while a bare label runs the whole row, cut there. It cuts a label holding `/` or `\` as a path, keeping the
     // tail, so the label shows look-alikes (∕ U+2215, ⧵ U+29F5) and is cut at its end; `text` keeps the real ones.
     const head = [l.marker, l.time?.slice(5), l.constraint ? '[constraint]' : undefined].filter(Boolean).join(' ')
-    const label = `${head ? `${head} ` : ''}${l.text}${l.tag === 'condensed' ? ' (condensed)' : ''}`
+    const label = `${head ? `${head} ` : ''}${l.text}`
       .replace(/\s+/g, ' ')
       .replace(/\//g, '∕')
       .replace(/\\/g, '⧵')

@@ -13,13 +13,12 @@
 //     [--boundaries 1,3,5] [--only REGEX] [--om-run om-live] [--live] [--out DIR]
 //   bun scripts/bench-replay.ts report [--transcripts ...] [--configs recorded,om,...] [--om-run DIR] [--questions DIR]
 //     [--out FILE]
-//   bun scripts/bench-replay.ts reflections --transcript NAME [--run DIR]
 //
 // NAME may be a chain, `a+b+c`: those transcripts joined in that order into one long session (chainTranscripts), each
 // one but the last shifted back to end an hour before the next starts, and each one's spec shifted to its boundaries
 // with its ids prefixed by its name (chainSpec), plus the chain's own spec, if it has one, at the chain's boundaries
-// (tests/fixtures/a+b+c.replay.local.ts for a chain with a private member). No single real session grows the memory to the Reflector's
-// threshold; a chain of them does. Its results go under <main checkout>/.scratch/om-replay/a+b+c/.
+// (tests/fixtures/a+b+c.replay.local.ts for a chain with a private member). No single real session grows its observations
+// past the memory message's cap; a chain of them does. Its results go under <main checkout>/.scratch/om-replay/a+b+c/.
 //
 // The transcripts are private copies, gitignored, in the main checkout's tests/fixtures/replay/ (--dir overrides).
 // Each transcript's constraint list and questions: tests/eval/replay-specs/<name>.ts, or, for a transcript whose
@@ -27,19 +26,17 @@
 // identifiers are scored. Results go under <main checkout>/.scratch/om-replay/<transcript>/<configuration>/.
 //
 // dry-run: parses each transcript, checks its spec against the user's own messages, and prints every model call a
-//   full run would make (om's Observer and Reflector calls, the built-in chain's /compact calls, the question
+//   full run would make (om's Observer calls, the built-in chain's /compact calls, the question
 //   stage's headless Sonnet sessions) with estimated tokens and cost per configuration. It spends nothing.
 // om: replays the transcript through the checkout's (or --src's) hooks/register.ts with a hand-built `$` on a
 //   virtual clock (its `claude-code` imports from scripts/claude-code-shim.ts), and compacts where the session compacted, each compaction on the previous one's output. Observer
-//   and Reflector calls go to pi through a response cache (<main checkout>/.scratch/om-replay/luna-cache; the earlier prior-art
+//   calls go to pi through a response cache (<main checkout>/.scratch/om-replay/luna-cache; the earlier prior-art
 //   replay's luna-cache under .scratch/om-vcc is read too when this machine still has it): --pi stub answers every call with
 //   a canned reply built from its prompt (free; checks the chain, not a measurement), --pi strict (the default)
 //   fails on a call not cached, --pi live runs pi on a miss, at most --max-calls times (default 0), and caches it.
 //   --cache DIR reads and writes that cache alone: a new one makes every pi call again, a second sample of the
-//   Observer and Reflector rather than a replay of the first. --reflector-cache DIR sends the Reflector's calls to that
-//   cache alone (the Observer's still use --cache): a resample of the Reflector draws only. Writes compaction-N.md (the memory message), kept-N.json (the rows
-//   kept raw), calls.json, log.txt and summary.json to <main checkout>/.scratch/om-replay/<name>/om-<pi>, and for each reflection
-//   reflection-N.json (the ledger just before and just after it) and each Reflector reply, reflector-C-level-L.txt.
+//   Observer rather than a replay of the first. Writes compaction-N.md (the memory message), kept-N.json (the rows
+//   kept raw), calls.json, log.txt and summary.json to <main checkout>/.scratch/om-replay/<name>/om-<pi>.
 //   `$.session.messages()` answers the newest 4096 rows, as the engine's does.
 // builtin: the live built-in chain (planBuiltinChain): seeds a sandbox session with span 0's raw rows, resumes it in
 //   the herdr pane with no observational-memory plugin, /compact, exits, reads the summary and kept rows back,
@@ -66,8 +63,6 @@
 //   others are recorded unscored (no model grader). Each session's result is appended to <out>/results.jsonl
 //   (default <main checkout>/.scratch/om-replay/<name>/questions); a (configuration, boundary, group) already there without an error is
 //   not run again. The budget is this invocation's.
-// reflections: scores each reflection of an om replay (--run, default <main checkout>/.scratch/om-replay/<name>/om-live) with no model:
-//   the memory just before against just after (scoreReflection), and lists the Reflector's calls.
 // report: scores, per transcript, the session's own compactions ("recorded") and every configuration with results
 //   under <main checkout>/.scratch/om-replay (--configs: only these), and prints the report (or writes it to --out). --om-run scores that
 //   om run (om-v130, say) as om in place of om-live and om-strict; the question stage is read from
@@ -80,7 +75,7 @@ import { basename, dirname, resolve } from 'path'
 // First: the hooks' `claude-code` imports resolve to it, not to npm's package of that name.
 import './claude-code-shim'
 import type { SessionMessage } from 'claude-code'
-import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, Reflection, ReplaySpec, Transcript } from '../tests/eval/replay'
+import type { Boundary, ConfigResult, Context, Question, QuestionGroup, QuestionResult, QuestionSession, ReplaySpec, Transcript } from '../tests/eval/replay'
 import {
   answerTexts,
   chainSpec,
@@ -103,7 +98,6 @@ import {
   questionRun,
   questionsAt,
   recallCallsIn,
-  renderReflections,
   renderTranscript,
   replayChain,
   scoreAnswers,
@@ -127,10 +121,8 @@ const members = (name: string) => name.split('+')
 const isPrivate = (name: string) => members(name).some((m) => PRIVATE.has(m))
 // As in hooks/register.ts: `$.session.messages()` answers the newest this many rows.
 const ROWS_CAP = 4096
-const REFLECT_TARGET_TOKENS = 20_000
 // Virtual latency of one pi call, as the earlier prior-art replay had it: fixed, so every replay schedules identically.
 const OBSERVER_MS = 15_000
-const REFLECTOR_MS = 30_000
 // The replayed session's id, which register.ts makes pi's --session-id (the provider's prompt cache key) from: one per
 // transcript and --cache (one per sample), as each real session has its own. One id for every replay would put every
 // transcript and both samples on one cache key, the samples' identical chunks among them, which no real session shares.
@@ -158,7 +150,7 @@ async function specOf(name: string, offsets: number[]): Promise<ReplaySpec | und
   if (names.length === 1) return memberSpec(name)
   const specs = await Promise.all(names.map(memberSpec))
   const spec = specs.some(Boolean) ? chainSpec(names.map((m, i) => ({ name: m, offset: offsets[i]!, ...(specs[i] ? { spec: specs[i] } : {}) }))) : undefined
-  // The chain's own spec, at the chain's boundaries: questions about what a reflection in it replaced, say.
+  // The chain's own spec, at the chain's boundaries: questions about what its compactions dropped, say.
   const own = await memberSpec(name)
   if (!own) return spec
   return { constraints: [...(spec?.constraints ?? []), ...own.constraints], questions: [...(spec?.questions ?? []), ...own.questions] }
@@ -178,7 +170,7 @@ async function dryRun(o: Options) {
     const { t, offsets } = load(o, name)
     const spec = await checkedSpec(name, t, offsets)
     const stub = `${OUT_ROOT}/${name}/om-stub/calls.json`
-    const omCalls = existsSync(stub) ? (JSON.parse(readFileSync(stub, 'utf8')) as { kind: 'observer' | 'reflector'; inTokens: number }[]) : undefined
+    const omCalls = existsSync(stub) ? (JSON.parse(readFileSync(stub, 'utf8')) as { kind: string; inTokens: number }[]) : undefined
     console.log(`${name}: ${t.boundaries.length} boundaries; ${spec ? `${spec.constraints.length} constraints, ${spec.questions.length} questions` : 'no spec: identifiers only, no questions'}; om calls ${omCalls ? `from ${stub}` : 'estimated'}`)
     const planned = planCalls(name, t, spec, omCalls ? { omCalls } : {})
     calls.push(...planned)
@@ -198,10 +190,7 @@ async function dryRun(o: Options) {
 
 type PiResult = { exitCode: number; stdout: string; stderr: string }
 // `inTokens` is the prompt's size estimated before the call; `in`, `out` and `cost` are pi's own usage record.
-// `level`: a Reflector call's compression level, read from its prompt.
-type Call = { kind: 'observer' | 'reflector'; level?: number; atCompaction: boolean; start: number; prompt: string; key?: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
-const LEVELS = ['## COMPRESSION REQUIRED', '## AGGRESSIVE COMPRESSION REQUIRED', '## CRITICAL COMPRESSION REQUIRED', '## EXTREME COMPRESSION REQUIRED']
-const REFLECTED = /reflected \d+ observations \(~(\d+) tokens\) into \d+ \(~(\d+) tokens\) at compression level (\d+)/
+type Call = { kind: 'observer'; atCompaction: boolean; start: number; prompt: string; key?: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
 
 function piMessage(stdout: string) {
   let message: any
@@ -213,14 +202,11 @@ function piMessage(stdout: string) {
       } catch {}
   return message
 }
-// A canned reply from the prompt alone: each block's first words as an observation (the Reflector's: every other
-// line). Enough for the chain to run; says nothing about what Luna would keep.
+// A canned reply from the prompt alone: each block's first words as an observation. Enough for the chain to run; says
+// nothing about what Luna would keep.
 function stub(prompt: string): PiResult {
-  const reflect = prompt.startsWith('## OBSERVATIONS TO REFLECT ON')
-  const lines = reflect
-    ? [...prompt.matchAll(/^\* .+$/gm)].map((m) => m[0]).filter((_, i) => i % 2 === 0)
-    : [...prompt.matchAll(/^\[(User|Assistant)(?: @ ([\d-]+ [\d:]+))?\]: (.{0,60})/gm)].map((m) => `* 🟡 ${m[2] ?? ''} ${m[1]} said ${m[3]!.replace(/\s+/g, ' ')}`)
-  const text = `<observations>\n${lines.join('\n') || '* 🟡 Nothing to note'}\n</observations>` + (reflect ? '' : '\n<continuation>\nActive: stub\n</continuation>')
+  const lines = [...prompt.matchAll(/^\[(User|Assistant)(?: @ ([\d-]+ [\d:]+))?\]: (.{0,60})/gm)].map((m) => `* 🟡 ${m[2] ?? ''} ${m[1]} said ${m[3]!.replace(/\s+/g, ' ')}`)
+  const text = `<observations>\n${lines.join('\n') || '* 🟡 Nothing to note'}\n</observations>\n<continuation>\nActive: stub\n</continuation>`
   const usage = { input: estimateTokens(prompt), output: estimateTokens(text), cost: { total: 0 } }
   const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage }
   return { exitCode: 0, stderr: '', stdout: JSON.stringify({ type: 'message_end', message }) }
@@ -238,12 +224,9 @@ async function om(o: Options) {
   if (existsSync(out) && readdirSync(out).length) fail(`${out} exists: move it or pass another --out`)
   mkdirSync(`${out}/stats`, { recursive: true })
   // --cache: a cache of this run's own, so a rerun makes its pi calls again (a second sample of the Observer).
-  const observerCache = str(o, 'cache') ?? CACHE
-  mkdirSync(observerCache, { recursive: true })
-  // Not the Reflector's cache: a Reflector resample keeps the Observer's calls, and their keys, as they were.
-  const session = sessionOf(name, observerCache)
-  const reflectorCache = str(o, 'reflector-cache')
-  if (reflectorCache) mkdirSync(reflectorCache, { recursive: true })
+  const cache = str(o, 'cache') ?? CACHE
+  mkdirSync(cache, { recursive: true })
+  const session = sessionOf(name, cache)
   const env: Record<string, string> = { HOME: process.env.HOME ?? '/root', OM_NO_PRUNE: '1', OM_STATS_DIR: `${out}/stats` }
 
   // The engine: a hand-built `$`, a virtual clock, and pi calls that land after a fixed virtual latency.
@@ -263,15 +246,11 @@ async function om(o: Options) {
   const delayed: Timer[] = []
   const calls: Call[] = []
   let compacting = false
-  // Each reflection, caught where the ledger is stored with observations gone, and the compactions run by then.
-  const reflections: Reflection[] = []
-  let compacted = 0
 
   // The cache key: the whole argv (the system prompt with it) and stdin. calls.json records it per call.
   const piKey = (argv: string[], stdin: string) => createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
-  async function runPi(argv: string[], stdin: string, init: { cwd?: string }, kind: 'observer' | 'reflector') {
+  async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
     if (piMode === 'stub') return { r: stub(stdin), hit: false }
-    const cache = kind === 'reflector' && reflectorCache ? reflectorCache : observerCache
     const hash = piKey(argv, stdin)
     const cached = () => {
       for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
@@ -335,13 +314,7 @@ async function om(o: Options) {
     },
     store: {
       get: async (k: string) => (store.has(k) ? JSON.parse(store.get(k)!) : undefined),
-      set: async (k: string, v: any) => {
-        const prev = k.startsWith('ledger:') && store.has(k) && Array.isArray(v?.entries) ? JSON.parse(store.get(k)!) : undefined
-        const ids = new Set(prev ? v.entries.map((e: { id: string }) => e.id) : [])
-        if (Array.isArray(prev?.entries) && prev.entries.some((e: { id: string }) => !ids.has(e.id)))
-          reflections.push({ at: now, afterBoundary: compacted, before: { entries: prev.entries, corrections: prev.corrections ?? [] }, after: { entries: v.entries, corrections: v.corrections ?? [] } })
-        store.set(k, JSON.stringify(v))
-      },
+      set: async (k: string, v: any) => void store.set(k, JSON.stringify(v)),
       delete: async (k: string) => void store.delete(k),
       keys: async () => [...store.keys()],
     },
@@ -411,31 +384,24 @@ async function om(o: Options) {
     },
     ui: { invalidate: () => {} },
   }
-  // One pi call, landing after its kind's fixed latency on the virtual clock.
+  // One pi call, landing after a fixed latency on the virtual clock.
   function start(argv: string[], stdin: string, init: { cwd?: string }) {
     if (argv[0] !== 'pi') return Promise.reject(new Error(`the replay runs pi alone, not ${argv[0]}`))
-    const kind = stdin.startsWith('## OBSERVATIONS TO REFLECT ON') ? 'reflector' : 'observer'
-    const level = kind === 'reflector' ? LEVELS.findLastIndex((l) => stdin.includes(`\n${l}\n`)) + 1 : 0
-    const call: Call = { kind, ...(level ? { level } : {}), atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
+    const call: Call = { kind: 'observer', atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
     calls.push(call)
-    const result = runPi(argv, stdin, init, kind).then(
+    const result = runPi(argv, stdin, init).then(
       ({ r, hit, realMs }) => {
         const m = piMessage(r.stdout)
         Object.assign(call, { hit, realMs, ok: r.exitCode === 0 && !!m, in: m?.usage?.input ?? 0, out: m?.usage?.output ?? 0, cost: m?.usage?.cost?.total ?? 0 })
-        // The Reflector's reply as it came back, for reading what it kept.
-        if (kind === 'reflector') writeFileSync(`${out}/reflector-${calls.indexOf(call) + 1}-level-${level}.txt`, m ? m.content.map((b: { text?: string }) => b.text ?? '').join('') : `(exit ${r.exitCode}) ${r.stderr}`)
         return r
       },
       (error: Error) => ({ exitCode: 1, stdout: '', stderr: error.message }),
     )
-    return new Promise<PiResult>((resolve) => pending.push({ due: now + (kind === 'reflector' ? REFLECTOR_MS : OBSERVER_MS), result, resolve }))
+    return new Promise<PiResult>((resolve) => pending.push({ due: now + OBSERVER_MS, result, resolve }))
   }
   $.ui.log = (text: any, opts?: any) => {
     const line = typeof text === 'string' ? text : text.text
     logs.push({ at: now, text: line, to: opts?.to ?? text?.to })
-    const m = REFLECTED.exec(line)
-    const last = reflections.at(-1)
-    if (m && last && !last.logged) last.logged = { tokensBefore: Number(m[1]), tokensAfter: Number(m[2]), level: Number(m[3]) }
   }
 
   const hooks: Record<string, any> = {}
@@ -536,7 +502,6 @@ async function om(o: Options) {
       compact: async (live, boundary) => {
         const before = calls.length
         const output = await compact(live, boundary)
-        compacted = boundary.n
         writeFileSync(`${out}/compaction-${boundary.n}.md`, output[0]?.text ?? '')
         writeFileSync(`${out}/kept-${boundary.n}.json`, JSON.stringify(output.slice(1), null, 1))
         console.log(`[${name}] compaction ${boundary.n}: ${live.length} live rows in, memory ~${estimateTokens(output[0]?.text ?? '')} tokens, ${output.length - 1} kept raw, ${calls.length - before} pi call(s) at compaction`)
@@ -557,8 +522,6 @@ async function om(o: Options) {
     luna: {
       calls: calls.length,
       observer: calls.filter((c) => c.kind === 'observer').length,
-      reflector: calls.filter((c) => c.kind === 'reflector').length,
-      reflections: reflections.length,
       atCompaction: calls.filter((c) => c.atCompaction).length,
       failed: calls.filter((c) => !c.ok).length,
       cacheHits: calls.filter((c) => c.hit).length,
@@ -571,7 +534,6 @@ async function om(o: Options) {
   }
   writeFileSync(`${out}/summary.json`, JSON.stringify(summary, null, 1))
   writeFileSync(`${out}/calls.json`, JSON.stringify(calls.map((c) => ({ ...c, start: new Date(c.start).toISOString() })), null, 1))
-  reflections.forEach((r, i) => writeFileSync(`${out}/reflection-${i + 1}.json`, JSON.stringify(r, null, 1)))
   writeFileSync(`${out}/log.txt`, logs.map((l) => `${new Date(l.at).toISOString()} ${l.to ?? ''} ${l.text}`).join('\n'))
   console.log(`[${name}] ${JSON.stringify(summary)}`)
   // The timers still on the virtual clock never fire.
@@ -683,28 +645,6 @@ async function report(o: Options) {
   const file = str(o, 'out')
   if (file) writeFileSync(file, text), console.log(`wrote ${file}`)
   else console.log(text)
-}
-
-// ---- reflections: what each reflection of an om replay kept ----
-
-async function reflectionsReport(o: Options) {
-  const name = str(o, 'transcript') ?? fail('--transcript: one of ' + TRANSCRIPTS.join(', ') + ', or a chain a+b+c')
-  const { t, offsets } = load(o, name)
-  const spec = await checkedSpec(name, t, offsets)
-  const run = str(o, 'run') ?? `${OUT_ROOT}/${name}/om-live`
-  const files = existsSync(run) ? readdirSync(run).filter((f) => /^reflection-\d+\.json$/.test(f)).sort((a, b) => parseInt(a.slice(11)) - parseInt(b.slice(11))) : []
-  const reflections = files.map((f) => JSON.parse(readFileSync(`${run}/${f}`, 'utf8')) as Reflection)
-  const lines = [renderReflections({ name, t, ...(spec ? { spec } : {}), reflections, target: REFLECT_TARGET_TOKENS, private: isPrivate(name) })]
-  const calls = existsSync(`${run}/calls.json`) ? (JSON.parse(readFileSync(`${run}/calls.json`, 'utf8')) as Call[]).filter((c) => c.kind === 'reflector') : []
-  if (calls.length)
-    lines.push(
-      '| Reflector call | level | ok | tokens in → out | real seconds | cost |',
-      '|---:|---:|---|---|---:|---:|',
-      ...calls.map((c, i) => `| ${i + 1} | ${c.level ?? '–'} | ${c.ok ? 'yes' : 'NO'} | ${c.in} → ${c.out} | ${c.realMs === undefined ? '–' : Math.round(c.realMs / 1000)} | $${c.cost.toFixed(4)} |`),
-      '',
-    )
-  if (offsets.length > 1) lines.push(`Chain: ${members(name).map((m, i) => `${m} from boundary ${offsets[i]! + 1}`).join(', ')}.`, '')
-  console.log(lines.join('\n'))
 }
 
 // ---- questions: the question stage ----
@@ -842,5 +782,4 @@ else if (command === 'om') await om(o)
 else if (command === 'builtin') await builtin(o)
 else if (command === 'questions') await questions(o)
 else if (command === 'report') await report(o)
-else if (command === 'reflections') await reflectionsReport(o)
-else fail('usage: bun scripts/bench-replay.ts dry-run|om|builtin|questions|report|reflections (see the header)')
+else fail('usage: bun scripts/bench-replay.ts dry-run|om|builtin|questions|report (see the header)')

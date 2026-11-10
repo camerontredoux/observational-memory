@@ -26,18 +26,16 @@ import {
   recallCallsIn,
   answerTexts,
   questionGroups,
-  renderReflections,
   renderTranscript,
   replayChain,
   scoreAnswers,
   scoreConstraints,
   scoreIdentifiers,
-  scoreReflection,
   seedRows,
   tallyQuestions,
   uncompacted,
 } from './eval/replay'
-import type { ConstraintSpec, Context, QuestionResult, Reflection, ReplaySpec } from './eval/replay'
+import type { ConstraintSpec, Context, QuestionResult, ReplaySpec } from './eval/replay'
 import { checkPluginList, checkRecallOnly, RECALL_TOOL } from './eval/config'
 import type { Configuration } from './eval/config'
 import { factHolds, grade, norm, score } from './eval/rubric'
@@ -255,7 +253,7 @@ describe('identifiers', () => {
   })
 
   test('leaves out what only looks like one: a shell variable, a word of hex, prose with a slash, a system path, a URL', () => {
-    expect([...identifiersIn('awk {print $1}; deadbeef; 12345678; pass/fail and Observer/Reflector; /dev/null; https://example.com/a/b.ts').keys()]).toEqual([])
+    expect([...identifiersIn('awk {print $1}; deadbeef; 12345678; pass/fail and input/output; /dev/null; https://example.com/a/b.ts').keys()]).toEqual([])
   })
 
   test('a context holds a path by its last two segments, and a hash by its prefix', () => {
@@ -627,11 +625,10 @@ describe('the plan and the report', () => {
     questions: [{ id: 'dir', ask: 'Where do worktrees go?', from: 2, expect: ['.worktrees'] }],
   }
 
-  test('plans every model call: observation per chunk, reflections, one /compact per boundary, questions per configuration', () => {
+  test('plans every model call: observation per chunk, one /compact per boundary, questions per configuration', () => {
     const t = parseTranscript(threeBoundaries().text())
     const calls = planCalls('t', t, spec)
     expect(calls.filter((c) => c.stage === 'observer').length).toBe(4) // one small chunk per span
-    expect(calls.filter((c) => c.stage === 'reflector').map((c) => c.boundary)).toEqual([1, 2])
     expect(calls.filter((c) => c.stage === 'compaction').map((c) => [c.boundary, c.inTokens])).toEqual([
       [1, 150_000],
       [2, 150_000],
@@ -646,10 +643,9 @@ describe('the plan and the report', () => {
     const recall = calls.find((c) => c.stage === 'question' && c.configs[0] === 'om+recall')!
     const plain = calls.find((c) => c.stage === 'question' && c.configs[0] === 'om')!
     expect(recall.usd).toBeGreaterThan(plain.usd)
-    // A stub replay's Observer calls replace the estimate of them; reflections stay estimated.
+    // A stub replay's Observer calls replace the estimate of them.
     const stubbed = planCalls('t', t, spec, { omCalls: [{ kind: 'observer', inTokens: 1000 }, { kind: 'observer', inTokens: 2000 }] })
     expect(stubbed.filter((c) => c.stage === 'observer').map((c) => c.inTokens)).toEqual([1000, 2000])
-    expect(stubbed.filter((c) => c.stage === 'reflector').length).toBe(2)
     const text = describeCalls(calls)
     expect(text).toStartWith(`Dry run: ${calls.length} planned model call(s), none made.`)
     expect(text).toContain('| om+recall |')
@@ -770,70 +766,6 @@ describe('a chain of transcripts', () => {
     const tiers = chainSpec([{ name: 'a', offset: 0, spec: { constraints: [], questions: [{ id: 'exact:sha', ask: '?', from: 0 }, { id: 'why', ask: '?', from: 0 }, { id: 'pr', ask: '?', from: 0, tier: 'lookup' }] } }])
     // The member prefix would hide exact:, so the tier is settled first.
     expect(tiers.questions.map((q) => [q.id, q.tier])).toEqual([['a-exact:sha', 'lookup'], ['a-why', 'core'], ['a-pr', 'lookup']])
-  })
-})
-
-describe('reflections', () => {
-  const t = () => parseTranscript(threeBoundaries().text())
-  const worktrees: ConstraintSpec = { id: 'worktrees', quote: 'Worktrees go in .worktrees.', setIn: 0, held: ['\\.worktrees'] }
-  const spec: ReplaySpec = { constraints: [worktrees], questions: [] }
-  const corrections = ['🔴 2026-09-24 12:00 User: "Worktrees go in .worktrees."']
-  // Three observations replaced by two, a newer one left alone.
-  const reflection: Reflection = {
-    at: 0,
-    afterBoundary: 1,
-    before: {
-      corrections,
-      entries: [
-        { id: 'o1', line: '🔴 2026-09-24 12:00 User wants worktrees in .worktrees', source: { from: 0, to: 60_000 } },
-        { id: 'o2', line: '🟡 2026-09-24 12:02 Assistant read hooks/register.ts at 1a2b3c4d; git log showed 9f8e7d6c', source: { from: 120_000, to: 240_000 } },
-        { id: 'o3', line: '🟢 2026-09-24 12:03 Assistant listed files' },
-        { id: 'o4', line: '🟡 2026-09-24 12:10 User asked about issue #13', source: { from: 600_000, to: 660_000 } },
-      ],
-    },
-    after: {
-      corrections,
-      entries: [
-        { id: 'o5', line: '🟡 2026-09-24 12:02 Assistant worked in hooks/register.ts', source: { from: 0, to: 240_000 } },
-        { id: 'o6', line: '🟢 2026-09-24 12:03 Assistant listed files', source: { from: 0, to: 60_000 } },
-        { id: 'o4', line: '🟡 2026-09-24 12:10 User asked about issue #13', source: { from: 600_000, to: 660_000 } },
-      ],
-    },
-    logged: { tokensBefore: 41_000, tokensAfter: 18_000, level: 2 },
-  }
-
-  test('scores what a reflection kept of the memory before it', () => {
-    const s = scoreReflection(t(), spec, reflection)
-    expect(s.lines).toEqual({ replaced: 3, written: 2, untouched: 1 })
-    expect(s.red).toEqual({ replaced: 1, written: 0 })
-    expect(s.correctionsUnchanged).toBe(true)
-    // The corrections still hold the constraint; the observations alone lost it.
-    expect(s.constraints).toEqual({ before: 1, after: 1, total: 1, lost: [] })
-    expect(s.constraintsInObservations).toEqual({ before: 1, after: 0, lost: ['worktrees'] })
-    // Boundaries 2 and 3 need hooks/register.ts, 9f8e7d6 and #13, all held before; the reflection lost the hash.
-    expect(s.identifiers.heldBefore).toBe(3)
-    expect(s.identifiers.keptAfter).toBe(2)
-    expect(s.identifiers.lost.map((x) => x.key)).toEqual(['9f8e7d6'])
-    expect(s.early).toEqual({ total: 3, heldBefore: 3, keptAfter: 1 })
-    // o5 got the whole span of what it replaced (the plugin's fallback), o6 a range of its own.
-    expect(s.sources).toEqual({ replaced: 2, written: 2, wholeSpan: 1, medianMinutes: { replaced: 2, written: 4 } })
-  })
-
-  test('a changed corrections section shows', () => {
-    const changed = { ...reflection, after: { ...reflection.after, corrections: [] } }
-    const s = scoreReflection(t(), spec, changed)
-    expect(s.correctionsUnchanged).toBe(false)
-    expect(s.constraints.lost).toEqual(['worktrees'])
-  })
-
-  test('renders a row per reflection, and a private replay without what was lost', () => {
-    const text = renderReflections({ name: 'demo', t: t(), spec, reflections: [reflection], target: 20_000 })
-    expect(text).toContain('| 1 | 1 | 41,000 → 18,000 (20,000) | 2 | 3 → 2 (1) | 1 → 0 | yes | 1 → 1 of 1 | 1 → 0 | 2/3 (67%) | 3 → 1 of 3 | 2/2 (1) | 2 → 4 |')
-    expect(text).toContain('from the observations alone worktrees; identifiers lost 9f8e7d6')
-    const quiet = renderReflections({ name: 'demo', t: t(), spec, reflections: [reflection], target: 20_000, private: true })
-    expect(quiet).not.toContain('9f8e7d6')
-    expect(quiet).not.toContain('worktrees')
-    expect(renderReflections({ name: 'demo', t: t(), reflections: [], target: 20_000 })).toContain('No reflection ran.')
   })
 })
 

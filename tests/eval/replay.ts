@@ -125,8 +125,7 @@ export function parseTranscript(jsonl: string | readonly Raw[]): Transcript {
 // ---- A chain of transcripts: one long session ----
 
 /**
- * Several transcripts as one continued session, in the order given (issue: the Reflector never ran on a real
- * session, none of which grew its memory to REFLECT_AT_TOKENS). Each transcript's rows follow the one before, and
+ * Several transcripts as one continued session, in the order given. Each transcript's rows follow the one before, and
  * every one but the last has its timestamps shifted back so it ends `gapMs` before the next one starts; the last
  * keeps its own, so nothing lands after the newest real row (a question session resumed on a seeded copy appends
  * rows stamped now, which must come after every seeded one). The order within each is kept. `offsets[i]` is how
@@ -201,7 +200,7 @@ const PATTERNS: [IdentifierKind, RegExp][] = [
 // System paths name no work of the session's.
 const SYSTEM_PATH = /^\/(?:dev|usr|bin|sbin|proc|etc|lib)\//
 // A relative path names a file (a segment with an extension) or a directory with a `-`, `_` or `.` in a segment:
-// `pass/fail` or `Observer/Reflector` is prose.
+// `pass/fail` or `input/output` is prose.
 const PATH_LIKE = /\.\w+$|[-_.]/
 
 /** Text as the scorer reads it: a home directory as `~`. */
@@ -411,131 +410,6 @@ export function earlyNeeded(t: Transcript): Needed[] {
   return [...tracked.values()]
 }
 
-// ---- Reflections ----
-
-/** An observation as the ledger holds it: its line, and the transcript times it was drawn from. */
-export type Observation = { id: string; line: string; source?: { from: number; to: number } }
-/** The ledger's observations and the user's constraints in force (its corrections), at one moment. */
-export type MemoryState = { entries: readonly Observation[]; corrections: readonly string[] }
-/**
- * One reflection in a replay: the ledger just before it replaced observations and just after, when it landed (the
- * virtual clock), how many compactions had run by then, and what the plugin logged of it.
- */
-export type Reflection = {
-  at: number
-  afterBoundary: number
-  before: MemoryState
-  after: MemoryState
-  logged?: { tokensBefore: number; tokensAfter: number; level: number }
-}
-
-export type ReflectionScore = {
-  /** Observations the reflection replaced, the ones it wrote in their place, and the newer ones it left alone. */
-  lines: { replaced: number; written: number; untouched: number }
-  /** 🔴 lines (the user's constraints as the Observer marked them) among those replaced, and among those written. */
-  red: { replaced: number; written: number }
-  /** The corrections section passes through the reflection unchanged, as the plugin promises. */
-  correctionsUnchanged: boolean
-  /** Constraints in force at the next boundary, held by the whole memory (corrections and observations). */
-  constraints: { before: number; after: number; total: number; lost: string[] }
-  /** The same, in the observations alone: what the corrections section does not carry. */
-  constraintsInObservations: { before: number; after: number; lost: string[] }
-  /** Identifiers needed at a boundary after the reflection that the memory held before it, and those it still held after. */
-  identifiers: { heldBefore: number; keptAfter: number; lost: Needed[] }
-  /** Identifiers first seen in span 0 that some boundary needs (as drift tracks them), held before and after. */
-  early: { total: number; heldBefore: number; keptAfter: number }
-  /**
-   * Source ranges: of the lines written, how many have one, how many have exactly the whole span of the lines
-   * replaced (the plugin's fallback when the Reflector gave none it could keep: om_recall then searches the whole
-   * span), and the median width in minutes of the replaced lines' ranges and of the written lines'.
-   */
-  sources: { replaced: number; written: number; wholeSpan: number; medianMinutes: { replaced: number; written: number } }
-}
-
-const memoryText = (m: MemoryState, corrections = true) => [...(corrections ? m.corrections : []), ...m.entries.map((e) => e.line)].join('\n')
-const median = (xs: number[]) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]! : 0)
-
-/**
- * What one reflection kept of what the memory held, scored with no model: constraints in force at the next boundary
- * (in the whole memory and in the observations alone), needed identifiers of every later boundary, the early facts
- * drift tracks, 🔴 lines, and source ranges.
- */
-export function scoreReflection(t: Transcript, spec: ReplaySpec | undefined, r: Reflection): ReflectionScore {
-  const beforeIds = new Set(r.before.entries.map((e) => e.id))
-  const afterIds = new Set(r.after.entries.map((e) => e.id))
-  const replaced = r.before.entries.filter((e) => !afterIds.has(e.id))
-  const written = r.after.entries.filter((e) => !beforeIds.has(e.id))
-  const red = (es: readonly Observation[]) => es.filter((e) => e.line.startsWith('🔴')).length
-  const whole = { before: normalize(memoryText(r.before)), after: normalize(memoryText(r.after)) }
-  const obs = { before: normalize(memoryText(r.before, false)), after: normalize(memoryText(r.after, false)) }
-  const next = r.afterBoundary + 1
-  const inForce = (spec?.constraints ?? []).filter((c) => c.setIn < next && !(c.reversal && c.reversal.in < next))
-  const shows = (text: string, c: ConstraintSpec) => matches(text, c.held)
-  const needed = new Map<string, Needed>()
-  for (let n = next; n <= t.boundaries.length; n++) for (const x of neededIdentifiers(t, n)) if (!needed.has(x.key) && holds(whole.before, x.key, x.kind)) needed.set(x.key, x)
-  const kept = [...needed.values()].filter((x) => holds(whole.after, x.key, x.kind))
-  const early = earlyNeeded(t)
-  const sources = (es: readonly Observation[]) => es.flatMap((e) => (e.source ? [e.source] : []))
-  const span = sources(replaced).reduce<{ from: number; to: number } | undefined>((s, x) => (s ? { from: Math.min(s.from, x.from), to: Math.max(s.to, x.to) } : { ...x }), undefined)
-  const minutes = (es: readonly Observation[]) => median(sources(es).map((s) => (s.to - s.from) / 60_000))
-  return {
-    lines: { replaced: replaced.length, written: written.length, untouched: r.after.entries.length - written.length },
-    red: { replaced: red(replaced), written: red(written) },
-    correctionsUnchanged: r.before.corrections.join('\n') === r.after.corrections.join('\n'),
-    constraints: {
-      before: inForce.filter((c) => shows(whole.before, c)).length,
-      after: inForce.filter((c) => shows(whole.after, c)).length,
-      total: inForce.length,
-      lost: inForce.filter((c) => shows(whole.before, c) && !shows(whole.after, c)).map((c) => c.id),
-    },
-    constraintsInObservations: {
-      before: inForce.filter((c) => shows(obs.before, c)).length,
-      after: inForce.filter((c) => shows(obs.after, c)).length,
-      lost: inForce.filter((c) => shows(obs.before, c) && !shows(obs.after, c)).map((c) => c.id),
-    },
-    identifiers: { heldBefore: needed.size, keptAfter: kept.length, lost: [...needed.values()].filter((x) => !kept.includes(x)) },
-    early: { total: early.length, heldBefore: early.filter((x) => holds(whole.before, x.key, x.kind)).length, keptAfter: early.filter((x) => holds(whole.after, x.key, x.kind)).length },
-    sources: {
-      replaced: sources(replaced).length,
-      written: sources(written).length,
-      wholeSpan: span ? written.filter((e) => e.source?.from === span.from && e.source?.to === span.to).length : 0,
-      medianMinutes: { replaced: minutes(replaced), written: minutes(written) },
-    },
-  }
-}
-
-/**
- * The reflections of one replay, a row each, then (unless private) the constraints and identifiers each one lost.
- * `target` is the size a reflection must come under (REFLECT_TARGET_TOKENS).
- */
-export function renderReflections(r: { name: string; t: Transcript; spec?: ReplaySpec; reflections: readonly Reflection[]; target: number; private?: boolean }): string {
-  const out = [`## Reflections: ${r.name}`, '']
-  if (!r.reflections.length) return [...out, 'No reflection ran.', ''].join('\n')
-  const scores = r.reflections.map((x) => scoreReflection(r.t, r.spec, x))
-  out.push(
-    '| # | after boundary | tokens before → after (target) | level | lines replaced → written (untouched) | 🔴 replaced → written | corrections unchanged | constraints in force held before → after | in observations alone | needed identifiers kept | early identifiers | written lines with a source (whole span) | median source minutes |',
-    '|---:|---:|---|---:|---|---|---|---|---|---|---|---|---|',
-    ...r.reflections.map((x, i) => {
-      const s = scores[i]!
-      const size = x.logged ? `${grouped(x.logged.tokensBefore)} → ${grouped(x.logged.tokensAfter)} (${grouped(r.target)})` : '–'
-      return (
-        `| ${i + 1} | ${x.afterBoundary} | ${size} | ${x.logged?.level ?? '–'} | ${s.lines.replaced} → ${s.lines.written} (${s.lines.untouched}) | ${s.red.replaced} → ${s.red.written} | ${s.correctionsUnchanged ? 'yes' : 'NO'} | ` +
-        `${s.constraints.before} → ${s.constraints.after} of ${s.constraints.total} | ${s.constraintsInObservations.before} → ${s.constraintsInObservations.after} | ${pct(s.identifiers.keptAfter, s.identifiers.heldBefore)} | ` +
-        `${s.early.heldBefore} → ${s.early.keptAfter} of ${s.early.total} | ${s.sources.written}/${s.lines.written} (${s.sources.wholeSpan}) | ${Math.round(s.sources.medianMinutes.replaced)} → ${Math.round(s.sources.medianMinutes.written)} |`
-      )
-    }),
-    '',
-  )
-  if (!r.private)
-    scores.forEach((s, i) =>
-      out.push(
-        `- Reflection ${i + 1}: constraints lost ${s.constraints.lost.join(', ') || 'none'}; from the observations alone ${s.constraintsInObservations.lost.join(', ') || 'none'}; ` +
-          `identifiers lost ${s.identifiers.lost.map((x) => x.key).join(', ') || 'none'}`,
-      ),
-    )
-  return [...out, ''].join('\n')
-}
-
 // ---- The question stage ----
 
 /** The questions asked at boundary `n`; with `only`, just those whose id it matches (the handoff questions, say). */
@@ -740,7 +614,6 @@ const OBSERVER_CHUNK_TOKENS = 10_000
  */
 const LUNA_USD_PER_INPUT_TOKEN = 0.0032532 / 12_282
 const OBSERVER_PROMPT_TOKENS = 2_300 // the Observer's system prompt and the chunk's framing
-const REFLECTOR_IN_TOKENS = 40_000
 /** A built-in summary's size, and a headless session's own overhead (system prompt and tool definitions). */
 const SUMMARY_TOKENS = 5_000
 const SESSION_OVERHEAD_TOKENS = 20_000
@@ -753,7 +626,7 @@ export type PlannedCall = {
   transcript: string
   /** The configurations that share the call: a compaction serves both its plain and its +recall configuration. */
   configs: readonly Configuration[]
-  stage: 'observer' | 'reflector' | 'compaction' | 'question'
+  stage: 'observer' | 'compaction' | 'question'
   boundary?: number
   model: string
   what: string
@@ -767,17 +640,14 @@ const sonnet = PRICES_USD_PER_MTOK.find((p) => p.model.test(MODEL))!
 const sonnetUsd = (inTokens: number, outTokens: number) => (inTokens * sonnet.cacheWrite5m + outTokens * sonnet.output) / 1e6
 
 export type PlanOptions = {
-  /**
-   * The om replay's own calls, from a stub replay: its Observer calls replace the estimate of them. Its Reflector
-   * calls do not: a stub's short observations never reach the Reflector's threshold, so reflections stay estimated.
-   */
-  omCalls?: readonly { kind: 'observer' | 'reflector'; inTokens: number }[]
+  /** The om replay's own calls, from a stub replay: its Observer calls replace the estimate of them. */
+  omCalls?: readonly { kind: string; inTokens: number }[]
 }
 
 /**
  * Every model call a full run would make, with an estimate of its tokens and cost. om compacts offline through the
- * checkout's hooks, its Observer and Reflector calls through pi (Luna), one per ~10k-token chunk of each span and,
- * as an estimate, one reflection per boundary after the first; a stub replay's own count replaces the estimate. The
+ * checkout's hooks, its Observer calls through pi (Luna), one per ~10k-token chunk of each span; a stub replay's own
+ * count replaces the estimate. The
  * built-in chain is one `/compact` per boundary in a resumed Sonnet session holding about the session's own
  * pre-compaction context. The question stage is one headless Sonnet session per boundary and configuration that
  * has questions, given that configuration's compacted context; a +recall one may search the transcript.
@@ -786,7 +656,7 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
   const calls: PlannedCall[] = []
   const om: Configuration[] = ['om', 'om+recall']
   const builtin: Configuration[] = ['builtin', 'builtin+recall']
-  const luna = (stage: 'observer' | 'reflector', inTokens: number, what: string, boundary?: number, outTokens = 700) =>
+  const luna = (stage: 'observer', inTokens: number, what: string, boundary?: number, outTokens = 700) =>
     calls.push({ transcript: name, configs: om, stage, ...(boundary ? { boundary } : {}), model: 'luna (pi)', what, inTokens, outTokens, usd: inTokens * LUNA_USD_PER_INPUT_TOKEN })
   const spanTokens = t.spans.map((span) => span.reduce((n, r) => n + estimateTokens(messageText(r)), 0))
   const observed = options.omCalls?.filter((c) => c.kind === 'observer')
@@ -796,7 +666,6 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
     if (!observed)
       for (let c = 0; c < chunks; c++)
         luna('observer', Math.min(OBSERVER_CHUNK_TOKENS, tokens - c * OBSERVER_CHUNK_TOKENS) + OBSERVER_PROMPT_TOKENS, `observe span ${k}, chunk ${c + 1} of ${chunks}`)
-    if (k >= 1 && k < t.boundaries.length) luna('reflector', REFLECTOR_IN_TOKENS, `reflect after boundary ${k} (estimated)`, k, 8_000)
   })
   for (const b of t.boundaries) {
     const inTokens = b.preTokens ?? (b.n === 1 ? spanTokens[0]! : SUMMARY_TOKENS + spanTokens[b.n - 1]!)

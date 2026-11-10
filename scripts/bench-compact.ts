@@ -6,22 +6,22 @@
 //   bun scripts/bench-compact.ts run --plugin <ref|dir> [--record] [--samples N] [--json FILE] [--items]
 //   bun scripts/bench-compact.ts ab --a <ref|dir> --b <ref|dir>[,<ref|dir>...] [--record] [--samples N] [--json FILE]
 //     per gate: scores, passed/total, flips; per transcript Δ. The verdict needs the weighted Δ, the sign of the net flips
-//     per unique item (gate, id) and 2 of 3 transcripts to agree. When B's Observer/Reflector cache keys differ from A's,
+//     per unique item (gate, id) and 2 of 3 transcripts to agree. When B's Observer cache keys differ from A's,
 //     B's replies are other model draws: the verdict also needs Δ beyond the noise floor, A's sample spread (--samples N)
 //     or A against its resample A' (sample 2, read from CACHE-s2; record it once: run --plugin <A> --record --samples 2).
 //   Efficiency is reported beside the quality total, never in it (docs/plans/compaction-goals.md in the main checkout):
-//     context tokens per cut, reduction ratio against the source's preTokens, Observer/Reflector calls and tokens,
+//     context tokens per cut, reduction ratio against the source's preTokens, Observer calls and tokens,
 //     critical-path calls (started inside session.compact). ab prints "efficiency: better/worse/same" (±10% on mean
 //     tokens, ratio, model tokens; ±1 critical-path call per transcript) and warns when B wins on quality but is worse on
 //     efficiency. When B's mean context tokens or model tokens are more than 10% above A's, B's verdict is at best
 //     "tradeoff", never "better". Latency is virtual: calls and tokens are measured, time is not.
 //   ab --a/--b also take contexts:DIR (ready-made contexts, as run --contexts), e.g. to price a hand-made context.
-//   --chain (run; on for ab, --no-chain to skip): also replay the reflection chain (CHAIN, the one track where the
-//     Reflector runs), graded by the mechanical gates and its specs, reported apart, never in the total. ab fails when B
-//     changes the Reflector's prompt or REFLECT_* constants and neither side made a Reflector call.
-//   --long (run, ab): also replay the long chain (LONG: 13 sessions a day apart through bench-replay --gap-hours 24, 80 compactions, reflections and the
+//   --chain (run; on for ab, --no-chain to skip): also replay the chain (CHAIN, four sessions chained into one, whose
+//     observations outgrow the memory message's cap), graded by the mechanical gates and its specs, reported apart,
+//     never in the total.
+//   --long (run, ab): also replay the long chain (LONG: 13 sessions a day apart through bench-replay --gap-hours 24, 80 compactions and the
 //     constraint cap), graded at every 5th cut by its members' items and its own, reported apart, never in the total, with
-//     the recall-aware credit (rubric.ts pointed) and the reflections and fallbacks it reached. A compaction that falls back
+//     the recall-aware credit (rubric.ts pointed) and the fallbacks it reached. A compaction that falls back
 //     takes the source session's own summary and the chain goes on (bench-replay --fallback recorded).
 //   --holdout (run; on for ab, --no-holdout to skip): also grade the holdout sessions (tests/fixtures/holdout.local.json)
 //     by the mechanical gates only, reported apart, never in the total. In ab its Δ is informational; with --samples N it
@@ -30,8 +30,6 @@
 //   --behavior (run, ab): also Luna (--thinking max, no tools) answers probes on each context (tests/eval/behavior.ts),
 //     3 samples, majority vote, graded by code; reported apart from retention. Answers are cached in BCACHE by
 //     sha256(context + probes + prompt + reader argv), so identical contexts in A and B cost nothing; misses are called.
-//     --b-reflector-sample K (ab): B's Reflector calls read and write their own cache CACHE-r<K> (its Observer calls stay
-//     in CACHE): with B = A's plugin, a resample of the Reflector draws alone, the noise floor of the chain and long tracks.
 //     --b-reader-sample K (ab, with --behavior): B's reader answers are cached apart, under sample K: with B = A's plugin,
 //     fresh reader draws on the same contexts, the noise floor of the behavior total.
 //     --behavior-sample K: read sample K's contexts instead of the first sample's (with --samples K or more).
@@ -44,7 +42,7 @@
 //     transcript's context passes, unless the item lists that transcript in `shared`)
 //
 // A ref is archived (git archive) into <main checkout>/.scratch/bench-compact/src-<sha>; a dir is used as it is, uncommitted edits too.
-// Observer/Reflector replies come from CACHE, keyed by sha256(pi argv incl. system prompt + stdin): a variant that
+// Observer replies come from CACHE, keyed by sha256(pi argv incl. system prompt + stdin): a variant that
 // changes neither replays for free and exactly. A miss fails the run unless --record, which calls pi (openai-codex
 // models only) and stores the reply; --samples N runs N independent samples (sample k>1 in its own cache CACHE-s<k>).
 // One Observer miss changes every later call of that chained replay, so a changed Observer input is one draw per transcript.
@@ -73,7 +71,7 @@ import { grade, hasExpect, itemTier, norm, pointed, proseContext, score } from '
 import type { Probe } from '../tests/eval/behavior'
 import { BSAMPLES, contextSquashed, gradeAnswer, input, isUnknown, parse, probes, PROMPT } from '../tests/eval/behavior'
 import type { BItem, Eff, Replay, Run, Sample, Tally } from '../tests/eval/report'
-import { ab, behaviorAb, behaviorCard, bRate, continuationCards, effRun, f1, longCard, longStats, reflections, sameKeys, scorecard, signed, tiered, total } from '../tests/eval/report'
+import { ab, behaviorAb, behaviorCard, bRate, continuationCards, effRun, f1, longCard, longStats, sameKeys, scorecard, signed, tiered, total } from '../tests/eval/report'
 import { fail, mainCheckout, num, options, str } from './cli'
 import { wireFixtures } from './wire-fixtures'
 
@@ -93,14 +91,14 @@ type Entry = { name: string; src: string; bytes: number }
 // The holdout: more real sessions, graded by the mechanical gates only (no specs), never in the main total.
 const HOLDOUT_LIST = `${mainCheckout()}/tests/fixtures/holdout.local.json`
 const HOLDOUT: Entry[] = existsSync(HOLDOUT_LIST) ? JSON.parse(readFileSync(HOLDOUT_LIST, 'utf8')) : []
-// The reflection track: no single corpus session grows the memory to REFLECT_AT_TOKENS, so a Reflector change ties
-// exactly there. This chain of four (chainTranscripts) reflects once, after boundary 22; graded by the mechanical gates
-// and its members' specs plus its own (lost-* questions on what the reflection replaced), reported apart from the total.
+// The chain track: no single corpus session grows its observations past the memory message's cap (MEMORY_MAX_TOKENS),
+// so what the cap drops is never seen there. This chain of four (chainTranscripts) does; graded by the mechanical gates
+// and its members' specs plus its own (its lost-* questions were written for the removed Reflector), reported apart.
 const CHAIN = [{ name: 'om-v04+om-orchestration+firstmate-11+firstmate-6' }]
 // The long chain (--long): 13 real sessions (none of the holdout's), oldest first, a day apart, as one indefinite
 // session of 80 compactions, graded at every LONG_EVERY-th cut. Its rubric: its members' items at their offsets plus
 // tests/fixtures/long.{rubric,hard}.local.ts (long-range items at the chain's boundaries). Reported apart from the total,
-// with recall-aware credit (pointedCredit) and the reflections, reflection failures and constraint-cap fallbacks reached.
+// with recall-aware credit (pointedCredit) and the constraint-cap fallbacks reached.
 const LONG_CORPUS: Entry[] = [
   { name: 'work-5', src: `${P}/-home-cameron-work/101da71e-42f4-490c-ad32-c48ba1527f0b.jsonl`, bytes: 6227881 },
   { name: 'lanterns-3', src: `${P}/-home-cameron-work-lanterns/2078477b-03db-4edd-a2f4-30ce476deead.jsonl`, bytes: 1401102 },
@@ -217,7 +215,7 @@ async function load<T>(files: string[], key: string): Promise<T | undefined> {
   return undefined
 }
 
-type Call = { kind: 'observer' | 'reflector'; atCompaction: boolean; inTokens: number; in: number; out: number }
+type Call = { kind: 'observer'; atCompaction: boolean; inTokens: number; in: number; out: number }
 function effOf(t: Transcript, contexts: (Context | undefined)[], calls: Call[]): Eff {
   const tally = (cs: Call[]): Tally => ({ calls: cs.length, in: cs.reduce((a, c) => a + (c.in || c.inTokens), 0), out: cs.reduce((a, c) => a + c.out, 0) })
   const cuts = t.boundaries.flatMap((b, i) => {
@@ -229,7 +227,7 @@ function effOf(t: Transcript, contexts: (Context | undefined)[], calls: Call[]):
   })
   return {
     tokens: cuts.map((c) => c.tokens), ratio: cuts.map((c) => c.ratio),
-    observer: tally(calls.filter((c) => c.kind === 'observer')), reflector: tally(calls.filter((c) => c.kind === 'reflector')), critical: tally(calls.filter((c) => c.atCompaction)),
+    observer: tally(calls.filter((c) => c.kind === 'observer')), critical: tally(calls.filter((c) => c.atCompaction)),
   }
 }
 
@@ -249,12 +247,11 @@ async function slot<T>(f: () => Promise<T>): Promise<T> {
   }
 }
 
-async function replay(name: string, dir: string, record: boolean, sample: number, reflectorSample?: number): Promise<Replay> {
+async function replay(name: string, dir: string, record: boolean, sample: number): Promise<Replay> {
   const cache = sample === 1 ? CACHE : `${CACHE}-s${sample}`
-  const refl = reflectorSample ? ['--reflector-cache', `${CACHE}-r${reflectorSample}`] : []
   const out = `${OUT}/runs/${createHash('sha256').update(`${dir}\0${sample}\0${Date.now()}\0${process.pid}\0${Math.random()}`).digest('hex').slice(0, 10)}-${name}`
   const long = name === LONG.name ? ['--gap-hours', String(LONG_GAP_HOURS), '--fallback', 'recorded'] : []
-  const args = ['scripts/bench-replay.ts', 'om', '--transcript', members(name).join('+'), ...long, '--src', dir, '--cache', cache, ...refl, '--out', out, '--dir', corpusDir(), '--pi', record ? 'live' : 'strict', ...(record ? ['--max-calls', '2000'] : [])]
+  const args = ['scripts/bench-replay.ts', 'om', '--transcript', members(name).join('+'), ...long, '--src', dir, '--cache', cache, '--out', out, '--dir', corpusDir(), '--pi', record ? 'live' : 'strict', ...(record ? ['--max-calls', '2000'] : [])]
   const p = Bun.spawn(['bun', ...args], { cwd: HERE, stdout: 'ignore', stderr: 'pipe' })
   const [stderr, status] = await Promise.all([new Response(p.stderr).text(), p.exited])
   if (status !== 0) fail(`${name}: the replay failed:\n${stderr.slice(-2000)}`)
@@ -265,7 +262,7 @@ async function replay(name: string, dir: string, record: boolean, sample: number
   )
   const calls = JSON.parse(readFileSync(`${out}/calls.json`, 'utf8')) as (Call & { key?: string; prompt: string })[]
   const keys = calls.map((c) => c.key ?? c.prompt).sort()
-  return { name, contexts, calls: s.luna.calls, fresh: s.luna.calls - s.luna.cacheHits, failed: s.luna.failed, keys, eff: effOf(t, contexts, calls), fallbacks: s.fallbacks ?? [], reflections: s.luna.reflections }
+  return { name, contexts, calls: s.luna.calls, fresh: s.luna.calls - s.luna.cacheHits, failed: s.luna.failed, keys, eff: effOf(t, contexts, calls), fallbacks: s.fallbacks ?? [] }
 }
 
 function readyMade(name: string, root: string): Replay {
@@ -367,7 +364,7 @@ async function behavior(label: string, dir: string, replays: Replay[], readerSam
 }
 
 /** `first`: the first sample's number (default 1). `lenient`: a cache miss throws instead of ending the run. */
-async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; reflectorSample?: number; readerSample?: number }): Promise<Run> {
+async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; readerSample?: number }): Promise<Run> {
   if (o.record && o.dir) {
     const model = /'--model', '([^']+)'/.exec(readFileSync(`${o.dir}/hooks/register.ts`, 'utf8'))?.[1] ?? ''
     if (!model.startsWith('openai-codex/')) fail(`--record: ${o.dir}'s pi model is "${model}"; only openai-codex models may be called`)
@@ -384,7 +381,7 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
       const r = await started[i]!
       console.error(`[${label}] ${kind === 'main' ? '' : `${kind} `}${name}${o.samples > 1 ? ` sample ${k}` : ''}`)
       if (r.failed && o.lenient) throw new Error(`${name}: not cached`)
-      if (r.failed) fail(`${label} ${name}: ${r.failed} of ${r.calls} Observer/Reflector calls are not cached (the variant changed their prompt or input); pass --record to call pi for them`)
+      if (r.failed) fail(`${label} ${name}: ${r.failed} of ${r.calls} Observer calls are not cached (the variant changed their prompt or input); pass --record to call pi for them`)
       const text = textOf(name)
       const t = parsedOf(name)
       const spec = specs ? await specFor(name) : undefined
@@ -401,7 +398,7 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
   }
   // Every replay starts at once, through slot(); grading waits for each in turn. The long chain and the chain first: they run longest.
   const start = (entries: { name: string }[], k: number) =>
-    entries.map(({ name }) => (o.contexts ? Promise.resolve(readyMade(name, o.contexts)) : slot(() => replay(name, o.dir!, o.record, k, o.reflectorSample))))
+    entries.map(({ name }) => (o.contexts ? Promise.resolve(readyMade(name, o.contexts)) : slot(() => replay(name, o.dir!, o.record, k))))
   const ks = Array.from({ length: o.samples }, (_, i) => (o.first ?? 1) + i)
   const started = ks.map((k) => {
     const long = run.long ? start([LONG], k) : []
@@ -419,24 +416,8 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
 }
 /** The holdout as a run of its own, for the scorecard and the A/B table. */
 const holdoutOf = (r: Run): Run => ({ label: `${r.label} (holdout)`, samples: r.holdout! })
-const chainOf = (r: Run): Run => ({ label: `${r.label} (reflection chain)`, samples: r.chain! })
+const chainOf = (r: Run): Run => ({ label: `${r.label} (chain)`, samples: r.chain! })
 const longOf = (r: Run): Run => ({ label: `${r.label} (long chain, every ${LONG_EVERY}th cut)`, samples: r.long! })
-/**
- * The Reflector's code as a variant would change it: REFLECTOR_SYSTEM_PROMPT, reflectionPrompt (prompts.ts) and the
- * REFLECT_* constants (register.ts).
- */
-function reflectorCode(dir: string) {
-  const block = (text: string, start: RegExp) => {
-    const lines = text.split('\n')
-    const i = lines.findIndex((l) => start.test(l))
-    if (i < 0) return ''
-    const end = lines.findIndex((l, j) => j > i && /^(?:export |const |function |type |let )/.test(l))
-    return lines.slice(i, end < 0 ? undefined : end).join('\n')
-  }
-  const prompts = readFileSync(`${dir}/hooks/prompts.ts`, 'utf8')
-  const register = readFileSync(`${dir}/hooks/register.ts`, 'utf8')
-  return [block(prompts, /^export const REFLECTOR_SYSTEM_PROMPT\b/), block(prompts, /^export function reflectionPrompt\b/), ...register.split('\n').filter((l) => /^const REFLECT_\w+ *=/.test(l))].join('\n')
-}
 
 const [command, ...rest] = process.argv.slice(2)
 const o = options(rest)
@@ -475,12 +456,8 @@ else if (command === 'run') {
   // A and every B at once: their replays share the JOBS slots.
   const [a, ...bs] = await Promise.all([
     evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior }),
-    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, reflectorSample: num(o, 'b-reflector-sample'), readerSample: num(o, 'b-reader-sample') })),
+    ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, readerSample: num(o, 'b-reader-sample') })),
   ])
-  // A Reflector change that nothing reflects on ties exactly and says nothing: refuse to call it a tie.
-  for (const [sb, b] of sbs.map((x, i) => [x, bs[i]!] as const))
-    if (sa.dir && sb.dir && reflectorCode(sa.dir) !== reflectorCode(sb.dir) && !reflections(a) && !reflections(b))
-      fail(`${sb.label} changes the Reflector (REFLECTOR_SYSTEM_PROMPT, reflectionPrompt or REFLECT_*), but neither side made a Reflector call: the A/B cannot see it. Run without --no-chain.`)
   // A's resample A' (the sample after the last, from its own cache), for the noise floor of a B whose Observer input changed.
   if (samples === 1 && sa.dir && bs.some((b) => !sameKeys(a.samples, b.samples) || (a.holdout && !sameKeys(a.holdout, b.holdout!))))
     a.noise = await evaluate(`A' ${sa.label}`, { dir: sa.dir, record: false, samples: 1, first: 2, lenient: true, holdout })
@@ -500,10 +477,10 @@ else if (command === 'run') {
     const main0 = ab(a, b)
     const lg = longs[i]
     if (lg) main0.text += `\n${lg.l.text.replace('# Compaction A/B', '## Long chain (not in the total)')}\nRecall-aware credit (not in any total): A ${f1(lg.ca)}, B ${f1(lg.cb)} (${signed(lg.cb - lg.ca)}); tiered A ${f1(lg.ta)}, B ${f1(lg.tb)} (${signed(lg.tb - lg.ta)})\n`
-    // The reflection chain: its own verdict, informational when its Observer draws differ (no resample of it is recorded).
+    // The chain: its own verdict, informational when its Observer draws differ (no resample of it is recorded).
     const c = a.chain && b.chain ? ab(chainOf(a), chainOf(b), { informational: !sameKeys(a.chain, b.chain) && samples === 1 }) : undefined
     const main = c
-      ? { ...main0, text: `${main0.text}\n${c.text.replace('# Compaction A/B', '## Reflection chain (not in the total)')}`, cd: `${signed(c.d)} (${c.up}↑ ${c.down}↓)${c.better ? ` ${c.better}` : ''}` }
+      ? { ...main0, text: `${main0.text}\n${c.text.replace('# Compaction A/B', '## Chain (not in the total)')}`, cd: `${signed(c.d)} (${c.up}↑ ${c.down}↓)${c.better ? ` ${c.better}` : ''}` }
       : { ...main0, cd: '' }
     if (!a.holdout) return { ...main, hd: '', warn: '' }
     const h = ab({ ...holdoutOf(a), ...(a.noise?.holdout ? { noise: holdoutOf(a.noise) } : {}) }, holdoutOf(b), { informational: samples === 1 })
@@ -516,7 +493,7 @@ else if (command === 'run') {
   })
   const names = CORPUS.map((c) => c.name).join(' / ')
   const summary = [
-    `# Against ${a.label}: ${f1(total(a))} (tiered ${f1(tiered(a))})${a.holdout ? `; holdout ${f1(total(holdoutOf(a)))}` : ''}${a.chain ? `; reflection chain ${f1(total(chainOf(a)))} (tiered ${f1(tiered(chainOf(a)))})` : ''}${a.long ? `; long chain ${f1(total(longOf(a)))} (tiered ${f1(tiered(longOf(a)))}), recall-aware ${f1(longStats(a).credit)} (tiered ${f1(longStats(a).tieredCredit)})` : ''}`,
+    `# Against ${a.label}: ${f1(total(a))} (tiered ${f1(tiered(a))})${a.holdout ? `; holdout ${f1(total(holdoutOf(a)))}` : ''}${a.chain ? `; chain ${f1(total(chainOf(a)))} (tiered ${f1(tiered(chainOf(a)))})` : ''}${a.long ? `; long chain ${f1(total(longOf(a)))} (tiered ${f1(tiered(longOf(a)))}), recall-aware ${f1(longStats(a).credit)} (tiered ${f1(longStats(a).tieredCredit)})` : ''}`,
     '',
     `| B | total | Δ | tiered (Δ) | Δ ${names} | unique ↑ | unique ↓ | p | noise | verdict | efficiency | gates that moved the total |${a.holdout ? ' holdout Δ (informational) |' : ''}${a.chain ? ' chain Δ |' : ''}${a.long ? ' long Δ |' : ''}`,
     `|---|---:|---:|---:|---|---:|---:|---:|---|---|---|---|${a.holdout ? '---:|' : ''}${a.chain ? '---:|' : ''}${a.long ? '---|' : ''}`,
