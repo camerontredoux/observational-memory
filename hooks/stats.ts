@@ -1,5 +1,6 @@
 // Usage statistics: one JSON file per session, written only by that session, debounced off every hook. Global
 // figures are merged from the files when asked for. A stats failure is logged once and never breaks anything.
+import { stamp, zone } from './lines'
 import { REFLECT_AT_TOKENS } from './memory'
 
 const SAMPLES = 200 // raw samples kept per metric, newest, for medians and p90
@@ -176,6 +177,9 @@ export function percentile(sorted: readonly number[], p: number) {
 export function parseSince(text: string, now: number) {
   const rel = text.match(/^(\d+(?:\.\d+)?)([mhdw])$/)
   if (rel) return now - Number(rel[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[rel[2] as 'm' | 'h' | 'd' | 'w']
+  // A date alone is the start of that day on the machine's clock, not in UTC as Date.parse would read it.
+  const day = text.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (day) return new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3])).getTime()
   const t = Date.parse(text)
   return Number.isNaN(t) ? undefined : t
 }
@@ -229,7 +233,8 @@ const show = (key: string, n: number) => (Number.isFinite(n) ? unit(key)(n) : '-
 const sumOf = (s: SessionStats, suffix: string) =>
   Object.entries(s.metrics).reduce((t, [k, m]) => (k.endsWith(suffix) && !k.includes('.failed.') ? t + m.sum : t), 0)
 const countOf = (s: SessionStats, re: RegExp) => Object.entries(s.metrics).reduce((t, [k, m]) => (re.test(k) ? t + m.count : t), 0)
-const when = (t: number) => (Number.isFinite(t) ? new Date(t).toISOString().slice(0, 16).replace('T', ' ') : '-')
+// Times as the machine's clock shows them, with its zone named after them.
+const when = (t: number) => (Number.isFinite(t) ? stamp(t) : '-')
 
 // The table om_stats and /om-stats answer with `full`: totals, then one row per metric, each value in its metric's unit.
 export function formatReport(title: string, merged: ReturnType<typeof merge>) {
@@ -241,7 +246,7 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const lines = [
     `## ${title}`,
     '',
-    `${sessions} session(s), ${when(s.firstSeen)} to ${when(s.lastSeen)} UTC. ${compactions} compaction(s), ${calls} model call(s) ` +
+    `${sessions} session(s), ${when(s.firstSeen)} to ${when(s.lastSeen)} ${zone(s.lastSeen)}. ${compactions} compaction(s), ${calls} model call(s) ` +
       `(${failed} failed), ${dollars(sumOf(s, '.cost'))}, ${grouped(sumOf(s, '.in'))} tokens in, ${grouped(sumOf(s, '.out'))} out.`,
     '',
     '| metric | count | sum | mean | median | p90 | min | max |',
@@ -319,7 +324,7 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const { stats: s, sessions, approximate } = merged
   if (!sessions) return `observational-memory · ${head}: no stats recorded yet.`
   const [from, to] = [when(s.firstSeen), when(s.lastSeen)]
-  const lines = [`observational-memory · ${head} · ${from.slice(0, 10) === to.slice(0, 10) ? `${from}–${to.slice(11)}` : `${from} – ${to}`} UTC`, '']
+  const lines = [`observational-memory · ${head} · ${from.slice(0, 10) === to.slice(0, 10) ? `${from}–${to.slice(11)}` : `${from} – ${to}`} ${zone(s.lastSeen)}`, '']
   const row = (label: string, text: string) => lines.push(`${label.padEnd(13)}${text}`)
   // Successful calls alone, unlike formatReport's total: a failed call records no cost, and the failures get their own row.
   const calls = countOf(s, /^(observer|reflector)\.\w+\.ms$/)
@@ -494,7 +499,7 @@ export async function report(io: Io, args: Args) {
   const merged = merge(files, since)
   if (args.scope === 'all' || args.historical) head += ` (${merged.sessions})`
   if (since !== undefined) {
-    const after = ` since ${new Date(since).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+    const after = ` since ${stamp(since)} ${zone(since)}`
     title += after
     head += after
   }

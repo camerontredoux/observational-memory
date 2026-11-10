@@ -13,6 +13,15 @@ export const stamp = (ms: number) => {
   const d = new Date(ms)
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
+// The machine's time zone at `ms`, as a reader knows it ("PST", "PDT"): every time the plugin shows is local.
+export function zone(ms: number) {
+  try {
+    const name = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(new Date(ms)).find((p) => p.type === 'timeZoneName')?.value
+    if (name) return name
+  } catch {}
+  const off = -new Date(ms).getTimezoneOffset()
+  return `UTC${off < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(off) / 60))}:${pad(Math.abs(off) % 60)}`
+}
 // A local time that exists as written, or undefined (a 25:00, a Feb 30, a clock skipped at a DST change).
 export function realTime(y: number, mo: number, d: number, h: number, mi: number) {
   const date = new Date(y, mo - 1, d, h, mi)

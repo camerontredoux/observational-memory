@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { add, addCacheUse, addCompaction, addRequest, addCall, addRecall, count, emptyStats, failureClass, formatCost, formatReport, formatSummary, merge, parseArgs, parseSince, percentile, report } from '../hooks/stats'
 import type { Io, SessionStats } from '../hooks/stats'
+import { stamp, zone } from '../hooks/lines'
 
 const T0 = Date.UTC(2026, 8, 20, 12, 0)
 const DAY = 86_400_000
@@ -84,7 +85,7 @@ describe('stats', () => {
     const m = merge([a, b], since)
     expect(m.sessions).toBe(1)
     expect(m.stats.metrics['observer.background.ms']).toMatchObject({ count: 1, sum: 30_000 })
-    expect(parseSince('2026-09-21', now)).toBe(Date.UTC(2026, 8, 21))
+    expect(parseSince('2026-09-21', now)).toBe(new Date(2026, 8, 21).getTime()) // the machine's midnight
     expect(parseSince('soon', now)).toBeUndefined()
   })
 
@@ -95,7 +96,7 @@ describe('stats', () => {
     addCall(s, { kind: 'reflector', phase: 'background', ok: false, failure: 'timeout', ms: 600_000 }, T0)
     const text = formatReport('stats, session a', merge([s]))
     expect(text).toContain('## stats, session a')
-    expect(text).toContain('1 session(s), 2026-09-20 12:00 to 2026-09-20 12:00 UTC. 2 compaction(s), 4 model call(s) (1 failed), $0.0090, 30,000 tokens in, 1,500 out.')
+    expect(text).toContain(`1 session(s), ${stamp(T0)} to ${stamp(T0)} ${zone(T0)}. 2 compaction(s), 4 model call(s) (1 failed), $0.0090, 30,000 tokens in, 1,500 out.`)
     expect(text).toContain('| observer.background.ms | 3 | 1m 0s | 20.0 s | 20.0 s | 30.0 s | 10.0 s | 30.0 s |')
     expect(text).toContain('| observer.background.cost | 3 | $0.0090 | $0.0030 | $0.0030 | $0.0040 | $0.0020 | $0.0040 |')
     expect(text).toContain('| compaction.manual.ms | 1 | 250 ms |')
@@ -129,7 +130,7 @@ describe('stats', () => {
   test('the summary says what happened in plain words', () => {
     expect(formatSummary('this session (/home/u/p)', merge([busy()]), '')).toBe(
       [
-        'observational-memory · this session (/home/u/p) · 2026-09-20 12:00–12:10 UTC',
+        `observational-memory · this session (/home/u/p) · ${stamp(T0)}–${stamp(T0 + 10 * 60_000).slice(11)} ${zone(T0)}`,
         '',
         'Cost         $0.0090 across 3 observer calls (about $0.0030 each)',
         'Compactions  6: 4 main, 2 subagent',
