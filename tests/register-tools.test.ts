@@ -26,16 +26,17 @@ describe('register: tools', () => {
     expect(registered).toEqual([expect.objectContaining({ name: 'om_recall', inputSchema: expect.objectContaining({ properties: expect.objectContaining({ query: expect.anything(), ref: expect.anything(), mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: expect.any(String) } }) }) }), expect.objectContaining({ name: 'om_stats' })])
     expect(registered[0]).not.toHaveProperty('inputSchema.required')
     const text = String(found.result)
-    // The newest prompt, note 29, is the one that asked: it is never a match. Hits are cut by the size cap, newest kept.
-    expect(text).toMatch(/^30 match\(es\) for "plum-7731" in 34 blocks of the live history; showing 20, the newest\.\n\[#14 · user\] 3 lines\n  1: note \d+: the PLUM-7731 marker y+…\n/)
+    // The newest prompt, note 29, is the one that asked: it is never a match. Hits are cut by the size cap, the best
+    // kept: the short file that holds the term, then the newest notes.
+    expect(text).toMatch(/^30 match\(es\) for "plum-7731" in 34 blocks of the live history; showing 20, the newest\.\n\[#2 · Read result \/src\/auth\.ts\] 1 line\n  1: export const marker = "PLUM-7731"\n\[#15 · user\] 3 lines\n  1: note \d+: the PLUM-7731 marker y+…\n/)
     expect(text).toContain('[#33 · user] 3 lines\n  1: note 28: the PLUM-7731 marker')
     expect(text).not.toContain('note 29')
-    expect(text).toMatch(/\n10 older matches not shown; only if none above answers, repeat with "to": "#13"\.\nOnly if an excerpt is not enough, read just the lines you need: \{"mode": "read", "ref": "#33", "lines": "1-3"\}\.$/)
+    expect(text).toMatch(/\n10 older matches not shown; only if none above answers, repeat with "to": "#14"\.$/)
     expect(text.length).toBeLessThan(12_000)
     expect(String(loose.result)).toBe(
       '1 match(es) for "auth.ts nothing-like-this" in 34 blocks of the live history; no block holds every term, so these hold some, chosen by the rarest.\n' +
         'No occurrences in this session of: nothing-like-this.\n' +
-        '[#1.2 · Read call] 1 line\n  1: file_path: /src/auth.ts\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#1.2", "lines": "1-1"}.',
+        '[#2 · Read result /src/auth.ts] 1 line\n  1: export const marker = "PLUM-7731"',
     )
     const whole = String((await $.tool.call({ tool: 'mcp__observational-memory__om_recall', ref: '#33', lines: '1' })).result)
     expect(whole).toMatch(/^\[#33 · user\] lines 1-1 of 3\n   1 \| note 28: the PLUM-7731 marker y+\n… 2 more lines \(1,031 characters\); only if you still need them: \{"mode": "read", "ref": "#33", "lines": "2-3"\}\.$/)
@@ -259,7 +260,7 @@ describe('register: tools', () => {
 
     const found = await $.tool.call({ tool: 'mcp__observational-memory__om_recall', query: 'PLUM' })
 
-    expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 blocks of the live history.\n[#2 · Read result] 1 line\n  1: export const marker = "PLUM-7731"\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#2", "lines": "1-1"}.')
+    expect(String(found.result)).toBe('1 match(es) for "PLUM" in 4 blocks of the live history.\n[#2 · Read result /src/auth.ts] 1 line\n  1: export const marker = "PLUM-7731"')
   })
 
   test('a genuine structured prompt that is the newest one is recognized as the asking row, never a historical search hit', async ($, on) => {
