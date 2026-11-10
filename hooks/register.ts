@@ -86,6 +86,12 @@ const RANGE_ATTEMPTS = 3
 // A subagent's history is observed in the background only once its context is within this much of its own
 // compaction point: most subagents answer before they compact, and their ledger goes with them (see dropLoop).
 const SUBAGENT_OBSERVE_TOKENS = 3 * CHUNK_TOKENS
+// The main conversation's, only once its context reaches MAIN_OBSERVE_TOKENS, or comes within MAIN_OBSERVE_MARGIN of
+// the first point it compacts at (TURN_END_COMPACT_TOKENS, or auto-compaction below it), whichever is earlier: a
+// session that never compacts costs no Observer call, and the backlog from its start (~8 chunks, ~3 s across the
+// MAX_PARALLEL slots) is observed with room to spare. A compaction before then observes it all on the spot.
+const MAIN_OBSERVE_TOKENS = 100_000
+const MAIN_OBSERVE_MARGIN = 5 * CHUNK_TOKENS
 // How long after a compaction stores its ledger as installed the loop waits for its history to show the new memory
 // message, the background landing nothing in the ledger meanwhile (see installPending).
 const INSTALL_WAIT_MS = 60_000
@@ -1318,16 +1324,18 @@ async function installPending($: EngineInterface, loop: Loop, v: View) {
   return false
 }
 
-// Whether a subagent's loop is observed in the background yet: only once its context is within SUBAGENT_OBSERVE_TOKENS
-// of its own compaction point (the session's, at most WINDOW_TOKENS: its model's window may be smaller). Most
-// subagents answer first, and their ledger goes with them. The main loop always is, and so is a subagent's when the
+// Whether a loop is observed in the background yet: a subagent's only once its context is within
+// SUBAGENT_OBSERVE_TOKENS of its own compaction point (the session's, at most WINDOW_TOKENS: its model's window may be
+// smaller), since most subagents answer first and their ledger goes with them; the main loop's past MAIN_OBSERVE_TOKENS
+// (see there), its context the larger of the history's estimate and the last request's measure. Either is when the
 // session cannot say where it compacts.
 async function observedYet($: EngineInterface, loop: Loop, v: View) {
-  if (loop.agentId === undefined) return true
   const context = (await $.session.usage({ breakdown: 'summary' }).catch(() => undefined))?.context
   const at = context?.breakdown?.autoCompactThreshold ?? context?.window
   if (at === undefined) return true
-  return OVERHEAD_TOKENS + tokensBetween(v, v.base, v.messages.length) >= Math.min(at, WINDOW_TOKENS) - SUBAGENT_OBSERVE_TOKENS
+  const tokens = OVERHEAD_TOKENS + tokensBetween(v, v.base, v.messages.length)
+  if (loop.agentId !== undefined) return tokens >= Math.min(at, WINDOW_TOKENS) - SUBAGENT_OBSERVE_TOKENS
+  return Math.max(tokens, context!.tokens ?? 0) >= Math.min(MAIN_OBSERVE_TOKENS, Math.min(at, TURN_END_COMPACT_TOKENS) - MAIN_OBSERVE_MARGIN)
 }
 
 // Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight across every loop (MAIN_SLOTS of

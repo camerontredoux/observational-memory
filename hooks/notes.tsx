@@ -68,7 +68,7 @@ export const registerNotes = (on: On) => {
       return (
         <Box flexDirection="column">
           <Text dimColor>No observations for {whose} yet.</Text>
-          <Text dimColor>The Observer writes them in the background, about every 10k tokens of history.</Text>
+          <Text dimColor>The Observer writes them once the context nears a compaction, then about every 10k tokens of history.</Text>
         </Box>
       )
 

@@ -321,7 +321,7 @@ describe('register: alignment', () => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
     ember(on)
-    on('session.usage', () => ({ value: { context: { tokens: 90_000, window: 200_000 }, rateLimits: [] } }) as never) // the fields the hook reads
+    on('session.usage', () => ({ value: { context: { tokens: 100_000, window: 200_000 }, rateLimits: [] } }) as never) // the fields the hook reads, at MAIN_OBSERVE_TOKENS: observed in the background
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)], at(22, 14, 30))
@@ -341,8 +341,8 @@ describe('register: alignment', () => {
     expect(file.metrics['observer.compaction.ms']?.count).toBeGreaterThan(0)
     expect(file.metrics['compaction.manual.syncCalls']?.sum).toBe(file.metrics['observer.compaction.ms']?.count)
     expect(file.metrics['compaction.manual.rowsObservedBefore']?.sum).toBe(7)
-    expect(file.metrics['compaction.manual.tokensBefore']?.sum).toBe(90_000)
-    expect(file.metrics['compaction.manual.estTokensAfter']?.sum).toBeLessThan(90_000)
+    expect(file.metrics['compaction.manual.tokensBefore']?.sum).toBe(100_000)
+    expect(file.metrics['compaction.manual.estTokensAfter']?.sum).toBeLessThan(100_000)
 
     const summary = String((await $.tool.call({ tool: 'mcp__observational-memory__om_stats' })).result)
     expect(summary).toStartWith('observational-memory · this session (/work/project) · ')

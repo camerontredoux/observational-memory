@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import { turn, CHUNK, at, world, ember, live, gates, steps, agentCall, readsIn, constraining, correctionsIn } from './harness'
+import { turn, CHUNK, at, world, ember, live, gates, steps, agentCall, readsIn, constraining, correctionsIn, observationsIn, originals } from './harness'
 import type { Ledger } from './harness'
 
 // How background observation is scheduled around compactions, across loops, and across the chunks of one batch.
@@ -82,7 +82,8 @@ describe('register: scheduling', () => {
   test("a subagent is observed in the background only once its context nears its compaction point", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on)
-    on('session.usage', () => ({ value: { context: { window: 200_000 }, rateLimits: [] } }) as never)
+    // A subagent's hook reads the main conversation's figures: that measured context, past the main loop's threshold, is not the subagent's.
+    on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
     const seen = ember(on, { reply: readsIn })
     const step = steps(on)
     await clock.set(at(23, 9, 0))
@@ -103,6 +104,57 @@ describe('register: scheduling', () => {
 
     expect(seen.prompts.length).toBeGreaterThan(0)
     expect((stored['ledger:session-1/agent-1'] as Ledger).entries.length).toBeGreaterThan(0)
+  })
+
+  // With a 200k window, the main conversation compacts at TURN_END_COMPACT_TOKENS (157k) at the earliest: it is
+  // observed in the background from MAIN_OBSERVE_TOKENS (100k), 20k of overhead included.
+  test('the main conversation is observed in the background only from MAIN_OBSERVE_TOKENS, then from its first row, and keeps up', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history, stored, files } = world(on)
+    on('session.usage', () => ({ value: { context: { window: 200_000 }, rateLimits: [] } }) as never)
+    const seen = ember(on)
+    const runTurn = live(on, clock, history)
+    const observed = () => ((stored['ledger:session-1'] as Ledger | undefined)?.entries ?? []).map((e) => e.line.match(/User: "(\w+)"/)?.[1])
+    const backgroundCalls = () => (JSON.parse(files['/stats/session-1.json'] ?? '{"metrics":{}}') as { metrics: Record<string, { count: number }> }).metrics['observer.background.ms']?.count
+
+    for (const [k, p] of [...'abcdefg'].entries()) await runTurn($, turn(p, p, CHUNK), at(22, 14, 2 * k)) // ~70k of history
+    await clock.settle()
+    expect(seen.prompts).toEqual([])
+    expect(seen.sessions).toEqual([]) // nor a Session line, written once observations land
+    await clock.advance(5_000)
+    expect(backgroundCalls()).toBeUndefined()
+
+    await runTurn($, turn('h', 'h', CHUNK), at(22, 14, 20))
+    await clock.settle()
+    expect(observed()).toEqual([...'abcdefgh'])
+    expect((stored['ledger:session-1'] as Ledger).watermark.from).toBe(0)
+    await runTurn($, turn('i', 'i', CHUNK), at(22, 14, 22))
+    await clock.settle()
+    expect(observed()).toEqual([...'abcdefghi'])
+    await clock.advance(5_000) // the stats file's last write
+    expect(backgroundCalls()).toBe(seen.prompts.length)
+  })
+
+  test('a manual compaction before MAIN_OBSERVE_TOKENS observes every row before its raw tail on the spot, all its chunks at once, and installs', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    on('session.usage', () => ({ value: { context: { window: 200_000 }, rateLimits: [] } }) as never)
+    const { gate, open } = gates()
+    const seen = ember(on, { hold: (n) => gate(n) })
+    const runTurn = live(on, clock, history)
+
+    for (const [k, p] of [...'abcdefg'].entries()) await runTurn($, turn(p, p, CHUNK), at(22, 14, 2 * k))
+    await clock.settle()
+    expect(seen.prompts).toEqual([])
+    const compacting = $.session.compact({ trigger: 'manual', messages: [...history] })
+    await clock.settle()
+    expect(seen.inFlight).toBe(7)
+    for (let n = 1; n <= 7; n++) open(n)
+    const result = await compacting
+
+    expect(observationsIn(result.messages?.[0]?.text)?.match(/User: "\w+"/g)).toEqual([...'abcdefg'].map((p) => `User: "${p}"`))
+    expect(originals(result.messages?.slice(1))).toEqual(history.slice(27))
+    expect(seen.logs.at(-1)).toMatch(/^Compacted in .* · observed 27 messages on the spot/)
   })
 
   test("a compaction does not queue behind another loop's scheduling pass", async ($, on) => {

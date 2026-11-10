@@ -98,3 +98,39 @@ almost always bounded the memory message first. The cap is now the only bound. T
 `om-reflector` cache key and its JSON schema above went with it. Ledgers stored with condensed (`r: true`) entries
 still load, and the flag is ignored. Stats files from before keep their `reflector.*` and `reflection.*` metrics, and
 `/om-stats historical` shows them in its full table.
+## The main session waits for its context to near a compaction
+
+Background observation exists so that a compaction is instant. It only has to be caught up when a compaction comes.
+In the Luna era, $5.60 of $24.51 of Observer spend (~23%) went on chunks of sessions that never compacted.
+
+The main session now waits, as subagents already did. `observedYet` in `hooks/register.ts` starts background
+observation of the main session only once its context reaches the lower of two points:
+
+- `MAIN_OBSERVE_TOKENS`, 100k.
+- The first point the session compacts at, less `MAIN_OBSERVE_MARGIN` (5 chunks, 50k). That point is
+  `TURN_END_COMPACT_TOKENS` (157k), or the auto-compaction point when it is lower.
+
+The context is the larger of two figures: the history's estimate plus `OVERHEAD_TOKENS`, and the last request's
+measured context from `$.session.usage`. The measure is right for the main session (a subagent's hook reads the main
+session's figures, so subagents use the estimate alone, as before). When the session cannot say where it compacts,
+both loops are observed from the start, as before.
+
+At the threshold the backlog from the session's first row is about 8 chunks. A scheduling pass gives the main session
+every free slot (`MAX_PARALLEL` 8, subagents at most 6), so at ~3 s per Ember call it is caught up in seconds, with
+57k of growth left before the turn-end compaction. After that the session is observed as before. A compaction resets
+the wait: the rows after it are observed once the context reaches the threshold again.
+
+A compaction before the threshold (a manual `/compact`) observes every row before its raw tail on the spot, as it
+already did for unobserved rows. `observeOnTheSpot` starts every chunk at once, outside `MAX_PARALLEL`: at 100k that
+is up to ~8 calls in parallel, so the compaction takes about one call's time (~3 s, 5 s at p90). A call that fails or
+times out (10 s) is retried once inside the 30 s deadline. Rows still unobserved at the deadline go to the brief that
+code compiles.
+
+What the session shows before the threshold:
+
+- The /notes pane says there are no observations yet.
+- The workers band shows no Observer calls.
+- The footer's `pending` and `ledger` gauges read 0, because no scheduling pass counts the history yet.
+- No Session line is written, since it waits for the first observation. A compaction before the threshold has no
+  Session line in its memory message; the line is written at the first scheduling pass after it.
+- om_stats shows no Background row and no failure. om_recall reads the transcript, not the ledger, and is unchanged.
