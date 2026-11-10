@@ -50,21 +50,22 @@ export const register: Register = (on) => {
           "whenever the summary lacks a detail you need: exact text, a tool's output, a quote, what happened when. It " +
           "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
           'what compaction removed from context and the transcripts this session was resumed or moved from, optionally its ' +
-          'subagents. Search first: its excerpts, the best lines of each ' +
-          'matching block, usually answer, and it names query terms that occur nowhere, so do not search again to confirm an ' +
-          'absence. Read a block only when its excerpt is not enough, and only the lines you need. Outline only to orient, ' +
-          'one page. Stop as soon as you have the answer.',
+          'subagents. Search first, with 2 to 4 rare terms: a path, an identifier, a command, a piece of an error; quote a ' +
+          'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. The ' +
+          'best match comes first; a short block shows whole, a long one its best lines, which usually answer. It names ' +
+          'query terms that occur nowhere, so do not search again to confirm an absence. Read a block only when its excerpt ' +
+          'is not enough, and only the lines you need. Outline only to orient, one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', maxLength: 500, description: 'Words, all of which must appear (failing that, blocks holding some, rarest first), "quoted phrases" or /regex/flags to find, e.g. a file name, an error, a marker; with files, part of a path' },
+            query: { type: 'string', maxLength: 500, description: '2 to 4 rare words or "quoted phrases", each matched as a case-insensitive substring: blocks holding all come first, then the best holding some, marked partial; or /regex/flags. E.g. a file name, an identifier, a piece of an error; with files, part of a path' },
             mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query; read with a ref alone, like a79f045b:2133: a block, a page of lines at a time; else outline: a line per message or tool call. files: the files the session read, edited or wrote, each with the blocks that touched it' },
-            ref: { type: 'string', description: 'A block reference from a search or outline, to read; a subagent reference, to outline its transcript' },
+            ref: { type: 'string', description: 'A block reference from a search or outline, like a79f045b:2133, to read; a subagent tag alone, like a1b2c3d4, to outline its transcript' },
             lines: { type: 'string', description: 'Lines of the block to read, e.g. "1-200" or "201-" (read)' },
             before: { type: 'number', description: 'Blocks before the read one to show too, at most 5 (read)' },
             after: { type: 'number', description: 'Blocks after the read one to show too, at most 5 (read)' },
-            from: { type: 'string', description: 'Range start: a reference, "HH:MM" or "YYYY-MM-DD HH:MM" (outline, search)' },
-            to: { type: 'string', description: 'Range end, inclusive, the same forms (outline, search)' },
+            from: { type: 'string', description: 'Range start: a reference, "YYYY-MM-DD HH:MM", or "HH:MM" on the newest day of the session that holds it, on the machine\'s clock, as the memory\'s sources give them (outline, search)' },
+            to: { type: 'string', description: 'Range end, inclusive, the same forms; beside it, an "HH:MM" from takes the latest day that keeps it no later than to (outline, search)' },
             limit: { type: 'number', description: `Most search matches to return (default and most ${SEARCH_MAX_HITS})` },
             subagents: { type: 'boolean', description: "Search the subagents' transcripts too (default false)" },
           },

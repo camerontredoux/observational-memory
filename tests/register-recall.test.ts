@@ -29,11 +29,10 @@ describe('register: recall', () => {
 
     expect(reads.filter((p) => p.startsWith('/t/'))).toEqual(['/t/session-1.jsonl'])
     expect(found).toBe(
-      '3 match(es) for "KIWI-42" in 4 blocks of 1 transcript file.\n' +
+      // The call is found through its result, which is labelled with its command.
+      '2 match(es) for "KIWI-42" in 4 blocks of 1 transcript file.\n' +
         `[session-1:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] 1 line\n  1: remember the KIWI-42 marker\n` +
-        `[session-1:2.2 · ${stampOf('2026-09-22T12:01:00.000Z')} · Bash call] 1 line\n  1: command: echo KIWI-42\n` +
-        `[session-1:3 · ${stampOf('2026-09-22T12:01:10.000Z')} · Bash result] 1 line\n  1: KIWI-42\n` +
-        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "session-1:3", "lines": "1-1"}.',
+        `[session-1:3 · ${stampOf('2026-09-22T12:01:10.000Z')} · Bash result echo KIWI-42] 1 line\n  1: KIWI-42`,
     )
   })
 
@@ -74,8 +73,7 @@ describe('register: recall', () => {
     expect(reads).toContain(`/t/${OLD}.jsonl`)
     expect(found).toBe(
       '1 match(es) for "FIG-8" in 2 blocks of 2 transcript files.\n' +
-        `[aaaaaaaa:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] 1 line\n  1: remember the FIG-8 marker\n` +
-        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "aaaaaaaa:1", "lines": "1-1"}.',
+        `[aaaaaaaa:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] 1 line\n  1: remember the FIG-8 marker`,
     )
     expect(read).toBe(`[aaaaaaaa:1 · ${stampOf('2026-09-22T12:00:00.000Z')} · user] lines 1-1 of 1\n   1 | remember the FIG-8 marker`)
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number>; metrics: Record<string, { count: number; sum: number }> }
@@ -105,7 +103,8 @@ describe('register: recall', () => {
 
     expect(asked.main).toBe(0)
     expect(reads.filter((p) => p === path)).toEqual([path])
-    expect(argvs).toEqual([['tail', '-c', `+${parsed + 1}`, '--', path]])
+    // From 64 characters before where the first call stopped, to see the file was only appended to.
+    expect(argvs).toEqual([['tail', '-c', `+${parsed - 64 + 1}`, '--', path]])
     expect(first).toMatch(/^1 match\(es\) for "PEAR" in 1 block of/)
     // The prompt that asked the first time is an ordinary match now: the newest one asked.
     expect(second).toMatch(/^3 match\(es\) for "PEAR" in 3 blocks/)

@@ -8,11 +8,11 @@ import { atom, update } from 'claude-code'
 import { newWorker, registerWorkers, settled, started as startedWorker } from './workers'
 import type { Gauges } from './workers'
 import type { Worker } from '../types'
-import { COPY_ID, isMemoryText, liveTranscript, loadTranscript, recall, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
+import { COPY_ID, isMemoryText, liveTranscript, loadTranscript, recall, RECALL_TOOL, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { RecallIo, TranscriptCache } from './recall'
-import { indexOf, queryOf, suggest } from './hash-recall'
+import { hashIndex, queryOf, suggest } from './hash-recall'
 import { withConstraints } from './spawn'
-import type { Index } from './hash-recall'
+import type { HashIndex } from './hash-recall'
 import { compileBrief, emptyBrief, mergeBriefs, openFailures, renderBrief } from './vcc'
 import {
   applyConstraints,
@@ -86,7 +86,6 @@ const COMPACTION_DEADLINE_MS = 30_000
 const REFLECTOR_TIMEOUT_MS = 10 * 60_000 // up to ~20k tokens of output, in the background
 const MAX_MARKS = 4_000
 const STAMP_SLACK_MS = 60_000
-const RECALL_TOOL = 'om_recall'
 const RECALL_TOOL_NAME = `mcp__observational-memory__${RECALL_TOOL}` // as the model sees it
 const STATS_TOOL = 'om_stats'
 const REPLIES_MAX_TOKENS = 1_000 // the assistant's replies section, newest kept
@@ -1112,29 +1111,29 @@ function reconcile($: EngineInterface, stored: Ledger | undefined, v: View): Led
 const loopOf = (sessionId: string, agentId?: string): Loop => ({ sessionId, agentId, key: agentId === undefined ? sessionId : `${sessionId}/${agentId}` })
 const ledgerKey = (sessionId: string) => key('ledger', sessionId)
 // `#` recall's rows per main session id, rebuilt from each ledger the main loop writes so a keystroke reads no store
-// (see recallIndexOf). A subagent's ledger goes when it finishes, so its lines would come and go: it updates nothing.
-const recallIndexes = new Map<string, Index>()
-const recallLoads = new Map<string, Promise<Index>>() // a cold read in flight, shared by the keystrokes that wait on it
+// (see hashIndexFor). A subagent's ledger goes when it finishes, so its lines would come and go: it updates nothing.
+const hashIndexes = new Map<string, HashIndex>()
+const hashIndexLoads = new Map<string, Promise<HashIndex>>() // a cold read in flight, shared by the keystrokes that wait on it
 async function saveLedger($: EngineInterface, loop: Loop, ledger: Ledger) {
   await $.store.set(ledgerKey(loop.key), ledger)
-  if (loop.agentId === undefined) recallIndexes.set(loop.sessionId, indexOf(ledger))
+  if (loop.agentId === undefined) hashIndexes.set(loop.sessionId, hashIndex(ledger))
 }
 // The session's index, read from the store once when missing (a worker restart, a resume); no ledger is cached empty.
 // A load that lands after a write built the index does not replace it.
-function recallIndexOf($: EngineInterface, sessionId: string): Index | Promise<Index> {
-  const warm = recallIndexes.get(sessionId)
+function hashIndexFor($: EngineInterface, sessionId: string): HashIndex | Promise<HashIndex> {
+  const warm = hashIndexes.get(sessionId)
   if (warm) return warm
-  let load = recallLoads.get(sessionId)
+  let load = hashIndexLoads.get(sessionId)
   if (!load) {
     load = ($.store.get(ledgerKey(sessionId)) as Promise<Ledger | undefined>)
       .then((ledger) => {
-        if (recallLoads.get(sessionId) !== load) return indexOf(ledger ?? {}) // dropped by /clear meanwhile: not cached
-        const index = recallIndexes.get(sessionId) ?? indexOf(ledger ?? {})
-        recallIndexes.set(sessionId, index)
+        if (hashIndexLoads.get(sessionId) !== load) return hashIndex(ledger ?? {}) // dropped by /clear meanwhile: not cached
+        const index = hashIndexes.get(sessionId) ?? hashIndex(ledger ?? {})
+        hashIndexes.set(sessionId, index)
         return index
       })
-      .finally(() => recallLoads.get(sessionId) === load && recallLoads.delete(sessionId))
-    recallLoads.set(sessionId, load)
+      .finally(() => hashIndexLoads.get(sessionId) === load && hashIndexLoads.delete(sessionId))
+    hashIndexLoads.set(sessionId, load)
   }
   return load
 }
@@ -2502,21 +2501,22 @@ export const register: Register = (on) => {
           "whenever the summary lacks a detail you need: exact text, a tool's output, a quote, what happened when. It " +
           "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
           'what compaction removed from context and the transcripts this session was resumed or moved from, optionally its ' +
-          'subagents. Search first: its excerpts, the best lines of each ' +
-          'matching block, usually answer, and it names query terms that occur nowhere, so do not search again to confirm an ' +
-          'absence. Read a block only when its excerpt is not enough, and only the lines you need. Outline only to orient, ' +
-          'one page. Stop as soon as you have the answer.',
+          'subagents. Search first, with 2 to 4 rare terms: a path, an identifier, a command, a piece of an error; quote a ' +
+          'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. The ' +
+          'best match comes first; a short block shows whole, a long one its best lines, which usually answer. It names ' +
+          'query terms that occur nowhere, so do not search again to confirm an absence. Read a block only when its excerpt ' +
+          'is not enough, and only the lines you need. Outline only to orient, one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', maxLength: 500, description: 'Words, all of which must appear (failing that, blocks holding some, rarest first), "quoted phrases" or /regex/flags to find, e.g. a file name, an error, a marker; with files, part of a path' },
+            query: { type: 'string', maxLength: 500, description: '2 to 4 rare words or "quoted phrases", each matched as a case-insensitive substring: blocks holding all come first, then the best holding some, marked partial; or /regex/flags. E.g. a file name, an identifier, a piece of an error; with files, part of a path' },
             mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query; read with a ref alone, like a79f045b:2133: a block, a page of lines at a time; else outline: a line per message or tool call. files: the files the session read, edited or wrote, each with the blocks that touched it' },
-            ref: { type: 'string', description: 'A block reference from a search or outline, to read; a subagent reference, to outline its transcript' },
+            ref: { type: 'string', description: 'A block reference from a search or outline, like a79f045b:2133, to read; a subagent tag alone, like a1b2c3d4, to outline its transcript' },
             lines: { type: 'string', description: 'Lines of the block to read, e.g. "1-200" or "201-" (read)' },
             before: { type: 'number', description: 'Blocks before the read one to show too, at most 5 (read)' },
             after: { type: 'number', description: 'Blocks after the read one to show too, at most 5 (read)' },
-            from: { type: 'string', description: 'Range start: a reference, "HH:MM" or "YYYY-MM-DD HH:MM" (outline, search)' },
-            to: { type: 'string', description: 'Range end, inclusive, the same forms (outline, search)' },
+            from: { type: 'string', description: 'Range start: a reference, "YYYY-MM-DD HH:MM", or "HH:MM" on the newest day of the session that holds it, on the machine\'s clock, as the memory\'s sources give them (outline, search)' },
+            to: { type: 'string', description: 'Range end, inclusive, the same forms; beside it, an "HH:MM" from takes the latest day that keeps it no later than to (outline, search)' },
             limit: { type: 'number', description: `Most search matches to return (default and most ${SEARCH_MAX_HITS})` },
             subagents: { type: 'boolean', description: "Search the subagents' transcripts too (default false)" },
           },
@@ -2567,7 +2567,7 @@ export const register: Register = (on) => {
 
   // The transcript file and those it continued from hold the whole session, compactions and --resume included; the
   // live history stands in when no file is known or readable.
-  on('tool.call', { tool: 'mcp__observational-memory__om_recall' }, async ($, e) => {
+  on('tool.call', { tool: RECALL_TOOL_NAME }, async ($, e) => {
     const sessionId = await $.session.id()
     const path = (await $.store.get(transcriptKey(sessionId))) as string | undefined
     let corpus: Awaited<ReturnType<typeof loadTranscript>> | undefined
@@ -2645,7 +2645,7 @@ export const register: Register = (on) => {
   on('session.end', async ($, e, next) => {
     gaugesOff.add(e.sessionId) // before any await, so no gauge write lands after its files go
     const cleared = e.reason === 'clear'
-    if (cleared) (recallIndexes.delete(e.sessionId), recallLoads.delete(e.sessionId))
+    if (cleared) (hashIndexes.delete(e.sessionId), hashIndexLoads.delete(e.sessionId))
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
     transcripts.delete(e.sessionId)
@@ -2673,7 +2673,7 @@ export const register: Register = (on) => {
     try {
       const query = queryOf(e.token)
       if (!query.length) return given
-      const found = suggest(await recallIndexOf($, await $.session.id()), query)
+      const found = suggest(await hashIndexFor($, await $.session.id()), query)
       // A row's trailing space ends the token; a space already after the cursor does that, so it would double.
       const rows = /^\s/.test(e.text.slice(e.cursor)) ? found.map((s) => ({ ...s, text: s.text.trimEnd() })) : found
       return rows.length ? { suggestions: [...given.suggestions, ...rows] } : given

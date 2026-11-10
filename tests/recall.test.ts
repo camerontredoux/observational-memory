@@ -58,7 +58,7 @@ describe('recall', () => {
     // The newest prompt asked, so it is no match; the replayed result after the compaction is read once.
     expect(back).toBe(
       '1 match(es) for "NEEDLE-42" in 6 blocks of 2 transcript files.\n' +
-        `[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result] 301 lines\n` +
+        `[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result cat big.txt] 301 lines\n` +
         '  250: row 250 has the NEEDLE-42 marker\n' +
         'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "aaaaaaaa:3", "lines": "240-260"}.',
     )
@@ -181,11 +181,13 @@ describe('recall', () => {
     }
 
     expect(io.reads).toEqual([`${DIR}/${OLD}.jsonl`, path]) // each read whole once, by the first call
+    // Each read starts 64 characters before where the last one stopped, to see the file was not rewritten.
     const bytes = (text: string) => new TextEncoder().encode(text).length
+    const before = (text: string) => bytes(text) - bytes(text.slice(-64))
     expect(io.from).toEqual([
-      [path, bytes(newFile)],
-      [path, bytes(newFile + steps[0])],
-      [path, bytes(newFile + steps[0])], // the cut-off row was left for the next call
+      [path, before(newFile)],
+      [path, before(newFile + steps[0])],
+      [path, before(newFile + steps[0])], // the cut-off row was left for the next call
     ])
     expect(first.main.blocks.length).toBe(blocks)
   })
@@ -212,7 +214,7 @@ describe('recall', () => {
     expect(parseInput({ mode: 'search' })).toBe('om_recall: give a query.')
     expect(parseInput({ mode: 'nope' })).toBe('om_recall: mode is search, read, outline or files.')
     const found = await run({ query: 'kiwi job', limit: 5 })
-    expect(found).toMatch(/^1 match\(es\) for "kiwi job" in 6 blocks of 2 transcript files\.\n\[aaaaaaaa:1 · [\d-]+ [\d:]+ · user\] 1 line\n  1: start the KIWI job\n/)
+    expect(found).toMatch(/^1 match\(es\) for "kiwi job" in 6 blocks of 2 transcript files\.\n\[aaaaaaaa:1 · [\d-]+ [\d:]+ · user\] 1 line\n  1: start the KIWI job$/)
   })
 
   test("never matches the memory message, om_recall's own calls and results, or the prompt that asked", async () => {
@@ -246,7 +248,7 @@ describe('recall', () => {
   test('regex and quoted phrases', async () => {
     expect(await run({ query: '/needle-\\d+/' })).toMatch(/^1 match\(es\) for \/needle-\\d\+\/ in .*\n\[aaaaaaaa:3 [^\n]*\n  250: row 250 has the NEEDLE-42 marker/)
     expect(await run({ query: '/NEEDLE-4[0-9]/' })).toContain('250: row 250')
-    expect(await run({ query: '/(unclosed/' })).toMatch(/^om_recall: not a valid regular expression/)
+    expect(await run({ query: '/(unclosed/' })).toMatch(/^0 match\(es\) for "\/\(unclosed\/" [^\n]*; not a valid regular expression \([^\n]*\), so searched as words\./)
     expect(await run({ query: '"plan is ALPHA"' })).toContain('aaaaaaaa:10')
     // A phrase must appear as written: failing that, blocks holding some of the terms, chosen by the rarest.
     expect(await run({ query: '"ALPHA plan"' })).toMatch(/^0 match/)
@@ -266,8 +268,8 @@ describe('recall', () => {
     const io = session(rows)
     let t = 0
     io.now = async () => (t += 1_000) // each look at the clock a second later: the 3 s budget runs out after 3 blocks
-    const out = (await run({ query: '/(a|a)+$/' }, io)).split('\n')
-    expect(out[0]).toMatch(/^3 match\(es\) for \/\(a\|a\)\+\$\/ in 3 blocks of 1 transcript file; the search stopped after 3 s, before bbbbbbbb:4: simplify the pattern, or search the rest with "from": "bbbbbbbb:4"\.$/)
+    const out = (await run({ query: '/a+a+$/' }, io)).split('\n')
+    expect(out[0]).toMatch(/^3 match\(es\) for \/a\+a\+\$\/ in 3 blocks of 1 transcript file; the search stopped after 3 s, before bbbbbbbb:4: simplify the pattern, or search the rest with "from": "bbbbbbbb:4"\.$/)
     expect(out.filter((l) => l.startsWith('[bbbbbbbb:'))).toHaveLength(3)
   })
 
@@ -288,7 +290,7 @@ describe('recall', () => {
     const io = chain({ [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: subagent, [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: '{}' })
     let t = 0
     io.now = async () => (t += 1_000)
-    expect((await run({ query: '/(a|a)+/', subagents: true }, io)).split('\n')[0]).toMatch(
+    expect((await run({ query: '/a+a+/', subagents: true }, io)).split('\n')[0]).toMatch(
       /; the search stopped after 3 s, before aaaaaaaa:\S+, with 1 subagent transcript not searched: simplify the pattern, or search one transcript at a time, without "subagents": "from": "aaaaaaaa:\S+" searches the rest of this one\.$/,
     )
   })
@@ -348,11 +350,12 @@ describe('recall', () => {
     const io = session(result(20, 'v1', out))
     expect(await run({ query: 'vitest failed' }, io)).toBe(
       `1 match(es) for "vitest failed" in 2 blocks of 1 transcript file.\n` +
-        `[bbbbbbbb:2 · 2026-09-22 ${hm(20)} · Bash result] 300 lines\n` +
+        `[bbbbbbbb:2 · 2026-09-22 ${hm(20)} · Bash result run v1] 300 lines\n` +
         '  10: throw new Error("failed fixture 10")\n' +
+        '  11: throw new Error("failed fixture 11")\n' +
         '  200:  FAIL vitest: 1 failed\n' +
         '  280: import { it } from "vitest" // 280\n' +
-        '  … 7 more matching lines\n' +
+        '  … 6 more matching lines\n' +
         'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "bbbbbbbb:2", "lines": "190-210"}.',
     )
     // A long line is cut around its rarest term, not its first.
@@ -366,33 +369,32 @@ describe('recall', () => {
       ...result(22, 'c', 'files to test\nall passed'),
     ])
     expect(await run({ query: 'test files passed', limit: 1 }, io)).toBe(
-      '3 match(es) for "test files passed" in 6 blocks of 1 transcript file; showing 1, those with the most terms on one line.\n' +
-        `[bbbbbbbb:2 · 2026-09-22 ${hm(20)} · Bash result] 1 line\n` +
+      '3 match(es) for "test files passed" in 6 blocks of 1 transcript file; showing 1, the best.\n' +
+        `[bbbbbbbb:2 · 2026-09-22 ${hm(20)} · Bash result run a] 1 line\n` +
         '  1: Test Files 2 passed (2)\n' +
-        '2 more matches not shown; only if none above answers, narrow the query or give "from" or "to".\n' +
-        'Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "bbbbbbbb:2", "lines": "1-1"}.',
+        '2 more matches not shown; only if none above answers, narrow the query or give "from" or "to".',
     )
     // Blocks alike are cut newest first, and the older ones are one "to" away.
     const alike = session([...result(20, 'a', 'PEAR one'), ...result(21, 'b', 'PEAR two'), ...result(22, 'c', 'PEAR three')])
     expect(await run({ query: 'PEAR', limit: 2 }, alike)).toMatch(
-      /^3 match\(es\) for "PEAR" in 6 blocks of 1 transcript file; showing 2, the newest\.\n[\s\S]*\n1 older match not shown; only if none above answers, repeat with "to": "bbbbbbbb:3"\.\n/,
+      /^3 match\(es\) for "PEAR" in 6 blocks of 1 transcript file; showing 2, the newest\.\n[\s\S]*\n1 older match not shown; only if none above answers, repeat with "to": "bbbbbbbb:3"\.$/,
     )
   })
 
   test('a quoted phrase matches across any run of whitespace, as aligned command output spaces its words', async () => {
     const io = () => session([...result(20, 'v', ' Test Files  10 passed (10)\n      Tests  110 passed (110)')])
     expect(await run({ query: '"Test Files 10 passed"' }, io())).toMatch(/^1 match\(es\) for "Test Files 10 passed" in [^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}1: {2}Test Files 10 passed \(10\)\n/)
-    expect(await run({ query: '"tests   110\tpassed"' }, io())).toMatch(/^1 match\(es\)[^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}2: {2}Tests 110 passed \(110\)\n/)
+    expect(await run({ query: '"tests   110\tpassed"' }, io())).toMatch(/^1 match\(es\)[^\n]*\n\[bbbbbbbb:2 [^\n]*\n {2}1:[^\n]*\n {2}2: {2}Tests 110 passed \(110\)$/)
     expect(await run({ query: '"Files 10passed"' }, io())).toMatch(/^0 match/)
   })
 
   test('a phrase across a newline, or split only by the display wrap, is excerpted at its real location', async () => {
     // The phrase is one real event, written across two lines; the excerpt must show where it actually is, not a
     // default first line.
-    const io = session([msg('assistant', 20, 'preface\nthe ALPHA\nplan is set\ntrailer')])
+    const io = session([msg('assistant', 20, `${'filler line\n'.repeat(100)}the ALPHA\nplan is set\ntrailer`)])
     const across = await run({ query: '"ALPHA plan"' }, io)
     expect(across).toMatch(/^1 match/)
-    expect(across).toContain('2-3: the ALPHA plan is set')
+    expect(across).toContain('101-102: the ALPHA plan is set')
 
     // A single long line, wrapped only for display at WRAP characters, with the phrase straddling that cut.
     const long = `${'A'.repeat(990)} ALPHA plan ${'B'.repeat(50)}`
@@ -423,7 +425,7 @@ describe('recall', () => {
   test('a compound term matches its parts when it appears nowhere whole, and is not called absent', async () => {
     const io = session([msg('assistant', 20, 'the RAW TRACE TOKEN is 7f3a'), msg('assistant', 21, 'nothing here')])
     const found = await run({ query: 'RAW_TOKEN' }, io)
-    expect(found).toMatch(/^1 match\(es\) for "RAW_TOKEN" in 2 blocks of 1 transcript file; no block holds every term, so these hold some, chosen by the rarest\.\n\[bbbbbbbb:1 [^\n]*\n  1: the RAW TRACE TOKEN is 7f3a\n/)
+    expect(found).toMatch(/^1 match\(es\) for "RAW_TOKEN" in 2 blocks of 1 transcript file; no block holds every term, so these hold some, chosen by the rarest\.\n\[bbbbbbbb:1 [^\n]*\n  1: the RAW TRACE TOKEN is 7f3a$/)
     expect(await run({ query: 'RAW_TOKEN zebra' }, io)).toContain('\nNo occurrences in this session of: zebra.\n')
   })
 
@@ -462,7 +464,7 @@ describe('recall', () => {
     ]
     const listed = await run({ mode: 'files' }, session(rows))
     expect(listed.split('\n')).toEqual([
-      'Files named by the Read, Edit, MultiEdit, Write, NotebookRead, NotebookEdit calls of 1 transcript file (bbbbbbbb), newest first: 3 files. Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.',
+      'Files named by the Read, Edit, MultiEdit, Write, NotebookEdit calls of 1 transcript file (bbbbbbbb), newest first: 3 files. Read a block for what a call did: {"mode": "read", "ref": "<ref>"}.',
       '/p/src/a.ts: read bbbbbbbb:1, bbbbbbbb:11; edited bbbbbbbb:3',
       '/p/missing.ts: edit failed bbbbbbbb:7',
       '/p/notes.md: wrote bbbbbbbb:5',
@@ -523,6 +525,97 @@ describe('recall', () => {
     expect((await run({ mode: 'outline' }, io)).length).toBeLessThanOrEqual(16_000)
   })
 
+  test('a bare HH:MM falls on the newest day of the session that holds it, and from takes the day that keeps it before to', async () => {
+    const at = (d: number, h: number, m: number) => ({ timestamp: new Date(2026, 8, d, h, m).toISOString() }) // the machine's clock
+    const io = memoryIo({
+      [`${DIR}/${NEW}.jsonl`]: [
+        msg('assistant', 0, 'KIWI on day one', at(22, 10, 0)),
+        msg('assistant', 0, 'MANGO before midnight', at(22, 23, 55)),
+        msg('assistant', 0, 'MANGO after midnight', at(23, 0, 5)),
+        msg('assistant', 0, 'KIWI on day two', at(23, 10, 0)),
+        msg('user', 0, 'what happened?', at(23, 11, 0)),
+      ].join('\n'),
+    })
+    // As the memory message writes a source range under its newest day's heading.
+    const newest = await run({ query: 'KIWI', from: '10:00', to: '10:00' }, io)
+    expect(newest).toMatch(/^1 match/)
+    expect(newest).toContain('day two')
+    expect(await run({ query: 'KIWI', from: '2026-09-22 10:00', to: '2026-09-22 10:00' }, io)).toContain('day one')
+    // 23:50 on the newest day is past the session's end: it falls on the day before.
+    expect(await run({ query: 'MANGO', from: '23:50' }, io)).toMatch(/^2 match/)
+    // A range across midnight: from is the day before to.
+    expect(await run({ query: 'MANGO', from: '23:50', to: '00:10' }, io)).toMatch(/^2 match/)
+  })
+
+  test('a repeated group of alternatives is refused, and a query only shaped like a regex is searched as words', async () => {
+    expect(await run({ query: '/error(.|\\s)*failed/' })).toMatch(/^om_recall: .* repeats a group of alternatives, .*\[\\s\\S\]\*/)
+    const io = session([msg('assistant', 20, 'archived to /home/x/.claude/om/archive today')])
+    expect(await run({ query: '/home/x/.claude/om/archive' }, io)).toMatch(/^1 match\(es\) for "\/home\/x\/\.claude\/om\/archive"/)
+    expect(await run({ query: '/needle-\\d+/i' })).toMatch(/^1 match/) // real flags: a regex
+  })
+
+  test('a tool result is searched and labelled with its call, which it then stands for', async () => {
+    const found = await run({ query: 'big.txt NEEDLE-42' })
+    expect(found).toMatch(/^1 match\(es\) for "big\.txt NEEDLE-42" in 6 blocks of 2 transcript files\.\n/)
+    expect(found).toContain(`[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result cat big.txt] 301 lines\n  250: row 250 has the NEEDLE-42 marker\n`)
+  })
+
+  test('a short block is shown whole, and a whole word outranks the same digits inside a longer number', async () => {
+    expect(await run({ query: 'FIG-3' }, session([msg('assistant', 20, 'alpha\nthe FIG-3 value\nomega')]))).toContain('  1: alpha\n  2: the FIG-3 value\n  3: omega')
+    const numbers = session([msg('assistant', 20, 'code 42 here'), msg('assistant', 21, 'code 4242 here')])
+    const found = await run({ query: '42', limit: 1 }, numbers)
+    expect(found).toContain('  1: code 42 here')
+    expect(found).not.toContain('4242')
+  })
+
+  test('a big block holding every term leaves the free slots to the best partial matches, labelled partial', async () => {
+    const dump = Array.from({ length: 400 }, (_, i) => `deploy step ${i} failed KIWI-77 retry`).join('\n')
+    const found = await run({ query: 'deploy failed KIWI-77' }, session([...result(20, 'd', dump), msg('assistant', 21, 'KIWI-77 deploy is done')]))
+    expect(found).toMatch(/^1 match\(es\) [^\n]*; and 1 partial match, which hold only some of the terms\./)
+    expect(found).toContain('partial, without failed')
+  })
+
+  test('a bare subagent tag outlines its transcript; files lists files by the time of their calls', async () => {
+    expect(parseInput({ ref: 'a1b2c3d4' })).toMatchObject({ mode: 'outline', ref: 'a1b2c3d4' })
+    const sub = `${DIR}/${NEW}/subagents`
+    const read = (m: number, id: string, path: string, extra = {}) => [
+      msg('assistant', m, [{ type: 'tool_use', id, name: 'Read', input: { file_path: path } }], extra),
+      msg('user', m, [{ type: 'tool_result', tool_use_id: id, content: 'x' }], extra),
+    ]
+    const io = memoryIo({
+      [`${DIR}/${NEW}.jsonl`]: [...read(20, 'm1', '/p/main.ts'), msg('user', 59, 'what happened?')].join('\n'),
+      // The subagent read its file before the main thread read its own.
+      [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: [msg('user', 10, 'look', { isSidechain: true }), ...read(10, 's1', '/p/sub.ts', { isSidechain: true })].join('\n'),
+      [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: '{}',
+    })
+    expect(await run({ ref: 'a1b2c3d4' }, io)).toContain(`a1b2c3d4:1 ${hm(10)} USER: look`)
+    const files = (await run({ mode: 'files', subagents: true }, io)).split('\n')
+    expect(files[1]).toMatch(/^\/p\/main\.ts: /)
+    expect(files[2]).toMatch(/^\/p\/sub\.ts: /)
+  })
+
+  test('a line range that holds no line is refused', async () => {
+    expect(await run({ ref: 'aaaaaaaa:3', lines: '0' })).toContain('holds no line')
+    expect(await run({ ref: 'aaaaaaaa:3', lines: '5-2' })).toContain('holds no line')
+    expect(await run({ ref: 'aaaaaaaa:3', lines: '5-5' })).toContain('   5 | row 5')
+  })
+
+  test("a cache keeps the subagents' transcripts and meta files, and a rewritten newest file is parsed again", async () => {
+    const path = `${DIR}/${NEW}.jsonl`
+    const sub = `${DIR}/${OLD}/subagents`
+    const files = { [`${DIR}/${OLD}.jsonl`]: oldFile, [path]: newFile, [`${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`]: subagent, [`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`]: '{}' }
+    const io = cachingIo(files)
+    const cache: TranscriptCache = {}
+    for (let i = 0; i < 2; i++) expect((await recall(await loadTranscript(io, path, { asking: true, cache }), { query: 'GRAPE-9', subagents: true })).text).toMatch(/^2 match/)
+    expect(io.reads.filter((p) => p.includes('/subagents/'))).toEqual([`${sub}/agent-a1b2c3d4e5f6a7b8c.meta.json`, `${sub}/agent-a1b2c3d4e5f6a7b8c.jsonl`])
+
+    // Rewritten, not appended to, and no shorter: read whole again.
+    files[path] = newFile.replace('Checking the old file.', 'A different reply, longer than the one it replaced.')
+    const corpus = await loadTranscript(io, path, { asking: true, cache })
+    expect(digest(corpus)).toEqual(await fresh(files, path))
+    expect(io.reads.filter((p) => p === path)).toHaveLength(2)
+  })
+
   test('a long argument is refused before it is searched or echoed', async () => {
     expect(await run({ query: 'x'.repeat(501) })).toBe('om_recall: query is at most 500 characters; search for its rarest words.')
     expect(await run({ ref: `aaaaaaaa:${'1'.repeat(600)}` })).toBe('om_recall: ref is at most 500 characters.')
@@ -545,7 +638,7 @@ describe('recall', () => {
   test('read pages a long block with a continuation, and shows neighbours', async () => {
     const first = await run({ ref: 'aaaaaaaa:3' })
     const lines = first.split('\n')
-    expect(lines[0]).toBe(`[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result] lines 1-200 of 301 (call: aaaaaaaa:2.2)`)
+    expect(lines[0]).toBe(`[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result cat big.txt] lines 1-200 of 301 (call: aaaaaaaa:2.2)`)
     expect(lines[1]).toBe('   1 | row 1')
     expect(lines).toHaveLength(202)
     expect(lines.at(-1)).toBe('… 101 more lines (832 characters); only if you still need them: {"mode": "read", "ref": "aaaaaaaa:3", "lines": "201-301"}.')
@@ -554,7 +647,7 @@ describe('recall', () => {
     expect(rest).toContain(' 250 | row 250 has the NEEDLE-42 marker')
     expect(rest).not.toContain('more line')
     expect(await run({ ref: 'aaaaaaaa:3', lines: '250' })).toBe(
-      `[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result] lines 250-250 of 301 (call: aaaaaaaa:2.2)\n 250 | row 250 has the NEEDLE-42 marker\n… 51 more lines (407 characters); only if you still need them: {"mode": "read", "ref": "aaaaaaaa:3", "lines": "251-301"}.`,
+      `[aaaaaaaa:3 · 2026-09-22 ${hm(1)} · Bash result cat big.txt] lines 250-250 of 301 (call: aaaaaaaa:2.2)\n 250 | row 250 has the NEEDLE-42 marker\n… 51 more lines (407 characters); only if you still need them: {"mode": "read", "ref": "aaaaaaaa:3", "lines": "251-301"}.`,
     )
     // A row holding several blocks: its reference alone finds the first.
     const call = await run({ ref: 'aaaaaaaa:2', after: 1 })
@@ -641,7 +734,7 @@ describe('recall', () => {
     const found = (await recall(c, { query: 'MANGO' })).text
     expect(found).toBe(
       '2 match(es) for "MANGO" in 3 blocks of the live history (only the newest 4 messages of the live history are readable).\n' +
-        '[#0 · user] 1 line\n  1: remember MANGO\n[#2 · Read result] 1 line\n  1: MANGO = 1\nOnly if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "#2", "lines": "1-1"}.',
+        '[#0 · user] 1 line\n  1: remember MANGO\n[#2 · Read result /a.ts] 1 line\n  1: MANGO = 1',
     )
     expect((await recall(c, { ref: '#1' })).text).toBe('[#1 · Read call] lines 1-1 of 1 (result: #2)\n   1 | file_path: /a.ts')
   })
