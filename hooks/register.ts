@@ -57,7 +57,11 @@ const EMBER_PRICE = { input: 0.1, cached: 0.004, output: 0.5 }
 // The API key, one line, under $HOME. Read on each call, so a key written or rotated takes effect without a reload.
 const EMBER_KEY_FILE = '.config/observational-memory/muse-api-key'
 const CHUNK_TOKENS = 10_000 // each Observer call reads about this much history
-const MAX_PARALLEL = 4 // background Observer calls in flight at once, across the main loop and every subagent's
+// Background Observer calls in flight at once, across the main loop and every subagent's. An Ember call is one HTTPS
+// request of ~3 s, so the cap only bounds a burst. Subagents share all but MAIN_SLOTS of them: however many run, the
+// main conversation's history is never left waiting on theirs.
+const MAX_PARALLEL = 8
+const MAIN_SLOTS = 2
 // After a failed background call its loop starts none for this long, doubled with each failure in a row up to the cap.
 const RETRY_MS = 5_000
 const RETRY_MAX_MS = 300_000
@@ -1402,7 +1406,8 @@ async function observedYet($: EngineInterface, loop: Loop, v: View) {
   return OVERHEAD_TOKENS + tokensBetween(v, v.base, v.messages.length) >= Math.min(at, WINDOW_TOKENS) - SUBAGENT_OBSERVE_TOKENS
 }
 
-// Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight across every loop: gaps a failed
+// Starts Observer calls over the unobserved history, up to MAX_PARALLEL in flight across every loop (MAIN_SLOTS of
+// them the main loop's alone): gaps a failed
 // call left first, then whole chunks at the frontier, which stops KEEP_RAW_TOKENS short of the end. A loop left short
 // of a slot waits for the next one to free. A pass for a loop that ended, before it or while it read, does nothing,
 // and so does one while the loop backs off after a failed call, or while a compaction's ledger waits to show (see
@@ -1427,7 +1432,8 @@ function schedule($: EngineInterface, loop: Loop, stamp: string) {
     const covered: Range[] = [ledger.watermark, ...ledger.chunks, ...elsewhere]
     const limit = tailStart(v, v.base)
     const now = await $.clock.now()
-    let slots = MAX_PARALLEL - running.length
+    const subagents = running.filter((j) => j.loop.agentId !== undefined).length
+    let slots = Math.min(MAX_PARALLEL - running.length, loop.agentId === undefined ? Infinity : MAX_PARALLEL - MAIN_SLOTS - subagents)
     for (; slots > 0; slots--) {
       covered.sort((a, b) => a.from - b.from)
       let from = ledger.watermark.to

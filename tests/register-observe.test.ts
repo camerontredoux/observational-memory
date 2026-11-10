@@ -808,26 +808,26 @@ describe('register: observe', () => {
     expect(originals(result.messages?.slice(1))).toEqual(history.slice(7))
   })
 
-  test('keeps at most four Observer calls in flight and schedules the rest as they land', async ($, on) => {
+  test('keeps at most eight Observer calls in flight and schedules the rest as they land', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const seen = ember(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
-    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK), ...turn('g', 'g', CHUNK), ...turn('h', 'h', CHUNK), ...turn('i', 'i', CHUNK), ...turn('j', 'j', CHUNK)], at(22, 14, 30))
     await clock.settle()
-    expect(seen.prompts).toHaveLength(4)
+    expect(seen.prompts).toHaveLength(8)
     open(1)
     await clock.settle()
-    expect(seen.prompts).toHaveLength(5)
-    for (const n of [2, 3, 4, 5, 6]) open(n)
+    expect(seen.prompts).toHaveLength(9)
+    for (const n of [2, 3, 4, 5, 6, 7, 8, 9, 10]) open(n)
     await clock.settle()
 
-    expect(seen.maxInFlight).toBe(4)
-    expect(seen.prompts).toHaveLength(6)
-    expect(seen.logs.filter((l) => l.includes('in the background'))).toHaveLength(6)
-    expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23) // the last ~6k tokens left raw
+    expect(seen.maxInFlight).toBe(8)
+    expect(seen.prompts).toHaveLength(10)
+    expect(seen.logs.filter((l) => l.includes('in the background'))).toHaveLength(10)
+    expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(39) // the last ~6k tokens left raw
   })
 
   test('a failing Ember with more chunks than slots is called again only as each back-off ends, doubling, and the chunks land once it answers', async ($, on) => {
@@ -837,28 +837,28 @@ describe('register: observe', () => {
     const seen = ember(on, { fail: () => (failing ? new Error('network down') : undefined) })
     const runTurn = live(on, clock, history)
 
-    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK), ...turn('g', 'g', CHUNK), ...turn('h', 'h', CHUNK), ...turn('i', 'i', CHUNK), ...turn('j', 'j', CHUNK)], at(22, 14, 30))
     await clock.settle()
-    expect(seen.prompts).toHaveLength(4) // the four in flight fail as one failure, and their slots start nothing
+    expect(seen.prompts).toHaveLength(8) // the eight in flight fail as one failure, and their slots start nothing
     await clock.advance(4_999)
-    expect(seen.prompts).toHaveLength(4)
-    await clock.advance(1)
     expect(seen.prompts).toHaveLength(8)
+    await clock.advance(1)
+    expect(seen.prompts).toHaveLength(16)
     await clock.advance(9_999)
-    expect(seen.prompts).toHaveLength(8)
+    expect(seen.prompts).toHaveLength(16)
     await clock.advance(1)
-    expect(seen.prompts).toHaveLength(12)
+    expect(seen.prompts).toHaveLength(24)
     expect(seen.logs).toContain('rows 0-3 failed 3 times in the background; left to the next compaction')
     failing = false
     await clock.advance(20_000)
 
-    // The four ranges that failed three times wait for the compaction; the two never tried land.
-    expect(seen.prompts).toHaveLength(14)
+    // The eight ranges that failed three times wait for the compaction; the two never tried land.
+    expect(seen.prompts).toHaveLength(26)
     expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(0)
     expect((stored['ledger:session-1'] as Ledger).chunks).toHaveLength(2)
     // Landed, the loop is back to no back-off: a failure now waits the first 5 s again.
     failing = true
-    await runTurn($, [...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000)], at(22, 15, 0))
+    await runTurn($, [...turn('k', 'k', CHUNK), ...turn('l', 'l', 8_000)], at(22, 15, 0))
     await clock.settle()
     const calls = seen.prompts.length
     await clock.advance(5_000)

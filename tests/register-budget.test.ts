@@ -7,7 +7,7 @@ import type { Ledger } from './harness'
 
 // Subagents side by side, the memory budget and the fallbacks.
 describe('register: budget', () => {
-  test('main and two subagents observe in the background side by side, each under its own keys, four Observer calls in flight across them', async ($, on) => {
+  test('main and two subagents observe in the background side by side, each under its own keys, eight Observer calls in flight across them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
@@ -30,16 +30,16 @@ describe('register: budget', () => {
       await step($, 's2', n, agents['agent-2'].length, 'agent-2')
       await clock.settle()
     }
-    expect(seen.inFlight).toBe(4)
+    expect(seen.inFlight).toBe(8)
     // The band above the prompt shows the main conversation's calls alone.
     const band = await $.ui.render({ surface: 'terminal', component: 'AbovePrompt', requestId: 'band', props: { hasSurvey: false, isWorking: true, maxRows: 10, columns: 120 } as never })
     const mains = seen.prompts.filter((p) => readers(p).has('main')).length
-    expect(mains).toBeLessThan(4)
+    expect(mains).toBeLessThan(8)
     expect(JSON.stringify(band).match(/\[observer\]/g)).toHaveLength(mains)
-    for (let n = 1; n <= 20; n++) open(n)
+    for (let n = 1; n <= 40; n++) open(n)
     await clock.settle()
 
-    expect(seen.maxInFlight).toBe(4)
+    expect(seen.maxInFlight).toBe(8)
     // The subagents' Observer calls are the session's piece of work too: one cache key for all of them.
     expect(new Set(seen.cacheKeys)).toEqual(new Set(['om-observer']))
     // Every call read one loop's rows, and a loop left short of a slot got the next one free.

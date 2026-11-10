@@ -198,7 +198,7 @@ describe('register: lifecycle', () => {
     expect(seen.logs).toContain('a reflection outlived its loop; discarded')
   })
 
-  test("a finished subagent's calls are stopped, and their slots go to a waiting main loop and sibling subagent", async ($, on) => {
+  test("subagents never take the main loop's own slots; a finished subagent's calls are stopped, and their slots go to a waiting sibling", async ($, on) => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
@@ -206,32 +206,32 @@ describe('register: lifecycle', () => {
     const step = steps(on)
     const runTurn = live(on, clock, history)
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
-    for (let n = 0; n < 16; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
+    for (let n = 0; n < 24; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
     agents['agent-2'] = [{ role: 'user', text: 'brief', toolUses: [] }]
     for (let n = 0; n < 4; n++) agents['agent-2'].push(...agentCall('two', n, 16_000))
     await clock.set(at(23, 9, 0))
     await step($, 's', 0, agents['agent-1'].length, 'agent-1')
     await clock.settle()
-    expect(seen.inFlight).toBe(4)
-    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0), 10_000) // no slot: main waits; the held calls stay within their timeout
-    await step($, 's2', 0, agents['agent-2'].length, 'agent-2') // and so does the sibling
+    expect(seen.inFlight).toBe(6) // all but the main loop's two
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0), 10_000) // main gets a slot of its own; the held calls stay within their timeout
+    await step($, 's2', 0, agents['agent-2'].length, 'agent-2') // the sibling waits on the subagents' slots
     await clock.settle()
-    expect(seen.prompts).toHaveLength(4)
+    expect(seen.prompts).toHaveLength(7)
+    expect(seen.prompts[6]).toContain(']: a\n') // main's chunk
 
     await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 's', reason: 'answer', agentId: 'agent-1' })
     await clock.settle()
-    expect(seen.stopped).toBe(4)
-    expect(seen.prompts.length).toBeGreaterThan(4) // the freed slots went to the loops waiting on them
-    for (let n = 5; n <= seen.prompts.length; n++) open(n)
+    expect(seen.stopped).toBe(6)
+    expect(seen.prompts.length).toBeGreaterThan(7) // the freed slots went to the sibling waiting on them
+    for (let n = 7; n <= seen.prompts.length; n++) open(n)
     await clock.settle()
     await runTurn($, turn('c', 'c', 8_000), at(23, 9, 1))
     await clock.settle()
-    for (let n = 5; n <= seen.prompts.length; n++) open(n)
+    for (let n = 7; n <= seen.prompts.length; n++) open(n)
     await clock.settle()
 
-    expect(seen.maxInFlight).toBe(4)
-    expect(seen.prompts.length).toBeGreaterThan(4)
-    expect(seen.prompts.slice(4).some((p) => readers(p).has('one'))).toBe(false) // the rest read main's rows and the sibling's
+    expect(seen.maxInFlight).toBeLessThanOrEqual(8)
+    expect(seen.prompts.slice(6).some((p) => readers(p).has('one'))).toBe(false) // the rest read main's rows and the sibling's
     expect((stored['ledger:session-1'] as Ledger).entries.length).toBeGreaterThan(0)
     expect((stored['ledger:session-1/agent-2'] as Ledger).entries.length).toBeGreaterThan(0)
     expect(Object.keys(stored).filter((k) => k.includes('agent-1'))).toEqual([])
