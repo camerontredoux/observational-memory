@@ -55,13 +55,20 @@ export const SOURCE_TRAILER = /\s*\(source:? ([^()]*)\)$/
 const dayless = (at: number, day: string) => (day && stamp(at).startsWith(`${day} `) ? stamp(at).slice(day.length + 1) : stamp(at))
 export const renderSource = (s: Source, day = '') => `(source ${dayless(s.from, day)} to ${dayless(s.to, day)})`
 
+// A source range as written, "YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM" or one time alone: null when it is no range of
+// times, undefined when it runs backwards.
+export function rangeOf(text: string): Source | undefined | null {
+  const [a, b = a] = text.split(' to ').map((t) => unstamp(t.trim()))
+  if (a === undefined || b === undefined) return null
+  return b < a ? undefined : { from: a, to: b }
+}
+
 // A line and the source range it ends with. A trailer that is not a range of times is part of the line; a range
 // that runs backwards is cut off and gives no source.
 export function splitSource(text: string): { line: string; source?: Source } {
   const m = text.match(SOURCE_TRAILER)
-  if (!m) return { line: text }
-  const [a, b = a] = m[1]!.split(' to ').map((t) => unstamp(t.trim()))
-  if (a === undefined || b === undefined) return { line: text }
-  const line = text.slice(0, m.index).trimEnd()
-  return b < a ? { line } : { line, source: { from: a, to: b } }
+  const source = m ? rangeOf(m[1]!) : null
+  if (source === null) return { line: text }
+  const line = text.slice(0, m!.index).trimEnd()
+  return source ? { line, source } : { line }
 }

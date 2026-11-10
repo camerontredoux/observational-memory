@@ -43,3 +43,28 @@ runs 7 and 8):
 The first JSON prompt left `told_the_user` null in 5 of 12 chunks where the text prompt wrote it. After the field's
 prompt and schema description said when to write it, the 4 left null were chunks where the text prompt had written only
 filler ("none recorded", "no report yet").
+
+## Reading the replies as JSON, and shorter observations
+
+Until this change the plugin still rendered each structured reply back to tagged lines and parsed those again. Now it
+reads the fields: a correction's `quote` is checked against the user's messages as it stands, `replaces` is read as
+given (the schema holds it to `^k[0-9a-f]{1,8}$`; a probe showed Ember's strict mode accepts `pattern`), and the
+continuation is read as an object. The text-era repairs are gone: 🔴 demotion of observations, which the schema
+already rules out, the Reflector's 🔴 demotion, and the old date-group reply form. Lines are still what the ledger and
+the memory message store.
+
+Grounding changed in two ways. A quote said to be relayed (`verbatim "…"`) now counts only in the assistant's own
+text, not in tool results, so a file or web page cannot vouch for a constraint. A correction is dropped as a restated
+constraint only when it shares 80% of its words with one in force (it was 30%); below that it is kept, or kept as 🟡
+when no user message bears it out.
+
+The test fake (`tests/harness.ts` `structured()`) now checks each reply against the schema and throws on one Ember
+cannot give, such as a 🔴 observation.
+
+The Observer prompt now asks for one fact per line (about 25 words, never more than 40), folds reading and searching
+into the finding they gave, and lists what must stay exact: commands with their outcomes, edited paths, IDs, versions,
+numbers, error text, and subagent briefs and reports. The size target went from one line per 1,100 chunk tokens to one
+per 1,400 (~9 to ~7 lines per 10k chunk). The analysis of 34.7k stored lines found 22.8% of tokens on tool-mechanics
+lines, which folding removes, and put the saving from ~9 to ~7 lines per 10k at 9.9% of stored tokens. 1,400 takes
+that step and no further, since agents go back after compaction for exact commands, paths and subagent outcomes.
+Status: landed, untested on bench.

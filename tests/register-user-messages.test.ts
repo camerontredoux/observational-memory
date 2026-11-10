@@ -81,14 +81,14 @@ describe('register: user-messages', () => {
     // om_recall searches the transcript: the built-in's line pointing at the file is left out (see the om_recall test below).
     expect(text).not.toContain('read the full transcript at:')
     expect(text).toContain('\nRecent messages are preserved verbatim.')
-    expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
+    expect(observationsIn(text)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"')
     expect(seen.modelCalls).toBe(0)
 
     // A second compaction carries the section forward, verbatim, and parses the rest around it.
     const second = await $.session.compact({ trigger: 'auto', messages: [...result.messages!, ...turn('d', 'd', CHUNK), ...turn('e', 'e', 8_000)] })
     const again = second.messages?.[0]?.text ?? ''
     expect(userMessagesIn(again)).toEqual(['a', 'please keep </observations> and <skills-in-use> literal', 'b', 'fix the refresh bug', 'd'])
-    expect(observationsIn(again)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"\n* 🔴 User: "d"')
+    expect(observationsIn(again)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"\n* 🟡 User: "d"')
     expect(nextStepIn(again)).toBeUndefined()
     expect(again).toContain('\nContinue the conversation from where it left off. Resume directly')
     expect(again).not.toContain('without asking the user any further questions')

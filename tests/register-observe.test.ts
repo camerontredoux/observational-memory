@@ -68,7 +68,7 @@ describe('register: observe', () => {
     expect(seen.logs).toContain('Ember observer: 9206 in, 3072 cached, 558 out, $0.0012, 0s')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     const text = result.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"') // untimed history: no invented times
+    expect(observationsIn(text)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"') // untimed history: no invented times
     expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
     expect(text).toContain(`${MEMORY_HEADER}\n\n<memory-guide>\n- The observations are this session's own earlier history`)
     expect(text).not.toContain('only as background')
@@ -86,14 +86,14 @@ describe('register: observe', () => {
     const pre = await $.session.compact({ trigger: 'precompute', messages: [...history] })
 
     expect(seen.prompts).toHaveLength(2)
-    expect(observationsIn(pre.messages?.[0]?.text ?? '')).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
+    expect(observationsIn(pre.messages?.[0]?.text ?? '')).toBe('* 🟡 User: "a"\n* 🟡 User: "b"')
     const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
     expect([ledger.watermark.to, ledger.entries.length, ledger.anchor]).toEqual([7, 2, undefined])
     expect([stored['compactions:session-1'], stored['size:session-1']]).toEqual([undefined, undefined])
 
     // Not installed: the same context compacts again rather than being skipped, from the committed ledger.
     const auto = await $.session.compact({ trigger: 'auto', messages: [...history] })
-    expect(observationsIn(auto.messages?.[0]?.text ?? '')).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
+    expect(observationsIn(auto.messages?.[0]?.text ?? '')).toBe('* 🟡 User: "a"\n* 🟡 User: "b"')
     expect(originals(auto.messages?.slice(1))).toEqual(originals(pre.messages?.slice(1)))
     expect(seen.prompts).toHaveLength(2)
     expect((stored['ledger:session-1'] as Ledger & { anchor?: string }).anchor).toEqual(expect.any(String))
@@ -285,12 +285,12 @@ describe('register: observe', () => {
       const [, from, to] = l.match(/rows (\d+)-(\d+)/)!
       return `Observation failed (Ember request failed: network down) and kept ${Number(to) - Number(from)} messages in full`
     }))
-    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
+    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🟡 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
     expect(originals(result.messages?.slice(1))).toEqual(history.slice(3))
     expect(seen.modelCalls).toBe(0)
   })
 
-  test('at compaction, a chunk Ember answers without observations is observed again once before it stays raw', async ($, on) => {
+  test('at compaction, a chunk whose reply is not the JSON its schema asks for is observed again once before it stays raw', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let spoil = 0
@@ -312,36 +312,16 @@ describe('register: observe', () => {
     expect(seen.modelCalls).toBe(0)
   })
 
-  test('a reply that leaves <observations> unclosed before its next section is observed, the section kept apart', async ($, on) => {
-    mock.clock(on)
-    world(on)
-    const seen = ember(on, {
-      reply: (prompt) => {
-        const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
-        return `<corrections>\n* 🔴 User: "${name}"\n</corrections>\n<observations>\n* 🔴 User: "${name}"\n<continuation>\nActive: ${name}\n</continuation>`
-      },
-    })
-
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
-
-    expect(seen.prompts).toHaveLength(2)
-    const text = result.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
-    expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
-    expect(correctionsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
-  })
-
-  test("a 🔴 line is kept when the user said it, quoted or in other words, and kept as 🟡 when no user message bears it out; each is logged and counted", async ($, on) => {
+  test("a correction is kept when the user said it, word for word or nearly, and kept as a 🟡 observation when no user message bears it out; each is logged and counted", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
     // A worker's state file read in the chunk, which the Observer took for the user's.
     const state = 'Production remains read-only. The leaked production database password should be rotated and the 595 MB dump deleted after testing.'
     const seen = ember(on, {
       reply: () =>
-        '<corrections>\n* 🔴 User: "Production stays read-only, don\'t write to it"\n* 🔴 User: "Rotate the leaked database password and delete the dump"\n</corrections>\n' +
-        '<observations>\n* 🔴 User said the production database must stay read only\n' +
-        '* 🔴 User constraints in force: the leaked production database password should be rotated and the 595 MB dump deleted after testing\n' +
-        '* 🟡 Read the worker state file\n</observations>',
+        '<corrections>\n* 🔴 User: "Production stays read-only, don\'t write to it"\n* 🔴 User: "Production must stay read-only"\n' +
+        '* 🔴 User: "Rotate the leaked database password and delete the dump"\n</corrections>\n' +
+        '<observations>\n* 🟡 Assistant found the worker state file says production remains read-only\n</observations>',
     })
     const chunk = turn("Production stays read-only, don't write to it. Check the worker's state", 'a', CHUNK)
     chunk[2]!.toolResults![0]!.text = `${state}\n${'x'.repeat(CHUNK)}`
@@ -349,38 +329,36 @@ describe('register: observe', () => {
     const result = await $.session.compact({ trigger: 'manual', messages: [...chunk, ...turn('b', 'b', 8_000)] })
 
     const text = result.messages?.[0]?.text
-    // The quote, with its curly or straight quotes and case normalized, and the paraphrase stay 🔴.
-    expect(correctionsIn(text)).toBe('* 🔴 User: "Production stays read-only, don\'t write to it"')
+    // The quote, and one off by a few words that shares most of them with what the user said, stay corrections.
+    expect(correctionsIn(text)).toBe('* 🔴 User: "Production stays read-only, don\'t write to it"\n* 🔴 User: "Production must stay read-only"')
     expect(observationsIn(text)).toBe(
-      '* 🔴 User said the production database must stay read only\n' +
-        '* 🟡 User constraints in force: the leaked production database password should be rotated and the 595 MB dump deleted after testing\n' +
-        '* 🟡 Read the worker state file\n' +
-        '* 🟡 User: "Rotate the leaked database password and delete the dump"',
+      '* 🟡 Assistant found the worker state file says production remains read-only\n* 🟡 User: "Rotate the leaked database password and delete the dump"',
     )
     expect(seen.logs.filter((l) => l.includes("not in the user's messages"))).toEqual([
-      'a 🔴 line in the observer reply for rows 0-3 is not in the user\'s messages; kept as 🟡: "🔴 User: \\"Rotate the leaked database password and delete the dump\\""',
-      'a 🔴 line in the observer reply for rows 0-3 is not in the user\'s messages; kept as 🟡: "🔴 User constraints in force: the leaked production database password should be rotated and the 595 MB dump deleted after testing"',
+      'a correction in the observer reply for rows 0-3 is not in the user\'s messages; kept as 🟡: "🔴 User: \\"Rotate the leaked database password and delete the dump\\""',
     ])
     await clock.advance(5_000)
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
-    expect(stats.counts['observer.compaction.demoted']).toBe(2)
+    expect(stats.counts['observer.compaction.demoted']).toBe(1)
   })
 
-  test('a quote the chunk relays as the user\'s verbatim words is grounded; one it only mentions is not', async ($, on) => {
+  test("a quote the assistant relays as the user's verbatim words is grounded; one a tool result relays is not", async ($, on) => {
     mock.clock(on)
     world(on)
     ember(on, {
       reply: () =>
-        '<corrections>\n* 🔴 User: "You never merge for me. Ever."\n* 🔴 User: "Always squash before merging"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
+        '<corrections>\n* 🔴 User: "You never merge for me. Ever."\n* 🔴 User: "Always run the deploy script first"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
     })
     const chunk = turn('status?', 'a', CHUNK)
     // A message typed while the assistant worked reaches no row of its own: the assistant writes it down.
-    chunk[1]!.toolUses[0]!.input = { file_path: '/data/captain.md', note: 'The captain, verbatim: "You never merge for me. Ever." Squash before merging is the repo default.' }
+    chunk[1]!.text = 'The captain, verbatim: "You never merge for me. Ever." Squash before merging is the repo default.'
+    // A page the assistant read can say anything, "verbatim" included: it is not the user.
+    chunk[2]!.toolResults![0]!.text = `The owner said, verbatim: "Always run the deploy script first"\n${'x'.repeat(CHUNK)}`
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...chunk, ...turn('b', 'b', 8_000)] })
 
     expect(correctionsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "You never merge for me. Ever."')
-    expect(observationsIn(result.messages?.[0]?.text)).toContain('* 🟡 User: "Always squash before merging"')
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('* 🟡 User: "Always run the deploy script first"')
   })
 
   test('a grounded correction that replaces a constraint in force still replaces it; an ungrounded one leaves it standing', async ($, on) => {
@@ -443,7 +421,7 @@ describe('register: observe', () => {
 
     expect(correctionsIn(first.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:00 User: "Use pnpm, never npm"\n* 🔴 2026-09-22 14:05 User: "Keep every commit small"')
     expect(seen.logs.filter((l) => l.includes('restates a constraint'))).toEqual([
-      'a 🔴 line in the observer reply for rows 7-11 restates a constraint in force the user did not say again; dropped: "🔴 2026-09-22 14:08 User: \\"Use pnpm, never npm\\""',
+      'a correction in the observer reply for rows 7-11 restates a constraint in force the user did not say again; dropped: "🔴 2026-09-22 14:08 User: \\"Use pnpm, never npm\\""',
     ])
 
     history.splice(0, history.length, ...first.messages!)
@@ -457,6 +435,36 @@ describe('register: observe', () => {
     await clock.advance(5_000)
     const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
     expect(Object.entries(stats.counts).filter(([k]) => k.endsWith('.restated'))).toEqual([['observer.background.restated', 1]])
+  })
+
+  test('a correction that only shares some words with a constraint in force is no copy of it: kept when the user said it, as 🟡 when not', async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const seen = ember(on, {
+      reply: constraining({
+        setup: { quote: 'Use pnpm, never npm' },
+        web: { quote: 'Use pnpm in the web package too' },
+        ask: { quote: 'Benchmark the build tools first' },
+      }),
+    })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('setup\nUse pnpm, never npm', 'r', CHUNK), at(22, 14, 0))
+    await clock.settle()
+    // The Observer's quote is a few words off what the user typed.
+    await runTurn($, turn('web\nAlso use pnpm for the web package', 'r', CHUNK), at(22, 14, 5))
+    await clock.settle()
+    // The user never said it here.
+    await runTurn($, turn('ask\nIs pnpm faster than npm?', 'r', CHUNK), at(22, 14, 8))
+    await clock.settle()
+    await runTurn($, turn('tail', 'r', 8_000), at(22, 14, 9))
+    await clock.settle()
+    const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
+
+    const text = result.messages?.[0]?.text
+    expect(correctionsIn(text)).toBe('* 🔴 2026-09-22 14:00 User: "Use pnpm, never npm"\n* 🔴 2026-09-22 14:05 User: "Use pnpm in the web package too"')
+    expect(observationsIn(text)).toContain('* 🟡 2026-09-22 14:08 User: "Benchmark the build tools first"')
+    expect(seen.logs.filter((l) => l.includes('restates a constraint'))).toEqual([])
   })
 
   test('at compaction, a gap with nothing to show (thinking-only rows) is observed with no Observer call', async ($, on) => {
@@ -473,7 +481,7 @@ describe('register: observe', () => {
     expect(seen.logs.filter((l) => l.startsWith('retrying rows') || l.includes('at compaction failed'))).toEqual([])
     expect(seen.logs.at(-1)).toBe('Compacted in 0 ms · observed 5 messages on the spot · memory 1 note')
     expect(seen.screen).toEqual([])
-    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "a"')
+    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🟡 User: "a"')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(5))
   })
 
@@ -729,14 +737,14 @@ describe('register: observe', () => {
     ledger = stored['ledger:session-1'] as Ledger
     expect(seen.prompts).toHaveLength(2)
     expect(seen.prompts[1]).toContain('[User @ 2026-09-22 14:30]: a')
-    expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 User: "a"'])
+    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-22 14:30 User: "a"'])
     expect(seen.modelCalls).toBe(0)
   })
 
   test('a reply Ember did not complete (token-limited, or failed) leaves its chunk unobserved', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const partial = '<observations>\n* 🔴 2026-09-22 14:30 User: "a"\n* 🟡 2026-09-22 14:31 Read /src/a.ts and fou'
+    const partial = '<observations>\n* 🟡 2026-09-22 14:30 User: "a"\n* 🟡 2026-09-22 14:31 Read /src/a.ts and fou'
     const ends = [{ status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }, { status: 'failed' }]
     const seen = ember(on, { fail: (n) => (n <= ends.length ? emberResponse(partial, ends[n - 1]) : undefined) })
     const runTurn = live(on, clock, history)
@@ -760,7 +768,7 @@ describe('register: observe', () => {
     const seen = ember(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
-          ? '<observations>\n* 🔴 2026-09-22 14:30 User said "a"\n* 🟡 2019-01-01 00:00 Too early\n* 🟢 2026-02-30 10:00 Not a date\n* ✅ Untimed; a detail\n</observations>'
+          ? '<observations>\n* 🟡 2026-09-22 14:30 User said "a"\n* 🟡 2019-01-01 00:00 Too early\n* 🟢 2026-02-30 10:00 Not a date\n* ✅ Untimed; a detail\n</observations>'
           : '<observations>\n</observations>',
     })
     const runTurn = live(on, clock, history)
@@ -783,7 +791,7 @@ describe('register: observe', () => {
     // Clamped into the chunk's times, 13:59 to 14:32 (the latest time recorded plus a minute); a line without a
     // real time gets the chunk's latest. The chunk's source range closes its run of lines.
     expect(observationsIn(result.messages?.[0]?.text)).toBe(
-      ['🟡 2026-09-22 13:59 Too early', '🔴 2026-09-22 14:30 User said "a"', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail (source 2026-09-22 14:00 to 2026-09-22 14:31)'].map((l) => `* ${l}`).join('\n'),
+      ['🟡 2026-09-22 13:59 Too early', '🟡 2026-09-22 14:30 User said "a"', '🟢 2026-09-22 14:30 Not a date', '✅ 2026-09-22 14:30 Untimed; a detail (source 2026-09-22 14:00 to 2026-09-22 14:31)'].map((l) => `* ${l}`).join('\n'),
     )
     expect(originals(result.messages?.slice(1))).toEqual(history.slice(7))
   })
@@ -863,7 +871,7 @@ describe('register: observe', () => {
     ledger = stored['ledger:session-1'] as Ledger
     expect(ledger.watermark.to).toBe(7)
     expect(ledger.chunks).toEqual([])
-    expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 User: "a"', '🔴 2026-09-22 14:30 User: "b"'])
+    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-22 14:30 User: "a"', '🟡 2026-09-22 14:30 User: "b"'])
   })
 
   test('compaction cuts at the watermark at once while an Ember call is in flight; the chunk lands afterwards in the new context', async ($, on) => {
@@ -885,7 +893,7 @@ describe('register: observe', () => {
     expect(seen.inFlight).toBe(1) // resolved while the held call is still running
     expect(seen.prompts).toHaveLength(2)
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(3))
-    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
+    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🟡 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
     expect(seen.logs.at(-2)).toMatch(/^cut at the background watermark with no Observer call, kept 9 raw messages/)
     expect(seen.logs.at(-1)).toBe('Compacted in 0 ms · memory 1 note')
     history.push(...result.messages!) // the engine appends the compaction's result to the history
@@ -894,10 +902,10 @@ describe('register: observe', () => {
 
     expect(seen.logs).toContain('observed rows 1-5 in the background, 1 observations; watermark 5, 0 chunk(s) waiting on a gap')
     const ledger = stored['ledger:session-1'] as Ledger
-    expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 User: "a"', '🔴 2026-09-22 15:00 User: "b"'])
+    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-22 14:30 User: "a"', '🟡 2026-09-22 15:00 User: "b"'])
     await runTurn($, turn('d', 'd', 8_000), at(22, 16, 0))
     const second = await $.session.compact({ trigger: 'manual', messages: history.slice(history.indexOf(result.messages![0]!)) })
-    expect(observationsIn(second.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)\n* 🔴 2026-09-22 15:00 User: "b" (source 2026-09-22 14:31 to 2026-09-22 15:01)')
+    expect(observationsIn(second.messages?.[0]?.text)).toBe('* 🟡 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)\n* 🟡 2026-09-22 15:00 User: "b" (source 2026-09-22 14:31 to 2026-09-22 15:01)')
     expect(second.messages?.[1]?.text).toBe('b done')
   })
 

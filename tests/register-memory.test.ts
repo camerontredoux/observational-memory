@@ -14,7 +14,7 @@ describe('register: memory', () => {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
           ? `<corrections>\n* ${correction}\n</corrections>\n${big}\n<continuation>\nActive: fixing the refresh endpoint\n</continuation>`
-          : `<observations>\n* 🔴 2026-09-22 15:00 User: "b"\n</observations>`,
+          : `<observations>\n* 🟡 2026-09-22 15:00 User: "b"\n</observations>`,
       reflect: (n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module (source 2026-09-22 14:30 to 2026-09-22 14:31)'),
     })
     const runTurn = live(on, clock, history)
@@ -192,7 +192,7 @@ describe('register: memory', () => {
     const second = await $.session.compact({ trigger: 'auto', messages: [...first.messages!, ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)] })
 
     expect(skillsIn(second.messages?.[0]?.text)).toBe('<skill name="deploy" invoked="2026-09-22 09:00">\nDeploy steps\n</skill> mid-text stays\n</skill>')
-    expect(observationsIn(second.messages?.[0]?.text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"\n* 🔴 User: "c"')
+    expect(observationsIn(second.messages?.[0]?.text)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"\n* 🟡 User: "c"')
   })
 
   test('a skill keeps its text through the last three turns, the running one included; an older one becomes a line with its time', async ($, on) => {
@@ -237,7 +237,7 @@ describe('register: memory', () => {
     const subagent = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })
 
     expect(skillsIn(main.messages?.[0]?.text)).toBe(`<skill name="deploy">${FINISHED}</skill>`)
-    expect(observationsIn(main.messages?.[0]?.text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"\n* 🔴 User: "c"')
+    expect(observationsIn(main.messages?.[0]?.text)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"\n* 🟡 User: "c"')
     expect(skillsIn(subagent.messages?.[0]?.text)).toBe('<skill name="deploy">\nDeploy steps\n</skill>')
   })
 })

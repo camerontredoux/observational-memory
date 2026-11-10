@@ -375,7 +375,7 @@ describe('register: alignment', () => {
     const second = await $.session.compact({ trigger: 'manual', messages: [...history] })
     await clock.advance(5_000)
 
-    expect(observationsIn(first.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:30)')
+    expect(observationsIn(first.messages?.[0]?.text)).toBe('* 🟡 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:30)')
     expect(second.messages?.[0]?.text).toContain('User: "c"')
     // A hook that throws is skipped, so the engine reports the write as unanswered.
     expect(seen.logs.filter((l) => l.startsWith('stats not saved'))).toEqual(['stats not saved (no implementation for fs.write); carrying on without them'])

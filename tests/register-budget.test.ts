@@ -126,7 +126,7 @@ describe('register: budget', () => {
     for (const agentId of [undefined, 'agent-1']) {
       const result = await $.session.compact({ trigger: 'auto', ...(agentId ? { agentId } : {}), messages: [...history] })
       expect(originals(result.messages?.slice(1))).toEqual(call(1, 36_000))
-      expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
+      expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"')
     }
     expect(seen.prompts).toHaveLength(4)
     expect(seen.logs.filter((l) => l.includes('built-in'))).toEqual([])
@@ -152,7 +152,7 @@ describe('register: budget', () => {
     const seen = ember(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]
-        return `${name === 'a' ? `<corrections>\n* ${correction}\n</corrections>\n` : ''}<observations>\n* 🔴 User: "${name}"\n</observations>\n<continuation>\nActive: ${name}\n</continuation>`
+        return `${name === 'a' ? `<corrections>\n* ${correction}\n</corrections>\n` : ''}<observations>\n* 🟡 User: "${name}"\n</observations>\n<continuation>\nActive: ${name}\n</continuation>`
       },
     })
     on('skill.prompt', ($, e) => ({ text: e.text }))
@@ -168,7 +168,7 @@ describe('register: budget', () => {
     expect(skillsIn(text)).toBe(`<skill name="style" invoked="2026-09-22 09:00">${FINISHED}</skill>\n<skill name="plan" invoked="2026-09-22 09:00">${FINISHED}</skill>`)
     expect(userMessagesIn(text)).toEqual(['a\nKeep the public API unchanged', 'b'])
     expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>`)
-    expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
+    expect(observationsIn(text)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"')
     expect(recordIn(text)).toBe(`${WHERE}:\nActive: b`)
     expect(nextStepIn(text)).toBe('b')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
@@ -313,7 +313,7 @@ describe('register: budget', () => {
     const ledger = stored['ledger:session-1'] as Ledger & { anchor?: string }
     expect([ledger.watermark.to, ledger.anchor]).toEqual([expect.any(Number), undefined])
     expect(ledger.watermark.to).toBeGreaterThan(3) // the chunk after the watermark landed; the held one did not
-    expect(ledger.entries.map((e) => e.line)).toContain('🔴 2026-09-22 15:00 User: "b"')
+    expect(ledger.entries.map((e) => e.line)).toContain('🟡 2026-09-22 15:00 User: "b"')
     expect(seen.logs).toContain('observation of rows 11-15 at compaction failed (settles-first settled the call); left unobserved')
     expect(seen.logs.filter((l) => l.startsWith('Compacted') || l.startsWith('observed'))).toEqual([expect.stringMatching(/^observed rows 0-3 in the background/)])
     await clock.advance(5_000)
@@ -351,7 +351,7 @@ describe('register: budget', () => {
     const named = '🔴 User: "Keep src/widget_registry.ts as it is: widget_registry is public"'
     const corrections = [named, ...Array.from({ length: 100 }, (_, i) => long(i))]
     const seen = ember(on, {
-      reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
+      reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🟡 Saw\n</observations>`,
     })
     // The default 90k-token budget holds the ~10k the corrections take whole; their 8k-token cap does not.
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))

@@ -1,12 +1,17 @@
 // The Observer's and Reflector's replies as structured output: the JSON schemas Ember answers to (strict, so a reply
-// always parses and always has its fields), and each reply read into the lines the rest of the plugin keeps: the
-// ledger, the memory message and recall all hold lines such as "🟡 2026-09-23 14:30 User asked …".
+// always parses and always has its fields), each reply read as its fields, and those fields rendered into what the
+// rest of the plugin keeps: the ledger, the memory message and recall all hold lines such as
+// "🟡 2026-09-23 14:30 User asked …", and the continuation record as "Name: value" lines.
+import type { Bounds } from './memory'
+import { rangeOf, renderLine, splitSource, unstamp } from './lines'
+import type { Source } from './lines'
 
 // A strict schema lists every property as required and allows no others; an optional value is a null.
 const nullable = (type: string) => ({ type: [type, 'null'] })
 const object = (properties: Record<string, unknown>) => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false })
 
-const TIME = { ...nullable('string'), description: 'The "YYYY-MM-DD HH:MM" of the block it comes from, copied exactly; null when that block has none' }
+const time = (of: string) => ({ ...nullable('string'), description: `The "YYYY-MM-DD HH:MM" of ${of}, copied exactly; null when it has none` })
+// 🔴 is left out: the user's constraints come only through the Observer's corrections.
 const PRIORITY = { type: 'string', enum: ['🟡', '🟢', '✅'] }
 
 export const OBSERVER_FORMAT = {
@@ -17,16 +22,20 @@ export const OBSERVER_FORMAT = {
     corrections: {
       type: 'array',
       items: object({
-        time: TIME,
+        time: time('the [User] block it quotes'),
         quote: { type: 'string', description: "The user's own words, copied word for word from a [User] block" },
-        replaces: { ...nullable('string'), description: 'The id of the listed constraint it replaces, such as k3fa2c1d0; null when it replaces none' },
+        replaces: {
+          ...nullable('string'),
+          pattern: '^k[0-9a-f]{1,8}$',
+          description: 'The id of the listed constraint it replaces, such as k3fa2c1d0; null when it replaces none',
+        },
         replaces_earlier: {
           ...nullable('string'),
           description: 'The constraint set earlier in the same chunk that it reverses, as YYYY-MM-DD HH:MM User: "<their words>"; null when none',
         },
       }),
     },
-    observations: { type: 'array', items: object({ priority: PRIORITY, time: TIME, text: { type: 'string' } }) },
+    observations: { type: 'array', items: object({ priority: PRIORITY, time: time('the block it comes from'), text: { type: 'string' } }) },
     continuation: {
       anyOf: [
         object({
@@ -52,7 +61,7 @@ export const REFLECTOR_FORMAT = {
       type: 'array',
       items: object({
         priority: PRIORITY,
-        time: TIME,
+        time: time('the latest line it condenses'),
         text: { type: 'string' },
         source: { ...nullable('string'), description: 'The source range, as "YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM"; null when the lines it condenses have none' },
       }),
@@ -62,10 +71,10 @@ export const REFLECTOR_FORMAT = {
 
 export type Format = typeof OBSERVER_FORMAT | typeof REFLECTOR_FORMAT
 
-type Observation = { priority: string; time: string | null; text: string; source?: string | null }
-type Correction = { time: string | null; quote: string; replaces: string | null; replaces_earlier: string | null }
-type Continuation = Record<(typeof FIELDS)[number][0], string | null>
-const FIELDS = [
+export type Observation = { priority: string; time: string | null; text: string; source?: string | null }
+export type Correction = { time: string | null; quote: string; replaces: string | null; replaces_earlier: string | null }
+// The continuation record's fields: each reply key, and its name in the record the ledger and memory message keep.
+export const RECORD_FIELDS = [
   ['active', 'Active'],
   ['completed', 'Completed'],
   ['next_steps', 'Next steps'],
@@ -73,11 +82,7 @@ const FIELDS = [
   ['blocked', 'Blocked'],
   ['waiting_for_user', 'Waiting for user'],
 ] as const
-
-// One line of text: a reply's string may hold a newline, which would start a line of its own.
-const flat = (text: string) => text.replace(/\s*\n\s*/g, ' ').trim()
-const timed = (time: string | null | undefined, text: string) => `${time?.trim() ? `${time.trim()} ` : ''}${flat(text)}`
-const lineOf = (o: Observation) => `${o.priority} ${timed(o.time, o.text)}${o.source?.trim() ? ` (source ${flat(o.source)})` : ''}`
+export type Continuation = Record<(typeof RECORD_FIELDS)[number][0], string | null>
 
 function parsed(text: string): Record<string, unknown> {
   try {
@@ -88,25 +93,36 @@ function parsed(text: string): Record<string, unknown> {
 }
 const list = <T>(value: unknown) => (Array.isArray(value) ? (value as T[]) : [])
 
-export type ObserverReply = { corrections: string[]; observations: string[]; continuation?: string }
-
-// The Observer's reply as lines: each correction as a 🔴 line quoting the user, with what it replaces; each
-// observation; and where the work stands as its record, one "Name: value" line per field (none when null or empty).
+export type ObserverReply = { corrections: Correction[]; observations: Observation[]; continuation: Continuation | null }
 export function readObserverReply(text: string): ObserverReply {
   const reply = parsed(text)
-  const corrections = list<Correction>(reply.corrections).map(
-    (c) =>
-      `🔴 ${timed(c.time, `User: "${flat(c.quote)}"`)}` +
-      (c.replaces?.trim() ? ` (replaces ${c.replaces.trim()})` : c.replaces_earlier?.trim() ? ` (this replaces the earlier constraint ${flat(c.replaces_earlier)})` : ''),
-  )
-  const state = reply.continuation as Continuation | null | undefined
-  // A null next_steps means the steps are done or dropped, so it is written as "none", which ends the ones carried from
-  // the record before. Any other null field is left out, and told_the_user carries from the record before.
-  const fields = state
-    ? FIELDS.flatMap(([key, name]) => (state[key]?.trim() ? [`${name}: ${flat(state[key]!)}`] : key === 'next_steps' ? [`${name}: none`] : []))
-    : []
-  return { corrections, observations: list<Observation>(reply.observations).map(lineOf), ...(fields.length ? { continuation: fields.join('\n') } : {}) }
+  return { corrections: list(reply.corrections), observations: list(reply.observations), continuation: (reply.continuation as Continuation | null | undefined) ?? null }
 }
+export const readReflectorReply = (text: string) => list<Observation>(parsed(text).observations)
 
-// The Reflector's reply as lines, each with its source range when it has one.
-export const readReflectorReply = (text: string) => list<Observation>(parsed(text).observations).map(lineOf)
+// One line of text: a reply's string may hold a newline, which would start a line of its own.
+export const flat = (text: string) => text.replace(/\s*\n\s*/g, ' ').trim()
+// A reply's time as its line keeps it. With `bounds`, a real time clamped into them, and the latest for none; without,
+// none, or with `unbounded` a real time as given.
+export function timeIn(given: string | null | undefined, bounds: Bounds, unbounded = false) {
+  const at = given ? unstamp(given.trim()) : undefined
+  if (!bounds) return unbounded ? at : undefined
+  return Math.min(Math.max(at ?? bounds.latest, bounds.lo), bounds.hi)
+}
+// An observation as its line: marker, time and text. The text without a source range it ends with: the range is
+// added from the transcript itself.
+export const observationLine = (o: Observation, bounds: Bounds, unbounded = false) =>
+  renderLine(o.priority, timeIn(o.time, bounds, unbounded), splitSource(flat(o.text)).line)
+// The Reflector's source range, or none when it gives no range of times.
+export const sourceIn = (o: Observation): Source | undefined => (o.source?.trim() ? (rangeOf(flat(o.source)) ?? undefined) : undefined)
+// A correction as its 🔴 line, quoting the user, with what it replaces.
+export const correctionLine = (c: Correction, bounds: Bounds) =>
+  renderLine('🔴', timeIn(c.time, bounds), `User: "${flat(c.quote)}"`) +
+  (c.replaces?.trim() ? ` (replaces ${c.replaces.trim()})` : c.replaces_earlier?.trim() ? ` (this replaces the earlier constraint ${flat(c.replaces_earlier)})` : '')
+
+// Where the work stands, as the record keeps it: one "Name: value" line per field that has a value. A record with
+// none is no record: the one before stands.
+export function recordOf(state: Continuation | null) {
+  const fields = state ? RECORD_FIELDS.flatMap(([key, name]) => (state[key]?.trim() ? [`${name}: ${flat(state[key]!)}`] : [])) : []
+  return fields.length ? fields.join('\n') : undefined
+}

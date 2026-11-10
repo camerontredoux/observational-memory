@@ -474,7 +474,7 @@ describe('register: compaction at a turn end', () => {
     expect(compactions).toHaveLength(1)
     expect(seen.prompts).toHaveLength(1)
     const text = compactions[0]!.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe('* 🔴 2026-09-23 09:00 User: "a" (source 2026-09-23 09:00 to 2026-09-23 09:01)')
+    expect(observationsIn(text)).toBe('* 🟡 2026-09-23 09:00 User: "a" (source 2026-09-23 09:00 to 2026-09-23 09:01)')
     expect(text).not.toContain('Resume directly')
     // The memory's header says this plugin ran the /compact, not the person.
     expect(text).toContain(`save space.\n${TURN_END_NOTE}\n\n<memory-guide>`)

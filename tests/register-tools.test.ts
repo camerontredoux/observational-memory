@@ -308,7 +308,7 @@ describe('register: tools', () => {
     const result = await $.session.compact({ trigger: 'manual', messages: [...history] })
 
     expect(seen.logs).toContain('the transcript changed under the observations; restarting the ledger from the memory message')
-    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "z"') // its rows were never timed
+    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🟡 User: "z"') // its rows were never timed
     expect(originals(result.messages?.slice(1))).toEqual(history.slice(3))
   })
 
@@ -323,7 +323,7 @@ describe('register: tools', () => {
     const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
     expect(seen.prompts).toHaveLength(1)
-    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 User: "a"')
+    expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🟡 User: "a"')
     expect(stored).toEqual({})
     expect(seen.logs).toContain("subagent agent-1's history is unreadable (no agent agent-1 in this session)")
     expect(seen.logs).toContain("subagent agent-1's history is unreadable (no agent agent-1 in this session); observing its context on the spot")

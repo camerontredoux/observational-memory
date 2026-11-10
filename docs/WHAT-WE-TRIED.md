@@ -25,6 +25,8 @@ Scores are from `scripts/bench-compact.ts` unless the row says otherwise. "Main"
 
 | Idea | Verdict | Result | Evidence |
 |---|---|---|---|
+| **2026-11-09** | | | |
+| Observer prompt for fewer, shorter lines: fold reads and searches into the finding they gave, one fact per line (~25 words, at most 40), always keep exact commands, paths, IDs and subagent outcomes; size target 1,100 → 1,400 tokens per line (~9 → ~7 lines per 10k chunk) | landed, untested on bench | Not scored. Aims at the 22.8% of stored tokens on tool-mechanics lines and the 24% of lines over 300 characters; lesson 3 says shrinking memory has lost identifiers before, so it needs a main, holdout and long run before it counts. | `~/work/scratch/om-analysis/observations-report.md`, `recall-report.md`; `docs/research/2026-11-09-ember-observer.md` |
 | **This week (2026-10-07/08)** | | | |
 | Truncation pass before an auto compaction: stub observed tool results outside the newest 10 calls, and images, instead of compacting | parked | Clears 37–39% of a tool-heavy context and defers compaction 40–70 requests, but costs ~$2 more per pass in prompt cache (cold rewrite of ~95k, then larger reads) and cannot fire in reasoning-heavy sessions, where kept thinking would matter. | `docs/plans/tool-output-truncation.md`; tag `archive/truncation-pass` |
 | Delete-only reflection filter at 15k, in place of the Reflector | parked | Long 62.5 → 42.9 without the 40k Reflector to bound the ledger. Main flat, 1–4% context saved for 8% more model tokens. | `docs/plans/reflection-filter.md`; tag `archive/reflection-filter` (`5642a87`) |

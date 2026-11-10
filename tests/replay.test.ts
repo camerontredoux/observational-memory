@@ -199,7 +199,7 @@ describe('the om chain through hooks/register.ts', () => {
       const session = body.instructions === SESSION_SYSTEM_PROMPT // the Session line's writer
       const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
       if (!session) observed.push(words)
-      const text = session ? 'Session: replay goal' : `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
+      const text = session ? 'Session: replay goal' : `<observations>\n${words.map((w) => `* 🟡 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
       return { value: emberResponse(structured(text, (body as { text?: { format?: { name?: string } } }).text?.format?.name)) }
     })
 

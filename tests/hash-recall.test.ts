@@ -131,7 +131,7 @@ describe('# recall', () => {
     const clock = mock.clock(on)
     const { history } = harness(on)
     core(on)
-    ember(on, { reply: (prompt) => (prompt.includes(']: a') ? '<observations>\n* 🔴 2026-09-22 14:30 User asked about auth tokens\n</observations>' : '<observations>\n</observations>') })
+    ember(on, { reply: (prompt) => (prompt.includes(']: a') ? '<observations>\n* 🟡 2026-09-22 14:30 User asked about auth tokens\n</observations>' : '<observations>\n</observations>') })
     const runTurn = live(on, clock, history)
     await runTurn($, turn('a', 'a', 8_000), at(22, 14, 0))
     await clock.settle()

@@ -3,6 +3,7 @@ import { describe, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { HttpResponse, On, ProcessRunResult, SessionMessage } from 'claude-code'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
+import { OBSERVER_FORMAT, REFLECTOR_FORMAT } from '../hooks/reply'
 import { originalId } from '../hooks/recall'
 import type { RecallIo } from '../hooks/recall'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
@@ -45,14 +46,52 @@ export function emberResponse(text: string, end: { status?: string; incomplete_d
   }
   return { status: 200, ok: true, headers: { 'content-type': 'application/json' }, text: JSON.stringify(body) }
 }
+// Where `value` breaks the strict JSON schema `schema` (the subset reply.ts uses), or undefined: Ember's strict mode
+// never answers outside its schema, so a test reply that does could not happen.
+function breaks(value: unknown, schema: Record<string, any>, at = 'reply'): string | undefined {
+  if (schema.anyOf) return (schema.anyOf as Record<string, any>[]).every((s) => breaks(value, s, at)) ? `${at} matches no anyOf branch` : undefined
+  const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+  if (![schema.type].flat().includes(type)) return `${at} is ${type}, not ${schema.type}`
+  if (schema.enum && !schema.enum.includes(value)) return `${at} is ${JSON.stringify(value)}, not one of ${schema.enum.join(' ')}`
+  if (schema.pattern && type === 'string' && !new RegExp(schema.pattern).test(value as string)) return `${at} ${JSON.stringify(value)} breaks ${schema.pattern}`
+  if (type === 'array') for (const [i, item] of (value as unknown[]).entries()) {
+    const broken = breaks(item, schema.items, `${at}[${i}]`)
+    if (broken) return broken
+  }
+  if (type === 'object') {
+    const fields = value as Record<string, unknown>
+    for (const k of Object.keys(fields)) if (!(k in schema.properties)) return `${at}.${k} is not in the schema`
+    for (const k of schema.required as string[]) {
+      if (!(k in fields)) return `${at}.${k} is missing`
+      const broken = breaks(fields[k], schema.properties[k], `${at}.${k}`)
+      if (broken) return broken
+    }
+  }
+  return undefined
+}
+const SCHEMAS: Record<string, Record<string, any>> = { [OBSERVER_FORMAT.name]: OBSERVER_FORMAT.schema, [REFLECTOR_FORMAT.name]: REFLECTOR_FORMAT.schema }
+
 // A test's reply written in the line format the plugin renders, as the JSON Ember answers to the request's schema
 // (`observer_reply` or `reflector_reply`), so tests read as the memory they make. A section's unmarked line joins the
 // line before. A reply with no section tag and no marked line stays as written: text that is not JSON, as a broken
-// reply would be. One already JSON is sent as it is.
+// reply would be. One already JSON is sent as it is. JSON that breaks the schema (a 🔴 observation, a `replaces` that
+// is no id) throws: the test asks for a reply Ember cannot give.
+export function structured(text: string, schema: string | undefined) {
+  const json = asJson(text, schema)
+  let value: unknown
+  try {
+    value = JSON.parse(json)
+  } catch {
+    return json // a broken reply, as the test means it
+  }
+  const broken = schema && breaks(value, SCHEMAS[schema]!)
+  if (broken) throw new Error(`a test reply Ember cannot give: ${broken}`)
+  return json
+}
 const SECTION = /^[ \t]*<(\/?)(observations|corrections|continuation|current-task)>[ \t]*$/i
 const MARKED = /^[ \t]*(?:[-*][ \t]*)?(🔴|🟡|🟢|✅)[ \t]*(\d{4}-\d\d-\d\d \d\d:\d\d)?[ \t]*(.*)$/u
 const STATE_FIELDS: Record<string, string> = { active: 'active', completed: 'completed', 'next steps': 'next_steps', 'told the user': 'told_the_user', blocked: 'blocked', 'waiting for user': 'waiting_for_user' }
-export function structured(text: string, schema: string | undefined) {
+function asJson(text: string, schema: string | undefined) {
   if (!schema || text.trimStart().startsWith('{')) return text
   const by: Record<string, string[]> = {}
   let at = ''
@@ -257,7 +296,7 @@ export function ember(
     } else
       text =
         options.reply?.(prompt) ??
-        `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
+        `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🟡 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
         `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
     return emberResponse(structured(text, schema))
   }
