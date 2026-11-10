@@ -2,19 +2,28 @@
 // against at every cut point. Mechanical gates are derived from the transcript; the rest come from the transcript's
 // ReplaySpec and its local RubricSpec. Pure: no file system or model.
 import type { Context, ReplaySpec, Row, Tier, Transcript } from './replay'
-import { contextText, earlyNeeded, itemTier, estimateTokens, holds, identifiersIn, isTyped, messageText, neededIdentifiers, normalize, scoreConstraints } from './replay'
+import { contextText, earlyNeeded, itemTier, holds, identifiersIn, isTyped, messageText, neededIdentifiers, normalize, refoundIdentifiers, rerunCommands, scoreConstraints, subagentReturns } from './replay'
 
 export type Gate =
   | 'identifiers' | 'constraints' | 'verbatim' | 'corrections' | 'reversals' | 'approvals' | 'asks' | 'in-progress' | 'handoff'
   | 'files-edited' | 'commits' | 'failures' | 'facts' | 'decisions' | 'lessons' | 'file-state' | 'multi-hop' | 'rationale'
-  | 'chronology' | 'recall' | 'absent' | 'purpose' | 'tokens' | 'budget'
+  | 'chronology' | 'recall' | 'absent' | 'purpose' | 'commands' | 'subagents' | 'refound'
 
-/** Weight per gate: the one table. */
+/**
+ * Weight per gate: the one table. Size is no gate: it is the efficiency card's cost (report.ts), not quality.
+ * commands, subagents and refound grade what the agent went back for after a cut (replay.ts rerunCommands,
+ * subagentReturns, refoundIdentifiers): their own gates, so their effect shows apart.
+ */
 export const WEIGHTS: Record<Gate, number> = {
   identifiers: 10, constraints: 6, verbatim: 5, corrections: 8, reversals: 6, approvals: 5, asks: 5, 'in-progress': 5, handoff: 8,
   'files-edited': 5, commits: 4, failures: 6, facts: 5, decisions: 5, lessons: 7, 'file-state': 7, 'multi-hop': 7, rationale: 7,
-  chronology: 6, recall: 5, absent: 5, purpose: 5, tokens: 6, budget: 3,
+  chronology: 6, recall: 5, absent: 5, purpose: 5, commands: 6, subagents: 5, refound: 6,
 }
+/**
+ * Gates graded and reported but kept out of every total: purpose passes another transcript's context about as often
+ * as its own (the negative control), so it cannot yet tell a better context from a worse one.
+ */
+export const APART: ReadonlySet<Gate> = new Set<Gate>(['purpose'])
 export type { Tier }
 /**
  * Tiers: what an item is worth to the next agent. `core` is what a compaction exists to carry (the goal, what is done and
@@ -27,7 +36,7 @@ export type { Tier }
  */
 export const TIER = { weight: { core: 1, lookup: 0.25 }, pointed: { core: 0.25, lookup: 0.9 } } as const
 /** A mechanical item's tier, by its gate: exact identifiers, quotes, paths and hashes are lookup; the rest core. */
-export const GATE_TIER: Partial<Record<Gate, Tier>> = { identifiers: 'lookup', verbatim: 'lookup', commits: 'lookup', 'files-edited': 'lookup', 'in-progress': 'lookup', chronology: 'lookup', recall: 'lookup' }
+export const GATE_TIER: Partial<Record<Gate, Tier>> = { identifiers: 'lookup', verbatim: 'lookup', commits: 'lookup', 'files-edited': 'lookup', 'in-progress': 'lookup', chronology: 'lookup', recall: 'lookup', refound: 'lookup', commands: 'lookup' }
 export { itemTier }
 export const tierOf = (i: Pick<Item, 'gate' | 'tier'>): Tier => i.tier ?? GATE_TIER[i.gate] ?? 'core'
 /**
@@ -42,13 +51,6 @@ export function itemGate(id: string, gate: Gate | undefined, dflt: Gate): Gate {
   const m = /^(neg|file|hop|multi|why|purpose)[:-]/.exec(id)
   return m ? by[m[1]!]! : (gate ?? dflt)
 }
-/**
- * Context size: full marks from FLOOR to LO tokens, falling linearly to none at HI (bloat) and at 0 (over-compression:
- * a context under FLOOR has thrown work away whatever else it holds). Over BUDGET, the budget item scores BUDGET/tokens,
- * and the mean budget score scales the weighted total.
- */
-export const TOKENS = { FLOOR: 4_000, LO: 12_000, HI: 40_000, BUDGET: 40_000 }
-
 export /** `shared`: transcripts that state the same fact (the negative control does not count their contexts against it). */
 type Span = { from: number; to?: number; shared?: readonly string[]; tier?: Tier }
 /** A behavior probe on an item (tests/eval/behavior.ts): the question, and a pattern the answer must match (default: every `expect`). */
@@ -67,8 +69,12 @@ export type RubricSpec = {
   probes?: (Span & { of: string; kind: 'rule' | 'permission' | 'done'; ask: string; answer: string })[]
 }
 
-/** `tier`: set on hand-authored items (itemTier), else by gate (tierOf). `pointed`: a missed fact the context points to. */
-export type Item = { gate: Gate; boundary: number; id: string; score: number; evidence: string; tier?: Tier; pointed?: boolean }
+/**
+ * `tier`: set on hand-authored items (itemTier), else by gate (tierOf). `pointed`: a missed fact the context points to.
+ * `control`: a hand-authored fact or question whose every expect is in a message the user typed before the cut: it
+ * passes for any version that keeps the user's words, so it is reported apart and counts in no total and no Δ.
+ */
+export type Item = { gate: Gate; boundary: number; id: string; score: number; evidence: string; tier?: Tier; pointed?: boolean; control?: boolean }
 
 const squash = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase()
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
@@ -180,7 +186,13 @@ export const isList = (line: string) => {
   const ids = idCount(line)
   return ids >= 3 && ids > line.split(/\s+/).filter(Boolean).length * LIST_DENSITY
 }
-const proseOnly = (text: string, keep?: (line: string) => boolean) => text.split('\n').filter((l) => keep?.(l) || (isProse(l) && !isList(l))).join('\n')
+/**
+ * A record: a `Key: value` line (a key of up to five words, then a value) or a markdown table row other than its
+ * separator. It states a fact as plainly as a sentence does, so the token gates read it as prose.
+ */
+export const isRecord = (line: string) =>
+  /^\s*(?:[-*]\s+)?\**[A-Za-z][\w'/()-]*(?: [\w'/()-]+){0,4}\**\s*:\**\s+\S/.test(line) || (/^\s*\|.*\S.*\|\s*$/.test(line) && !/^\s*\|[\s:|-]+\|\s*$/.test(line))
+const proseOnly = (text: string, keep?: (line: string) => boolean) => text.split('\n').filter((l) => keep?.(l) || isRecord(l) || (isProse(l) && !isList(l))).join('\n')
 
 // ---- Grounding: an identifier counts where its context line says what the transcript said about it ----
 
@@ -328,6 +340,11 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
   const lastTwo = t.spans.slice(Math.max(0, n - 2), n).flat()
   const lastThree = t.spans.slice(Math.max(0, n - 3), n).flat()
   const typed = before.filter(isTyped)
+  // A control: every expect is in a message the user typed before the cut (see Item).
+  const typedText = typed.map((r) => normalize(r.text)).join('\n')
+  const [tsq, tnm] = [squash(typedText), norm(typedText)]
+  const inTyped = (xs: readonly Expect[], id: string) => xs.length > 0 && xs.every((e) => hasExpect(tsq, tnm, e, isExact(id)))
+  const control = (xs: readonly Expect[], id: string) => (inTyped(xs, id) ? { control: true } : {})
   // Identifier gates: held on a grounded line of the prose context (see grounded).
   const plines = pr.split('\n')
   const has = (key: string, kind: Parameters<typeof holds>[2]) => grounded(t, before.length, plines, key, probeOf(key, kind), (l) => holds(l, key, kind))
@@ -352,7 +369,7 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
       items.push(pass('verbatim', n, `${c.id}:reversal`, text.includes(squash(normalize(c.reversal!.quote))), cut(c.reversal!.quote)))
     }
     for (const q of spec.questions.filter((q) => q.expect?.length && q.from <= n && (q.to === undefined || n <= q.to)))
-      items.push({ ...pass(q.to === undefined ? 'facts' : 'handoff', n, q.id, expectAll(q.expect!, q.id), `${q.expect!.length} tokens`), tier: itemTier(q.id, q.tier) })
+      items.push({ ...pass(q.to === undefined ? 'facts' : 'handoff', n, q.id, expectAll(q.expect!, q.id), `${q.expect!.length} tokens`), tier: itemTier(q.id, q.tier), ...control(q.expect!, q.id) })
   }
 
   // The user's corrections and standing rules, verbatim, for the rest of the session.
@@ -461,7 +478,7 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
   for (const f of rubric?.facts ?? [])
     if (inSpan(f, n)) {
       const ok = factHolds(f, ptext, pnorm, pr)
-      items.push({ ...pass(itemGate(f.id, f.gate, 'facts'), n, f.id, ok, `${f.expect.length} tokens`), tier: itemTier(f.id, f.tier), ...(!ok && pts?.get(f.id) ? { pointed: true } : {}) })
+      items.push({ ...pass(itemGate(f.id, f.gate, 'facts'), n, f.id, ok, `${f.expect.length} tokens`), tier: itemTier(f.id, f.tier), ...(!ok && pts?.get(f.id) ? { pointed: true } : {}), ...control(f.expect, f.id) })
     }
   for (const a of rubric?.absent ?? []) if (inSpan(a, n)) items.push({ ...pass('absent', n, a.id, !statedAsCurrent(raw, a.pattern), 'stale or false claim'), tier: itemTier(a.id, a.tier) })
   for (const l of rubric?.latest ?? [])
@@ -475,37 +492,40 @@ export function grade(t: Transcript, n: number, context: Context, spec?: ReplayS
       items.push({ ...pass('recall', n, r.id, r.expect.every((e) => got.includes(squash(e))), `${r.expect.length} tokens`), tier: r.tier ?? 'lookup' })
     }
 
-  const tokens = estimateTokens(raw)
-  const size = tokens < TOKENS.FLOOR ? tokens / TOKENS.FLOOR : Math.max(0, Math.min(1, (TOKENS.HI - tokens) / (TOKENS.HI - TOKENS.LO)))
-  items.push({ gate: 'tokens', boundary: n, id: 'size', score: size, evidence: `${tokens} tokens` })
-  // Over budget the context does not fit: the budget item scores BUDGET/tokens, and it scales the whole total (see score).
-  items.push({ gate: 'budget', boundary: n, id: 'size', score: Math.min(1, TOKENS.BUDGET / tokens), evidence: `${tokens} ≤ ${TOKENS.BUDGET}` })
+  // What the agent went back for after the cut: commands it ran again or looked up, with the outcome line of their last
+  // run; subagent briefs and reports it returned to; identifiers it found again by a tool call. The whole context is
+  // read (a command and its output are not prose), but an identifier is graded as the identifiers gate grades it.
+  const nraw = squash(normalize(raw))
+  for (const c of rerunCommands(t, n))
+    items.push(pass('commands', n, `cmd:${cut(c.command, 80)}`, nraw.includes(c.command.toLowerCase().slice(0, 120)) && (!c.outcome || nraw.includes(c.outcome.toLowerCase())), `${c.how}${c.line ? ` at line ${c.line}` : ''}; outcome "${cut(c.outcome, 50)}"`))
+  for (const a of subagentReturns(t, n)) items.push(pass('subagents', n, `agent:${a.id}`, a.expect.every((e) => hasWhole(nraw, e)), `${a.how}: ${a.expect.length} tokens`))
+  for (const x of refoundIdentifiers(t, n)) items.push(pass('refound', n, `${x.kind}:${x.key}`, has(x.key, x.kind), `found again at line ${x.line}`))
   return items
 }
 
 /**
- * `total`: the flat weighted total (tiers ignored), comparable with every earlier report. `tiered`: the same gates and
- * weights, but inside each gate an item weighs TIER.weight of its tier (a gate of lookups alone weighs a quarter of its
- * WEIGHTS), and a missed pointed fact earns TIER.pointed of its tier. `core`, `lookup`: the tiered total over one tier's
- * items alone (the size gates, tokens and budget, left out), to show where a change comes from.
+ * `total`: the flat weighted total (tiers ignored). `tiered`: the same gates and weights, but inside each gate an item
+ * weighs TIER.weight of its tier (a gate of lookups alone weighs a quarter of its WEIGHTS), and a missed pointed fact
+ * earns TIER.pointed of its tier. `core`, `lookup`: the tiered total over one tier's items alone, to show where a change
+ * comes from. The APART gates and the control items are in `gates` and `controls` but in no total.
  */
-export type Scores = { total: number; tiered: number; core: number; lookup: number; gates: Partial<Record<Gate, { score: number; items: number; passed: number }>> }
+export type Scores = { total: number; tiered: number; core: number; lookup: number; gates: Partial<Record<Gate, { score: number; items: number; passed: number }>>; controls: { items: number; passed: number } }
 /** An item's credit in the tiered total: its score, or TIER.pointed of its tier for a missed fact the context points to. */
 export const tieredCredit = (i: Item) => (i.pointed && i.score < 1 ? Math.max(i.score, TIER.pointed[tierOf(i)]) : i.score)
-const SIZE_GATES = new Set<Gate>(['tokens', 'budget'])
-/** Each gate's mean item score and passed count, and the weighted totals over gates with items times the budget fit, 0-100. */
+/** Whether an item counts toward the totals and Δ: not a control, not in an APART gate. */
+export const counts = (i: Pick<Item, 'gate' | 'control'>) => !i.control && !APART.has(i.gate)
+/** Each gate's mean item score and passed count (controls left out), and the weighted totals over the counting gates, 0-100. */
 export function score(items: readonly Item[]): Scores {
   const gates: Scores['gates'] = {}
   const byGate = new Map<Gate, Item[]>()
-  for (const i of items) byGate.set(i.gate, [...(byGate.get(i.gate) ?? []), i])
+  for (const i of items) if (!i.control) byGate.set(i.gate, [...(byGate.get(i.gate) ?? []), i])
   for (const g of Object.keys(WEIGHTS) as Gate[]) {
     const xs = byGate.get(g) ?? []
     if (xs.length) gates[g] = { score: (100 * xs.reduce((s, i) => s + i.score, 0)) / xs.length, items: xs.length, passed: xs.filter((i) => i.score >= 1).length }
   }
-  const used = Object.keys(gates) as Gate[]
+  const used = (Object.keys(gates) as Gate[]).filter((g) => !APART.has(g))
   const w = used.reduce((s, g) => s + WEIGHTS[g], 0)
-  // An over-budget context buys its recall with room it does not have: the total is scaled by the budget gate's mean fit.
-  const fit = gates.budget ? gates.budget.score / 100 : 1
+  const ctl = items.filter((i) => i.control)
   // Each item weighs its gate's weight over the gate's item count, times its tier's weight.
   const tiered = (keep: (i: Item) => boolean) => {
     let [num, den] = [0, 0]
@@ -516,10 +536,13 @@ export function score(items: readonly Item[]): Scores {
           num += x * tieredCredit(i)
           den += x
         }
-    return den ? (100 * fit * num) / den : 0
+    return den ? (100 * num) / den : 0
   }
-  const only = (t: Tier) => (i: Item) => !SIZE_GATES.has(i.gate) && tierOf(i) === t
-  return { total: w ? (fit * used.reduce((s, g) => s + WEIGHTS[g] * gates[g]!.score, 0)) / w : 0, tiered: tiered(() => true), core: tiered(only('core')), lookup: tiered(only('lookup')), gates }
+  const only = (t: Tier) => (i: Item) => tierOf(i) === t
+  return {
+    total: w ? used.reduce((s, g) => s + WEIGHTS[g] * gates[g]!.score, 0) / w : 0, tiered: tiered(() => true), core: tiered(only('core')), lookup: tiered(only('lookup')), gates,
+    controls: { items: ctl.length, passed: ctl.filter((i) => i.score >= 1).length },
+  }
 }
 
 const SOURCE = /\(source:? (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d) to (?:(\d{4}-\d\d-\d\d) )?(\d\d):(\d\d)\)/
@@ -578,4 +601,73 @@ export function pointed(t: Transcript, n: number, context: Context, rubric: Rubr
     })
     return { boundary: n, id: f.id, held: false, pointed: !!hit, evidence: hit ? cut(hit.line) : '', tier }
   })
+}
+
+/**
+ * Items that grade the same thing twice, dropped: a repeated id (the later one), and two items with the same expects
+ * whose spans share a cut (the one with the narrower span; else the later). The spec's questions come before the rubric's
+ * facts. Returns what is left and a line per dropped item.
+ */
+export function dedupe(spec: ReplaySpec | undefined, rubric: RubricSpec | undefined) {
+  type X = { id: string; from: number; to?: number; expect?: readonly Expect[] }
+  const all: { x: X; drop: () => void }[] = []
+  const qs = [...(spec?.questions ?? [])]
+  const fs = [...(rubric?.facts ?? [])]
+  const dropped = new Set<X>()
+  for (const q of qs) all.push({ x: q, drop: () => dropped.add(q) })
+  for (const f of fs) all.push({ x: f, drop: () => dropped.add(f) })
+  const key = (x: X) => JSON.stringify((x.expect ?? []).map((e) => (typeof e === 'string' ? [e] : [...e]).map(norm).sort()).sort())
+  const notes: string[] = []
+  for (const [i, a] of all.entries())
+    for (const b of all.slice(i + 1)) {
+      if (dropped.has(a.x) || dropped.has(b.x)) continue
+      const sameId = a.x.id === b.x.id
+      const overlap = a.x.from <= (b.x.to ?? Infinity) && b.x.from <= (a.x.to ?? Infinity)
+      const sameExpect = !!a.x.expect?.length && overlap && key(a.x) === key(b.x)
+      if (!sameId && !sameExpect) continue
+      const width = (x: X) => (x.to === undefined ? Infinity : x.to - x.from)
+      const [keep, lose] = !sameId && width(b.x) > width(a.x) ? [b, a] : [a, b]
+      lose.drop()
+      notes.push(`${lose.x.id}: ${sameId ? 'a repeated id' : `the same expects as ${keep.x.id}`}; dropped`)
+    }
+  return {
+    spec: spec && { ...spec, questions: qs.filter((q) => !dropped.has(q)) },
+    rubric: rubric && { ...rubric, facts: fs.filter((f) => !dropped.has(f)) },
+    notes,
+  }
+}
+
+/** The degenerate contexts every run prints its total beside: where a real context sits between them. */
+export const CONTROLS = ['lines shuffled', 'user messages + grep dump', 'raw tail only', 'user messages only', "another transcript's context", 'empty'] as const
+export type Control = (typeof CONTROLS)[number]
+// The grep dump's size: about a real context's (~25k tokens at 4 characters each).
+const GREP_CHARS = 100_000
+const hashOf = (s: string) => [...s].reduce((h, c) => (Math.imul(h, 31) + c.charCodeAt(0)) | 0, 7)
+/**
+ * The control contexts at cut n, from the real context there and `other`, another transcript's at a cut: its summary's
+ * lines in a fixed shuffled order (the raw tail kept); the user's typed messages then every transcript line before the
+ * cut that names an identifier or an error, newest first up to GREP_CHARS, put back in order (no model); the raw tail
+ * alone; the typed messages alone; the other transcript's context; nothing.
+ */
+export function controlContexts(t: Transcript, n: number, real: Context, other: Context | undefined): Record<Control, Context> {
+  const before = t.spans.slice(0, n).flat()
+  const typed = before.filter(isTyped).map((r) => r.text).join('\n\n')
+  const lines = real.summary.split('\n')
+  const shuffled = lines.map((l, i) => [hashOf(`${i}\0${l}`), l] as const).sort((a, b) => a[0] - b[0]).map(([, l]) => l).join('\n')
+  const grep: string[] = []
+  let size = typed.length
+  for (const l of before.flatMap((r) => messageText(r).split('\n')).reverse()) {
+    if (size >= GREP_CHARS) break
+    if (!identifiersIn(l).size && !ERROR_KEY.test(l)) continue
+    grep.push(l.slice(0, 400))
+    size += Math.min(l.length, 400) + 1
+  }
+  return {
+    'lines shuffled': { summary: shuffled, kept: real.kept },
+    'user messages + grep dump': { summary: `${typed}\n\n${grep.reverse().join('\n')}`, kept: [] },
+    'raw tail only': { summary: '', kept: real.kept },
+    'user messages only': { summary: typed, kept: [] },
+    "another transcript's context": other ?? { summary: '', kept: [] },
+    empty: { summary: '', kept: [] },
+  }
 }

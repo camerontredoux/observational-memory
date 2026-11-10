@@ -1,7 +1,7 @@
 // What the benchmark scripts (bench-replay.ts and others) share: their options, failing, the main checkout, a
-// session's transcripts under ~/.claude/projects, and a herdr step in a live pane. Not a script of its own. Not
-// typechecked by `tsc -p .` (Bun's Node APIs).
-import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
+// session's transcripts under ~/.claude/projects, a herdr step in a live pane, and a live Ember call. Not a script of
+// its own. Not typechecked by `tsc -p .` (Bun's Node APIs).
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { shellLine } from '../tests/eval/config'
@@ -39,6 +39,48 @@ export function mainCheckout() {
   const r = spawnSync('git', ['-C', HERE, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' })
   if (r.status !== 0) fail(`cannot find the main checkout from ${HERE}: ${r.stderr}`)
   return dirname(r.stdout.trim())
+}
+
+/** Ember on Meta's Responses API, as hooks/register.ts calls it, and its prices in dollars per million tokens. */
+export const EMBER_URL = 'https://api.meta.ai/v1/responses'
+export const EMBER_MODEL = 'muse-ember-1.0'
+const EMBER_PRICE = { input: 0.1, cached: 0.004, output: 0.5 }
+const EMBER_KEY_FILE = `${process.env.HOME}/.config/observational-memory/muse-api-key`
+// Every live Ember call a benchmark makes appends its usage here, one JSON line, for `muse-usage` (~/.local/bin).
+// `run` is the PID of the benchmark's top process: the first script to load this module sets it, and the scripts it
+// spawns inherit it, so a run's spend is counted while that process lives.
+const USAGE_LOG = `${process.env.HOME}/.cache/om-bench-compact/usage.jsonl`
+process.env.OM_BENCH_RUN ||= String(process.pid)
+
+/**
+ * One live Ember request with `body`, a Responses API request as JSON. The API key is read from its file for this call
+ * alone and never returned, logged or stored. Rejects on a network failure or past `timeoutMs`.
+ */
+export async function ember(body: string, timeoutMs: number): Promise<{ status: number; text: string }> {
+  const key = readFileSync(EMBER_KEY_FILE, 'utf8').trim()
+  if (!key) throw new Error('no Ember API key in ~/.config/observational-memory/muse-api-key')
+  const res = await fetch(EMBER_URL, { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body, signal: AbortSignal.timeout(timeoutMs) })
+  const text = await res.text()
+  const u = emberReply(text)
+  try {
+    mkdirSync(dirname(USAGE_LOG), { recursive: true })
+    appendFileSync(USAGE_LOG, JSON.stringify({ at: Date.now(), run: Number(process.env.OM_BENCH_RUN), pid: process.pid, in: u.input, cached: u.cached, out: u.output, cost: u.cost }) + '\n')
+  } catch {} // the ledger is for reporting only; a call never fails on it
+  return { status: res.status, text }
+}
+
+/** A Responses API reply, read as hooks/register.ts reads it: its message text, whether it completed, its usage and cost. */
+export function emberReply(text: string) {
+  let r: any = {}
+  try {
+    r = JSON.parse(text) ?? {}
+  } catch {}
+  const message = ((r.output ?? []) as any[]).flatMap((o) => (o.type === 'message' ? (o.content ?? []) : [])).flatMap((c: any) => (c.type === 'output_text' && c.text ? [c.text] : [])).join('')
+  const cached: number = r.usage?.input_tokens_details?.cached_tokens ?? 0
+  const input: number = r.usage?.input_tokens ?? 0
+  const output: number = r.usage?.output_tokens ?? 0
+  const cost = ((input - cached) * EMBER_PRICE.input + cached * EMBER_PRICE.cached + output * EMBER_PRICE.output) / 1e6
+  return { completed: r.status === 'completed' && !!message, message, error: String(r.error?.code ?? r.status ?? ''), input, cached, output, cost }
 }
 
 /** Where Claude Code keeps the transcripts of sessions run in `cwd`. */

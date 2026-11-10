@@ -5,7 +5,7 @@
 // the om replay and drives the built-in chain. Not typechecked by `tsc -p .` (Bun's Node APIs).
 //
 //   bun scripts/bench-replay.ts dry-run [--transcripts om-orchestration,om-v04,firstmate-11] [--dir DIR]
-//   bun scripts/bench-replay.ts om --transcript NAME [--pi stub|strict|live] [--max-calls N] [--boundaries N]
+//   bun scripts/bench-replay.ts om --transcript NAME [--ember stub|strict|live] [--max-calls N] [--boundaries N]
 //     [--src DIR] [--cache DIR] [--out DIR] [--gap-hours N (a chain's gap, default 1)] [--fallback recorded (a fallback
 //     compaction takes the source session's own, logged in summary.json fallbacks, instead of failing)]
 //   bun scripts/bench-replay.ts builtin --transcript NAME --pane w1:p2 --budget-usd N [--live] [--out DIR]
@@ -29,14 +29,19 @@
 //   full run would make (om's Observer calls, the built-in chain's /compact calls, the question
 //   stage's headless Sonnet sessions) with estimated tokens and cost per configuration. It spends nothing.
 // om: replays the transcript through the checkout's (or --src's) hooks/register.ts with a hand-built `$` on a
-//   virtual clock (its `claude-code` imports from scripts/claude-code-shim.ts), and compacts where the session compacted, each compaction on the previous one's output. Observer
-//   calls go to pi through a response cache (<main checkout>/.scratch/om-replay/luna-cache; the earlier prior-art
-//   replay's luna-cache under .scratch/om-vcc is read too when this machine still has it): --pi stub answers every call with
-//   a canned reply built from its prompt (free; checks the chain, not a measurement), --pi strict (the default)
-//   fails on a call not cached, --pi live runs pi on a miss, at most --max-calls times (default 0), and caches it.
-//   --cache DIR reads and writes that cache alone: a new one makes every pi call again, a second sample of the
+//   virtual clock (its `claude-code` imports from scripts/claude-code-shim.ts), and compacts where the session compacted, each compaction on the previous one's output. The
+//   plugin's Ember requests (`$.http.fetch`: the Observer's, the Session line's) land 3 virtual seconds after they are
+//   sent, answered through a response cache (<main checkout>/.scratch/om-replay/ember-cache) keyed by sha256 of the
+//   model, instructions, input, reasoning effort and output format, never by the headers: --ember stub answers every
+//   call with a canned reply built from its request (free; checks the chain, not a measurement), --ember strict (the
+//   default) fails on a call not cached, --ember live sends a miss to Ember, at most --max-calls times (default 0),
+//   and caches the reply with its usage. Only a completed reply is cached: a failed fetch or an error reply (after three
+//   tries) is not, and counts in summary.json's ember.failed, which bench-compact.ts stops on as a miss. The plugin reads a stand-in for its API key; a live call reads the real one
+//   from ~/.config/observational-memory/muse-api-key itself. The virtual clock waits for a live call, so the
+//   plugin's timeout on it never fires first. A plugin before v1.17.0 ran pi, not Ember, and cannot be replayed.
+//   --cache DIR reads and writes that cache alone: a new one makes every Ember call again, a second sample of the
 //   Observer rather than a replay of the first. Writes compaction-N.md (the memory message), kept-N.json (the rows
-//   kept raw), calls.json, log.txt and summary.json to <main checkout>/.scratch/om-replay/<name>/om-<pi>.
+//   kept raw), calls.json, log.txt and summary.json to <main checkout>/.scratch/om-replay/<name>/om-<mode>.
 //   `$.session.messages()` answers the newest 4096 rows, as the engine's does.
 // builtin: the live built-in chain (planBuiltinChain): seeds a sandbox session with span 0's raw rows, resumes it in
 //   the herdr pane with no observational-memory plugin, /compact, exits, reads the summary and kept rows back,
@@ -49,7 +54,7 @@
 // questions: the question stage. For each configuration (default: all four) and boundary with questions (default:
 //   every one), headless Sonnet sessions (planQuestionSession) are asked the boundary's questions about that
 //   configuration's context, read from the chained replay's results: om's from om-live, or the run --om-run names
-//   (om-v130, say; left out, as in the report, when its pi calls failed), builtin's from builtin; a +recall
+//   (om-v130, say; left out, as in the report, when its Ember calls failed), builtin's from builtin; a +recall
 //   configuration uses its base's context. A boundary's standing fact questions and its handoff questions (those
 //   with a `to`) go to two sessions (questionGroups): asked in one, Sonnet answered the handoff from the memory and
 //   seldom searched. --only asks just the questions whose id the regular expression matches (`--only
@@ -106,13 +111,12 @@ import {
 } from '../tests/eval/replay'
 import { checkPluginList, checkRecallOnly, CONFIGURATIONS, RECALL_TOOL, shellLine } from '../tests/eval/config'
 import type { Configuration } from '../tests/eval/config'
-import { fail, findTranscripts, mainCheckout, num, options, projectsDir, send, str } from './cli'
+import { ember, EMBER_URL, emberReply, fail, findTranscripts, mainCheckout, num, options, projectsDir, send, str } from './cli'
 import type { Options } from './cli'
 
 const HERE = resolve(import.meta.dir, '..')
 const OUT_ROOT = `${mainCheckout()}/.scratch/om-replay`
-const CACHE = `${OUT_ROOT}/luna-cache`
-const OLD_CACHE = `${mainCheckout()}/.scratch/om-vcc/luna-cache`
+const CACHE = `${OUT_ROOT}/ember-cache`
 const TRANSCRIPTS = ['om-orchestration', 'om-v04', 'firstmate-11']
 // Transcripts whose content (memories, questions, answers, excerpts) never leaves this machine: aggregate numbers only.
 const PRIVATE = new Set(['firstmate-11', 'firstmate-6', 'crew-uspa-4', 'crew-opie-4'])
@@ -121,11 +125,10 @@ const members = (name: string) => name.split('+')
 const isPrivate = (name: string) => members(name).some((m) => PRIVATE.has(m))
 // As in hooks/register.ts: `$.session.messages()` answers the newest this many rows.
 const ROWS_CAP = 4096
-// Virtual latency of one pi call, as the earlier prior-art replay had it: fixed, so every replay schedules identically.
-const OBSERVER_MS = 15_000
-// The replayed session's id, which register.ts makes pi's --session-id (the provider's prompt cache key) from: one per
-// transcript and --cache (one per sample), as each real session has its own. One id for every replay would put every
-// transcript and both samples on one cache key, the samples' identical chunks among them, which no real session shares.
+// Virtual latency of one Ember call, about a real one's: fixed, so every replay schedules identically, and under the
+// plugin's shortest call timeout (10 s at compaction), which would otherwise fire first.
+const EMBER_MS = 3_000
+// The replayed session's id: one per transcript and --cache (one per sample), as each real session has its own.
 const sessionOf = (name: string, cache: string) => `replay-${name}-${basename(cache)}`
 
 const transcriptDir = (o: Options) => str(o, 'dir') ?? `${mainCheckout()}/tests/fixtures/replay`
@@ -188,48 +191,46 @@ async function dryRun(o: Options) {
 
 // ---- om: the offline replay through a build's hooks ----
 
-type PiResult = { exitCode: number; stdout: string; stderr: string }
-// `inTokens` is the prompt's size estimated before the call; `in`, `out` and `cost` are pi's own usage record.
-type Call = { kind: 'observer'; atCompaction: boolean; start: number; prompt: string; key?: string; inTokens: number; hit: boolean; realMs?: number; in: number; out: number; cost: number; ok: boolean }
+// `inTokens` is the request's size estimated before the call; `in` (cached input with it), `cached`, `out` and `cost`
+// are Ember's own usage record, which the cache keeps with the reply.
+type Call = { kind: string; atCompaction: boolean; start: number; prompt: string; key: string; inTokens: number; hit: boolean; realMs?: number; in: number; cached: number; out: number; cost: number; ok: boolean }
+type Reply = { status: number; text: string }
 
-function piMessage(stdout: string) {
-  let message: any
-  for (const line of stdout.split('\n'))
-    if (line.startsWith('{"type":"message_end"'))
-      try {
-        const e = JSON.parse(line)
-        if (e.message?.role === 'assistant') message = e.message
-      } catch {}
-  return message
+// A canned reply from the request alone: each block's first words as an observation, in the Observer's schema when the
+// request asks for it. Enough for the chain to run; says nothing about what Ember would keep.
+function stub(request: any): Reply {
+  const lines = [...String(request.input).matchAll(/^\[(User|Assistant)(?: @ ([\d-]+ [\d:]+))?\]: (.{0,60})/gm)].map((m) => ({ priority: '🟡', time: m[2] ?? null, text: `${m[1]} said ${m[3]!.replace(/\s+/g, ' ')}` }))
+  const continuation = { active: 'stub', completed: null, next_steps: null, told_the_user: null, blocked: null, waiting_for_user: null }
+  const observations = lines.length ? lines : [{ priority: '🟡', time: null, text: 'Nothing to note' }]
+  const text = request.text?.format?.name === 'observer_reply' ? JSON.stringify({ corrections: [], observations, continuation }) : 'stub'
+  const usage = { input_tokens: estimateTokens(`${request.instructions}${request.input}`), output_tokens: estimateTokens(text) }
+  return { status: 200, text: JSON.stringify({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text }] }], usage }) }
 }
-// A canned reply from the prompt alone: each block's first words as an observation. Enough for the chain to run; says
-// nothing about what Luna would keep.
-function stub(prompt: string): PiResult {
-  const lines = [...prompt.matchAll(/^\[(User|Assistant)(?: @ ([\d-]+ [\d:]+))?\]: (.{0,60})/gm)].map((m) => `* 🟡 ${m[2] ?? ''} ${m[1]} said ${m[3]!.replace(/\s+/g, ' ')}`)
-  const text = `<observations>\n${lines.join('\n') || '* 🟡 Nothing to note'}\n</observations>\n<continuation>\nActive: stub\n</continuation>`
-  const usage = { input: estimateTokens(prompt), output: estimateTokens(text), cost: { total: 0 } }
-  const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage }
-  return { exitCode: 0, stderr: '', stdout: JSON.stringify({ type: 'message_end', message }) }
-}
+// What determines a reply, and so its cache key; never the headers, which hold the API key.
+const replyKey = (r: any) => createHash('sha256').update(JSON.stringify([r.model, r.instructions, r.input, r.reasoning?.effort ?? null, r.text?.format ?? null])).digest('hex')
 
 async function om(o: Options) {
   const name = str(o, 'transcript') ?? fail('--transcript: one of ' + TRANSCRIPTS.join(', '))
-  const piMode = (str(o, 'pi') ?? 'strict') as 'stub' | 'strict' | 'live'
-  if (!['stub', 'strict', 'live'].includes(piMode)) fail(`--pi ${piMode}: stub, strict or live`)
+  const mode = (str(o, 'ember') ?? 'strict') as 'stub' | 'strict' | 'live'
+  if (!['stub', 'strict', 'live'].includes(mode)) fail(`--ember ${mode}: stub, strict or live`)
   let liveLeft = num(o, 'max-calls', 0)!
   const src = resolve(str(o, 'src') ?? HERE)
+  if (!readFileSync(`${src}/hooks/register.ts`, 'utf8').includes(EMBER_URL)) fail(`${src}: its Observer does not call Ember (a plugin before v1.17.0, which ran pi); the replay answers Ember alone`)
   const { path, t } = load(o, name)
   const upTo = Math.min(num(o, 'boundaries', t.boundaries.length)!, t.boundaries.length)
-  const out = str(o, 'out') ?? `${OUT_ROOT}/${name}/om-${piMode}`
+  const out = str(o, 'out') ?? `${OUT_ROOT}/${name}/om-${mode}`
   if (existsSync(out) && readdirSync(out).length) fail(`${out} exists: move it or pass another --out`)
   mkdirSync(`${out}/stats`, { recursive: true })
-  // --cache: a cache of this run's own, so a rerun makes its pi calls again (a second sample of the Observer).
+  // --cache: a cache of this run's own, so a rerun makes its Ember calls again (a second sample of the Observer).
   const cache = str(o, 'cache') ?? CACHE
   mkdirSync(cache, { recursive: true })
   const session = sessionOf(name, cache)
   const env: Record<string, string> = { HOME: process.env.HOME ?? '/root', OM_NO_PRUNE: '1', OM_STATS_DIR: `${out}/stats` }
+  // The plugin reads its API key from here on each call: the replay answers it a stand-in, and a live call reads the
+  // real key itself (scripts/cli.ts ember).
+  const keyFile = `${env.HOME}/.config/observational-memory/muse-api-key`
 
-  // The engine: a hand-built `$`, a virtual clock, and pi calls that land after a fixed virtual latency.
+  // The engine: a hand-built `$`, a virtual clock, and Ember calls that land after a fixed virtual latency.
   let now = t.events[0]?.at ?? 0
   // The chain's history (every row, each compaction's output after the rows it compacted), as the engine shows it.
   let history: readonly SessionMessage[] = []
@@ -239,30 +240,28 @@ async function om(o: Options) {
   const stateKey = (ref: { plugin: string; key: string; id?: string }) => `${ref.plugin}/${ref.key}/${ref.id ?? ''}`
   const logs: { at: number; text: string; to?: string }[] = []
   let timers = 0
-  type Pending = { due: number; result: Promise<PiResult>; resolve: (v: PiResult) => void }
+  type Fetched = { status: number; ok: boolean; headers: Record<string, string>; text: string }
+  type Pending = { due: number; result: Promise<Fetched>; resolve: (v: Promise<Fetched>) => void }
   const pending: Pending[] = []
-  // The timers set with a delay (pi's timeout, the compaction's deadline, the delayed store writes), on the virtual clock.
+  // The timers set with a delay (Ember's timeout, the compaction's deadline, the delayed store writes), on the virtual clock.
   type Timer = { due: number; fn: () => void }
   const delayed: Timer[] = []
   const calls: Call[] = []
   let compacting = false
 
-  // The cache key: the whole argv (the system prompt with it) and stdin. calls.json records it per call.
-  const piKey = (argv: string[], stdin: string) => createHash('sha256').update(argv.join('\0')).update('\0\0').update(stdin).digest('hex')
-  async function runPi(argv: string[], stdin: string, init: { cwd?: string }) {
-    if (piMode === 'stub') return { r: stub(stdin), hit: false }
-    const hash = piKey(argv, stdin)
+  // One reply per request (replyKey; calls.json records each call's key): the stub's, the cache's, or a live call's,
+  // cached once it completes.
+  async function reply(request: any, body: string, hash: string): Promise<{ r: Reply; hit: boolean; realMs?: number }> {
+    if (mode === 'stub') return { r: stub(request), hit: false }
     const cached = () => {
-      for (const dir of cache === CACHE ? [CACHE, OLD_CACHE] : [cache])
-        if (existsSync(`${dir}/${hash}.json`)) {
-          const c = JSON.parse(readFileSync(`${dir}/${hash}.json`, 'utf8'))
-          return { r: { exitCode: c.exitCode, stdout: c.stdout, stderr: c.stderr }, hit: true, realMs: c.ms as number }
-        }
+      if (!existsSync(`${cache}/${hash}.json`)) return undefined
+      const c = JSON.parse(readFileSync(`${cache}/${hash}.json`, 'utf8'))
+      return { r: { status: c.status, text: c.text }, hit: true, realMs: c.ms as number }
     }
     const hit = cached()
     if (hit) return hit
-    if (piMode === 'strict') throw new Error(`strict: no cached pi reply for ${hash}`)
-    // One pi call per key across concurrent replays (bench-compact --jobs): the first takes the lock, the others wait
+    if (mode === 'strict') throw new Error(`strict: no cached Ember reply for ${hash}`)
+    // One live call per key across concurrent replays (bench-compact --jobs): the first takes the lock, the others wait
     // for its reply. A lock whose process is gone is taken over.
     const lock = `${cache}/${hash}.lock`
     for (;;) {
@@ -285,18 +284,34 @@ async function om(o: Options) {
     try {
       const after = cached()
       if (after) return after
-      if (liveLeft <= 0) throw new Error(`--max-calls reached: no live pi call for ${hash}`)
-      liveLeft--
-      const started = Date.now()
-      const p = Bun.spawn(argv, { cwd: init.cwd, stdin: new TextEncoder().encode(stdin), stdout: 'pipe', stderr: 'pipe' })
-      const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
-      const ms = Date.now() - started
-      // Written whole, then renamed, so a concurrent replay never reads half a reply.
-      if (exitCode === 0) {
-        writeFileSync(`${lock}.json`, JSON.stringify({ argv, stdin, stdout, stderr, exitCode, ms, at: new Date().toISOString() }))
-        renameSync(`${lock}.json`, `${cache}/${hash}.json`)
+      // A failed or unfinished call is tried again, three tries in all, each one a live call.
+      for (let attempt = 1; ; attempt++) {
+        if (liveLeft <= 0) throw new Error(`--max-calls reached: no live Ember call for ${hash}`)
+        liveLeft--
+        const started = Date.now()
+        let r: Reply
+        try {
+          r = await ember(body, 300_000)
+        } catch (error) {
+          r = { status: 0, text: String((error as Error).message) }
+        }
+        const ms = Date.now() - started
+        const got = emberReply(r.text)
+        if (r.status === 200 && got.completed) {
+          // Written whole, then renamed, so a concurrent replay never reads half a reply.
+          const usage = { in: got.input, cached: got.cached, out: got.output, cost: got.cost }
+          writeFileSync(`${lock}.json`, JSON.stringify({ request, status: r.status, text: r.text, usage, ms, at: new Date().toISOString() }))
+          renameSync(`${lock}.json`, `${cache}/${hash}.json`)
+          return { r, hit: false, realMs: ms }
+        }
+        const why = r.status ? `HTTP ${r.status} ${got.error}` : r.text
+        console.error(`[${name}] live Ember call ${hash.slice(0, 12)} failed (${attempt}/3): ${why.slice(0, 200)}`)
+        if (attempt === 3) {
+          if (!r.status) throw new Error(why)
+          return { r, hit: false, realMs: ms }
+        }
+        await Bun.sleep(2000 * attempt)
       }
-      return { r: { exitCode, stdout, stderr }, hit: false, realMs: ms }
     } finally {
       unlinkSync(lock)
     }
@@ -352,6 +367,7 @@ async function om(o: Options) {
     command: { register: async () => {} },
     fs: {
       read: async (p: string) => {
+        if (p === keyFile) return 'replay'
         if (!inOut(p)) throw new Error(`ENOENT: ${p} (outside the replay)`)
         return readFileSync(p, 'utf8')
       },
@@ -367,37 +383,24 @@ async function om(o: Options) {
         return { kind: 'file', size: statSync(p).size, mtimeMs: statSync(p).mtimeMs, isLink: false }
       },
     },
-    process: {
-      // `run` for a build before pi went through `spawn`.
-      run: (argv: string[], init: { cwd?: string; stdin?: string } = {}) => start(argv, init.stdin ?? '', init),
-      // The reply in one piece per stream once its call lands. A run the plugin leaves early lands all the same.
-      spawn: (request: { argv: string[]; cwd?: string; input?: string }) => {
-        const landed = start(request.argv, request.input ?? '', request)
-        landed.catch(() => {})
-        return (async function* () {
-          const r = await landed
-          if (r.stdout) yield { stream: 'stdout', text: r.stdout }
-          if (r.stderr) yield { stream: 'stderr', text: r.stderr }
-          return { code: r.exitCode, signal: null }
-        })()
-      },
-    },
+    http: { fetch: (url: string, init: { body?: string } = {}) => start(url, init.body ?? '') },
     ui: { invalidate: () => {} },
   }
-  // One pi call, landing after a fixed latency on the virtual clock.
-  function start(argv: string[], stdin: string, init: { cwd?: string }) {
-    if (argv[0] !== 'pi') return Promise.reject(new Error(`the replay runs pi alone, not ${argv[0]}`))
-    const call: Call = { kind: 'observer', atCompaction: compacting, start: now, prompt: createHash('sha256').update(stdin).digest('hex').slice(0, 16), key: piKey(argv, stdin), inTokens: estimateTokens(stdin + (argv[argv.indexOf('--system-prompt') + 1] ?? '')), hit: false, in: 0, out: 0, cost: 0, ok: false }
+  // One Ember call, landing after a fixed latency on the virtual clock: its reply, or the failure the fetch would throw.
+  function start(url: string, body: string) {
+    if (url !== EMBER_URL) return Promise.reject(new Error(`the replay answers Ember alone, not ${url}`))
+    const request = JSON.parse(body)
+    const hash = replyKey(request)
+    const kind = String(request.prompt_cache_key ?? '').replace(/^om-/, '')
+    const call: Call = { kind, atCompaction: compacting, start: now, prompt: createHash('sha256').update(String(request.input)).digest('hex').slice(0, 16), key: hash, inTokens: estimateTokens(`${request.instructions}${request.input}`), hit: false, in: 0, cached: 0, out: 0, cost: 0, ok: false }
     calls.push(call)
-    const result = runPi(argv, stdin, init).then(
-      ({ r, hit, realMs }) => {
-        const m = piMessage(r.stdout)
-        Object.assign(call, { hit, realMs, ok: r.exitCode === 0 && !!m, in: m?.usage?.input ?? 0, out: m?.usage?.output ?? 0, cost: m?.usage?.cost?.total ?? 0 })
-        return r
-      },
-      (error: Error) => ({ exitCode: 1, stdout: '', stderr: error.message }),
-    )
-    return new Promise<PiResult>((resolve) => pending.push({ due: now + OBSERVER_MS, result, resolve }))
+    const result = reply(request, body, hash).then(({ r, hit, realMs }) => {
+      const got = emberReply(r.text)
+      Object.assign(call, { hit, realMs, ok: r.status === 200 && got.completed, in: got.input, cached: got.cached, out: got.output, cost: mode === 'stub' ? 0 : got.cost })
+      return { status: r.status, ok: r.status >= 200 && r.status < 300, headers: {}, text: r.text }
+    })
+    result.catch(() => {})
+    return new Promise<Fetched>((resolve) => pending.push({ due: now + EMBER_MS, result, resolve }))
   }
   $.ui.log = (text: any, opts?: any) => {
     const line = typeof text === 'string' ? text : text.text
@@ -420,7 +423,7 @@ async function om(o: Options) {
       quiet = timers === 0 ? quiet + 1 : 0
     }
   }
-  // What is due next by `to`: a pi call or a delayed timer, the pi call first when both are due at once.
+  // What is due next by `to`: an Ember call or a delayed timer, the call first when both are due at once.
   function nextDue(to: number) {
     const call = pending.filter((p) => p.due <= to).sort((a, b) => a.due - b.due)[0]
     const timer = delayed.filter((d) => d.due <= to).sort((a, b) => a.due - b.due)[0]
@@ -433,10 +436,12 @@ async function om(o: Options) {
       next.fn()
     } else {
       pending.splice(pending.indexOf(next), 1)
-      next.resolve(await next.result)
+      // The clock waits for a live call: the plugin's timeout on it cannot fire before it lands.
+      await next.result.catch(() => {})
+      next.resolve(next.result)
     }
   }
-  // Moves the clock to `to`, landing each pi call and firing each timer due by then in order, OM's work after each
+  // Moves the clock to `to`, landing each Ember call and firing each timer due by then in order, OM's work after each
   // one drained.
   async function advance(to: number) {
     await drain()
@@ -504,7 +509,7 @@ async function om(o: Options) {
         const output = await compact(live, boundary)
         writeFileSync(`${out}/compaction-${boundary.n}.md`, output[0]?.text ?? '')
         writeFileSync(`${out}/kept-${boundary.n}.json`, JSON.stringify(output.slice(1), null, 1))
-        console.log(`[${name}] compaction ${boundary.n}: ${live.length} live rows in, memory ~${estimateTokens(output[0]?.text ?? '')} tokens, ${output.length - 1} kept raw, ${calls.length - before} pi call(s) at compaction`)
+        console.log(`[${name}] compaction ${boundary.n}: ${live.length} live rows in, memory ~${estimateTokens(output[0]?.text ?? '')} tokens, ${output.length - 1} kept raw, ${calls.length - before} Ember call(s) at compaction`)
         return output
       },
     }),
@@ -517,15 +522,16 @@ async function om(o: Options) {
   const summary = {
     transcript: name,
     src,
-    pi: piMode,
+    mode,
     boundaries: steps.length,
-    luna: {
+    ember: {
       calls: calls.length,
       observer: calls.filter((c) => c.kind === 'observer').length,
       atCompaction: calls.filter((c) => c.atCompaction).length,
       failed: calls.filter((c) => !c.ok).length,
       cacheHits: calls.filter((c) => c.hit).length,
       tokensIn: sum((c) => c.in),
+      tokensCached: sum((c) => c.cached),
       tokensOut: sum((c) => c.out),
       cost: +sum((c) => c.cost).toFixed(5),
     },
@@ -603,9 +609,9 @@ const readContexts = (dir: string, n: number): (Context | undefined)[] =>
   )
 // Each result directory under <main checkout>/.scratch/om-replay/<transcript>/ the report reads, as the configuration it stands for.
 const SOURCES: { dir: string; config: string; source: string }[] = [
-  { dir: 'om-live', config: 'om', source: 'om replay of this checkout, Luna through pi (cached)' },
-  { dir: 'om-strict', config: 'om', source: 'om replay of this checkout, Luna through pi (cached)' },
-  { dir: 'om-stub', config: 'om (stub)', source: 'om replay of this checkout with pi stubbed: checks the chain, not a measurement' },
+  { dir: 'om-live', config: 'om', source: 'om replay of this checkout, Ember (cached)' },
+  { dir: 'om-strict', config: 'om', source: 'om replay of this checkout, Ember (cached)' },
+  { dir: 'om-stub', config: 'om (stub)', source: 'om replay of this checkout with Ember stubbed: checks the chain, not a measurement' },
   { dir: 'builtin', config: 'built-in', source: 'live built-in chain (Sonnet)' },
 ]
 
@@ -625,7 +631,7 @@ async function report(o: Options) {
     const only = str(o, 'configs')?.split(',')
     if (only) results.splice(0, results.length, ...results.filter((r) => only.includes(r.config)))
     const omRun = str(o, 'om-run')
-    const sources = omRun ? [{ dir: omRun, config: 'om', source: `om replay ${omRun}, Luna through pi` }, ...SOURCES.filter((x) => x.config !== 'om')] : SOURCES
+    const sources = omRun ? [{ dir: omRun, config: 'om', source: `om replay ${omRun}, Ember` }, ...SOURCES.filter((x) => x.config !== 'om')] : SOURCES
     for (const { dir, config, source } of sources) {
       if (only && !only.includes(config)) continue
       const path = `${OUT_ROOT}/${name}/${dir}`

@@ -1,5 +1,5 @@
 // The behavior check of `scripts/bench-compact.ts --behavior`: probes built from rubric items, asked of a reader model
-// (Luna) given a compacted context, and graded by code. Pure: the caller makes the model and om_recall calls.
+// (Ember) given a compacted context, and graded by code. Pure: the caller makes the model and om_recall calls.
 import type { Context, ReplaySpec, Transcript } from './replay'
 import { contextText, holds, isTyped, neededIdentifiers } from './replay'
 import type { Expect, Gate, RubricSpec, Tier } from './rubric'
@@ -13,7 +13,7 @@ export const BSAMPLES = 3
 const bgate = (g: Gate): BGate => (g === 'constraints' || g === 'reversals' ? 'rule' : g === 'lessons' || g === 'file-state' || g === 'multi-hop' || g === 'rationale' || g === 'purpose' ? g : 'value')
 /** `answer`: a pattern (case-insensitive) for rule/value/next, the word for permission, the short SHA for done. */
 /** `tier`: as the retention item's (rubric.ts TIER); the report's tiered pass rate weights a lookup probe TIER.weight.lookup; unset is core. */
-export type Probe = { gate: BGate; id: string; ask: string; answer?: string; expect?: readonly Expect[]; quoteOf?: string; query?: readonly string[]; tier?: Tier }
+export type Probe = { gate: BGate; id: string; ask: string; answer?: string; expect?: readonly Expect[]; quoteOf?: string; query?: readonly string[]; tier?: Tier; /** A done probe whose right answer is "not done". */ notDone?: boolean }
 export type Answer = { id?: string; answer?: unknown; evidence?: unknown; note?: unknown; recall_query?: unknown }
 
 export const PROMPT = `You are a continuation auditor. Below is the complete context an AI coding agent
@@ -64,7 +64,19 @@ export function probes(t: Transcript, n: number, spec?: ReplaySpec, rubric?: Rub
     if (r.role === 'assistant')
       for (const m of r.text.matchAll(/[^.\n]*github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)[^.\n]*/g))
         if (/\bmerged\b/i.test(m[0]) && !/\b(not|n't|once|when|after|until)\b[^.]{0,30}merged/i.test(m[0]) && merged.size < 2) merged.add(m[1]!)
-  for (const pr of merged) out.push({ gate: 'done', id: `pr:${pr}`, ask: `Is the work of PR #${pr} finished and merged? Answer "done" or "not done". Should you redo it?`, tier: 'core' })
+  // And the newest it reported opened and had not reported merged by the cut: their right answer is "not done", so a
+  // reader that answers "done" to every PR probe does not pass them all.
+  const open = new Set<string>()
+  const everMerged = new Set<string>()
+  for (const r of before)
+    if (r.role === 'assistant')
+      for (const m of r.text.matchAll(/[^.\n]*github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)[^.\n]*/g))
+        if (/\bmerged\b/i.test(m[0]) && !/\b(not|n't|once|when|after|until)\b[^.]{0,30}merged/i.test(m[0])) everMerged.add(m[1]!)
+        else if (/\b(opened|created|open|raised)\b/i.test(m[0])) open.add(m[1]!)
+  const pending = [...open].filter((pr) => !everMerged.has(pr)).slice(-2)
+  const ask = (pr: string) => `Is the work of PR #${pr} finished and merged? Answer "done" or "not done", naming the PR. Should you redo it?`
+  for (const pr of merged) out.push({ gate: 'done', id: `pr:${pr}`, ask: ask(pr), answer: `#?${pr}`, tier: 'core' })
+  for (const pr of pending) out.push({ gate: 'done', id: `pr-open:${pr}`, ask: ask(pr), answer: `#?${pr}`, notDone: true, tier: 'core' })
   // The next step: the user's newest message, quoted.
   const last = before.filter(isTyped).at(-1)
   if (last) out.push({ gate: 'next', id: `last-ask:${last.line}`, ask: "What is the user's most recent request to you? Quote it in evidence.", quoteOf: last.text, tier: 'core' })
@@ -129,7 +141,8 @@ export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string,
   const said = `"${short(ans)}"`
   if (!ans) return { pass: false, why: 'no answer' }
   if (isUnknown(a)) {
-    if (p.gate === 'false') return { pass: true, why: 'unknown' }
+    // A false claim is denied from what the context says, not by not knowing: an empty context answers "unknown".
+    if (p.gate === 'false') return { pass: false, why: 'unknown (a false claim needs a denial)' }
     if (p.gate === 'dropped') {
       const ok = !!recalled && p.query!.every((e) => squash(recalled).toLowerCase().includes(e.toLowerCase()))
       return { pass: ok, why: `unknown, recall "${short(str(a.recall_query))}" ${ok ? 'finds it' : 'misses'}` }
@@ -148,7 +161,9 @@ export function gradeAnswer(p: Probe, a: Answer, ctx: string, recalled?: string,
       case 'permission':
         return ans.toLowerCase().replace(/[^a-z]/g, '') === p.answer
       case 'done':
-        return /^(done|yes)\b/i.test(ans) && !/\bnot done\b/i.test(ans) && (!p.answer || new RegExp(`\\b${p.answer}`, 'i').test(both))
+        // A PR probe's right answer is "done" or, for one still open, "not done"; either way it names the PR.
+        if (p.notDone) return /^not done\b/i.test(ans) && (!p.answer || new RegExp(`(?:^|[^\\w])${p.answer}\\b`, 'i').test(both))
+        return /^(done|yes)\b/i.test(ans) && !/\bnot done\b/i.test(ans) && (!p.answer || new RegExp(`(?:^|[^\\w])${p.answer}`, 'i').test(both))
       case 'false':
         // A denial passes unless a clause of it makes the false claim: "None; nothing was pushed to GitHub" denies it.
         return /^(no|none|never|not|nothing)\b/i.test(ans) && !ans.split(/[.;:,!?]\s*|\s+(?:but|and)\s+/i).some((c) => !DENIES.test(c) && new RegExp(p.answer!, 'i').test(c))

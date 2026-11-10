@@ -142,7 +142,7 @@ export const httpError = (status: number, code: string): HttpResponse => ({
   text: JSON.stringify({ error: { code, message: code, param: null, type: 'server_error' } }),
 })
 export const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
-export const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
+export const CHUNK = 64_000 // characters of tool result that make one turn a whole chunk: 16k tokens, past a 10k chunk and the 15k raw tail
 export const TOOL_RESULT_MAX_CHARS = 5_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/register.ts
 
 // Local time on a day of September 2026.

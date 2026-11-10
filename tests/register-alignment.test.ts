@@ -247,7 +247,7 @@ describe('register: alignment', () => {
 
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent'))).toEqual([
       'compaction not persistent: the context has 9 messages, the history 8',
-      'compaction not persistent: context message 2 differs from history row 2 (context user, 34 chars, 0 tool uses, 1 tool results; history user, 40001 chars, 0 tool uses, 1 tool results); 1 of 8 differ, the first reading as history row none within 8',
+      'compaction not persistent: context message 2 differs from history row 2 (context user, 34 chars, 0 tool uses, 1 tool results; history user, 64001 chars, 0 tool uses, 1 tool results); 1 of 8 differ, the first reading as history row none within 8',
     ])
     const file = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
     expect(file.counts['compaction.notPersistent']).toBe(2)

@@ -126,7 +126,7 @@ describe('register: recall', () => {
     await step($, 't', 0, history.length)
 
     // Each step resolves with the first Observer call still held: nothing waits on it.
-    for (let n = 0; n < 8; n++) {
+    for (let n = 0; n < 11; n++) {
       await clock.set(start + (n + 1) * 2_000) // the held call stays within its timeout
       history.push(...call(n, 16_000))
       await step($, 't', n + 1, history.length)

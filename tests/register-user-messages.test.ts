@@ -100,7 +100,7 @@ describe('register: user-messages', () => {
     ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const long = (n: number) => `${n} ${'w'.repeat(4_000)}`
     const brief = `brief ${'b'.repeat(14_600)}`
-    const messages = [...turn(brief, 'r', 2_000), ...Array.from({ length: 30 }, (_, i) => turn(long(i), 'r', 2_000)).flat(), ...turn('last', 'r', 8_000)]
+    const messages = [...turn(brief, 'r', 2_000), ...Array.from({ length: 30 }, (_, i) => turn(long(i), 'r', 2_000)).flat(), ...turn('last', 'r', 44_000)]
 
     const result = await $.session.compact({ trigger: 'manual', messages })
 
@@ -116,7 +116,7 @@ describe('register: user-messages', () => {
 
     // Chained: the brief stays first and the omitted count grows rather than resets.
     const more = Array.from({ length: 5 }, (_, i) => turn(long(100 + i), 'r', 2_000)).flat()
-    const second = await $.session.compact({ trigger: 'manual', messages: [...result.messages!, ...more, ...turn('end', 'r', 8_000)] })
+    const second = await $.session.compact({ trigger: 'manual', messages: [...result.messages!, ...more, ...turn('end', 'r', 44_000)] })
     const again = userMessagesIn(second.messages?.[0]?.text) ?? []
     expect(again[0]).toBe(brief)
     // In order, the short 'last' kept whole past the cap, the long ones between counted, and the counts accumulated.
@@ -139,7 +139,7 @@ describe('register: user-messages', () => {
     ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const long = (n: number) => `${n} ${'w'.repeat(8_000)}`
     const prompts = Array.from({ length: 12 }, (_, i) => (i % 3 === 0 ? `no, use option ${i} instead` : long(i)))
-    const messages = [...turn('brief', 'r', 2_000), ...prompts.flatMap((p) => turn(p, 'r', 2_000)), ...turn('last', 'r', 8_000)]
+    const messages = [...turn('brief', 'r', 2_000), ...prompts.flatMap((p) => turn(p, 'r', 2_000)), ...turn('last', 'r', 44_000)]
 
     const kept = userMessagesIn((await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text) ?? []
     expect(kept[0]).toBe('brief')

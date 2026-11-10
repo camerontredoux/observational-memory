@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 import { turn, COMPOSER, CHUNK, at, world, ember, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
 import type { Ledger } from './harness'
-import { TURN_END_NOTE } from '../hooks/prompts'
+import { idleNote, TURN_END_NOTE } from '../hooks/prompts'
 
 // Delegation, finished subagents and scheduling writes.
 describe('register: lifecycle', () => {
@@ -156,7 +156,7 @@ describe('register: lifecycle', () => {
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
     for (let n = 0; n < 24; n++) agents['agent-1'].push(...agentCall('one', n, 16_000))
     agents['agent-2'] = [{ role: 'user', text: 'brief', toolUses: [] }]
-    for (let n = 0; n < 4; n++) agents['agent-2'].push(...agentCall('two', n, 16_000))
+    for (let n = 0; n < 7; n++) agents['agent-2'].push(...agentCall('two', n, 16_000))
     await clock.set(at(23, 9, 0))
     await step($, 's', 0, agents['agent-1'].length, 'agent-1')
     await clock.settle()
@@ -284,7 +284,7 @@ describe('register: lifecycle', () => {
     const seen = ember(on, { reply: readsIn })
     on('turn.complete', () => ({ text: '' }))
     agents['mate-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
-    for (let n = 0; n < 4; n++) agents['mate-1'].push(...agentCall('one', n, 16_000))
+    for (let n = 0; n < 7; n++) agents['mate-1'].push(...agentCall('one', n, 16_000))
 
     await $.turn.complete({ answer: 'done', durationMs: 0, isAborted: false, turnId: 'm', reason: 'answer', agentId: 'mate-1' })
     await clock.settle()
@@ -412,10 +412,10 @@ describe('register: compaction at a turn end', () => {
 
   test("a main turn that ends past 157k compacts, observing as an auto one does without the resume-directly wording, counted apart; one under it does not", async ($, on) => {
     const { clock, files, seen, compactions, runTurn } = session($, on)
-    await runTurn(turn('a', 'a', 16_000), 150_000, at(23, 9, 0))
+    await runTurn(turn('a', 'a', 36_000), 150_000, at(23, 9, 0))
     expect(compactions).toEqual([])
 
-    await runTurn(turn('b', 'b', 16_000), 160_000, at(23, 9, 5))
+    await runTurn(turn('b', 'b', 28_000), 160_000, at(23, 9, 5))
 
     // Less than a chunk before the raw tail: the person's `/compact` briefs it by code (the next test); this one
     // observes it on the spot.
@@ -435,8 +435,8 @@ describe('register: compaction at a turn end', () => {
 
   test("the person's /compact and another plugin's compaction keep their handling: less than a chunk unobserved is briefed by code", async ($, on) => {
     const { clock, files, history, seen, runTurn } = session($, on)
-    await runTurn(turn('a', 'a', 16_000), 150_000, at(23, 9, 0))
-    await runTurn(turn('b', 'b', 16_000), 150_000, at(23, 9, 5))
+    await runTurn(turn('a', 'a', 36_000), 150_000, at(23, 9, 0))
+    await runTurn(turn('b', 'b', 28_000), 150_000, at(23, 9, 5))
 
     const manual = await $.session.compact({ trigger: 'manual', messages: [...history] })
     history.push(...turn('c', 'c', 100))
@@ -477,5 +477,182 @@ describe('register: compaction at a turn end', () => {
     expect(seen.screen).toEqual([])
     await runTurn(turn('b', 'b', 16_000), 161_000, at(23, 9, 5))
     expect(refused()).toBe(2)
+  })
+})
+
+// The main conversation's own compaction once it has had no request for an hour, when its prompt cache has expired
+// and compacting removes enough. A timer, re-armed as each main turn ends; `/compact` is raised as at a turn's end.
+describe('register: compaction after an idle hour', () => {
+  const vetoes = { name: 'vetoes', tier: 'prepend' as const, register: ((on) => {
+    on('session.compact', ($, e, next) => (e.trigger === 'manual' ? { skip: 'not now' } : next(e)))
+  }) satisfies Register }
+  const HOUR = 60 * 60_000
+  // The test's `on` for the clock, with `$.clock.every` refused: the workers band's tick, which an interactive start
+  // begins, would otherwise resolve a wait every frame of the hours these tests advance.
+  const noTicks = (on: On) =>
+    ((event: string, ...rest: unknown[]) =>
+      event === 'clock.every'
+        ? on('clock.every', () => {
+            throw new Error('no workers band in these tests')
+          })
+        : (on as unknown as (event: string, ...rest: unknown[]) => unknown)(event, ...rest)) as unknown as On
+
+  // As the turn-end tests' session, with `autoCompact` false for a session whose auto-compaction is off. `start`
+  // raises session.start, interactive unless told; `end` ends the session as a restart would, keeping its store.
+  function session($: Engine, on: On, autoCompact = true) {
+    const clock = mock.clock(noTicks(on))
+    const w = world(on)
+    const seen = ember(on)
+    const compactions: SessionCompactResult[] = []
+    let context = 0
+    on('session.usage', () => ({ value: { context: { window: 235_000, ...(autoCompact ? {} : { breakdown: { isAutoCompactEnabled: false } }) }, rateLimits: [] } }) as never)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+    on('turn.step', async function* ($, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { ...USAGE, cache_read_input_tokens: context, model: 'claude' } }
+    })
+    on('tool.register', ($, e) => ({ value: { tool: `mcp__observational-memory__${e.name}` } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+    on('command.run', { command: 'compact' }, async () => {
+      compactions.push(await $.session.compact({ trigger: 'manual', messages: [...w.history] }))
+      return {}
+    })
+    // A turn's prompt at `startAt`, one request over `tokens` of context, and its end a minute later; with `open`, the
+    // turn is left running after its request.
+    const runTurn = async (rows: SessionMessage[], tokens: number, startAt: number, options: { agentId?: string; open?: boolean } = {}) => {
+      const { agentId } = options
+      const turnId = `turn-${w.history.length}`
+      await clock.set(startAt)
+      if (agentId === undefined) {
+        w.history.push(rows[0]!)
+        await $.turn.start({ text: rows[0]!.text, turnId })
+        w.history.push(...rows.slice(1))
+      } else w.agents[agentId] = rows
+      context = tokens
+      for await (const _ of $.turn.step({ turnId, index: 0, model: 'claude', messageCount: rows.length, ...(agentId ? { agentId } : {}) }));
+      await clock.advance(60_000)
+      if (options.open) return clock.settle().then(() => turnId)
+      await $.turn.complete({ answer: '', durationMs: 60_000, isAborted: false, turnId, reason: 'answer', ...(agentId ? { agentId } : {}) })
+      await clock.settle()
+      return turnId
+    }
+    const start = async (isInteractive = true) => {
+      await $.session.start({ cwd: '/work/project', surface: null, isInteractive })
+      await clock.settle()
+    }
+    const end = () => $.session.end({ reason: 'other', sessionId: 'session-1', resume: { id: 'session-1' } })
+    return { clock, ...w, seen, compactions, runTurn, start, end }
+  }
+  const metrics = (files: Record<string, string>) => (JSON.parse(files['/stats/session-1.json']!) as { metrics: Record<string, { count: number }> }).metrics
+
+  test('an hour after the last main request, a context past 85k with no compaction yet compacts once, says why on screen and in the memory, and counts apart', async ($, on) => {
+    const { clock, files, seen, compactions, runTurn } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 100_000, at(23, 9, 0))
+    await clock.advance(HOUR - 1_000)
+    expect(compactions).toEqual([])
+
+    await clock.advance(1_000)
+
+    expect(compactions).toHaveLength(1)
+    expect(seen.screen).toEqual(['Compacting after 1h 0m idle: the prompt cache has expired, so the next request rewrites the context anyway'])
+    const text = compactions[0]!.messages?.[0]?.text ?? ''
+    // The user's next prompt follows the memory: the model answers it, and is not told to resume on its own.
+    expect(text).toContain(`save space.\n${idleNote('1h 0m')}\n\n<memory-guide>`)
+    expect(text).toContain("Answer the user's next message; do not resume earlier work it does not ask for.")
+    expect(text).not.toContain('Resume directly')
+    expect(seen.logs).toContain('the idle compaction installed')
+    await clock.advance(5 * HOUR)
+    expect(compactions).toHaveLength(1)
+    expect(metrics(files)['compaction.idle.ms']!.count).toBe(1)
+    expect(metrics(files)['compaction.manual.ms']).toBeUndefined()
+    expect((await $.command.run({ command: 'om-stats', args: '', ...COMPOSER })).text).toContain('1 main (1 after an idle hour)')
+  })
+
+  test('the size margin: 85k before any compaction, then 20k over the first request after the last one', async ($, on) => {
+    const { clock, compactions, runTurn } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 80_000, at(23, 9, 0))
+    await clock.advance(2 * HOUR)
+    expect(compactions).toEqual([])
+
+    await runTurn(turn('b', 'b', 16_000), 90_000, at(23, 12, 0))
+    await clock.advance(HOUR)
+    expect(compactions).toHaveLength(1)
+
+    // The first request after it measures 60k: 75k is under the margin, 81k past it.
+    await runTurn(turn('c', 'c', 100), 60_000, at(23, 14, 0))
+    await runTurn(turn('d', 'd', 100), 75_000, at(23, 14, 5))
+    await clock.advance(2 * HOUR)
+    expect(compactions).toHaveLength(1)
+    await runTurn(turn('e', 'e', 100), 81_000, at(23, 17, 0))
+    await clock.advance(HOUR)
+    expect(compactions).toHaveLength(2)
+  })
+
+  test('a turn starting clears the timer and a running turn is never idle, however long; its end starts the hour again', async ($, on) => {
+    const { clock, compactions, runTurn } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 100_000, at(23, 9, 0))
+    const running = await runTurn(turn('b', 'b', 100), 100_000, at(23, 9, 30), { open: true })
+    await clock.advance(3 * HOUR)
+    expect(compactions).toEqual([])
+
+    await $.turn.complete({ answer: '', durationMs: 3 * HOUR, isAborted: false, turnId: running, reason: 'answer' })
+    await clock.settle()
+    await clock.advance(HOUR)
+    expect(compactions).toHaveLength(1)
+  })
+
+  test("a subagent's turns arm nothing, however large their context", async ($, on) => {
+    const { clock, compactions, runTurn } = session($, on)
+    await runTurn(turn('brief', 'r', 100), 170_000, at(23, 9, 0), { agentId: 'agent-1' })
+    await clock.advance(3 * HOUR)
+    expect(compactions).toEqual([])
+  })
+
+  test('with auto-compaction off it does not compact', async ($, on) => {
+    const { clock, seen, compactions, runTurn } = session($, on, false)
+    await runTurn(turn('a', 'a', 16_000), 100_000, at(23, 9, 0))
+    await clock.advance(2 * HOUR)
+    expect(compactions).toEqual([])
+    expect(seen.logs).toContain('idle, but auto-compaction is off: not compacting')
+  })
+
+  test('one try per idle period: a vetoed one is not tried again, by the timer or a session start, until a turn has run', { plugins: [vetoes] }, async ($, on) => {
+    const { clock, seen, compactions, runTurn, start } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 100_000, at(23, 9, 0))
+    await clock.advance(HOUR)
+    expect(compactions).toEqual([{ skip: 'not now' }])
+    expect(seen.logs).toContain('the idle compaction did not install')
+
+    await clock.advance(5 * HOUR)
+    expect(compactions).toHaveLength(1)
+
+    await runTurn(turn('b', 'b', 100), 100_000, at(23, 16, 0))
+    await clock.advance(HOUR)
+    expect(compactions).toHaveLength(2)
+    await clock.advance(5 * HOUR)
+    await start()
+    expect(compactions).toHaveLength(2)
+  })
+
+  test('a resumed session reads the idle hour from the store: past it, it compacts at the start; under it, it waits out the rest; a -p run does not', async ($, on) => {
+    const { clock, compactions, runTurn, start, end } = session($, on)
+    await runTurn(turn('a', 'a', 16_000), 100_000, at(23, 9, 0))
+    await end()
+    await clock.set(at(23, 9, 31))
+    await start()
+    await clock.advance(HOUR / 2 - 60_000)
+    expect(compactions).toEqual([])
+    await clock.advance(60_000)
+    expect(compactions).toHaveLength(1)
+
+    await runTurn(turn('b', 'b', 100), 60_000, at(23, 11, 0)) // the first request after it
+    await runTurn(turn('c', 'c', 16_000), 100_000, at(23, 11, 5))
+    await end()
+    await clock.set(at(23, 18, 0))
+    await start(false)
+    expect(compactions).toHaveLength(1)
+    await start()
+    expect(compactions).toHaveLength(2)
   })
 })

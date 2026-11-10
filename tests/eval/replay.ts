@@ -28,6 +28,8 @@ export type Boundary = {
   preTokens?: number
   postTokens?: number
   trigger?: string
+  /** The model requests the session made in the span after this boundary, up to the next one. */
+  requests?: number
   /** The session's own compaction: its summary, and the rows it kept raw. */
   summary: string
   kept: Row[]
@@ -114,7 +116,11 @@ export function parseTranscript(jsonl: string | readonly Raw[]): Transcript {
       inTurn = true
       return
     }
-    if (row.role === 'assistant' && r.message?.id !== lastId) events.push({ kind: 'step', at: t })
+    if (row.role === 'assistant' && r.message?.id !== lastId) {
+      events.push({ kind: 'step', at: t })
+      const b = boundaries.at(-1)
+      if (b) b.requests = (b.requests ?? 0) + 1
+    }
     if (row.role === 'assistant') lastId = r.message?.id
     events.push({ kind: 'row', row, at: t })
   })
@@ -267,24 +273,135 @@ export type Needed = { key: string; kind: IdentifierKind; line: number }
  * then the assistant read it, it did not remember it).
  */
 export function neededIdentifiers(t: Transcript, n: number): Needed[] {
+  return usedAfter(t, n).needed
+}
+/**
+ * The identifiers the agent found again after boundary n: known before it, not kept raw across it, and shown again by
+ * a tool result (not a message the user typed, nor the assistant's own mention) before the assistant's first use of
+ * them in span n. neededIdentifiers leaves them out; they are what a lost identifier costs: a search to find it again.
+ */
+export function refoundIdentifiers(t: Transcript, n: number): Needed[] {
+  return usedAfter(t, n).refound
+}
+function usedAfter(t: Transcript, n: number) {
   const before = new Set<string>()
   for (const span of t.spans.slice(0, n)) for (const row of span) for (const key of identifiersIn(messageText(row)).keys()) before.add(key)
   const kept = normalize(t.boundaries[n - 1]?.kept.map(messageText).join('\n') ?? '')
   const shown = new Set<string>()
+  const byTool = new Set<string>()
   const needed = new Map<string, Needed>()
+  const refound = new Map<string, Needed>()
   for (const row of t.spans[n] ?? []) {
     if (row.role === 'user') {
-      for (const key of identifiersIn(messageText(row)).keys()) shown.add(key)
+      for (const key of identifiersIn(messageText(row)).keys()) (row.toolResults ? byTool : shown).add(key)
       continue
     }
     for (const [key, kind] of identifiersIn(assistantUse(row))) {
-      if (needed.has(key) || shown.has(key) || !before.has(key) || holds(kept, key, kind)) continue
-      needed.set(key, { key, kind, line: row.line })
+      if (needed.has(key) || refound.has(key) || shown.has(key) || !before.has(key) || holds(kept, key, kind)) continue
+      ;(byTool.has(key) ? refound : needed).set(key, { key, kind, line: row.line })
     }
     // The assistant's own mention shows it from here on: a later use is not a second recall.
     for (const key of identifiersIn(assistantUse(row)).keys()) shown.add(key)
   }
-  return [...needed.values()]
+  return { needed: [...needed.values()], refound: [...refound.values()] }
+}
+
+const RECALL_TOOL_NAME = /(?:^|__)om_recall$/
+const SUBAGENT_TOOLS = new Set(['Agent', 'Task'])
+// Commands whose output is the moment's state or a manual, never something to remember: a status, a listing, a
+// working directory, a help page; and shell plumbing (a loop, a heredoc script, an assignment, a subshell).
+const TRIVIAL_COMMAND = /^(?:git (?:status|diff|log|branch|remote|show|fetch)\b|ls\b|pwd|date|clear|true|echo\b|cat\b|head\b|tail\b|sleep\b|which\b|for |while |if |\(|\w+=|(?:python3?|node|bun) -[ce]?(?:\s|$))|--help\b|<</
+/**
+ * A command's core, the part a rerun repeats: the leading `cd DIR &&` and environment assignments dropped, then its
+ * first pipeline stage, without redirections. `claude plugin test 2>&1 | tail -5` and `cd w && claude plugin test` are
+ * one command.
+ */
+export function commandCore(command: string): string {
+  let c = command.trim()
+  for (let i = 0; i < 4; i++) c = c.replace(/^cd\s+\S+\s*(?:&&|;)\s*/, '').replace(/^(?:[A-Z_][A-Z0-9_]*=\S*\s+)+/, '')
+  return squashed(c.split(/\s*(?:\|\|?|&&|;|\n)\s*/)[0]!.replace(/\s*\d?>>?\s*(?:&\d|\S+)/g, ''))
+}
+const squashed = (s: string) => normalize(s).replace(/\s+/g, ' ').trim()
+const wordsOf = (s: string) => new Set(s.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) ?? [])
+/** The om_recall queries of span n's assistant rows, each as its content words. */
+function recallQueries(t: Transcript, n: number) {
+  return (t.spans[n] ?? []).flatMap((r) => r.toolUses.filter((u) => RECALL_TOOL_NAME.test(u.tool)).map((u) => wordsOf(String((u.input as { query?: unknown }).query ?? ''))))
+}
+/** Whether a recall query (two or more content words) asks for `text`: every word of it is in the text. */
+const asksFor = (q: Set<string>, text: string) => q.size >= 2 && [...q].every((w) => text.toLowerCase().includes(w))
+/** The line of a command's output that shows its outcome: its first error line on a failure, else its last line. */
+export function outcomeLine(output: string, isError: boolean): string {
+  const lines = output.split('\n').map((l) => l.trim()).filter((l) => l.length >= 4)
+  const line = (isError ? lines.find((l) => /\b(?:error|fail|fatal|cannot|not found|denied|exit code)\b/i.test(l)) : undefined) ?? lines.at(-1) ?? ''
+  return squashed(line).slice(0, 100)
+}
+export type RerunCommand = { command: string; outcome: string; line: number; how: 'rerun' | 'recall' }
+/**
+ * Bash commands run before boundary n that the agent runs again in span n (the same commandCore) or looks up there (an
+ * om_recall query whose words are all in it), each with the outcome line of its last run before the cut. The commands
+ * the session's own compaction kept raw are left out, as neededIdentifiers leaves out kept identifiers; so are trivial
+ * ones (TRIVIAL_COMMAND) and cores under 12 characters.
+ */
+export function rerunCommands(t: Transcript, n: number, max = 6): RerunCommand[] {
+  const results = new Map(t.spans.slice(0, n).flat().flatMap((r) => (r.toolResults ?? []).map((x) => [x.tool_use_id, x] as const)))
+  const last = new Map<string, { outcome: string }>()
+  for (const r of t.spans.slice(0, n).flat())
+    for (const u of r.toolUses) {
+      const c = (u.input as { command?: unknown }).command
+      if (u.tool !== 'Bash' || typeof c !== 'string') continue
+      const command = commandCore(c)
+      if (command.length < 12 || TRIVIAL_COMMAND.test(command)) continue
+      const x = results.get(u.tool_use_id)
+      last.set(command, { outcome: x ? outcomeLine(x.text, x.isError) : '' })
+    }
+  const kept = squashed(t.boundaries[n - 1]?.kept.map(messageText).join('\n') ?? '')
+  const queries = recallQueries(t, n)
+  const out = new Map<string, RerunCommand>()
+  for (const r of t.spans[n] ?? [])
+    for (const u of r.toolUses) {
+      const c = (u.input as { command?: unknown }).command
+      const command = u.tool === 'Bash' && typeof c === 'string' ? commandCore(c) : ''
+      const hit = last.get(command)
+      if (hit && !out.has(command) && !kept.includes(command)) out.set(command, { command, outcome: hit.outcome, line: r.line, how: 'rerun' })
+    }
+  for (const q of queries)
+    for (const [command, hit] of last) if (!out.has(command) && !kept.includes(command) && asksFor(q, command)) out.set(command, { command, outcome: hit.outcome, line: 0, how: 'recall' })
+  return [...out.values()].slice(0, max)
+}
+export type SubagentReturn = { id: string; expect: string[]; how: 'recall' | 'resume' | 'identifiers' }
+/**
+ * Subagent briefs and reports from before boundary n (an Agent or Task call: its prompt, and its result) that the agent
+ * goes back to in span n: an om_recall query whose words are all in the brief and report, a message to the subagent
+ * by the id its report gave, or two or more identifiers the assistant uses unprompted that, before the cut, only that
+ * brief or report named. `expect`: what the agent went back for, which the context must hold.
+ */
+export function subagentReturns(t: Transcript, n: number): SubagentReturn[] {
+  const before = t.spans.slice(0, n).flat()
+  const results = new Map(before.flatMap((r) => (r.toolResults ?? []).map((x) => [x.tool_use_id, x.text] as const)))
+  const agents = before.flatMap((r) =>
+    r.toolUses.filter((u) => SUBAGENT_TOOLS.has(u.tool)).map((u) => {
+      const i = u.input as { description?: unknown; prompt?: unknown }
+      const report = results.get(u.tool_use_id) ?? ''
+      return { id: squashed(String(i.description ?? u.tool_use_id)).slice(0, 60), text: `${String(i.prompt ?? '')}\n${report}`, agentId: /agentId: ?([\w-]{6,})/.exec(report)?.[1] }
+    }),
+  )
+  if (!agents.length) return []
+  // Identifiers each brief and report names that nothing else before the cut does.
+  const elsewhere = new Map<string, number>()
+  for (const r of before) for (const key of identifiersIn(messageText(r)).keys()) elsewhere.set(key, (elsewhere.get(key) ?? 0) + 1)
+  const needed = new Set(neededIdentifiers(t, n).map((x) => x.key))
+  const queries = recallQueries(t, n)
+  const after = (t.spans[n] ?? []).filter((r) => r.role === 'assistant').flatMap((r) => r.toolUses.map((u) => JSON.stringify(u.input))).join('\n')
+  const out = new Map<string, SubagentReturn>()
+  for (const a of agents) {
+    if (out.has(a.id)) continue
+    const own = [...identifiersIn(a.text).keys()].filter((k) => needed.has(k) && (elsewhere.get(k) ?? 0) <= 2)
+    const q = queries.find((q) => asksFor(q, a.text))
+    if (q) out.set(a.id, { id: a.id, expect: [...q].filter((w) => a.text.toLowerCase().includes(w)), how: 'recall' })
+    else if (a.agentId && after.includes(a.agentId)) out.set(a.id, { id: a.id, expect: [a.id], how: 'resume' })
+    else if (own.length >= 2) out.set(a.id, { id: a.id, expect: own.slice(0, 4), how: 'identifiers' })
+  }
+  return [...out.values()]
 }
 
 // ---- A compacted context and what it holds ----
@@ -606,13 +723,67 @@ export function tallyQuestions(results: readonly QuestionResult[]): QuestionTall
 /** Characters per token for estimates, as `hooks/memory.ts` estimates. */
 const CHARS_PER_TOKEN = 4
 export const estimateTokens = (text: string) => Math.ceil(text.length / CHARS_PER_TOKEN)
+/**
+ * The characters per token a transcript's own requests recorded, to calibrate estimateTokens on it. Each request (the
+ * assistant rows sharing one message.id) records its context in message.usage (input, cache read and cache creation
+ * tokens together) and its output. Between two successive requests of one span the context grew by the first one's
+ * output (its thinking included, which the transcript does not show) and the user rows after it (tool results, typed
+ * messages); so the user rows' characters (messageText, as a context holds them) over the input growth less that output
+ * is one measure. The median over the pairs adding at least `minTokens` such tokens, with no attachment or meta row
+ * between them (those add tokens no row shows). Tool results are most of what it measures: code and logs, denser in
+ * tokens than a memory message's prose, so it may read a context's tokens somewhat high.
+ */
+export function charsPerToken(jsonl: string | readonly Raw[], minTokens = 300): { median: number; p10: number; p90: number; pairs: number } {
+  const ratios: number[] = []
+  const seen = new Set<string>()
+  let prev: { id: string; tokens: number; out: number } | undefined
+  let chars = 0
+  // An attachment row (a system reminder, a changed file, the todo list) or a meta row adds tokens the rows do not
+  // show: the pair it falls in is left out. Two kinds come with nearly every request and are counted instead: a hook's
+  // success with nothing to say (no tokens), and the remaining-tokens reminder (its text).
+  let hidden = false
+  let session: unknown
+  rawRows(jsonl).forEach((r, i) => {
+    // Several transcripts joined pool their pairs: a new session starts afresh.
+    if (r.sessionId !== undefined && r.sessionId !== session) ((session = r.sessionId), (prev = undefined), (chars = 0))
+    if (r.type === 'system' && r.subtype === 'compact_boundary') return void ((prev = undefined), (chars = 0))
+    if (r.isSidechain) return
+    if (r.type === 'attachment') {
+      const a = r.attachment ?? {}
+      if (a.type === 'hook_success' && !a.content) return
+      if (a.type === 'total_tokens_reminder' && typeof a.text === 'string') return void (chars += a.text.length)
+      return void (hidden = true)
+    }
+    if (r.isMeta) return void (hidden = true)
+    if (r.type !== 'user' && r.type !== 'assistant') return
+    if (typeof r.uuid === 'string') {
+      if (seen.has(r.uuid)) return
+      seen.add(r.uuid)
+    }
+    const u = r.message?.usage
+    const id = r.message?.id
+    if (r.type === 'assistant' && u && id) {
+      // A streamed message repeats its usage on each row; its output count grows to the final one.
+      if (prev && id === prev.id) return void (prev.out = Math.max(prev.out, u.output_tokens ?? 0))
+      const tokens = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
+      const added = prev ? tokens - prev.tokens - prev.out : 0
+      if (prev && !hidden && added >= minTokens && chars > 0) ratios.push(chars / added)
+      prev = { id, tokens, out: u.output_tokens ?? 0 }
+      chars = 0
+      hidden = false
+      return
+    }
+    const row = r.type === 'user' ? rowOf(r, i + 1, 0) : undefined
+    if (row) chars += messageText(row).length
+  })
+  const s = ratios.sort((a, b) => a - b)
+  const q = (p: number) => s[Math.min(s.length - 1, Math.floor(p * s.length))] ?? CHARS_PER_TOKEN
+  return { median: q(0.5), p10: q(0.1), p90: q(0.9), pairs: s.length }
+}
 /** The Observer's chunk, as in `hooks/register.ts`. */
 const OBSERVER_CHUNK_TOKENS = 10_000
-/**
- * One Luna call's cost per input token: a cached Observer call over a ~10k-token chunk cost $0.0032532 for 12,282
- * tokens in and 664 out (pi's own usage record), so a call is priced at its input share of that.
- */
-const LUNA_USD_PER_INPUT_TOKEN = 0.0032532 / 12_282
+/** Ember's dollars per million tokens in and out, as `hooks/register.ts` prices a call (its cached input left out). */
+const EMBER_USD_PER_MTOK = { input: 0.1, output: 0.5 }
 const OBSERVER_PROMPT_TOKENS = 2_300 // the Observer's system prompt and the chunk's framing
 /** A built-in summary's size, and a headless session's own overhead (system prompt and tool definitions). */
 const SUMMARY_TOKENS = 5_000
@@ -646,7 +817,7 @@ export type PlanOptions = {
 
 /**
  * Every model call a full run would make, with an estimate of its tokens and cost. om compacts offline through the
- * checkout's hooks, its Observer calls through pi (Luna), one per ~10k-token chunk of each span; a stub replay's own
+ * checkout's hooks, its Observer calls to Ember, one per ~10k-token chunk of each span; a stub replay's own
  * count replaces the estimate. The
  * built-in chain is one `/compact` per boundary in a resumed Sonnet session holding about the session's own
  * pre-compaction context. The question stage is one headless Sonnet session per boundary and configuration that
@@ -656,16 +827,16 @@ export function planCalls(name: string, t: Transcript, spec?: ReplaySpec, option
   const calls: PlannedCall[] = []
   const om: Configuration[] = ['om', 'om+recall']
   const builtin: Configuration[] = ['builtin', 'builtin+recall']
-  const luna = (stage: 'observer', inTokens: number, what: string, boundary?: number, outTokens = 700) =>
-    calls.push({ transcript: name, configs: om, stage, ...(boundary ? { boundary } : {}), model: 'luna (pi)', what, inTokens, outTokens, usd: inTokens * LUNA_USD_PER_INPUT_TOKEN })
+  const observe = (stage: 'observer', inTokens: number, what: string, boundary?: number, outTokens = 700) =>
+    calls.push({ transcript: name, configs: om, stage, ...(boundary ? { boundary } : {}), model: 'ember', what, inTokens, outTokens, usd: (inTokens * EMBER_USD_PER_MTOK.input + outTokens * EMBER_USD_PER_MTOK.output) / 1e6 })
   const spanTokens = t.spans.map((span) => span.reduce((n, r) => n + estimateTokens(messageText(r)), 0))
   const observed = options.omCalls?.filter((c) => c.kind === 'observer')
-  observed?.forEach((c, i) => luna('observer', c.inTokens, `observer call ${i + 1} of ${observed.length} in the stub replay`))
+  observed?.forEach((c, i) => observe('observer', c.inTokens, `observer call ${i + 1} of ${observed.length} in the stub replay`))
   spanTokens.forEach((tokens, k) => {
     const chunks = Math.ceil(tokens / OBSERVER_CHUNK_TOKENS)
     if (!observed)
       for (let c = 0; c < chunks; c++)
-        luna('observer', Math.min(OBSERVER_CHUNK_TOKENS, tokens - c * OBSERVER_CHUNK_TOKENS) + OBSERVER_PROMPT_TOKENS, `observe span ${k}, chunk ${c + 1} of ${chunks}`)
+        observe('observer', Math.min(OBSERVER_CHUNK_TOKENS, tokens - c * OBSERVER_CHUNK_TOKENS) + OBSERVER_PROMPT_TOKENS, `observe span ${k}, chunk ${c + 1} of ${chunks}`)
   })
   for (const b of t.boundaries) {
     const inTokens = b.preTokens ?? (b.n === 1 ? spanTokens[0]! : SUMMARY_TOKENS + spanTokens[b.n - 1]!)
@@ -878,15 +1049,16 @@ export function uncompacted(c: ReturnType<typeof lastCompaction>, boundary: numb
 
 /**
  * Why the report leaves a result directory out, or undefined to score it: a cached or live om replay (`om-live`,
- * `om-strict`) whose pi calls failed compacted on the model-free floor or with what it had, which is not om's
- * measurement. A stub replay answers every call itself, and the built-in chain makes no pi call.
+ * `om-strict`) whose Ember calls failed compacted on the model-free floor or with what it had, which is not om's
+ * measurement. A stub replay answers every call itself, and the built-in chain makes no Ember call. A replay from
+ * before Ember (pi's, which counted its calls under `luna`) has no count and is left out.
  */
-export function leftOut(dir: string, summary: { luna?: { failed?: number } } | undefined): string | undefined {
-  // Every cached or live om replay (om-live, om-strict, or a named run such as om-v130); a stub makes no pi call.
+export function leftOut(dir: string, summary: { ember?: { failed?: number } } | undefined): string | undefined {
+  // Every cached or live om replay (om-live, om-strict, or a named run such as om-v130); a stub makes no Ember call.
   if (!dir.startsWith('om-') || dir.startsWith('om-stub')) return undefined
-  const failed = summary?.luna?.failed
-  if (failed === undefined) return 'no pi call count (summary.json)'
-  return failed ? `${failed} pi call(s) failed` : undefined
+  const failed = summary?.ember?.failed
+  if (failed === undefined) return 'no Ember call count (summary.json)'
+  return failed ? `${failed} Ember call(s) failed` : undefined
 }
 
 export type BuiltinStep =
@@ -928,7 +1100,7 @@ export function planBuiltinChain(input: { runDir: string; sessionId: string; pan
 
 export type ConfigResult = {
   config: string
-  /** How the contexts were made: the session's own compaction, an om replay (with pi stubbed or cached), a live built-in chain. */
+  /** How the contexts were made: the session's own compaction, an om replay (with Ember stubbed or cached), a live built-in chain. */
   source: string
   /** Boundary n's context at index n - 1; undefined where the configuration has none. */
   contexts: readonly (Context | undefined)[]

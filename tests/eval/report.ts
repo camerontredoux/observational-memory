@@ -4,7 +4,7 @@
 import type { Context } from './replay'
 import { estimateTokens } from './replay'
 import type { Gate, Item, Pointed, Scores } from './rubric'
-import { tierOf, TIER, WEIGHTS } from './rubric'
+import { APART, counts, tierOf, TIER, WEIGHTS } from './rubric'
 import type { BGate } from './behavior'
 import { BGATES, BSAMPLES } from './behavior'
 import type { Category, ContinuationScore } from './continuation'
@@ -12,17 +12,18 @@ import { CATEGORIES, CATEGORY_WEIGHTS, continuation, continuationBehavior } from
 
 /** One transcript's replay: its contexts, and the cache keys of its Observer calls (sorted). */
 export type Replay = { name: string; contexts: (Context | undefined)[]; calls: number; fresh: number; failed: number; keys: string[]; eff: Eff; fallbacks: { n: number; reason: string }[] }
-/** Model calls and their tokens in and out (the pi reply's usage; the estimated prompt when it has none). */
+/** Model calls and their tokens in and out (Ember's usage; the estimated request when it has none). */
 export type Tally = { calls: number; in: number; out: number }
 /**
- * Efficiency, apart from the quality total. Per cut: the compacted context's tokens, and that over the context it replaced
- * (the source session's own preTokens at the cut). Critical path: the calls bench-replay starts while register.ts's
+ * Efficiency and cost, apart from the quality total. Per cut (Cut): the compacted context's tokens, estimated and
+ * calibrated, the source session's requests before its next compaction, and the context over the one it replaced (the
+ * source session's own preTokens at the cut). `cpt`: the transcript's recorded characters per token. Critical path: the calls bench-replay starts while register.ts's
  * session.compact hook runs (calls.json atCompaction), which compaction waits for; a background call still in flight that
  * merely finishes during compaction counts as background.
  */
-export type Eff = { tokens: number[]; ratio: number[]; observer: Tally; critical: Tally }
+export type Eff = { cuts: Cut[]; cpt: number; observer: Tally; critical: Tally }
 export type Sample = { replays: Replay[]; items: Item[]; scores: Scores; perTranscript: Record<string, Scores>; pointed?: Pointed[] }
-export type Run = { label: string; dir?: string; behavior?: BItem[]; samples: Sample[]; holdout?: Sample[]; chain?: Sample[]; long?: Sample[]; noise?: Run }
+export type Run = { label: string; dir?: string; behavior?: BItem[]; samples: Sample[]; holdout?: Sample[]; chain?: Sample[]; long?: Sample[] }
 export type BItem = { gate: BGate; boundary: number; id: string; pass: boolean; votes: number; why: string; tier?: 'core' | 'lookup' }
 
 /** The long chain's recall-aware credit (held 1, pointed ½, over its hand-authored facts) and what the plugin reached. */
@@ -69,63 +70,83 @@ export const total = (r: Run) => mean(r.samples.map((s) => s.scores.total))
 export const tiered = (r: Run, k: 'tiered' | 'core' | 'lookup' = 'tiered') => mean(r.samples.map((s) => s.scores[k]))
 const tierLine = (r: Run) => `Tiered total: **${f1(tiered(r))}** (core ${f1(tiered(r, 'core'))}, lookup ${f1(tiered(r, 'lookup'))}); flat total ${f1(total(r))}.`
 
-// ---- Efficiency: apart from the quality total (docs/plans/compaction-goals.md).
-type EffRow = { tokens: number; max: number; ratio: number; observer: Tally; model: number; critical: Tally }
+// ---- Efficiency and cost: apart from the quality total, the verdict's second axis ----
+
+// Prompt-cache prices against the plain input price: a compacted context is written to the cache once, at the
+// compaction, and read from it on every later request until the next one.
+const CACHE_WRITE = 1.25
+const CACHE_READ = 0.1
+/** A context over this many calibrated tokens does not fit the budget the plugin aims for. */
+export const BUDGET_TOKENS = 40_000
+/** Per cut: the context's tokens (characters ÷ 4), calibrated tokens (characters over the corpus's recorded characters per token), the requests the source session made before its next compaction. */
+export type Cut = { tokens: number; calibrated: number; requests: number; ratio: number }
+/** A cut's cost in input-token equivalents: its context written to the cache once, then read on each later request. */
+export const cutCost = (c: Cut) => c.calibrated * (CACHE_WRITE + CACHE_READ * Math.max(1, c.requests))
+type EffRow = { tokens: number; calibrated: number; carried: number; max: number; over: number; cost: number; cpt: number; ratio: number; observer: Tally; model: number; critical: Tally }
 const effOfReplays = (rs: Replay[]): EffRow => {
   const add = (k: 'observer' | 'critical') => rs.reduce((a, r) => ({ calls: a.calls + r.eff[k].calls, in: a.in + r.eff[k].in, out: a.out + r.eff[k].out }), { calls: 0, in: 0, out: 0 })
-  const tokens = rs.flatMap((r) => r.eff.tokens)
+  const cuts = rs.flatMap((r) => r.eff.cuts)
+  const reqs = cuts.reduce((s, c) => s + Math.max(1, c.requests), 0)
   const observer = add('observer')
-  return { tokens: mean(tokens), max: Math.max(...tokens), ratio: mean(rs.flatMap((r) => r.eff.ratio)), observer, model: observer.in + observer.out, critical: add('critical') }
+  return {
+    tokens: mean(cuts.map((c) => c.tokens)), calibrated: mean(cuts.map((c) => c.calibrated)), carried: cuts.reduce((s, c) => s + c.calibrated * Math.max(1, c.requests), 0) / reqs,
+    max: Math.max(...cuts.map((c) => c.calibrated)), over: cuts.filter((c) => c.calibrated > BUDGET_TOKENS).length, cost: cuts.reduce((s, c) => s + cutCost(c), 0),
+    cpt: mean(rs.map((r) => r.eff.cpt)), ratio: mean(cuts.map((c) => c.ratio)), observer, model: observer.in + observer.out, critical: add('critical'),
+  }
 }
 /** A run's efficiency, over all its transcripts or one, as the mean over its samples. */
 export function effRun(r: Run, name?: string): EffRow {
   const rows = r.samples.map((s) => effOfReplays(s.replays.filter((x) => !name || x.name === name)))
   const m = (f: (e: EffRow) => number) => mean(rows.map(f))
   const t = (k: 'observer' | 'critical'): Tally => ({ calls: m((e) => e[k].calls), in: m((e) => e[k].in), out: m((e) => e[k].out) })
-  return { tokens: m((e) => e.tokens), max: m((e) => e.max), ratio: m((e) => e.ratio), observer: t('observer'), model: m((e) => e.model), critical: t('critical') }
+  return { tokens: m((e) => e.tokens), calibrated: m((e) => e.calibrated), carried: m((e) => e.carried), max: m((e) => e.max), over: m((e) => e.over), cost: m((e) => e.cost), cpt: m((e) => e.cpt), ratio: m((e) => e.ratio), observer: t('observer'), model: m((e) => e.model), critical: t('critical') }
 }
 const kt = (n: number) => (n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n)}`)
 const pct = (n: number) => `${(100 * n).toFixed(1)}%`
 const EFF: [string, (e: EffRow) => string][] = [
-  ['context tokens per cut, mean', (e) => kt(e.tokens)],
-  ['context tokens per cut, max', (e) => kt(e.max)],
+  ['context tokens per cut, mean: estimated (chars ÷ 4) / calibrated', (e) => `${kt(e.tokens)} / ${kt(e.calibrated)}`],
+  ['tokens rewritten per compaction (calibrated), max', (e) => kt(e.max)],
+  ['tokens carried per later request (calibrated)', (e) => kt(e.carried)],
+  [`cuts over ${kt(BUDGET_TOKENS)} calibrated tokens`, (e) => String(Math.round(e.over))],
+  ['context cache cost (input-token equivalents)', (e) => kt(e.cost)],
+  ['characters per token recorded', (e) => e.cpt.toFixed(2)],
   ['reduction ratio (compacted / replaced), mean', (e) => pct(e.ratio)],
   ['Observer calls (tokens in / out)', (e) => `${Math.round(e.observer.calls)} (${kt(e.observer.in)} / ${kt(e.observer.out)})`],
   ['model tokens in + out', (e) => kt(e.model)],
   ['critical-path calls (tokens in / out)', (e) => `${Math.round(e.critical.calls)} (${kt(e.critical.in)} / ${kt(e.critical.out)})`],
 ]
-const EFF_NOTE = "Critical path: the Observer calls started inside register.ts's session.compact hook, which compaction waits for (calls.json atCompaction); a background call that only finishes during compaction counts as background. Ratio: against the source session's preTokens at the cut. Latency is virtual: calls and tokens are measured, time is not (the replay's clock is simulated)."
+const EFF_NOTE =
+  `Calibrated: the context's characters over the characters per token the corpus's own requests recorded (replay.ts charsPerToken, pooled over the main corpus; chars ÷ 4 reads well under it). Cost: each compacted context written to the prompt cache once (${CACHE_WRITE}× the input price) and read on each request the source session made before its next compaction (${CACHE_READ}×); the rows after the cut are the same in A and B and left out. The replay compacts at the source's own cuts, so a larger context does not bring the next compaction sooner here. ` +
+  "Critical path: the Observer calls started inside register.ts's session.compact hook, which compaction waits for (calls.json atCompaction). Ratio: against the source session's preTokens at the cut. Latency is virtual: calls and tokens are measured, time is not."
 function effTable(r: Run) {
   const names = Object.keys(r.samples[0]!.perTranscript)
   const all = effRun(r)
   const per = names.map((n) => effRun(r, n))
-  return [`Efficiency (not in the total):`, '', `| metric | all | ${names.join(' | ')} |`, `|---|---:|${names.map(() => '---:|').join('')}`, ...EFF.map(([k, f]) => `| ${k} | ${f(all)} | ${per.map(f).join(' | ')} |`), '', EFF_NOTE, ''].join('\n')
+  return [`Efficiency and cost (not in the quality total):`, '', `| metric | all | ${names.join(' | ')} |`, `|---|---:|${names.map(() => '---:|').join('')}`, ...EFF.map(([k, f]) => `| ${k} | ${f(all)} | ${per.map(f).join(' | ')} |`), '', EFF_NOTE, ''].join('\n')
 }
-/**
- * The four efficiency measures an A/B is judged on, each lower-is-better, and B's change on each: relative (+0.12: 12%
- * worse; ±10% counts) for tokens and the ratio, absolute per transcript (±1 call counts) for critical-path calls, which
- * are about 2 per transcript. `costly`: B's context or model tokens more than 10% above A's, which caps its verdict.
- */
+/** Beyond this relative change in the context cache cost, B costs more (or less) than A. */
+export const COST_TOLERANCE = 0.1
+/** B's change in cost (relative) and in the other efficiency measures, for the verdict's second axis and the table. */
 function effDelta(a: Run, b: Run) {
   const [x, y] = [effRun(a), effRun(b)]
   const n = Object.keys(a.samples[0]!.perTranscript).length
   const rel = (p: number, q: number) => (p === q ? 0 : p === 0 ? Infinity : (q - p) / p)
-  const ms = [
-    ['mean tokens', rel(x.tokens, y.tokens), 0.1], ['reduction ratio', rel(x.ratio, y.ratio), 0.1],
-    ['model tokens', rel(x.model, y.model), 0.1], ['critical-path calls per transcript', (y.critical.calls - x.critical.calls) / n, 1],
-  ] as const
-  const worse = ms.filter(([, d, t]) => d >= t && d > 0)
-  const better = ms.filter(([, d, t]) => d <= -t && d < 0)
-  const verdict = worse.length ? 'worse' : better.length ? 'better' : 'same'
-  const show = (d: number, t: number) => (d === Infinity ? '+∞' : t === 1 ? `${d > 0 ? '+' : ''}${d.toFixed(1)}` : `${d > 0 ? '+' : ''}${(100 * d).toFixed(0)}%`)
-  const line = `efficiency: ${verdict} (B vs A: ${ms.map(([k, d, t]) => `${k} ${show(d, t)}`).join(', ')}; ±10%, or ±1 critical-path call per transcript, counts)`
-  const table = [`| efficiency | A | B |`, '|---|---:|---:|', ...EFF.map(([k, f]) => `| ${k} | ${f(x)} | ${f(y)} |`), ''].join('\n')
-  const costly = ms.filter(([k, d]) => (k === 'mean tokens' || k === 'model tokens') && d > 0.1).map(([k, d, t]) => `${show(d, t)} ${k}`)
-  return { verdict, line, table, worse: worse.map(([k, d, t]) => `${k} ${show(d, t)}`), costly }
+  const cost = rel(x.cost, y.cost)
+  const show = (d: number) => (d === Infinity ? '+∞' : `${d > 0 ? '+' : ''}${(100 * d).toFixed(0)}%`)
+  const line = `cost: B vs A ${show(cost)} context cache cost (${kt(x.cost)} → ${kt(y.cost)}); tokens rewritten per compaction ${show(rel(x.calibrated, y.calibrated))}, carried per request ${show(rel(x.carried, y.carried))}; beside it: Observer model tokens ${show(rel(x.model, y.model))}, critical-path calls per transcript ${signed((y.critical.calls - x.critical.calls) / n)}`
+  const table = [`| efficiency and cost | A | B |`, '|---|---:|---:|', ...EFF.map(([k, f]) => `| ${k} | ${f(x)} | ${f(y)} |`), ''].join('\n')
+  return { cost, costText: show(cost), line, table }
 }
 
 function provenance(r: Run) {
   return r.samples.map((s, i) => `sample ${i + 1}: ${s.replays.map((x) => `${x.name} ${x.calls} calls, ${x.fresh} fresh`).join('; ')}`).join('\n')
+}
+
+const gateRow = (r: Run, g: Gate) => (APART.has(g) ? `apart (${WEIGHTS[g]})` : String(WEIGHTS[g]))
+const controlLine = (r: Run) => {
+  const c = r.samples.map((s) => s.scores.controls ?? { items: 0, passed: 0 })
+  const items = c.reduce((s, x) => s + x.items, 0)
+  return items ? `Controls (hand-authored items wholly in the user's typed messages; in no total and no Δ): ${c.reduce((s, x) => s + x.passed, 0)}/${items} pass.` : ''
 }
 
 export function scorecard(r: Run, items: boolean) {
@@ -136,17 +157,31 @@ export function scorecard(r: Run, items: boolean) {
   const tGate = (name: string, g: Gate) => mean(r.samples.map((x) => x.perTranscript[name]?.gates[g]?.score ?? NaN))
   for (const g of gates) {
     if (!s.scores.gates[g]) continue
-    out.push(`| ${g} | ${WEIGHTS[g]} | ${f1(gateScore(r, g))} | ${passedOf(r, g)} | ${names.map((c) => (Number.isNaN(tGate(c.name, g)) ? '–' : f1(tGate(c.name, g)))).join(' | ')} |`)
+    out.push(`| ${g} | ${gateRow(r, g)} | ${f1(gateScore(r, g))} | ${passedOf(r, g)} | ${names.map((c) => (Number.isNaN(tGate(c.name, g)) ? '–' : f1(tGate(c.name, g)))).join(' | ')} |`)
   }
   out.push(`| **total** | | **${f1(total(r))}** | ${passRate(r)} | ${names.map((c) => f1(tTotal(r, c.name))).join(' | ')} |`, '')
+  out.push(`A gate marked apart is graded and shown but in no total (rubric.ts APART).${controlLine(r) ? ` ${controlLine(r)}` : ''}`, '')
   if (r.samples.length > 1) out.push(`Scores are means over the ${r.samples.length} samples; passed counts are summed over them.`, '')
   out.push(effTable(r))
   if (items) {
     out.push(`Failed items${r.samples.length > 1 ? ' (sample 1)' : ''}:`, '')
-    for (const i of s.items.filter((i) => i.score < 1)) out.push(`- ${i.gate} @${i.boundary} ${i.id}: ${i.evidence}${i.score > 0 ? ` (${f1(i.score * 100)})` : ''}`)
+    for (const i of s.items.filter((i) => i.score < 1)) out.push(`- ${i.gate} @${i.boundary} ${i.id}: ${i.evidence}${i.score > 0 ? ` (${f1(i.score * 100)})` : ''}${i.control ? ' (control)' : ''}`)
     out.push('')
   }
   return out.join('\n')
+}
+
+/** The control contexts' totals beside the real one's (rubric.ts controlContexts): `rows` maps a context to its total per transcript. */
+export function controlsCard(label: string, real: Record<string, number>, rows: [string, Record<string, number>][]) {
+  const names = Object.keys(real)
+  const all = (x: Record<string, number>) => mean(Object.values(x))
+  return [
+    `## Controls: degenerate contexts graded as ${label}'s (sample 1)`, '',
+    `| context | total | ${names.join(' | ')} |`, `|---|---:|${names.map(() => '---:|').join('')}`,
+    `| **${label} (real)** | **${f1(all(real))}** | ${names.map((n) => f1(real[n]!)).join(' | ')} |`,
+    ...rows.map(([k, x]) => `| ${k} | ${f1(all(x))} | ${names.map((n) => f1(x[n] ?? NaN)).join(' | ')} |`),
+    '', 'A real context should sit well above every control; a gain that a control also earns is not a gain in what the context says.', '',
+  ].join('\n')
 }
 
 type Pair = [Item, Item]
@@ -156,9 +191,10 @@ const passes = (i: Item) => i.score >= 1
 export const sameKeys = (a: Sample[], b: Sample[]) => a[0]!.replays.every((x, i) => x.keys.join() === b[0]!.replays[i]?.keys.join())
 
 /**
- * Flips over every pair of samples (A's k-th against B's k-th): items that pass in one and fail in the other. The unit of
- * the sign test is one item (gate, id) over all its cuts and samples, counted by its net flips: successive cuts of one
- * chained replay are not independent.
+ * Flips over every pair of samples (A's k-th against B's k-th): items that pass in one and fail in the other, counted
+ * items in no total left out. A unique item (gate, id) is counted by its net flips over its cuts and samples. Successive
+ * cuts of one chained replay share one Observer chain, so these counts describe where Δ comes from: they are not
+ * independent trials, and no p value is drawn from them.
  */
 function flips(a: Sample[], b: Sample[]) {
   const up: Pair[] = []
@@ -167,7 +203,7 @@ function flips(a: Sample[], b: Sample[]) {
     const bm = new Map(b[k]!.items.map((i) => [itemKey(i), i]))
     for (const x of a[k]!.items) {
       const y = bm.get(itemKey(x))
-      if (y && x.gate !== 'tokens' && passes(x) !== passes(y)) (passes(y) ? up : down).push([x, y])
+      if (y && counts(x) && passes(x) !== passes(y)) (passes(y) ? up : down).push([x, y])
     }
   }
   const net = new Map<string, { gate: Gate; id: string; tier: 'core' | 'lookup'; up: number[]; down: number[] }>()
@@ -177,28 +213,42 @@ function flips(a: Sample[], b: Sample[]) {
   const units = [...net.values()]
   const uu = units.filter((u) => u.up.length > u.down.length).length
   const ud = units.filter((u) => u.down.length > u.up.length).length
-  return { up, down, units, uu, ud, p: signTest(uu, ud) }
+  return { up, down, units, uu, ud }
 }
 
-/** Two-sided sign test: how likely a split this uneven is if neither side were better. */
-function signTest(x: number, y: number) {
-  const n = x + y
-  let p = 0
-  for (let k = 0; k <= Math.min(x, y); k++) p += Math.exp(lnFact(n) - lnFact(k) - lnFact(n - k) - n * Math.LN2)
-  return Math.min(1, 2 * p)
+/**
+ * Δ over the items that can vary: the counting items (item × cut) present in every sample of both runs whose score is
+ * not the same in all of them. Most items pass or fail in every sample of every version; they dilute the total's Δ.
+ */
+export function varying(a: Sample[], b: Sample[]) {
+  const all = [...a, ...b].map((s) => new Map(s.items.filter(counts).map((i) => [itemKey(i), i.score])))
+  const keys = [...all[0]!.keys()].filter((k) => all.every((m) => m.has(k)))
+  const vary = keys.filter((k) => new Set(all.map((m) => m.get(k))).size > 1)
+  const rate = (ms: typeof all) => (vary.length ? (100 * mean(ms.flatMap((m) => vary.map((k) => m.get(k)!)))) : NaN)
+  const [x, y] = [rate(all.slice(0, a.length)), rate(all.slice(a.length))]
+  return { items: vary.length, of: keys.length, a: x, b: y, d: y - x }
 }
 export const signed = (d: number) => (Math.abs(d) < 0.05 ? '0' : (d > 0 ? '+' : '') + f1(d))
 const tTotal = (r: Run, name: string) => mean(r.samples.map((s) => s.perTranscript[name]?.total ?? NaN))
+/** The fewest samples per arm a verdict needs when B's Observer calls differ from A's. */
+export const MIN_SAMPLES = 3
+const range = (r: Run) => Math.max(...r.samples.map((s) => s.scores.total)) - Math.min(...r.samples.map((s) => s.scores.total))
 
 /**
- * A against B. The verdict needs the weighted Δ, the net flips per unique item and at least 2 of 3 transcripts to agree
- * in sign; when B's Observer calls differ from A's it also needs Δ beyond the noise floor (A's sample spread,
- * or A against its resample A'), or with several samples B's lowest total above A's highest. `informational`: no verdict.
+ * A against B, on two axes. Quality: the weighted Δ, the net flips per unique item and at least 2 of 3 transcripts must
+ * agree in sign. When B's Observer calls differ from A's (other model draws), it also needs MIN_SAMPLES samples an arm,
+ * |Δ| beyond the noise floor (the larger arm's range of sample totals), and the winner's lowest sample above the
+ * loser's highest; with fewer samples it says so and names no winner. Same-key A/Bs are exact and need neither.
+ * Cost (effDelta): the context cache cost, the verdict's second axis. "B is better" needs quality up and cost not up by
+ * more than COST_TOLERANCE; a quality gain at a higher cost is "tradeoff", stating both; equal quality at a lower cost
+ * is "cheaper".
+ * `informational`: no verdict.
  */
 export function ab(a: Run, b: Run, o: { informational?: boolean } = {}) {
   const n = Math.min(a.samples.length, b.samples.length)
   const exact = sameKeys(a.samples, b.samples)
   const f = flips(a.samples, b.samples)
+  const v = varying(a.samples, b.samples)
   const out = [`# Compaction A/B`, '', `A: ${a.label}`, `B: ${b.label}`, '', provenance(a).replace(/^/gm, 'A '), provenance(b).replace(/^/gm, 'B '), '']
   const count = (xs: Pair[], g: Gate) => xs.filter(([x]) => x.gate === g).length || ''
   out.push(`| gate | weight | A | B | Δ | A passed | B passed | ↑ | ↓ |`, '|---|---:|---:|---:|---:|---:|---:|---:|---:|')
@@ -206,82 +256,95 @@ export function ab(a: Run, b: Run, o: { informational?: boolean } = {}) {
     const x = gateScore(a, g)
     const y = gateScore(b, g)
     if (Number.isNaN(x) && Number.isNaN(y)) continue
-    out.push(`| ${g} | ${WEIGHTS[g]} | ${f1(x)} | ${f1(y)} | ${signed(y - x)} | ${passedOf(a, g)} | ${passedOf(b, g)} | ${count(f.up, g)} | ${count(f.down, g)} |`)
+    out.push(`| ${g} | ${gateRow(a, g)} | ${f1(x)} | ${f1(y)} | ${signed(y - x)} | ${passedOf(a, g)} | ${passedOf(b, g)} | ${count(f.up, g)} | ${count(f.down, g)} |`)
   }
   const d = total(b) - total(a)
   out.push(`| **total** | | **${f1(total(a))}** | **${f1(total(b))}** | **${signed(d)}** | ${passRate(a)} | ${passRate(b)} | **${f.up.length}** | **${f.down.length}** |`, '')
   const names = Object.keys(a.samples[0]!.perTranscript)
   const dT = names.map((name) => [name, tTotal(b, name) - tTotal(a, name)] as const)
+  const totals = (r: Run) => r.samples.map((s) => f1(s.scores.total)).join(', ')
+  const floor = Math.max(range(a), range(b))
+  out.push(`Samples: A ${totals(a)}; B ${totals(b)}.${exact ? '' : ` Noise floor (the larger arm's range): ${a.samples.length > 1 || b.samples.length > 1 ? f1(floor) : 'unknown with one sample an arm'}.`}`)
+  out.push(`Δ over the ${v.items} items that vary (of ${v.of} counting items × cuts in every sample): pass rate A ${f1(v.a)}% → B ${f1(v.b)}% (${signed(v.d)}).`)
   out.push(`Per transcript: ${dT.map(([name, x]) => `${name} ${f1(tTotal(a, name))} → ${f1(tTotal(b, name))} (${signed(x)})`).join('; ')}.`)
-  out.push(`Flips: ${f.up.length} up, ${f.down.length} down (item × cut, over ${n} paired sample${n > 1 ? 's' : ''}); by unique item (gate, id; net over its cuts): ${f.uu} up, ${f.ud} down, sign test p=${f.p.toPrecision(2)}. Passed counts are over all samples.`)
+  out.push(`Flips: ${f.up.length} up, ${f.down.length} down (item × cut, over ${n} paired sample${n > 1 ? 's' : ''}); by unique item (gate, id; net over its cuts): ${f.uu} up, ${f.ud} down. Items of one Observer chain are not independent: no p value. Passed counts are over all samples.`)
+  const ctl = [controlLine(a), controlLine(b)].filter(Boolean)
+  if (ctl.length) out.push(`A: ${controlLine(a) || 'no controls'} B: ${controlLine(b) || 'no controls'}`)
   const byTier = (t: 'core' | 'lookup') => {
-    const [u, d] = [f.up, f.down].map((xs) => xs.filter(([x]) => tierOf(x) === t).length)
+    const [u, dn] = [f.up, f.down].map((xs) => xs.filter(([x]) => tierOf(x) === t).length)
     const us = f.units.filter((x) => x.tier === t)
-    return `${t} ${u} up, ${d} down (unique ${us.filter((x) => x.up.length > x.down.length).length} up, ${us.filter((x) => x.down.length > x.up.length).length} down)`
+    return `${t} ${u} up, ${dn} down (unique ${us.filter((x) => x.up.length > x.down.length).length} up, ${us.filter((x) => x.down.length > x.up.length).length} down)`
   }
   const dt = tiered(b) - tiered(a)
   out.push(`Tiered total: A ${f1(tiered(a))} → B ${f1(tiered(b))} (${signed(dt)}); core ${f1(tiered(a, 'core'))} → ${f1(tiered(b, 'core'))} (${signed(tiered(b, 'core') - tiered(a, 'core'))}), lookup ${f1(tiered(a, 'lookup'))} → ${f1(tiered(b, 'lookup'))} (${signed(tiered(b, 'lookup') - tiered(a, 'lookup'))}). Flips by tier: ${byTier('core')}; ${byTier('lookup')}. The verdict reads the flat total.`, '')
 
-  // The noise floor: A's own sample spread, or A against its resample A' (sample 2 from A's cache CACHE-s2).
-  const totals = (r: Run) => r.samples.map((s) => s.scores.total)
-  const nz = a.noise ? { d: total(a.noise) - total(a), f: flips(a.samples.slice(0, 1), a.noise.samples) } : undefined
-  const spread = a.samples.length > 1 ? Math.max(...totals(a)) - Math.min(...totals(a)) : nz ? Math.abs(nz.d) : undefined
-  const noiseLine = nz ? `A vs A' (A's resample): Δ ${signed(nz.d)}, ${nz.f.up.length} up / ${nz.f.down.length} down (${nz.f.uu} / ${nz.f.ud} unique items).` : ''
   const byScore = d >= 0.05 ? 'B' : d <= -0.05 ? 'A' : undefined
   const byUnits = f.uu > f.ud ? 'B' : f.ud > f.uu ? 'A' : undefined
   const agree = dT.filter(([, x]) => byScore && Math.abs(x) >= 0.05 && (x > 0) === (byScore === 'B')).length
   const need = Math.min(2, names.length)
+  const few = !exact && (a.samples.length < MIN_SAMPLES || b.samples.length < MIN_SAMPLES)
   const why: string[] = []
-  if (byUnits !== byScore) why.push(`the unique-item flips favour ${byUnits ?? 'neither'} (${f.uu} up, ${f.ud} down)`)
-  if (agree < need) why.push(`only ${agree} of ${names.length} transcripts move that way`)
-  if (!exact && byScore) {
-    const [lo, hi] = byScore === 'B' ? [Math.min(...totals(b)), Math.max(...totals(a))] : [Math.min(...totals(a)), Math.max(...totals(b))]
-    const apart = n > 1 && lo > hi
-    if (spread === undefined && !apart) why.push(`the noise floor is unknown (record A's resample: run --plugin <A> --record --samples 2)`)
-    else if (spread !== undefined && Math.abs(d) <= spread && !apart) why.push(`|Δ| ${f1(Math.abs(d))} is within the noise floor ${f1(spread)}${n > 1 ? ` and the samples overlap` : ''}`)
+  if (byScore) {
+    if (byUnits !== byScore) why.push(`the unique-item flips favour ${byUnits ?? 'neither'} (${f.uu} up, ${f.ud} down)`)
+    if (agree < need) why.push(`only ${agree} of ${names.length} transcripts move that way`)
+    if (!exact && !few) {
+      const nums = (r: Run) => r.samples.map((s) => s.scores.total)
+      const [lo, hi] = byScore === 'B' ? [Math.min(...nums(b)), Math.max(...nums(a))] : [Math.min(...nums(a)), Math.max(...nums(b))]
+      if (lo <= hi) why.push(`the samples overlap (${byScore}'s lowest ${f1(lo)} is not above the other's highest ${f1(hi)})`)
+      if (Math.abs(d) <= floor) why.push(`|Δ| ${f1(Math.abs(d))} is within the noise floor ${f1(floor)}`)
+    }
   }
   const e = effDelta(a, b)
+  const costly = e.cost > COST_TOLERANCE
+  const cheaper = e.cost < -COST_TOLERANCE
+  const winner = byScore && !why.length && !few ? byScore : undefined
+  const quality = !byScore && !f.up.length && !f.down.length ? 'no difference' : !byScore ? `the weighted score does not move (${signed(d)})` : `the weighted score favours ${byScore} (${signed(d)}), but ${why.join('; ')}`
   const verdict = o.informational
     ? `none (informational: ${n === 1 ? 'one draw per arm cannot support one; use --samples N' : 'see the main corpus'})`
-    : !byScore && !f.up.length && !f.down.length
-      ? 'no difference'
-      : !byScore
-        ? `no verdict: the weighted score does not move (${signed(d)}); the unique-item flips are ${f.uu} up, ${f.ud} down`
-        : why.length
-          ? `no verdict: the weighted score favours ${byScore} (${signed(d)}), but ${why.join('; ')}`
-          : byScore === 'B' && e.costly.length
-            ? `tradeoff: B ${signed(d)} quality for ${e.costly.join(', ')} (more than 10% more tokens is never "better")`
-            : `${byScore} is better: ${f1(Math.abs(d))} weighted points, ${agree} of ${names.length} transcripts agree, ${Math.max(f.uu, f.ud)} unique items flip to ${byScore} against ${Math.min(f.uu, f.ud)}${f.p < 0.05 ? '' : ' (not significant by the sign test)'}`
+    : few
+      ? `no verdict: B's Observer inputs differ from A's and there ${a.samples.length === 1 ? 'is 1 sample' : `are ${a.samples.length} samples`} of A and ${b.samples.length} of B; a verdict needs ${MIN_SAMPLES} an arm (record them: run --plugin <X> --record --samples ${MIN_SAMPLES}). Δ ${signed(d)}, cost ${e.costText}`
+      : winner === 'B'
+        ? costly
+          ? `tradeoff: B ${signed(d)} quality for ${e.costText} context cache cost`
+          : `B is better: ${f1(d)} weighted points (${agree} of ${names.length} transcripts agree, ${f.uu} unique items up against ${f.ud}), at ${e.costText} context cache cost`
+        : winner === 'A'
+          ? cheaper
+            ? `tradeoff: B ${signed(d)} quality for ${e.costText} context cache cost`
+            : `A is better: ${f1(-d)} weighted points (${agree} of ${names.length} transcripts agree, ${f.ud} unique items down against ${f.uu}), B at ${e.costText} context cache cost`
+          : cheaper
+            ? `B is cheaper: ${e.costText} context cache cost at equal quality (${quality})`
+            : costly
+              ? `A is cheaper: B costs ${e.costText} at equal quality (${quality})`
+              : quality === 'no difference'
+                ? 'no difference'
+                : `no verdict: ${quality}`
   const caveat = exact
     ? `B's Observer calls are the same as A's (same cache keys): the difference is deterministic, not sampling noise.`
-    : `B's Observer inputs differ from A's, so its replies are other model draws: part of Δ is sampling noise, and the real unit is one Observer draw per transcript.${[...a.samples, ...b.samples].some((s) => s.replays.some((r) => r.fresh)) ? ' Some replies were fresh calls in this run.' : ''} ${noiseLine || "No resample of A is recorded: the noise floor is unknown."}`
-  const effFlag = !o.informational && verdict.startsWith('B is') && e.verdict === 'worse' ? `WARNING: B wins on quality but is worse on efficiency by more than 10% (${e.worse.join(', ')}): a regression by docs/plans/compaction-goals.md.` : ''
-  out.push(`Verdict: ${verdict}.`, e.line + '.', ...(effFlag ? [effFlag] : []), '', caveat, '', e.table, EFF_NOTE, '')
+    : `B's Observer inputs differ from A's, so its replies are other model draws: part of Δ is sampling noise, and the real unit is one Observer draw per transcript.${[...a.samples, ...b.samples].some((s) => s.replays.some((r) => r.fresh)) ? ' Some replies were fresh calls in this run.' : ''}`
+  out.push(`Verdict: ${verdict}.`, e.line + '.', '', caveat, '', e.table, EFF_NOTE, '')
   const unitLine = (u: (typeof f.units)[number]) => `- ${u.gate} ${u.id}: ${u.up.length ? `↑ at ${u.up.map((x) => `@${x}`).join(' ')}` : ''}${u.up.length && u.down.length ? '; ' : ''}${u.down.length ? `↓ at ${u.down.map((x) => `@${x}`).join(' ')}` : ''}`
   const list = (title: string, us: typeof f.units) => [`${title} (${us.length} unique items):`, '', ...us.slice(0, 150).map(unitLine), ...(us.length > 150 ? [`- and ${us.length - 150} more`] : []), '']
   out.push(...list('Worse in B', f.units.filter((u) => u.down.length > u.up.length)), ...list('Better in B', f.units.filter((u) => u.up.length > u.down.length)))
   const mixed = f.units.filter((u) => u.up.length === u.down.length)
   if (mixed.length) out.push(...list('Both ways', mixed))
   // The gates that moved the total most: weight times score change, over the total weight.
-  const w = gates.filter((g) => !Number.isNaN(gateScore(a, g))).reduce((s, g) => s + WEIGHTS[g], 0)
+  const w = gates.filter((g) => !APART.has(g) && !Number.isNaN(gateScore(a, g))).reduce((s, g) => s + WEIGHTS[g], 0)
   const moved = gates
+    .filter((g) => !APART.has(g))
     .map((g) => [g, (WEIGHTS[g] * ((gateScore(b, g) || 0) - (gateScore(a, g) || 0))) / w] as const)
     .filter(([, x]) => Math.abs(x) >= 0.05)
     .sort((x, y) => Math.abs(y[1]) - Math.abs(x[1]))
   const top = moved.slice(0, 4).map(([g, x]) => `${g} ${signed(x)}`).join(', ')
-  const better = verdict.startsWith('A is') ? 'A' : verdict.startsWith('B is') ? 'B' : undefined
+  const better = verdict.startsWith('A is better') ? 'A' : verdict.startsWith('B is better') ? 'B' : undefined
+  const short = better ?? (verdict.startsWith('tradeoff') ? 'tradeoff' : verdict.startsWith('B is cheaper') ? 'B cheaper' : verdict.startsWith('A is cheaper') ? 'A cheaper' : few ? `– (${a.samples.length}/${b.samples.length} samples)` : '–')
+  const rng = (r: Run) => `${f1(Math.min(...r.samples.map((s) => s.scores.total)))}–${f1(Math.max(...r.samples.map((s) => s.scores.total)))}`
   const perT = dT.map(([, x]) => signed(x)).join(' / ')
   return {
-    d, dt, up: f.up.length, down: f.down.length, uu: f.uu, ud: f.ud, p: f.p, units: f.units, exact, better, text: out.join('\n'), effFlag,
-    row: `| ${b.label} | ${f1(total(b))} | ${signed(d)} | ${f1(tiered(b))} (${signed(dt)}) | ${perT} | ${f.uu} | ${f.ud} | ${f.p.toPrecision(2)} | ${exact ? 'exact' : nz ? `A' ${signed(nz.d)}` : 'noise unknown'} | ${better ?? (verdict.startsWith('tradeoff') ? 'tradeoff' : '–')} | ${e.verdict}${effFlag ? ' **(!)**' : ''} | ${top || '–'} |`,
+    d, dt, up: f.up.length, down: f.down.length, uu: f.uu, ud: f.ud, units: f.units, exact, better, verdict, varying: v, cost: e.cost, text: out.join('\n'),
+    row: `| ${b.label} | ${f1(total(b))} | ${signed(d)} | ${rng(a)} / ${rng(b)} | ${exact ? 'exact' : f1(floor)} | ${signed(v.d)} (${v.items}) | ${f1(tiered(b))} (${signed(dt)}) | ${perT} | ${f.uu} | ${f.ud} | ${short} | ${e.costText} | ${top || '–'} |`,
   }
 }
 
-const lnFact = (n: number) => {
-  let s = 0
-  for (let k = 2; k <= n; k++) s += Math.log(k)
-  return s
-}
 /** A gate's passed/total items over all samples. */
 const passedOf = (r: Run, g: Gate) => {
   const xs = r.samples.map((s) => s.scores.gates[g]).filter((x) => x !== undefined)
@@ -289,7 +352,7 @@ const passedOf = (r: Run, g: Gate) => {
 }
 /** The share of pass/fail items passed, over all samples. */
 const passRate = (r: Run) => {
-  const xs = r.samples.flatMap((s) => s.items).filter((i) => i.gate !== 'tokens')
+  const xs = r.samples.flatMap((s) => s.items).filter(counts)
   return `${f1((100 * xs.filter(passes).length) / xs.length)}%`
 }
 
@@ -312,7 +375,7 @@ const split = (xs: readonly BItem[]) => xs.filter((i) => i.votes > 0 && i.votes 
 /** `names`: the corpus's transcripts, a column each. */
 export function behaviorCard(r: Run, items: boolean, names: readonly string[]) {
   const xs = r.behavior!
-  const out = [`## Behavior: ${r.label}`, '', `Passed: **${bRate(xs)}%** (${bPassed(xs)} probes, majority of ${BSAMPLES} Luna samples); tiered ${bTiered(xs)}%. Not part of the retention total.`, '']
+  const out = [`## Behavior: ${r.label}`, '', `Passed: **${bRate(xs)}%** (${bPassed(xs)} probes, majority of ${BSAMPLES} Ember samples); tiered ${bTiered(xs)}%. Not part of the retention total.`, '']
   out.push(`| gate | passed | ${names.join(' | ')} |`, `|---|---:|${names.map(() => '---:|').join('')}`)
   for (const g of BGATES) if (xs.some((i) => i.gate === g)) out.push(`| ${g} | ${bPassed(xs, g)} | ${names.map((n) => bPassed(xs.filter((i) => i.id.startsWith(`${n}/`)), g)).join(' | ')} |`)
   out.push('')
@@ -327,7 +390,7 @@ export function behaviorAb(a: Run, b: Run) {
   const pairs = b.behavior!.flatMap((y) => (am.has(bKey(y)) ? [[am.get(bKey(y))!, y] as const] : []))
   const up = pairs.filter(([x, y]) => !x.pass && y.pass)
   const down = pairs.filter(([x, y]) => x.pass && !y.pass)
-  const out = [`## Behavior A/B (Luna reader; not blended into retention)`, '', '| gate | A passed | B passed | ↑ | ↓ |', '|---|---:|---:|---:|---:|']
+  const out = [`## Behavior A/B (Ember reader; not blended into retention)`, '', '| gate | A passed | B passed | ↑ | ↓ |', '|---|---:|---:|---:|---:|']
   for (const g of BGATES)
     if (pairs.some(([x]) => x.gate === g)) out.push(`| ${g} | ${bPassed(a.behavior!, g)} | ${bPassed(b.behavior!, g)} | ${up.filter(([x]) => x.gate === g).length || ''} | ${down.filter(([x]) => x.gate === g).length || ''} |`)
   out.push(`| **all** | **${bRate(a.behavior!)}%** | **${bRate(b.behavior!)}%** | **${up.length}** | **${down.length}** |`, `| tiered | ${bTiered(a.behavior!)}% | ${bTiered(b.behavior!)}% | | |`, '')

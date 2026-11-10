@@ -5,16 +5,28 @@
 //   bun scripts/bench-compact.ts corpus                      # (re)build the local corpus and seed the cache
 //   bun scripts/bench-compact.ts run --plugin <ref|dir> [--record] [--samples N] [--json FILE] [--items]
 //   bun scripts/bench-compact.ts ab --a <ref|dir> --b <ref|dir>[,<ref|dir>...] [--record] [--samples N] [--json FILE]
-//     per gate: scores, passed/total, flips; per transcript Δ. The verdict needs the weighted Δ, the sign of the net flips
-//     per unique item (gate, id) and 2 of 3 transcripts to agree. When B's Observer cache keys differ from A's,
-//     B's replies are other model draws: the verdict also needs Δ beyond the noise floor, A's sample spread (--samples N)
-//     or A against its resample A' (sample 2, read from CACHE-s2; record it once: run --plugin <A> --record --samples 2).
-//   Efficiency is reported beside the quality total, never in it (docs/plans/compaction-goals.md in the main checkout):
-//     context tokens per cut, reduction ratio against the source's preTokens, Observer calls and tokens,
-//     critical-path calls (started inside session.compact). ab prints "efficiency: better/worse/same" (±10% on mean
-//     tokens, ratio, model tokens; ±1 critical-path call per transcript) and warns when B wins on quality but is worse on
-//     efficiency. When B's mean context tokens or model tokens are more than 10% above A's, B's verdict is at best
-//     "tradeoff", never "better". Latency is virtual: calls and tokens are measured, time is not.
+//     per gate: scores, passed/total, flips; per transcript Δ; Δ over the items that vary (report.ts varying). Quality
+//     is judged alone: the weighted Δ, the sign of the net flips per unique item (gate, id) and 2 of 3 transcripts
+//     agreeing. When B's Observer cache keys differ from A's, B's replies are other model draws: the verdict then needs
+//     MIN_SAMPLES (3) samples an arm (--samples 3; with fewer it says "no verdict" and names no winner), |Δ| beyond the
+//     noise floor (the larger arm's range of sample totals) and the winner's lowest sample above the loser's highest.
+//     No p value: the items of one Observer chain are not independent. Same-key A/Bs are exact and need one sample.
+//   Cost is the verdict's second axis, never in the quality total (docs/plans/compaction-goals.md in the main checkout):
+//     "B is better" needs quality up and the context cache cost up by no more than 10%; a quality gain at more cost is
+//     "tradeoff" with both numbers; equal quality at lower cost is "cheaper". The efficiency card: context tokens per cut, estimated (chars ÷ 4) and calibrated (over the characters per token the
+//     main corpus's own requests recorded, replay.ts charsPerToken, pooled: 2.22 at this writing), the largest context, tokens carried per later
+//     request, cuts over 40k, the context's prompt-cache cost (written once, read on each of the source's requests to its
+//     next compaction), the reduction ratio against the source's preTokens, Observer calls and tokens, critical-path
+//     calls (started inside session.compact). The replay compacts at the source's own cuts, so a larger context does
+//     not bring compactions sooner here. Latency is virtual: calls and tokens are measured, time is not.
+//   Controls: every run and ab (not on contexts:DIR) prints the totals of degenerate contexts graded as the real ones
+//     (rubric.ts controlContexts: lines shuffled, user messages + grep dump, raw tail only, user messages only, another
+//     transcript's context, empty), so a reader sees where a real context sits between them.
+//   Items: hand-authored items that grade the same thing twice are dropped, with a line on stderr (rubric.ts dedupe);
+//     one whose every expect is in a message the user typed is a control, graded and in no total or Δ. Gates in
+//     rubric.ts APART (purpose) are graded and shown, in no total. The commands, subagents and refound gates grade what
+//     the agent went back for after a cut, mined from the transcript (replay.ts rerunCommands, subagentReturns,
+//     refoundIdentifiers).
 //   ab --a/--b also take contexts:DIR (ready-made contexts, as run --contexts), e.g. to price a hand-made context.
 //   --chain (run; on for ab, --no-chain to skip): also replay the chain (CHAIN, four sessions chained into one, whose
 //     observations outgrow the memory message's cap), graded by the mechanical gates and its specs, reported apart,
@@ -25,11 +37,13 @@
 //     takes the source session's own summary and the chain goes on (bench-replay --fallback recorded).
 //   --holdout (run; on for ab, --no-holdout to skip): also grade the holdout sessions (tests/fixtures/holdout.local.json)
 //     by the mechanical gates only, reported apart, never in the total. In ab its Δ is informational; with --samples N it
-//     gets a verdict (B's lowest total above A's highest, or Δ beyond A's spread). ab warns when B wins the main corpus
+//     gets a verdict under the same rule as the main corpus's. ab warns when B wins the main corpus
 //     but loses the holdout, when the holdout difference is exact.
-//   --behavior (run, ab): also Luna (--thinking max, no tools) answers probes on each context (tests/eval/behavior.ts),
-//     3 samples, majority vote, graded by code; reported apart from retention. Answers are cached in BCACHE by
-//     sha256(context + probes + prompt + reader argv), so identical contexts in A and B cost nothing; misses are called.
+//   --behavior (run, ab): also Ember (READER: reasoning effort max, no tools) answers probes on each context
+//     (tests/eval/behavior.ts), 3 samples, majority vote, graded by code; reported apart from retention. Answers are
+//     cached in BCACHE by sha256(context + probes + prompt + reader model and effort), so identical contexts in A and B
+//     cost nothing; misses are called, at most --reader-max-calls N of them (default no limit). The answers of the
+//     earlier Luna reader stay in ~/.cache/om-bench-compact/behavior, unread.
 //     --b-reader-sample K (ab, with --behavior): B's reader answers are cached apart, under sample K: with B = A's plugin,
 //     fresh reader draws on the same contexts, the noise floor of the behavior total.
 //     --behavior-sample K: read sample K's contexts instead of the first sample's (with --samples K or more).
@@ -42,12 +56,18 @@
 //     transcript's context passes, unless the item lists that transcript in `shared`)
 //
 // A ref is archived (git archive) into <main checkout>/.scratch/bench-compact/src-<sha>; a dir is used as it is, uncommitted edits too.
-// Observer replies come from CACHE, keyed by sha256(pi argv incl. system prompt + stdin): a variant that
-// changes neither replays for free and exactly. A miss fails the run unless --record, which calls pi (openai-codex
-// models only) and stores the reply; --samples N runs N independent samples (sample k>1 in its own cache CACHE-s<k>).
+// The plugin's Ember replies come from CACHE (~/.cache/om-bench-compact/ember-cache), keyed by sha256 of the request's
+// model, instructions, input, reasoning effort and output format (bench-replay.ts): a variant that changes none of them
+// replays for free and exactly. A miss fails the run unless --record, which sends it to Ember (the API key read from
+// ~/.config/observational-memory/muse-api-key at each call; at most --max-calls N per replay, default 2000) and stores
+// the reply with its usage; --samples N runs N independent samples (sample k>1 in its own cache CACHE-s<k>). A plugin
+// before v1.17.0 ran pi, not Ember, and cannot be replayed; the pi replies stay in the luna-cache directories, unread.
 // One Observer miss changes every later call of that chained replay, so a changed Observer input is one draw per transcript.
+// With --record, a call that fails (a failed fetch, an error reply after three tries, --max-calls reached) is not cached
+// and stops the run as a miss.
 // --jobs N (default 3): the most replays run at once, across transcripts, samples and the sides of an ab.
-// Token gates read the context's prose only (rubric.ts proseContext): a bare list of identifiers counts for nothing.
+// Token gates read the context's prose and its records (`Key: value` lines, table rows; rubric.ts proseContext): a bare
+// list of identifiers counts for nothing.
 // Hand-authored items print their ids, not their expected strings.
 // Tiers (rubric.ts TIER): every item is core (what the next agent must know: goal, done and next, rules, decisions and
 // why, findings, open risks, file state) or lookup (an exact hash, path, PR number, string or count om_recall recovers).
@@ -62,23 +82,22 @@
 // main checkout's. An ord:/order: fact holds only with its expects' last mentions in order. Not typechecked by `tsc -p .`.
 import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 import type { Context, ReplaySpec, Transcript } from '../tests/eval/replay'
-import { chainSpec, chainTranscripts, contextText, estimateTokens, messageText, parseTranscript } from '../tests/eval/replay'
+import { chainSpec, chainTranscripts, charsPerToken, contextText, estimateTokens, messageText, parseTranscript } from '../tests/eval/replay'
 import type { Item, Pointed, RubricSpec, Scores, Tier } from '../tests/eval/rubric'
-import { grade, hasExpect, itemTier, norm, pointed, proseContext, score } from '../tests/eval/rubric'
+import { controlContexts, CONTROLS, dedupe, grade, hasExpect, itemTier, norm, pointed, proseContext, score } from '../tests/eval/rubric'
 import type { Probe } from '../tests/eval/behavior'
 import { BSAMPLES, contextSquashed, gradeAnswer, input, isUnknown, parse, probes, PROMPT } from '../tests/eval/behavior'
 import type { BItem, Eff, Replay, Run, Sample, Tally } from '../tests/eval/report'
-import { ab, behaviorAb, behaviorCard, bRate, continuationCards, effRun, f1, longCard, longStats, sameKeys, scorecard, signed, tiered, total } from '../tests/eval/report'
-import { fail, mainCheckout, num, options, str } from './cli'
+import { ab, behaviorAb, behaviorCard, bRate, continuationCards, controlsCard, effRun, f1, longCard, longStats, MIN_SAMPLES, sameKeys, scorecard, signed, tiered, total } from '../tests/eval/report'
+import { ember, EMBER_MODEL, emberReply, fail, mainCheckout, num, options, str } from './cli'
 import { wireFixtures } from './wire-fixtures'
 
 const HERE = resolve(import.meta.dir, '..')
 const OUT = `${mainCheckout()}/.scratch/bench-compact`
-const CACHE = `${process.env.HOME}/.cache/om-bench-compact/luna-cache`
-const OLD_CACHE = `${mainCheckout()}/.scratch/om-replay/luna-cache`
+const CACHE = `${process.env.HOME}/.cache/om-bench-compact/ember-cache`
 const P = `${process.env.HOME}/.claude/projects`
 const CORPUS = [
   { name: 'om-orchestration', src: `${P}/-home-cameron-work-mods-observational-memory/28895069-a753-4a74-88b2-e0d5d4628d43.jsonl`, bytes: 10626428 },
@@ -166,6 +185,19 @@ async function specFor(name: string): Promise<ReplaySpec | undefined> {
   return { constraints: [...chained.constraints, ...(own?.constraints ?? [])], questions: [...chained.questions, ...(own?.questions ?? [])] }
 }
 
+/** A transcript's spec and rubric with the items that grade the same thing twice dropped (rubric.ts dedupe), said once. */
+const specsMemo = new Map<string, Promise<{ spec?: ReplaySpec; rubric?: RubricSpec }>>()
+function specsOf(name: string, withRubric = true) {
+  const k = `${name}\0${withRubric}`
+  if (!specsMemo.has(k))
+    specsMemo.set(k, (async () => {
+      const d = dedupe(await specFor(name), withRubric ? await rubricFor(name) : undefined)
+      if (withRubric) for (const x of d.notes) console.error(`${name}: ${x}`)
+      return { ...(d.spec ? { spec: d.spec } : {}), ...(d.rubric ? { rubric: d.rubric } : {}) }
+    })())
+  return specsMemo.get(k)!
+}
+
 async function corpus() {
   mkdirSync(corpusDir(), { recursive: true })
   for (const c of [...CORPUS, ...HOLDOUT, ...LONG_CORPUS]) {
@@ -178,12 +210,6 @@ async function corpus() {
     if (buf.length < c.bytes) fail(`${c.src}: ${buf.length} bytes, fewer than the ${c.bytes} the corpus pins`)
     writeFileSync(dst, buf.subarray(0, c.bytes), { mode: 0o600 })
     console.log(`${c.name}: wrote ${dst}`)
-  }
-  mkdirSync(CACHE, { recursive: true })
-  if (existsSync(OLD_CACHE)) {
-    let n = 0
-    for (const f of readdirSync(OLD_CACHE)) if (!existsSync(`${CACHE}/${f}`)) copyFileSync(`${OLD_CACHE}/${f}`, `${CACHE}/${f}`), n++
-    console.log(`cache: ${n} replies copied from ${OLD_CACHE} into ${CACHE}`)
   }
   // Every hand-authored fact must be in the transcript before the first boundary that grades it.
   for (const c of [...CORPUS, LONG]) {
@@ -216,24 +242,29 @@ async function load<T>(files: string[], key: string): Promise<T | undefined> {
 }
 
 type Call = { kind: 'observer'; atCompaction: boolean; inTokens: number; in: number; out: number }
-function effOf(t: Transcript, contexts: (Context | undefined)[], calls: Call[]): Eff {
+// The characters per token the main corpus's own requests recorded (replay.ts charsPerToken), pooled over its
+// transcripts: the calibration, one figure for every replay, so A and B are priced alike.
+let cptMemo: ReturnType<typeof charsPerToken> | undefined
+const cptOf = (_name: string) => (cptMemo ??= charsPerToken(CORPUS.map((c) => textOf(c.name)).join('\n')))
+function effOf(name: string, t: Transcript, contexts: (Context | undefined)[], calls: Call[]): Eff {
   const tally = (cs: Call[]): Tally => ({ calls: cs.length, in: cs.reduce((a, c) => a + (c.in || c.inTokens), 0), out: cs.reduce((a, c) => a + c.out, 0) })
+  const cpt = cptOf(name).median
   const cuts = t.boundaries.flatMap((b, i) => {
     const ctx = contexts[i]
     if (!ctx) return []
+    const chars = contextText(ctx).length
     const tokens = estimateTokens(contextText(ctx))
     const pre = b.preTokens ?? estimateTokens(t.spans.slice(0, i + 1).flat().map(messageText).join('\n'))
-    return [{ tokens, ratio: tokens / pre }]
+    return [{ tokens, calibrated: chars / cpt, requests: b.requests ?? 1, ratio: chars / cpt / pre }]
   })
-  return {
-    tokens: cuts.map((c) => c.tokens), ratio: cuts.map((c) => c.ratio),
-    observer: tally(calls.filter((c) => c.kind === 'observer')), critical: tally(calls.filter((c) => c.atCompaction)),
-  }
+  return { cuts, cpt, observer: tally(calls.filter((c) => c.kind === 'observer')), critical: tally(calls.filter((c) => c.atCompaction)) }
 }
 
 // At most JOBS replays run at once (--jobs, default 3): the transcripts are independent, and each replay stays sequential
 // inside. Each call's cache key is its own, so the replies and the scores do not depend on the order.
 const JOBS = Math.max(1, num(options(process.argv.slice(3)), 'jobs', 3)!)
+// With --record, the most live Ember calls each replay makes (--max-calls, default 2000); past it the replay fails.
+const MAX_CALLS = num(options(process.argv.slice(3)), 'max-calls', 2000)!
 let running = 0
 const waiting: (() => void)[] = []
 async function slot<T>(f: () => Promise<T>): Promise<T> {
@@ -251,7 +282,7 @@ async function replay(name: string, dir: string, record: boolean, sample: number
   const cache = sample === 1 ? CACHE : `${CACHE}-s${sample}`
   const out = `${OUT}/runs/${createHash('sha256').update(`${dir}\0${sample}\0${Date.now()}\0${process.pid}\0${Math.random()}`).digest('hex').slice(0, 10)}-${name}`
   const long = name === LONG.name ? ['--gap-hours', String(LONG_GAP_HOURS), '--fallback', 'recorded'] : []
-  const args = ['scripts/bench-replay.ts', 'om', '--transcript', members(name).join('+'), ...long, '--src', dir, '--cache', cache, '--out', out, '--dir', corpusDir(), '--pi', record ? 'live' : 'strict', ...(record ? ['--max-calls', '2000'] : [])]
+  const args = ['scripts/bench-replay.ts', 'om', '--transcript', members(name).join('+'), ...long, '--src', dir, '--cache', cache, '--out', out, '--dir', corpusDir(), '--ember', record ? 'live' : 'strict', ...(record ? ['--max-calls', String(MAX_CALLS)] : [])]
   const p = Bun.spawn(['bun', ...args], { cwd: HERE, stdout: 'ignore', stderr: 'pipe' })
   const [stderr, status] = await Promise.all([new Response(p.stderr).text(), p.exited])
   if (status !== 0) fail(`${name}: the replay failed:\n${stderr.slice(-2000)}`)
@@ -262,14 +293,14 @@ async function replay(name: string, dir: string, record: boolean, sample: number
   )
   const calls = JSON.parse(readFileSync(`${out}/calls.json`, 'utf8')) as (Call & { key?: string; prompt: string })[]
   const keys = calls.map((c) => c.key ?? c.prompt).sort()
-  return { name, contexts, calls: s.luna.calls, fresh: s.luna.calls - s.luna.cacheHits, failed: s.luna.failed, keys, eff: effOf(t, contexts, calls), fallbacks: s.fallbacks ?? [] }
+  return { name, contexts, calls: s.ember.calls, fresh: s.ember.calls - s.ember.cacheHits, failed: s.ember.failed, keys, eff: effOf(name, t, contexts, calls), fallbacks: s.fallbacks ?? [] }
 }
 
 function readyMade(name: string, root: string): Replay {
   const t = parseTranscript(textOf(name))
   const d = `${root}/${name}`
   const contexts = t.boundaries.map((b) => (existsSync(`${d}/compaction-${b.n}.md`) ? { summary: readFileSync(`${d}/compaction-${b.n}.md`, 'utf8'), kept: existsSync(`${d}/kept-${b.n}.json`) ? JSON.parse(readFileSync(`${d}/kept-${b.n}.json`, 'utf8')) : [] } : undefined))
-  return { name, contexts, calls: 0, fresh: 0, failed: 0, keys: [], eff: effOf(t, contexts, []), fallbacks: [] }
+  return { name, contexts, calls: 0, fresh: 0, failed: 0, keys: [], eff: effOf(name, t, contexts, []), fallbacks: [] }
 }
 
 // om_recall's search, in-process, over the transcript up to the cut, with the plugin's own recall.ts.
@@ -281,27 +312,39 @@ async function search(dir: string, name: string, text: string, b: ReturnType<typ
   const io = { read: async (p: string) => readFileSync(p, 'utf8'), list: async (x: string) => (existsSync(x) ? readdirSync(x) : []), continuing: async () => undefined, now: async () => b.at }
   return (await recall(await loadTranscript(io, path), { query })).text
 }
+const recallMemo = new Map<string, Map<string, string>>()
 async function recallTexts(name: string, text: string, t: ReturnType<typeof parseTranscript>, rubric: RubricSpec | undefined, dir: string) {
+  const k = `${name}\0${dir}`
+  if (recallMemo.has(k)) return recallMemo.get(k)!
   const out = new Map<string, string>()
+  recallMemo.set(k, out)
   for (const b of t.boundaries)
     for (const q of rubric?.recall ?? []) if (q.from <= b.n && (q.to === undefined || b.n <= q.to)) out.set(`${q.id}@${b.n}`, await search(dir, name, text, b, q.query))
   return out
 }
 
-// ---- The behavior check (--behavior): Luna reads each context and answers probes; code grades the answers ----
+// ---- The behavior check (--behavior): Ember reads each context and answers probes; code grades the answers ----
 
-const BCACHE = `${process.env.HOME}/.cache/om-bench-compact/behavior`
-const READER = ['pi', '-p', '--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'max', '--system-prompt', PROMPT, '--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--append-system-prompt', '']
+const BCACHE = `${process.env.HOME}/.cache/om-bench-compact/behavior-ember`
+// The reader: Ember at the highest reasoning effort it takes, the probes' instructions as its system prompt, no tools.
+const READER = { model: EMBER_MODEL, effort: 'max' }
 const PARALLEL = 20
+// --reader-max-calls N: the most live reader calls this run makes; the answers past it are not asked and count as wrong.
+let readerLeft = num(options(process.argv.slice(3)), 'reader-max-calls', Infinity)!
+const readerSpent = { calls: 0, in: 0, out: 0, cost: 0 }
 
 async function ask(inp: string, file: string): Promise<boolean> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const p = Bun.spawn(READER, { cwd: '/tmp', stdin: new TextEncoder().encode(inp), stdout: 'pipe', stderr: 'pipe' })
-    const timer = setTimeout(() => p.kill(), 20 * 60_000)
-    const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()])
-    clearTimeout(timer)
-    if ((await p.exited) === 0 && out.includes('[')) return writeFileSync(file, out), true
-    console.error(`reader call failed (${attempt + 1}/2): ${err.slice(-300) || out.slice(-300)}`)
+  for (let attempt = 0; attempt < 2 && readerLeft > 0; attempt++) {
+    readerLeft--
+    const body = JSON.stringify({ model: READER.model, instructions: PROMPT, input: inp, reasoning: { effort: READER.effort }, store: false })
+    const r = await ember(body, 20 * 60_000).catch((error: Error) => ({ status: 0, text: error.message }))
+    const got = emberReply(r.text)
+    readerSpent.calls++
+    readerSpent.in += got.input
+    readerSpent.out += got.output
+    readerSpent.cost += got.cost
+    if (r.status === 200 && got.completed && got.message.includes('[')) return writeFileSync(file, got.message), true
+    console.error(`reader call failed (${attempt + 1}/2): ${r.status ? `HTTP ${r.status} ${got.error}` : r.text.slice(-300)}`)
   }
   return false
 }
@@ -315,20 +358,19 @@ async function behavior(label: string, dir: string, replays: Replay[], readerSam
     const text = textOf(r.name)
     texts.set(r.name, text)
     const t = parseTranscript(text)
-    const spec = await specFor(r.name)
-    const rubric = await rubricFor(r.name)
+    const { spec, rubric } = await specsOf(r.name)
     t.boundaries.forEach((b, i) => {
       const ctx = r.contexts[i]
       const ps = ctx ? probes(t, b.n, spec, rubric) : []
       if (!ctx || !ps.length) return
       const inp = input(ctx, ps)
-      const h = createHash('sha256').update([inp, PROMPT, ...READER, ...(readerSample ? [`reader-sample ${readerSample}`] : [])].join('\0')).digest('hex').slice(0, 24)
+      const h = createHash('sha256').update([inp, PROMPT, READER.model, READER.effort, ...(readerSample ? [`reader-sample ${readerSample}`] : [])].join('\0')).digest('hex').slice(0, 24)
       jobs.push({ name: r.name, b, ctx, ps, inp, files: Array.from({ length: BSAMPLES }, (_, k) => `${BCACHE}/${h}-s${k + 1}.txt`) })
     })
   }
   const misses = jobs.flatMap((j) => j.files.filter((f) => !existsSync(f)).map((f) => [j, f] as const))
   const n = jobs.reduce((s, j) => s + j.ps.length, 0)
-  console.error(`[${label}] behavior: ${n} probes at ${jobs.length} cuts, ${jobs.length * BSAMPLES} reader calls, ${misses.length} not cached: calling Luna for them now`)
+  console.error(`[${label}] behavior: ${n} probes at ${jobs.length} cuts, ${jobs.length * BSAMPLES} reader calls, ${misses.length} not cached: calling Ember for them now`)
   const t0 = Date.now()
   let next = 0
   let done = 0
@@ -342,7 +384,8 @@ async function behavior(label: string, dir: string, replays: Replay[], readerSam
     }),
   )
   const lost = misses.filter(([, f]) => !existsSync(f)).length
-  if (lost) console.error(`[${label}] behavior: ${lost} reader calls failed; their answers count as wrong (rerun to retry them)`)
+  console.error(`[${label}] behavior: ${readerSpent.calls} live reader call(s), ${readerSpent.in} tokens in, ${readerSpent.out} out, $${readerSpent.cost.toFixed(4)}`)
+  if (lost) console.error(`[${label}] behavior: ${lost} reader calls failed or were not made; their answers count as wrong (rerun to retry them)`)
   const items: BItem[] = []
   for (const j of jobs) {
     const ctx = contextSquashed(j.ctx)
@@ -365,10 +408,6 @@ async function behavior(label: string, dir: string, replays: Replay[], readerSam
 
 /** `first`: the first sample's number (default 1). `lenient`: a cache miss throws instead of ending the run. */
 async function evaluate(label: string, o: { dir?: string; contexts?: string; record: boolean; samples: number; first?: number; lenient?: boolean; behavior?: boolean; holdout?: boolean; chain?: boolean; long?: boolean; readerSample?: number }): Promise<Run> {
-  if (o.record && o.dir) {
-    const model = /'--model', '([^']+)'/.exec(readFileSync(`${o.dir}/hooks/register.ts`, 'utf8'))?.[1] ?? ''
-    if (!model.startsWith('openai-codex/')) fail(`--record: ${o.dir}'s pi model is "${model}"; only openai-codex models may be called`)
-  }
   const run: Run = { label, ...(o.dir ? { dir: o.dir } : {}), samples: [], ...(o.holdout && HOLDOUT.length ? { holdout: [] } : {}), ...(o.chain ? { chain: [] } : {}), ...(o.long ? { long: [] } : {}) }
   // One sample of a corpus; the holdout is graded by the mechanical gates alone, the chain without the rubric files.
   const gradeAll = async (entries: { name: string }[], k: number, kind: 'main' | 'holdout' | 'chain' | 'long', started: Promise<Replay>[]): Promise<Sample> => {
@@ -381,11 +420,10 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
       const r = await started[i]!
       console.error(`[${label}] ${kind === 'main' ? '' : `${kind} `}${name}${o.samples > 1 ? ` sample ${k}` : ''}`)
       if (r.failed && o.lenient) throw new Error(`${name}: not cached`)
-      if (r.failed) fail(`${label} ${name}: ${r.failed} of ${r.calls} Observer calls are not cached (the variant changed their prompt or input); pass --record to call pi for them`)
+      if (r.failed) fail(o.record ? `${label} ${name}: ${r.failed} of ${r.calls} Observer calls failed (a failed fetch or --max-calls reached; nothing of them was cached): rerun to retry them` : `${label} ${name}: ${r.failed} of ${r.calls} Observer calls are not cached (the variant changed their prompt or input); pass --record to call Ember for them`)
       const text = textOf(name)
       const t = parsedOf(name)
-      const spec = specs ? await specFor(name) : undefined
-      const rubric = kind === 'main' || kind === 'long' ? await rubricFor(name) : undefined
+      const { spec, rubric } = specs ? await specsOf(name, kind === 'main' || kind === 'long') : {}
       const recalled = await recallTexts(name, text, t, rubric, o.dir ?? HERE)
       const graded = (n: number) => kind !== 'long' || n % LONG_EVERY === 0
       const mine = t.boundaries.flatMap((b, i) => (r.contexts[i] && graded(b.n) ? grade(t, b.n, r.contexts[i]!, spec, rubric, recalled).map((x) => ({ ...x, id: `${name}/${x.id}` })) : []))
@@ -414,6 +452,35 @@ async function evaluate(label: string, o: { dir?: string; contexts?: string; rec
   if (o.behavior) run.behavior = await behavior(label, o.dir ?? HERE, (run.samples[behaviorSample - (o.first ?? 1)] ?? fail(`--behavior-sample ${behaviorSample}: no such sample`)).replays, o.readerSample)
   return run
 }
+/**
+ * The controls card: sample 1's real contexts and the degenerate ones built from them (rubric.ts controlContexts), each
+ * graded as the run's contexts are, over the main corpus. "Another transcript's context" is the next corpus
+ * transcript's context at the same cut (its last when it has fewer).
+ */
+async function controls(r: Run): Promise<string> {
+  const reps = r.samples[0]!.replays
+  const real: Record<string, number> = {}
+  const rows = new Map<string, Record<string, number>>(CONTROLS.map((c) => [c, {}]))
+  for (const [k, rp] of reps.entries()) {
+    const other = reps[(k + 1) % reps.length]!.contexts.filter((c) => c !== undefined)
+    const t = parsedOf(rp.name)
+    const { spec, rubric } = await specsOf(rp.name)
+    const recalled = await recallTexts(rp.name, textOf(rp.name), t, rubric, r.dir ?? HERE)
+    const items = new Map<string, Item[]>(CONTROLS.map((c) => [c, []]))
+    const mine: Item[] = []
+    t.boundaries.forEach((b, i) => {
+      const ctx = rp.contexts[i]
+      if (!ctx) return
+      mine.push(...grade(t, b.n, ctx, spec, rubric, recalled))
+      const cs = controlContexts(t, b.n, ctx, other[Math.min(i, other.length - 1)])
+      for (const c of CONTROLS) items.get(c)!.push(...grade(t, b.n, cs[c], spec, rubric, recalled))
+    })
+    real[rp.name] = score(mine).total
+    for (const c of CONTROLS) rows.get(c)![rp.name] = score(items.get(c)!).total
+  }
+  return controlsCard(r.label, real, [...rows])
+}
+
 /** The holdout as a run of its own, for the scorecard and the A/B table. */
 const holdoutOf = (r: Run): Run => ({ label: `${r.label} (holdout)`, samples: r.holdout! })
 const chainOf = (r: Run): Run => ({ label: `${r.label} (chain)`, samples: r.chain! })
@@ -432,13 +499,14 @@ const json = (x: unknown, name: string) => {
   console.error(`results: ${file}`)
 }
 const stripS = (s: Sample) => ({ ...s, replays: s.replays.map(({ contexts: _, ...x }) => x) })
-const strip = (r: Run): unknown => ({ ...r, efficiency: effRun(r), samples: r.samples.map(stripS), ...(r.holdout ? { holdout: r.holdout.map(stripS) } : {}), ...(r.chain ? { chain: r.chain.map(stripS) } : {}), ...(r.long ? { long: r.long.map(stripS), longStats: longStats(r) } : {}), ...(r.noise ? { noise: strip(r.noise) } : {}) })
+const strip = (r: Run): unknown => ({ ...r, efficiency: effRun(r), samples: r.samples.map(stripS), ...(r.holdout ? { holdout: r.holdout.map(stripS) } : {}), ...(r.chain ? { chain: r.chain.map(stripS) } : {}), ...(r.long ? { long: r.long.map(stripS), longStats: longStats(r) } : {}) })
 if (command === 'corpus') await corpus()
 else if (command === 'run') {
   const ctx = str(o, 'contexts')
   const src = source(ctx ? `contexts:${ctx}` : (str(o, 'plugin') ?? fail('--plugin <ref|dir> or --contexts DIR')))
   const r = await evaluate(src.label, { dir: src.dir, contexts: src.contexts, record, samples, behavior: withBehavior, holdout: !!o.holdout && !src.contexts, chain: !!o.chain && !src.contexts, long: !!o.long })
   console.log(scorecard(r, !!o.items))
+  if (!src.contexts) console.log(await controls(r))
   if (r.holdout) console.log(scorecard(holdoutOf(r), !!o.items))
   if (r.chain) console.log(scorecard(chainOf(r), !!o.items))
   if (r.long) console.log(longCard(r, longOf(r), !!o.items))
@@ -458,19 +526,14 @@ else if (command === 'run') {
     evaluate(`A ${sa.label}`, { ...from(sa), record, samples, behavior: withBehavior }),
     ...sbs.map((sb) => evaluate(`B ${sb.label}`, { ...from(sb), record, samples, behavior: withBehavior, readerSample: num(o, 'b-reader-sample') })),
   ])
-  // A's resample A' (the sample after the last, from its own cache), for the noise floor of a B whose Observer input changed.
-  if (samples === 1 && sa.dir && bs.some((b) => !sameKeys(a.samples, b.samples) || (a.holdout && !sameKeys(a.holdout, b.holdout!))))
-    a.noise = await evaluate(`A' ${sa.label}`, { dir: sa.dir, record: false, samples: 1, first: 2, lenient: true, holdout })
-      .catch(() => evaluate(`A' ${sa.label}`, { dir: sa.dir, record: false, samples: 1, first: 2, lenient: true, holdout: false }))
-      .catch(() => undefined)
   // The long chain per B: its own A/B (flips by unique item, like the other tracks) and the recall-aware credit of each side.
   const longs = bs.map((b) => {
     if (!a.long || !b.long) return undefined
-    const l = ab(longOf(a), longOf(b), { informational: !sameKeys(a.long, b.long) && samples === 1 })
+    const l = ab(longOf(a), longOf(b), { informational: !sameKeys(a.long, b.long) && samples < MIN_SAMPLES })
     const [ca, cb] = [longStats(a).credit, longStats(b).credit]
     const [ta, tb] = [longStats(a).tieredCredit, longStats(b).tieredCredit]
     const cell = `${signed(l.d)} (${l.uu}↑ ${l.ud}↓)${l.better ? ` ${l.better}` : ''}; tiered ${signed(l.dt)}; recall-aware ${f1(cb)} (${signed(cb - ca)}), tiered ${f1(tb)} (${signed(tb - ta)})`
-    const json = { b: b.label, total: { a: total(longOf(a)), b: total(longOf(b)) }, tiered: { a: tiered(longOf(a)), b: tiered(longOf(b)) }, recallAware: { a: ca, b: cb }, tieredRecallAware: { a: ta, b: tb }, d: l.d, up: l.up, down: l.down, uniqueUp: l.uu, uniqueDown: l.ud, p: l.p, better: l.better ?? null, units: l.units }
+    const json = { b: b.label, total: { a: total(longOf(a)), b: total(longOf(b)) }, tiered: { a: tiered(longOf(a)), b: tiered(longOf(b)) }, recallAware: { a: ca, b: cb }, tieredRecallAware: { a: ta, b: tb }, d: l.d, up: l.up, down: l.down, uniqueUp: l.uu, uniqueDown: l.ud, better: l.better ?? null, units: l.units }
     return { l, ca, cb, ta, tb, cell, json }
   })
   const rs = bs.map((b, i) => {
@@ -478,12 +541,12 @@ else if (command === 'run') {
     const lg = longs[i]
     if (lg) main0.text += `\n${lg.l.text.replace('# Compaction A/B', '## Long chain (not in the total)')}\nRecall-aware credit (not in any total): A ${f1(lg.ca)}, B ${f1(lg.cb)} (${signed(lg.cb - lg.ca)}); tiered A ${f1(lg.ta)}, B ${f1(lg.tb)} (${signed(lg.tb - lg.ta)})\n`
     // The chain: its own verdict, informational when its Observer draws differ (no resample of it is recorded).
-    const c = a.chain && b.chain ? ab(chainOf(a), chainOf(b), { informational: !sameKeys(a.chain, b.chain) && samples === 1 }) : undefined
+    const c = a.chain && b.chain ? ab(chainOf(a), chainOf(b), { informational: !sameKeys(a.chain, b.chain) && samples < MIN_SAMPLES }) : undefined
     const main = c
       ? { ...main0, text: `${main0.text}\n${c.text.replace('# Compaction A/B', '## Chain (not in the total)')}`, cd: `${signed(c.d)} (${c.up}↑ ${c.down}↓)${c.better ? ` ${c.better}` : ''}` }
       : { ...main0, cd: '' }
     if (!a.holdout) return { ...main, hd: '', warn: '' }
-    const h = ab({ ...holdoutOf(a), ...(a.noise?.holdout ? { noise: holdoutOf(a.noise) } : {}) }, holdoutOf(b), { informational: samples === 1 })
+    const h = ab(holdoutOf(a), holdoutOf(b), { informational: !sameKeys(a.holdout, b.holdout!) && samples < MIN_SAMPLES })
     // The main corpus's specs were written against this plugin's history: a gain there that the unseen holdout does not
     // share is fitted to the specs. Only said when the holdout difference is exact (no Observer draws in it).
     const worse = h.d <= -0.05 || h.down > h.up
@@ -495,17 +558,19 @@ else if (command === 'run') {
   const summary = [
     `# Against ${a.label}: ${f1(total(a))} (tiered ${f1(tiered(a))})${a.holdout ? `; holdout ${f1(total(holdoutOf(a)))}` : ''}${a.chain ? `; chain ${f1(total(chainOf(a)))} (tiered ${f1(tiered(chainOf(a)))})` : ''}${a.long ? `; long chain ${f1(total(longOf(a)))} (tiered ${f1(tiered(longOf(a)))}), recall-aware ${f1(longStats(a).credit)} (tiered ${f1(longStats(a).tieredCredit)})` : ''}`,
     '',
-    `| B | total | Δ | tiered (Δ) | Δ ${names} | unique ↑ | unique ↓ | p | noise | verdict | efficiency | gates that moved the total |${a.holdout ? ' holdout Δ (informational) |' : ''}${a.chain ? ' chain Δ |' : ''}${a.long ? ' long Δ |' : ''}`,
-    `|---|---:|---:|---:|---|---:|---:|---:|---|---|---|---|${a.holdout ? '---:|' : ''}${a.chain ? '---:|' : ''}${a.long ? '---|' : ''}`,
+    `| B | total | Δ | sample range A / B | noise floor | Δ varying items (n) | tiered (Δ) | Δ ${names} | unique ↑ | unique ↓ | verdict | cost | gates that moved the total |${a.holdout ? ' holdout Δ |' : ''}${a.chain ? ' chain Δ |' : ''}${a.long ? ' long Δ |' : ''}`,
+    `|---|---:|---:|---|---:|---:|---:|---|---:|---:|---|---:|---|${a.holdout ? '---:|' : ''}${a.chain ? '---:|' : ''}${a.long ? '---|' : ''}`,
     ...rs.map((r, i) => r.row + (a.holdout ? ` ${r.hd}${r.warn ? ' **(!)**' : ''} |` : '') + (a.chain ? ` ${r.cd} |` : '') + (a.long ? ` ${longs[i]?.cell ?? '–'} |` : '')),
     '',
     ...rs.filter((r) => r.warn).map((r) => r.warn),
-    ...rs.filter((r) => r.effFlag).map((r) => r.effFlag),
+    ...rs.map((r, i) => `${bs[i]!.label}: ${r.verdict}.`),
+    '',
     ...(a.behavior ? [`Behavior (probes passed): A ${bRate(a.behavior)}%; ${bs.map((b) => `${b.label} ${bRate(b.behavior!)}%`).join('; ')}`, ''] : []),
   ]
   const cards = (r: Run) => [scorecard(r, false), ...(r.holdout ? [scorecard(holdoutOf(r), false)] : []), ...(r.chain ? [scorecard(chainOf(r), false)] : []), ...(r.long ? [longCard(r, longOf(r), false)] : [])]
   const cc = o.continuation ? bs.map((b) => continuationCards([a, b])) : []
-  console.log([summary.join('\n'), ...cc.flatMap((x) => x.map((c) => c.text)), ...rs.flatMap((r, i) => [r.text, ...(a.behavior ? [behaviorAb(a, bs[i]!)] : [])]), ...cards(a), ...bs.flatMap(cards)].join('\n'))
+  const ctl = sa.contexts ? '' : await controls(a)
+  console.log([summary.join('\n'), ctl, ...cc.flatMap((x) => x.map((c) => c.text)), ...rs.flatMap((r, i) => [r.text, ...(a.behavior ? [behaviorAb(a, bs[i]!)] : [])]), ...cards(a), ...bs.flatMap(cards)].join('\n'))
   json({ a: strip(a), b: bs.map(strip), ...(a.long ? { long: longs.map((x) => x?.json ?? null) } : {}), ...(cc.length ? { continuation: cc.map((x) => x.map((c) => c.json)) } : {}) }, 'ab')
 } else if (command === 'controls') {
   // The negative-control fixture (tests/replay.test.ts): each transcript's fact and latest items, and a plugin's prose

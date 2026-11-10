@@ -32,7 +32,7 @@ describe('the floor', () => {
 
   // A manual /compact soon after the last compaction: less than the whole chunk the background waits for lies before
   // the raw tail, so nothing was observed. The person waits on a manual compaction; an auto one observes as before.
-  const SHORT = [...turn('a', 'a', 16_000), ...turn('b', 'b', 16_000)] // ~4k tokens before the raw tail, which starts at row 3
+  const SHORT = [...turn('a', 'a', 36_000), ...turn('b', 'b', 28_000)] // ~9k tokens before the raw tail, which starts at row 3
 
   test('a manual compaction with less than a chunk unobserved briefs it by code, with no Observer call', async ($, on) => {
     const clock = mock.clock(on)

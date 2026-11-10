@@ -5,7 +5,9 @@ import {
   chainSpec,
   chainTranscripts,
   checkAnswer,
+  charsPerToken,
   checkSpec,
+  commandCore,
   contextOf,
   describeCalls,
   hookDriver,
@@ -24,6 +26,9 @@ import {
   questionSeedRows,
   questionsAt,
   recallCallsIn,
+  refoundIdentifiers,
+  rerunCommands,
+  subagentReturns,
   answerTexts,
   questionGroups,
   renderTranscript,
@@ -38,8 +43,11 @@ import {
 import type { ConstraintSpec, Context, QuestionResult, ReplaySpec } from './eval/replay'
 import { checkPluginList, checkRecallOnly, RECALL_TOOL } from './eval/config'
 import type { Configuration } from './eval/config'
-import { factHolds, grade, norm, score } from './eval/rubric'
-import { gradeAnswer, parse as parseReply } from './eval/behavior'
+import { controlContexts, dedupe, factHolds, grade, isRecord, norm, score } from './eval/rubric'
+import type { Item } from './eval/rubric'
+import { gradeAnswer, parse as parseReply, probes as probesAt } from './eval/behavior'
+import { ab, COST_TOLERANCE } from './eval/report'
+import type { Run, Sample } from './eval/report'
 import { categoryOf, continuation, continuationBehavior, probeCategory } from './eval/continuation'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 
@@ -150,13 +158,13 @@ describe('the chain', () => {
 
 describe('the om chain through hooks/register.ts', () => {
   // The plugin under test at every boundary, driven as `bench-replay.ts om` drives it (hookDriver), with Ember answering
-  // each Observer chunk by naming its user prompts. Each span is a turn with a 10k-token tool result, so compaction
+  // each Observer chunk by naming its user prompts. Each span is a turn with a 16k-token tool result, past the 15k raw tail, so compaction
   // has older history to observe and a tail to keep raw.
   function chained() {
     const s = session()
     for (const [i, word] of ['alpha', 'bravo', 'charlie', 'delta'].entries()) {
       if (i) s.compact(`recorded summary ${i}`)
-      s.user(word).tool('Read', { file_path: `/src/${word}.ts` }, 'x'.repeat(40_000)).reply(`${word} read`).user(`${word}2`).reply('ok')
+      s.user(word).tool('Read', { file_path: `/src/${word}.ts` }, 'x'.repeat(64_000)).reply(`${word} read`).user(`${word}2`).reply('ok')
     }
     return parseTranscript(s.text())
   }
@@ -686,13 +694,13 @@ describe('the plan and the report', () => {
     for (const secret of ['dir', 'worktrees', 'somewhere-secret', 's2']) expect(hidden).not.toContain(secret)
   })
 
-  test('leaves out a cached or live om replay whose pi calls failed or went uncounted, and nothing else', () => {
-    expect(leftOut('om-strict', { luna: { failed: 0 } })).toBeUndefined()
-    expect(leftOut('om-live', { luna: { failed: 2 } })).toBe('2 pi call(s) failed')
-    expect(leftOut('om-strict', undefined)).toBe('no pi call count (summary.json)')
+  test('leaves out a cached or live om replay whose Ember calls failed or went uncounted, and nothing else', () => {
+    expect(leftOut('om-strict', { ember: { failed: 0 } })).toBeUndefined()
+    expect(leftOut('om-live', { ember: { failed: 2 } })).toBe('2 Ember call(s) failed')
+    expect(leftOut('om-strict', undefined)).toBe('no Ember call count (summary.json)')
     expect(leftOut('om-stub', undefined)).toBeUndefined()
-    expect(leftOut('om-v130', { luna: { failed: 1 } })).toBe('1 pi call(s) failed')
-    expect(leftOut('om-v130', { luna: { failed: 0 } })).toBeUndefined()
+    expect(leftOut('om-v130', { ember: { failed: 1 } })).toBe('1 Ember call(s) failed')
+    expect(leftOut('om-v130', { ember: { failed: 0 } })).toBeUndefined()
     expect(leftOut('builtin', undefined)).toBeUndefined()
   })
 
@@ -785,7 +793,7 @@ describe('the compaction rubric', () => {
     expect(score(good).total).toBeGreaterThan(score(stale).total)
   })
 
-  test('counts a token only in prose, takes paraphrases, and scales the total by the budget fit', () => {
+  test('counts a token only in prose or a record line, takes paraphrases, and leaves size out of the total', () => {
     const t = parseTranscript(threeBoundaries().text())
     const rubric = { facts: [{ id: 'where', from: 2, expect: ['hooks/register.ts'] }, { id: 'turns', from: 2, expect: [['last 3', 'final 3']] }] }
     const at = (summary: string) => grade(t, 2, { summary, kept: [] }, undefined, rubric)
@@ -793,9 +801,13 @@ describe('the compaction rubric', () => {
     expect(facts(at('## Identifiers\nhooks/register.ts 1a2b3c4d tests/kept-file.ts last 3'))).toEqual([0, 0])
     const prose = 'The work is in hooks/register.ts and it keeps the last three turns raw.'
     expect(facts(at(prose))).toEqual([1, 1])
+    // A `Key: value` line and a table row state a fact as a sentence does.
+    expect(facts(at('- Where: hooks/register.ts\n- Raw tail: last 3 turns'))).toEqual([1, 1])
+    expect(facts(at('| where | hooks/register.ts |\n|---|---|\n| tail | last 3 turns |'))).toEqual([1, 1])
+    // Size is the efficiency card's cost: a bloated context grades as the lean one.
     const bloated = at(`${prose}\n${'word '.repeat(60_000)}`)
-    expect(bloated.find((i) => i.gate === 'budget')!.score).toBeLessThan(1)
-    expect(score(bloated).total).toBeLessThan(score(at(prose)).total)
+    expect(bloated.some((i) => i.gate === ('budget' as never) || i.gate === ('tokens' as never))).toBe(false)
+    expect(score(bloated).total).toBe(score(at(prose)).total)
   })
 
   test('weights a lookup item a quarter of a core one in the tiered total, and credits a pointed lookup nearly in full', () => {
@@ -826,7 +838,6 @@ describe('the compaction rubric', () => {
     expect(categoryOf(it('chronology', 'order:a-then-b', 1))).toBe('history')
     expect(categoryOf(it('facts', 'exact:port', 1, { tier: 'lookup' }))).toBe('references')
     expect(categoryOf(it('lessons', 'neg:cookie', 1))).toBe('lessons')
-    expect(categoryOf(it('budget', 'size', 1))).toBeUndefined()
     expect(probeCategory({ gate: 'value', id: 'om-v04/ord:5-after-7', tier: 'lookup' })).toBe('history')
     expect(probeCategory({ gate: 'rule', id: 'om-v04/scope:no-lavish' })).toBe('rules')
     // Rules held, history lost: the total weighs rules 10 against history 1.
@@ -836,8 +847,8 @@ describe('the compaction rubric', () => {
     // A missed lookup reference pointed to by a source range earns 0.9; a missed core finding pointed to, 0.25.
     expect(r(continuation([it('facts', 'exact:x', 0, { tier: 'lookup', pointed: true })]).total)).toBe(90)
     expect(r(continuation([it('facts', 'f', 0, { pointed: true })]).total)).toBe(25)
-    // Over budget, the budget fit scales it, as the totals.
-    expect(r(continuation([it('constraints', 'c1', 1), it('budget', 'size', 0.5)]).total)).toBe(50)
+    // A control item (wholly in the user's typed messages) is left out.
+    expect(r(continuation([it('constraints', 'c1', 1), { ...it('facts', 'typed', 0), control: true }]).total)).toBe(100)
     // Behavior: majority passes by category, a lookup probe weighing a quarter inside its category.
     const b = continuationBehavior([{ gate: 'purpose', id: 'x/purpose:a', pass: true }, { gate: 'value', id: 'x/path:p', pass: false, tier: 'lookup' }, { gate: 'value', id: 'x/v', pass: true }])
     expect(b.categories).toEqual({ goal: { score: 100, items: 1 }, findings: { score: 100, items: 1 }, references: { score: 0, items: 1 } })
@@ -915,5 +926,167 @@ describe('the compaction rubric', () => {
     const stitched = { answer: '~/work/mods/app/tests/register.test.ts', evidence: '~/work/mods/app; tests/register.test.ts' }
     expect(gradeAnswer({ gate: 'value', id: 'path', ask: 'Which test file?', answer: 'register\\.test' }, stitched, tree).pass).toBe(false)
     expect(gradeAnswer({ ...hop, answer: 'register\\.test' }, stitched, tree).pass).toBe(true)
+  })
+})
+
+describe('what the agent goes back for after a cut', () => {
+  test('a command run again or looked up after the cut is an item with its outcome line; a status check is not', () => {
+    const s = session()
+      .user('Run the tests.')
+      .tool('Bash', { command: 'bun test tests/register.test.ts' }, 'running 12 tests\n12 pass\n0 fail')
+      .tool('Bash', { command: 'git status' }, 'clean')
+      .tool('Bash', { command: 'gh pr view 41 --json state' }, '{"state":"OPEN"}')
+      .compact('Summary one.')
+      .tool('Bash', { command: 'cd /w && bun test tests/register.test.ts 2>&1 | tail -3' }, '12 pass')
+      .tool('Bash', { command: 'git status' }, 'clean')
+      .tool('mcp__observational-memory__om_recall', { query: 'gh pr view json state' }, 'found')
+    expect(commandCore('cd /w && FORCE=1 claude plugin test 2>&1 | tail -5')).toBe('claude plugin test')
+    const got = rerunCommands(parseTranscript(s.text()), 1)
+    expect(got).toEqual([
+      { command: 'bun test tests/register.test.ts', outcome: '0 fail', line: expect.any(Number), how: 'rerun' },
+      { command: 'gh pr view 41 --json state', outcome: '{"state":"OPEN"}', line: 0, how: 'recall' },
+    ])
+  })
+
+  test("a subagent the agent resumes by its report's id is an item; one never gone back to is not", () => {
+    const s = session()
+      .user('Research the cache.')
+      .tool('Agent', { description: 'Map the cache layout', prompt: 'Find where replies are cached.' }, 'The cache is keyed by sha256.\nagentId: a1b2c3d4e5')
+      .tool('Agent', { description: 'Count the corpus', prompt: 'Count the transcripts.' }, 'Three transcripts.\nagentId: f9e8d7c6b5')
+      .compact('Summary one.')
+      .tool('SendMessage', { to: 'a1b2c3d4e5', message: 'And the lock?' }, 'A lock file per key.')
+    expect(subagentReturns(parseTranscript(s.text()), 1)).toEqual([{ id: 'Map the cache layout', expect: ['Map the cache layout'], how: 'resume' }])
+  })
+
+  test('an identifier a tool result showed again before its use is refound, not needed', () => {
+    const s = session()
+      .user('Fix it.')
+      .reply('The bug is in hooks/pins.ts and the fix sits on commit 7c1d2e3f.')
+      .compact('Summary one.')
+      .tool('Bash', { command: 'git log --oneline -3' }, '7c1d2e3f pins: cap')
+      .reply('7c1d2e3f is the fix; hooks/pins.ts still needs a test.')
+    const t = parseTranscript(s.text())
+    expect(refoundIdentifiers(t, 1).map((x) => x.key)).toEqual(['7c1d2e3'])
+    expect(neededIdentifiers(t, 1).map((x) => x.key)).toEqual(['hooks/pins.ts'])
+    // Graded under its own gate, so a lost identifier the agent had to search for again shows apart.
+    const items = grade(t, 1, { summary: 'The bug is in hooks/pins.ts and the fix sits on commit 7c1d2e3f.', kept: [] })
+    expect(items.filter((i) => i.gate === 'refound').map((i) => [i.id, i.score])).toEqual([['commit:7c1d2e3', 1]])
+  })
+
+  test('calibrates characters per token on what the context grew by between requests, less the first request\'s output', () => {
+    const usage = (input: number, output: number) => ({ input_tokens: 0, cache_read_input_tokens: input, cache_creation_input_tokens: 0, output_tokens: output })
+    const a = (id: string, input: number, output: number) => ({ type: 'assistant', sessionId: 's', uuid: id, message: { id, role: 'assistant', content: [{ type: 'text', text: 'ok' }], usage: usage(input, output) } })
+    const u = (id: string, text: string) => ({ type: 'user', sessionId: 's', uuid: id, message: { role: 'user', content: text } })
+    // 3,500 characters of user rows over 1,200 tokens of growth less 200 of output: 3.5 per token.
+    const rows = [a('m1', 10_000, 200), u('u1', 'y'.repeat(3500)), a('m2', 11_200, 100)]
+    expect(charsPerToken(rows)).toEqual({ median: 3.5, p10: 3.5, p90: 3.5, pairs: 1 })
+    // An attachment between two requests adds tokens no row shows: that pair is left out.
+    const att = { type: 'attachment', sessionId: 's', uuid: 'x1', attachment: { type: 'todo_reminder', content: 'a todo list' } }
+    expect(charsPerToken([...rows, u('u2', 'z'.repeat(3500)), att, a('m3', 12_400, 0)]).pairs).toBe(1)
+  })
+})
+
+describe('the rubric and its controls', () => {
+  test('reads a `Key: value` line and a table row as records, not a bare list or a separator', () => {
+    expect(isRecord('- Branch: worktree-agent-a38 at 181f04d')).toBe(true)
+    expect(isRecord('**Floor**: 15k tokens')).toBe(true)
+    expect(isRecord('| om-v04 | 84.0 | -1.6 |')).toBe(true)
+    expect(isRecord('|---|---:|')).toBe(false)
+    expect(isRecord('hooks/register.ts hooks/rows.ts hooks/pins.ts')).toBe(false)
+  })
+
+  test('a shuffled context scores as the real one and a grep dump holds the identifiers: the substring rubric cannot tell them apart', () => {
+    const t = parseTranscript(threeBoundaries().text())
+    const real = { summary: 'The user wants worktrees in .worktrees.\nWork is in hooks/register.ts at commit 1a2b3c4d.\nThe budget is $30.', kept: [] }
+    const c = controlContexts(t, 1, real, { summary: 'Another session entirely.', kept: [] })
+    expect(c['lines shuffled'].summary.split('\n').sort()).toEqual(real.summary.split('\n').sort())
+    expect(score(grade(t, 1, c['lines shuffled'])).total).toBe(score(grade(t, 1, real)).total)
+    expect(c['user messages + grep dump'].summary).toContain('1a2b3c4d')
+    expect(c['user messages only'].summary).toBe('Worktrees go in .worktrees. Spend at most $30 on this.')
+    expect(c.empty).toEqual({ summary: '', kept: [] })
+  })
+
+  test("an item wholly in the user's typed messages is a control, graded but in no total", () => {
+    const t = parseTranscript(threeBoundaries().text())
+    const rubric = { facts: [{ id: 'typed', from: 1, expect: ['.worktrees'] }, { id: 'where', from: 1, expect: ['hooks/register.ts'] }] }
+    const items = grade(t, 1, { summary: 'The user wants the worktrees to go in .worktrees from now on.', kept: [] }, undefined, rubric)
+    expect(items.find((i) => i.id === 'typed')).toMatchObject({ score: 1, control: true })
+    expect(items.find((i) => i.id === 'where')!.control).toBeUndefined()
+    const s = score(items)
+    expect(s.controls).toEqual({ items: 1, passed: 1 })
+    expect(s.gates.facts).toMatchObject({ items: 1, passed: 0 })
+  })
+
+  test('drops a repeated id and a second item with the same expects over a shared cut', () => {
+    const spec = { constraints: [], questions: [{ id: 'repo', from: 2, ask: 'Which repo?', expect: ['lllyasviel/VCC'] }] } as unknown as ReplaySpec
+    const rubric = { facts: [{ id: 'repo', from: 3, expect: ['VCC'] }, { id: 'told-3', from: 1, to: 4, expect: ['concurrent'] }, { id: 'next-3', from: 2, to: 3, expect: [['concurrent']] }, { id: 'later', from: 9, expect: ['concurrent'] }] }
+    const d = dedupe(spec, rubric)
+    expect(d.spec!.questions.map((q) => q.id)).toEqual(['repo'])
+    // The narrower span goes: the wider one grades every cut it does.
+    expect(d.rubric!.facts.map((f) => f.id)).toEqual(['told-3', 'later'])
+    expect(d.notes).toEqual(['repo: a repeated id; dropped', 'next-3: the same expects as told-3; dropped'])
+  })
+})
+
+// A run from per-sample totals: one transcript of 100 items, the first `total` of them passed; `keys` its Observer calls.
+function run(label: string, totals: number[], keys: string, tokens = 10_000): Run {
+  const sample = (x: number, k: number): Sample => {
+    const items: Item[] = Array.from({ length: 100 }, (_, j) => ({ gate: 'facts', boundary: 1, id: `f${j}`, score: j < x ? 1 : 0, evidence: '' }))
+    const scores = score(items)
+    const eff = { cuts: [{ tokens, calibrated: tokens, requests: 10, ratio: 0.1 }], cpt: 4, observer: { calls: 1, in: 1, out: 1 }, critical: { calls: 0, in: 0, out: 0 } }
+    return { replays: [{ name: 't', contexts: [], calls: 1, fresh: 0, failed: 0, keys: [`${keys}${k}`], eff, fallbacks: [] }], items, scores, perTranscript: { t: scores } }
+  }
+  return { label, samples: totals.map(sample) }
+}
+
+describe('the A/B verdict', () => {
+  test('two draws of one version never make B better: with fewer than 3 samples an arm it names no winner', () => {
+    const r = ab(run('A', [80, 81], 'a'), run('B', [83, 84], 'b'))
+    expect(r.better).toBeUndefined()
+    expect(r.verdict).toMatch(/^no verdict: B's Observer inputs differ from A's and there are 2 samples of A and 2 of B; a verdict needs 3 an arm/)
+  })
+
+  test('with 3 samples an arm, B is better only when its lowest sample is above A\'s highest and Δ is beyond the larger range', () => {
+    const overlap = ab(run('A', [80, 82, 84], 'a'), run('B', [83, 85, 87], 'b'))
+    expect(overlap.better).toBeUndefined()
+    expect(overlap.verdict).toMatch(/the samples overlap \(B's lowest 83\.0 is not above the other's highest 84\.0\)/)
+    expect(ab(run('A', [80, 81, 82], 'a'), run('B', [85, 86, 87], 'b')).better).toBe('B')
+  })
+
+  test('the same Observer calls make an exact A/B: one sample suffices', () => {
+    expect(ab(run('A', [80], 'k'), run('B', [82], 'k')).better).toBe('B')
+  })
+
+  test('cost is the second axis: a quality win at +27% context cost is a tradeoff, at +5% it is better', () => {
+    const costly = ab(run('A', [80], 'k'), run('B', [82], 'k', 12_700))
+    expect(costly.cost).toBeGreaterThan(COST_TOLERANCE)
+    expect(costly.better).toBeUndefined()
+    expect(costly.verdict).toBe('tradeoff: B +2.0 quality for +27% context cache cost')
+    expect(ab(run('A', [80], 'k'), run('B', [82], 'k', 10_500)).verdict).toMatch(/^B is better: 2\.0 weighted points .* at \+5% context cache cost/)
+    const same = ab(run('A', [80], 'k'), run('B', [80], 'k', 5_000))
+    expect(same.verdict).toMatch(/^B is cheaper: -50% context cache cost at equal quality/)
+  })
+})
+
+describe('behavior probes', () => {
+  test('a false-claim probe fails on "unknown": an empty context would pass it', () => {
+    const claim = { gate: 'false' as const, id: 'no-remote', ask: 'Which commit did you push to GitHub?', answer: 'pushed to (github|origin)' }
+    expect(gradeAnswer(claim, { answer: 'unknown' }, 'anything').pass).toBe(false)
+  })
+
+  test('a PR still open is a done probe whose right answer is "not done", and both kinds name the PR', () => {
+    const s = session()
+      .user('Ship both.')
+      .reply('Opened https://github.com/o/r/pull/41 for the cap.')
+      .reply('https://github.com/o/r/pull/40 is merged.')
+      .compact('Summary one.')
+    const ps = probesAt(parseTranscript(s.text()), 1).filter((p) => p.gate === 'done')
+    expect(ps.map((p) => [p.id, !!p.notDone])).toEqual([['pr:40', false], ['pr-open:41', true]])
+    const ctx = 'PR #40 is merged. PR #41 is open for review.'
+    const [merged, open] = ps
+    expect(gradeAnswer(merged!, { answer: 'done, #40', evidence: 'PR #40 is merged.' }, ctx).pass).toBe(true)
+    expect(gradeAnswer(merged!, { answer: 'done', evidence: 'PR #40 is merged.' }, ctx).pass).toBe(true)
+    expect(gradeAnswer(open!, { answer: 'done, #41', evidence: 'PR #41 is open for review.' }, ctx).pass).toBe(false)
+    expect(gradeAnswer(open!, { answer: 'not done: #41 is open', evidence: 'PR #41 is open for review.' }, ctx).pass).toBe(true)
   })
 })

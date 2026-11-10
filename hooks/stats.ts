@@ -336,10 +336,13 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const triggers = [...new Set(Object.keys(s.metrics).flatMap((k) => k.match(/^compaction\.([\w-]+)\.ms$/)?.[1] ?? []))]
   const main = compactions(s, triggers.filter((t) => t !== 'subagent'))
   const sub = compactions(s, ['subagent'])
-  // The main conversation's own between turns, which the plugin started as a turn ended (`turnEnd`).
+  // The main conversation's own between turns, which the plugin started as a turn ended (`turnEnd`) or after an idle
+  // hour (`idle`).
   const turnEnd = s.metrics['compaction.turnEnd.ms']?.count ?? 0
+  const idle = s.metrics['compaction.idle.ms']?.count ?? 0
+  const own = [turnEnd ? `${grouped(turnEnd)} at a turn's end` : '', idle ? `${grouped(idle)} after an idle hour` : ''].filter(Boolean).join(', ')
   if (main.total + sub.total)
-    row('Compactions', `${grouped(main.total + sub.total)}: ${grouped(main.total)} main${turnEnd ? ` (${grouped(turnEnd)} at a turn's end)` : ''}, ${grouped(sub.total)} subagent`)
+    row('Compactions', `${grouped(main.total + sub.total)}: ${grouped(main.total)} main${own ? ` (${own})` : ''}, ${grouped(sub.total)} subagent`)
   for (const [label, c] of [['  Main', main], ['  Subagent', sub]] as const) {
     if (!c.instant.length && !c.waited.length) continue
     const parts = [`${grouped(c.instant.length)} of ${grouped(c.instant.length + c.waited.length)} instant${c.instant.length ? ` (median ${duration(median(c.instant))})` : ''}`]

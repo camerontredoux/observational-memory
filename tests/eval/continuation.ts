@@ -7,18 +7,18 @@
 // not to repeat), state (what files and features do now), findings (facts that still matter), references (the paths,
 // commits and PRs needed to continue), history (event order and old values om_recall recovers). Inside a category an
 // item weighs its tier's weight (rubric.ts TIER: a lookup item ¼) and earns its tiered credit (a missed fact the
-// context points to by a source range om_recall can follow: 0.9 if lookup, 0.25 if core). The retention score is
-// scaled by the budget gate's fit, as the totals are; context size is its own small category.
+// context points to by a source range om_recall can follow: 0.9 if lookup, 0.25 if core). Context size is no
+// category: it is the efficiency card's cost (report.ts).
 import type { BGate } from './behavior'
 import type { Gate, Item, Tier } from './rubric'
 import { TIER, tieredCredit, tierOf } from './rubric'
 
-export type Category = 'goal' | 'status' | 'rules' | 'decisions' | 'lessons' | 'state' | 'findings' | 'references' | 'history' | 'size'
-export const CATEGORIES: Category[] = ['goal', 'status', 'rules', 'decisions', 'lessons', 'state', 'findings', 'references', 'history', 'size']
-export const CATEGORY_WEIGHTS: Record<Category, number> = { goal: 10, status: 10, rules: 10, decisions: 8, lessons: 9, state: 8, findings: 6, references: 4, history: 1, size: 4 }
+export type Category = 'goal' | 'status' | 'rules' | 'decisions' | 'lessons' | 'state' | 'findings' | 'references' | 'history'
+export const CATEGORIES: Category[] = ['goal', 'status', 'rules', 'decisions', 'lessons', 'state', 'findings', 'references', 'history']
+export const CATEGORY_WEIGHTS: Record<Category, number> = { goal: 10, status: 10, rules: 10, decisions: 8, lessons: 9, state: 8, findings: 6, references: 4, history: 1 }
 
-/** A retention gate's category. The budget gate scales the score (see continuation), in no category. */
-const GATE_CATEGORY: Record<Exclude<Gate, 'budget'>, Category> = {
+/** A retention gate's category. */
+const GATE_CATEGORY: Record<Gate, Category> = {
   purpose: 'goal',
   handoff: 'status', asks: 'status', approvals: 'status', 'in-progress': 'status',
   constraints: 'rules', corrections: 'rules', reversals: 'rules', verbatim: 'rules',
@@ -26,9 +26,8 @@ const GATE_CATEGORY: Record<Exclude<Gate, 'budget'>, Category> = {
   lessons: 'lessons', failures: 'lessons',
   'file-state': 'state',
   facts: 'findings', 'multi-hop': 'findings', absent: 'findings',
-  identifiers: 'references', commits: 'references', 'files-edited': 'references',
+  identifiers: 'references', commits: 'references', 'files-edited': 'references', refound: 'references', commands: 'references', subagents: 'findings',
   chronology: 'history', recall: 'history',
-  tokens: 'size',
 }
 /** A behavior probe's category: its gate's, a lookup value probe a reference. */
 const BGATE_CATEGORY: Record<BGate, Category> = {
@@ -46,8 +45,7 @@ const ID_CATEGORY: [RegExp, Category][] = [
 const byId = (id: string) => ID_CATEGORY.find(([re]) => re.test(id))?.[1]
 
 /** An item's category: its id's, else its gate's; a lookup item in findings or state is a reference. */
-export function categoryOf(i: Pick<Item, 'gate' | 'id' | 'tier'>): Category | undefined {
-  if (i.gate === 'budget') return undefined
+export function categoryOf(i: Pick<Item, 'gate' | 'id' | 'tier'>): Category {
   const c = byId(i.id) ?? GATE_CATEGORY[i.gate]
   return (c === 'findings' || c === 'state') && tierOf(i) === 'lookup' ? 'references' : c
 }
@@ -59,8 +57,8 @@ export function probeCategory(p: { gate: BGate; id: string; tier?: Tier }): Cate
 
 export type ContinuationScore = { total: number; categories: Partial<Record<Category, { score: number; items: number }>> }
 
-/** `xs`: [category, tier, credit 0-1]; the weighted mean over the categories with items, 0-100, times `fit`. */
-function weigh(xs: readonly (readonly [Category | undefined, Tier, number])[], fit = 1): ContinuationScore {
+/** `xs`: [category, tier, credit 0-1]; the weighted mean over the categories with items, 0-100. */
+function weigh(xs: readonly (readonly [Category, Tier, number])[]): ContinuationScore {
   const categories: ContinuationScore['categories'] = {}
   for (const c of CATEGORIES) {
     const ys = xs.filter(([k]) => k === c)
@@ -69,14 +67,12 @@ function weigh(xs: readonly (readonly [Category | undefined, Tier, number])[], f
   }
   const used = Object.keys(categories) as Category[]
   const w = used.reduce((s, c) => s + CATEGORY_WEIGHTS[c], 0)
-  return { total: w ? (fit * used.reduce((s, c) => s + CATEGORY_WEIGHTS[c] * categories[c]!.score, 0)) / w : 0, categories }
+  return { total: w ? (used.reduce((s, c) => s + CATEGORY_WEIGHTS[c] * categories[c]!.score, 0)) / w : 0, categories }
 }
 
-/** The continuation score of one sample's retention items. */
+/** The continuation score of one sample's retention items (the controls left out). */
 export function continuation(items: readonly Item[]): ContinuationScore {
-  const budget = items.filter((i) => i.gate === 'budget')
-  const fit = budget.length ? budget.reduce((s, i) => s + i.score, 0) / budget.length : 1
-  return weigh(items.map((i) => [categoryOf(i), tierOf(i), tieredCredit(i)] as const), fit)
+  return weigh(items.filter((i) => !i.control).map((i) => [categoryOf(i), tierOf(i), tieredCredit(i)] as const))
 }
 
 /** The continuation score of behavior probes (majority-vote pass or fail). */

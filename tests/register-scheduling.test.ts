@@ -117,20 +117,20 @@ describe('register: scheduling', () => {
     const observed = () => ((stored['ledger:session-1'] as Ledger | undefined)?.entries ?? []).map((e) => e.line.match(/User: "(\w+)"/)?.[1])
     const backgroundCalls = () => (JSON.parse(files['/stats/session-1.json'] ?? '{"metrics":{}}') as { metrics: Record<string, { count: number }> }).metrics['observer.background.ms']?.count
 
-    for (const [k, p] of [...'abcdefg'].entries()) await runTurn($, turn(p, p, CHUNK), at(22, 14, 2 * k)) // ~70k of history
+    for (const [k, p] of [...'abcd'].entries()) await runTurn($, turn(p, p, CHUNK), at(22, 14, 2 * k)) // ~64k of history
     await clock.settle()
     expect(seen.prompts).toEqual([])
     expect(seen.sessions).toEqual([]) // nor a Session line, written once observations land
     await clock.advance(5_000)
     expect(backgroundCalls()).toBeUndefined()
 
-    await runTurn($, turn('h', 'h', CHUNK), at(22, 14, 20))
+    await runTurn($, turn('e', 'e', CHUNK), at(22, 14, 20))
     await clock.settle()
-    expect(observed()).toEqual([...'abcdefgh'])
+    expect(observed()).toEqual([...'abcde'])
     expect((stored['ledger:session-1'] as Ledger).watermark.from).toBe(0)
-    await runTurn($, turn('i', 'i', CHUNK), at(22, 14, 22))
+    await runTurn($, turn('f', 'f', CHUNK), at(22, 14, 22))
     await clock.settle()
-    expect(observed()).toEqual([...'abcdefghi'])
+    expect(observed()).toEqual([...'abcdef'])
     await clock.advance(5_000) // the stats file's last write
     expect(backgroundCalls()).toBe(seen.prompts.length)
   })
@@ -143,18 +143,18 @@ describe('register: scheduling', () => {
     const seen = ember(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
-    for (const [k, p] of [...'abcdefg'].entries()) await runTurn($, turn(p, p, CHUNK), at(22, 14, 2 * k))
+    for (const [k, p] of [...'abcd'].entries()) await runTurn($, turn(p, p, CHUNK), at(22, 14, 2 * k))
     await clock.settle()
     expect(seen.prompts).toEqual([])
     const compacting = $.session.compact({ trigger: 'manual', messages: [...history] })
     await clock.settle()
-    expect(seen.inFlight).toBe(7)
-    for (let n = 1; n <= 7; n++) open(n)
+    expect(seen.inFlight).toBe(4)
+    for (let n = 1; n <= 4; n++) open(n)
     const result = await compacting
 
-    expect(observationsIn(result.messages?.[0]?.text)?.match(/User: "\w+"/g)).toEqual([...'abcdefg'].map((p) => `User: "${p}"`))
-    expect(originals(result.messages?.slice(1))).toEqual(history.slice(27))
-    expect(seen.logs.at(-1)).toMatch(/^Compacted in .* · observed 27 messages on the spot/)
+    expect(observationsIn(result.messages?.[0]?.text)?.match(/User: "\w+"/g)).toEqual([...'abcd'].map((p) => `User: "${p}"`))
+    expect(originals(result.messages?.slice(1))).toEqual(history.slice(15))
+    expect(seen.logs.at(-1)).toMatch(/^Compacted in .* · observed 15 messages on the spot/)
   })
 
   test("a compaction does not queue behind another loop's scheduling pass", async ($, on) => {

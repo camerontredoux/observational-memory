@@ -20,7 +20,7 @@ describe('register: budget', () => {
     agents['agent-1'] = [{ role: 'user', text: 'first brief', toolUses: [] }]
     agents['agent-2'] = [{ role: 'user', text: 'second brief', toolUses: [] }]
 
-    for (let n = 0; n < 10; n++) {
+    for (let n = 0; n < 12; n++) {
       await clock.set(at(23, 9, 0) + (n + 1) * 1_500) // the held calls stay within their timeout
       history.push(...agentCall('main', n, 16_000))
       await step($, 't', n, history.length)
@@ -52,7 +52,7 @@ describe('register: budget', () => {
     for (const [who, key] of Object.entries(ledgers)) {
       const ledger = stored[key] as Ledger
       expect([...readers(ledger.entries.map((e) => e.line).join('\n'))]).toEqual([who])
-      expect(ledger.watermark.to).toBe(19) // each loop observed up to its own raw tail, its newest call
+      expect(ledger.watermark.to).toBe(19) // each loop observed up to its own raw tail, its newest calls
       expect(ledger.chunks).toEqual([])
     }
     expect(Object.keys(stored).sort()).toEqual([
@@ -118,14 +118,14 @@ describe('register: budget', () => {
     mock.clock(on)
     const { history, agents } = world(on)
     const seen = ember(on)
-    // The newest row, a 36 KB read (~9k tokens), is more than the raw tail's 6k on its own. Turn b is short of a chunk
+    // The newest row, a 64 KB read (~16k tokens), is more than the raw tail's 15k on its own. Turn b is short of a chunk
     // so the kept tail is just the call and its result: with a full-size b, b's closing reply stays raw too.
-    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000), ...call(1, 36_000))
+    history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000), ...call(1, 64_000))
     agents['agent-1'] = [...history]
 
     for (const agentId of [undefined, 'agent-1']) {
       const result = await $.session.compact({ trigger: 'auto', ...(agentId ? { agentId } : {}), messages: [...history] })
-      expect(originals(result.messages?.slice(1))).toEqual(call(1, 36_000))
+      expect(originals(result.messages?.slice(1))).toEqual(call(1, 64_000))
       expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🟡 User: "a"\n* 🟡 User: "b"')
     }
     expect(seen.prompts).toHaveLength(4)

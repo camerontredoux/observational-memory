@@ -30,7 +30,7 @@ export const crewmate = (fx: Turns) =>
     await $.turn.start({ text: fx.brief, turnId: 't' })
     let index = 0
     let live = 0 // where the live context starts in the history
-    const report: { lunaAtCompaction: number; midTurnLanded: number; rawTokens: number; nextStep: boolean }[] = []
+    const report: { callsAtCompaction: number; midTurnLanded: number; rawTokens: number; nextStep: boolean }[] = []
     for (let i = 1; i < fx.rows.length; i++) {
       await clock.set(Math.max(clock.now(), fx.at[i]!))
       if (fx.compactions.some((c) => c.at === i)) {
@@ -40,7 +40,7 @@ export const crewmate = (fx: Turns) =>
         const text = result.messages?.[0]?.text ?? ''
         const watermark = history.length - (result.messages!.length - 1)
         report.push({
-          lunaAtCompaction: seen.prompts.length - before,
+          callsAtCompaction: seen.prompts.length - before,
           midTurnLanded: landed,
           rawTokens: history.slice(watermark).reduce((n, m) => n + tokens(m), 0),
           nextStep: nextStepIn(text) !== undefined,
@@ -57,9 +57,9 @@ export const crewmate = (fx: Turns) =>
 
     expect(report).toHaveLength(fx.compactions.length)
     for (const r of report) {
-      expect(r.lunaAtCompaction).toBe(0)
+      expect(r.callsAtCompaction).toBe(0)
       expect(r.midTurnLanded).toBeGreaterThan(0)
-      expect(r.rawTokens).toBeLessThanOrEqual(6_000 + 10_000 + 2_000) // the raw tail and about one chunk, as chunks end past CHUNK_TOKENS
+      expect(r.rawTokens).toBeLessThanOrEqual(15_000 + 10_000 + 2_000) // the raw tail and about one chunk, as chunks end past CHUNK_TOKENS
       expect(r.nextStep).toBe(false)
     }
     const ledger = stored['ledger:session-1'] as Ledger
@@ -82,7 +82,7 @@ export const subagent = (fx: Turns) =>
 
     let index = 0
     let live = 0 // where the live context starts in the subagent's history
-    const report: { lunaAtCompaction: number; landed: number; rawTokens: number; nextStep: boolean }[] = []
+    const report: { callsAtCompaction: number; landed: number; rawTokens: number; nextStep: boolean }[] = []
     for (let i = 1; i < fx.rows.length; i++) {
       await clock.set(Math.max(clock.now(), fx.at[i]!))
       if (fx.compactions.some((c) => c.at === i)) {
@@ -90,7 +90,7 @@ export const subagent = (fx: Turns) =>
         const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: rows.slice(live) })
         const text = result.messages?.[0]?.text ?? ''
         report.push({
-          lunaAtCompaction: seen.prompts.length - before,
+          callsAtCompaction: seen.prompts.length - before,
           landed: seen.logs.filter((l) => l.includes('in the background')).length,
           rawTokens: result.messages!.slice(1).reduce((n, m) => n + tokens(m), 0),
           nextStep: nextStepIn(text) !== undefined,
@@ -107,9 +107,9 @@ export const subagent = (fx: Turns) =>
 
     expect(report).toHaveLength(fx.compactions.length)
     for (const r of report) {
-      expect(r.lunaAtCompaction).toBe(0)
+      expect(r.callsAtCompaction).toBe(0)
       expect(r.landed).toBeGreaterThan(0)
-      expect(r.rawTokens).toBeLessThanOrEqual(6_000 + 5_000 + 10_000) // the raw tail, a scheduling interval, a chunk in flight
+      expect(r.rawTokens).toBeLessThanOrEqual(15_000 + 5_000 + 10_000) // the raw tail, a scheduling interval, a chunk in flight
       expect(r.nextStep).toBe(false)
     }
     expect(seen.screen).toEqual([])
@@ -119,7 +119,7 @@ export const subagent = (fx: Turns) =>
 
 // Run 1 of the v0.4.10 subagent smoke (/tmp/om-sub/live/run1), replayed from its subagent's transcript:
 // /tmp/om-tail/make-fixture.py writes the module (gitignored). The subagent read 36 KB files (~9k tokens each, more
-// than the raw tail's budget) and was compacted five times, each right after a read; every one fell back to the
+// than the raw tail's 6k budget then) and was compacted five times, each right after a read; every one fell back to the
 // built-in summary. Here the Observer fails until the first compaction, as in run 1, so the floor briefs what leaves
 // context; the engine appends its memory message to the subagent's history. Each later compaction must match that
 // history and cut at the background watermark.
@@ -137,13 +137,13 @@ export const fallback = (fx: Turns) =>
 
     let index = 0
     let live = 0 // where the live context starts in the subagent's history
-    const report: { lunaAtCompaction: number; floor: boolean }[] = []
+    const report: { callsAtCompaction: number; floor: boolean }[] = []
     for (let i = 1; i < fx.rows.length; i++) {
       await clock.set(Math.max(clock.now(), fx.at[i]!))
       if (fx.compactions.some((c) => c.at === i)) {
         const before = seen.prompts.length
         const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: rows.slice(live) })
-        report.push({ lunaAtCompaction: seen.prompts.length - before, floor: briefIn(result.messages![0]!.text)?.startsWith(FLOOR_NOTE) ?? false })
+        report.push({ callsAtCompaction: seen.prompts.length - before, floor: briefIn(result.messages![0]!.text)?.startsWith(FLOOR_NOTE) ?? false })
         live = rows.length
         rows.push(...result.messages!)
         failing = false
@@ -156,8 +156,8 @@ export const fallback = (fx: Turns) =>
 
     expect(builtin).toBe(0)
     expect(report).toHaveLength(fx.compactions.length)
-    expect(report[0]!).toEqual({ lunaAtCompaction: expect.any(Number), floor: true })
-    for (const r of report.slice(1)) expect(r).toEqual({ lunaAtCompaction: 0, floor: false })
+    expect(report[0]!).toEqual({ callsAtCompaction: expect.any(Number), floor: true })
+    for (const r of report.slice(1)) expect(r).toEqual({ callsAtCompaction: 0, floor: false })
     expect(seen.logs.filter((l) => l.startsWith('compaction not persistent') || l.includes('restarting the ledger'))).toEqual([])
     expect(seen.screen).toEqual([])
     expect(seen.logs.filter((l) => l.startsWith('Compacted'))).toEqual([
@@ -204,11 +204,11 @@ export const firstmate = (fx: Firstmate) =>
       await clock.settle()
     }
 
-    // As the session logged: rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail
-    // until the turn that ended at 15:08:26. Past the stub's one line, each chunk carries the assistant's own sentences.
+    // As the session logged: rows 1-56 at 14:37:56; then too little new history for a chunk past the raw tail. The
+    // session, at a 6k tail, also observed rows 56-139 after the turn that ended at 15:08:26; at 15k those rows (~15k
+    // tokens) are the raw tail the compaction keeps. Past the stub's one line, each chunk carries the assistant's own sentences.
     expect(seen.logs.filter((l) => l.includes('in the background'))).toEqual([
       'observed rows 1-56 in the background, 2 observations; watermark 56, 0 chunk(s) waiting on a gap',
-      'observed rows 56-139 in the background, 6 observations; watermark 139, 0 chunk(s) waiting on a gap',
     ])
     expect(seen.logs).not.toContain('the transcript changed under the observations; restarting the ledger from the memory message')
     expect(atCompaction).toBe(0)

@@ -172,7 +172,7 @@ describe('the memory row', () => {
     await clock.settle()
     await draw(memory)
 
-    expect(drawn).toEqual(['Compacted into observational memory · to ~32.6k tokens', 'Compacted into observational memory · to ~27.4k tokens'])
+    expect(drawn).toEqual(['Compacted into observational memory · to ~28.4k tokens', 'Compacted into observational memory · to ~27.4k tokens'])
   })
 
   test('the rows a compaction kept draw once: the copies it wrote after the memory row draw as nothing, the rows after them as written', async ($, on) => {
