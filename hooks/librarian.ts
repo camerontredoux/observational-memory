@@ -1,7 +1,7 @@
-// om_recall's librarian. Ember gets a search's query, what the agent said it will do with the result, and the best
-// hits' blocks with their lines numbered, and answers with line ranges, the most important first. Code pastes those
-// lines from the blocks, each range grown to the whole unit it is in, so every word the agent reads is the
-// transcript's own, never Ember's. Ported from the replay prototype's v3.1 (docs/research/2026-11-09-recall-librarian.md).
+// om_recall's librarian. Ember gets a search's query, the agent's newest text before it, what the agent said it will do
+// with the result, and the best hits' blocks with their lines numbered, and answers with line ranges, the most
+// important first. Code pastes those lines from the blocks, each range grown to the whole unit it is in, so every word
+// the agent reads is the transcript's own, never Ember's. Ported from the replay prototype's v3.1 (docs/research/2026-11-09-recall-librarian.md).
 // No `$`: register.ts passes in the call to Ember.
 import { LIBRARIAN_SYSTEM_PROMPT } from './prompts'
 import { linesOf } from './recall'
@@ -12,6 +12,7 @@ const TOP = 10 // hits given to Ember, each with its call or result
 const BLOCK_MAX = 20_000 // characters of one block given to Ember, cut at a line
 const CAP = 6_000 // characters of the answer and pasted lines; the units past it become pointers
 const FIRST_MAX = 10_000 // the first unit is pasted whole up to this many, past CAP
+const SAID_MAX = 1_500 // characters of the agent's text before the search, its end kept, as the replay gave Ember
 
 export const LIBRARIAN_FORMAT = {
   type: 'json_schema',
@@ -241,7 +242,12 @@ export type Ask = (system: string, input: string) => Promise<LibrarianReply>
 // `not-found`, `no-ranges` (none inside a block it was given) or `too-long` (no unit fits). A failed call throws.
 export async function librarian(h: Hits, ask: Ask): Promise<{ text: string; refs: string[] } | { fallback: string }> {
   const blocks = blocksOf(h.candidates)
-  const question = `What the agent said it will do with the result:\n${h.need ?? '(not said)'}\n\nIts search query: ${h.query}`
+  const said = (h.said ?? '').trim()
+  const question = [
+    `The agent's stated intent just before it searched:\n${(said.length > SAID_MAX ? `…${said.slice(-SAID_MAX)}` : said) || '(none)'}`,
+    ...(h.need ? [`What the agent said it will do with the result:\n${h.need}`] : []),
+    `Its search query: ${h.query}`,
+  ].join('\n\n')
   const blocksText = [...blocks.values()].map((b) => `=== block ${b.ref}: ${b.label} (${b.lines.length} lines) ===\n${numbered(b.lines)}\n=== end ${b.ref} ===`)
   const reply = await ask(LIBRARIAN_SYSTEM_PROMPT, `${question}\n\n${blocksText.join('\n\n')}`)
   if (!reply.found) return { fallback: 'not-found' }

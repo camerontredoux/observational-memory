@@ -46,7 +46,10 @@ $0.0031).
   A burst test found the answer in a subagent transcript in 5 of 15 real recall bursts. A unit from a subagent is
   labelled with its thread.
 - After the pasted units, the search's other hits stay listed, so every block the excerpts offered can still be read.
-- An optional `need` input says what Claude will do with the result. It goes to Ember with the query.
+- An optional `need` input says what Claude will do with the result. It goes to Ember with the query, after the
+  agent's newest text since the prompt, the last 1,500 characters of it, as the replay gave. That text comes from
+  the response as it streams (`turn.step`). The transcript file gains a message only once its tool calls have run,
+  so during the search it lacks the text in the search call's own message.
 
 When Ember fails, times out (8 s), gives bad JSON or `found: false`, gives no valid range, or has no key, the search
 answers with its excerpts as before. The log and `/om-stats` record each fallback by class.

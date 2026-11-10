@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { HttpResponse, On } from 'claude-code'
+import type { HttpResponse, On, TurnStepChunk } from 'claude-code'
 import { loadTranscript, recall } from '../hooks/recall'
 import type { RecallInput } from '../hooks/recall'
 import { EMBER_KEY_PATH, ember, httpError, memoryIo, world } from './harness'
@@ -90,8 +90,11 @@ describe('register: librarian', () => {
     const body = seen.librarianCalls[0]!.body
     expect(body).toMatchObject({ model: 'muse-ember-1.0', reasoning: { effort: 'low' }, store: false, prompt_cache_key: 'om-librarian', prompt_cache_retention: '24h' })
     expect(body.text).toMatchObject({ format: { type: 'json_schema', name: 'librarian', strict: true } })
-    // The need goes to Ember with the query, and every block with its lines numbered.
-    expect(seen.librarian[0]).toStartWith('What the agent said it will do with the result:\nwrite the PR body to the standard\n\nIts search query: PLUM\n\n')
+    // The need goes to Ember with the query, after what the agent wrote since the prompt (nothing here), and every
+    // block with its lines numbered.
+    expect(seen.librarian[0]).toStartWith(
+      "The agent's stated intent just before it searched:\n(none)\n\nWhat the agent said it will do with the result:\nwrite the PR body to the standard\n\nIts search query: PLUM\n\n",
+    )
     expect(seen.librarian[0]).toContain('=== block aaaaaaaa:5: result of Read (17 lines) ===\n   1 | # Standards\n   2 | Read before any PR.\n')
     // The answer on one line, then the list Ember pointed into, whole, with a line each way.
     expect(found).toStartWith('The standard lists three parts.\n\n[aaaaaaaa:5] lines 4-8\n   4 | The PLUM PR body has:\n   5 | - Summary of the change\n   6 | - Evidence with numbers\n   7 | - Known gaps\n   8 | ## Release\n\n3 match(es) for "PLUM" in ')
@@ -118,7 +121,7 @@ describe('register: librarian', () => {
 
     const found = await search({ query: 'PLUM' })
 
-    expect(seen.librarian[0]).toStartWith('What the agent said it will do with the result:\n(not said)\n\nIts search query: PLUM\n\n')
+    expect(seen.librarian[0]).toStartWith("The agent's stated intent just before it searched:\n(none)\n\nIts search query: PLUM\n\n")
     const units = found.split('\n\n').filter((p) => p.startsWith('['))
     expect(units.map((u) => u.split('\n')[0])).toEqual(['[aaaaaaaa:5] lines 2-8', '[aaaaaaaa:5] lines 12-17', '[aaaaaaaa:2] lines 1-4'])
     expect(units[1]).toContain('  13 | ```bash\n  14 | bun scripts/deploy.ts \\\n  15 |   --channel stable\n  16 | ```')
@@ -209,6 +212,53 @@ describe('register: librarian', () => {
     // When the librarian stands aside, the search is today's: the subagent left out, as asked.
     expect(without).toBe(await today(transcript(), { query: 'GRAPE-9 config.ts nowhere' }, files))
     expect(without).toContain('1 subagent transcript not searched: repeat with "subagents": true.')
+  })
+
+  // What Ember is told the agent wrote before the search: the question's head, up to the need or the query.
+  const said = (prompt: string) => prompt.split(/\n\n(?:What the agent said|Its search query)/)[0]!.replace("The agent's stated intent just before it searched:\n", '')
+  const SUB = 'a1b2c3d4e5f6a7b8c'
+  const subagent = (text: string) => ({
+    [`${SUBAGENTS}/agent-${SUB}.jsonl`]: [row('user', 3, 'Find the GRAPE-9 config', { isSidechain: true }), row('assistant', 4, [{ type: 'text', text }], { isSidechain: true })].join('\n') + '\n',
+    [`${SUBAGENTS}/agent-${SUB}.meta.json`]: JSON.stringify({ agentType: 'Explore', description: 'find config' }),
+  })
+
+  test("Ember gets the text the agent wrote before it searched: its response's as it streams, kept through a step with none, each thread its own, gone at the turn's end", async ($, on) => {
+    // The transcript file gains a message only once its tool calls have run, so the text comes from the response.
+    const steps: TurnStepChunk[][] = []
+    on('turn.step', async function* ($, e) {
+      for (const c of steps.shift() ?? []) yield c
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
+    })
+    on('turn.complete', () => ({ text: '' }))
+    const { seen, search } = await session($, on, transcript(), undefined, subagent('GRAPE-9 is in config.ts.'))
+    const step = async (texts: [number, string][], agentId?: string) => {
+      steps.push(texts.map(([index, text]) => ({ kind: 'text', index, text })))
+      for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude', messageCount: 1, ...(agentId ? { agentId } : {}) }));
+    }
+
+    await step([[0, 'Re-run the brief '], [0, 'command'], [2, 'with the same flags.']])
+    await search({ query: 'PLUM' })
+    await step([])
+    await search({ query: 'PLUM', need: 're-run it' })
+    await step([[0, 'Look for the config.']], SUB)
+    await $.tool.call({ tool: RECALL, agentId: SUB, query: 'GRAPE-9' })
+    await $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })
+    await search({ query: 'PLUM' })
+
+    const flags = 'Re-run the brief command\n\nwith the same flags.'
+    expect(seen.librarian.map(said)).toEqual([flags, flags, 'Look for the config.', '(none)'])
+    expect(seen.librarian[1]).toContain('with the same flags.\n\nWhat the agent said it will do with the result:\nre-run it\n\nIts search query: PLUM\n\n')
+  })
+
+  test("with none streamed (hooks loaded mid-turn), the transcript's newest text since the prompt, a subagent's from its own; the last 1,500 characters", async ($, on) => {
+    const long = `${'early words '.repeat(150)}and the last part.`
+    const text = transcript() + row('assistant', 10, [{ type: 'text', text: 'Let me find where the PR went.' }]) + '\n'
+    const { seen, search } = await session($, on, text, undefined, subagent(long))
+
+    await search({ query: 'PLUM' })
+    await $.tool.call({ tool: RECALL, agentId: SUB, query: 'GRAPE-9' })
+
+    expect(seen.librarian.map(said)).toEqual(['Let me find where the PR went.', `…${long.slice(-1_500)}`])
   })
 
   const fallbacks: [string, string, ((prompt: string) => string | HttpResponse | Error | Promise<never>) | undefined, string][] = [

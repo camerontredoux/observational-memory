@@ -8,7 +8,7 @@ import { atom, update } from 'claude-code'
 import { newWorker, registerWorkers, settled, started as startedWorker } from './workers'
 import type { Gauges } from './workers'
 import type { Worker } from '../types'
-import { COPY_ID, isMemoryText, liveTranscript, loadTranscript, parseInput, recall, RECALL_TOOL, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
+import { COPY_ID, isMemoryText, lastSaid, liveTranscript, loadTranscript, parseInput, recall, RECALL_TOOL, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
 import type { Hits, RecallInput, RecallIo, TranscriptCache } from './recall'
 import { librarian, LIBRARIAN_FORMAT, readLibrarianReply } from './librarian'
 import type { LibrarianReply } from './librarian'
@@ -885,6 +885,25 @@ function followRecall($: EngineInterface, key: string, uses: readonly { name: st
 function closeRecall($: EngineInterface, key: string) {
   for (const _ of recallWindows.get(key) ?? []) noteFollow($, false)
   recallWindows.delete(key)
+}
+
+// Each loop's newest response text, by loop key, as it streams (turn.step): om_recall's librarian gives Ember what the
+// agent said before it searched. The transcript file cannot: it gains a message only once that message's tool calls
+// have run. A response's text is taken piece by piece, as a tool may start before the response ends. A step with no
+// text leaves the last step's, and the turn's end clears it, as the replay took the newest text since the prompt.
+const saidBy = new Map<string, string>()
+// `chunks` as they come, each shown to `see` first; next, return and throw pass through as `yield*` passes them.
+function tap<T, R>(chunks: AsyncGenerator<T, R>, see: (chunk: T) => void): AsyncIterable<T, R> {
+  const it: AsyncIterator<T, R> = {
+    next: async () => {
+      const c = await chunks.next()
+      if (!c.done) see(c.value)
+      return c
+    },
+    return: (value) => chunks.return(value as R),
+    throw: (error) => chunks.throw(error),
+  }
+  return { [Symbol.asyncIterator]: () => it }
 }
 
 type Call = { phase: ModelCall['phase']; chunkTokens?: number }
@@ -2564,10 +2583,11 @@ export const register: Register = (on) => {
     const fromFile = !!corpus?.main.blocks.length
     const rows = fromFile ? [] : await $.session.messages()
     const corpusNow = fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, loopOf(sessionId)), 0).at, rows.length >= ROWS_CAP, () => $.clock.now())
-    const found = await recall(corpusNow, e, (hits) => librarianFor($, hits))
+    const key = loopOf(sessionId, e.agentId).key
+    // What the agent said before this call: its response's text as it streamed, else the newest the transcript holds.
+    const found = await recall(corpusNow, e, async (hits) => librarianFor($, { ...hits, said: saidBy.get(key) ?? (await lastSaid(corpusNow, e.agentId)) }))
     noteRecall($, sessionId, found.matches, fromFile)
     if (found.mode === 'search' && found.refs?.length) {
-      const key = loopOf(sessionId, e.agentId).key
       recallWindows.set(key, [...(recallWindows.get(key) ?? []), { refs: new Set(found.refs), left: RECALL_FOLLOW_CALLS }])
     }
     return { result: found.text }
@@ -2604,8 +2624,16 @@ export const register: Register = (on) => {
       const at = await $.clock.now()
       $.clock.after(0, () => void noteCacheAt($, at))
     }
-    const r = yield* next(e)
-    if (recallWindows.size) followRecall($, loopOf(await $.session.id(), e.agentId).key, r.toolUses)
+    const key = loopOf(await $.session.id(), e.agentId).key
+    let text = ''
+    let block = -1
+    const r = yield* tap(next(e), (c) => {
+      if (c.kind !== 'text') return
+      text += (block >= 0 && c.index !== block ? '\n\n' : '') + c.text
+      block = c.index
+      saidBy.set(key, text)
+    })
+    if (recallWindows.size) followRecall($, key, r.toolUses)
     const usage = r.usage
     if (e.agentId === undefined && usage) $.clock.after(0, () => void noteCacheUse($, usage).catch((error) => log($, errorText(error))))
     return r
@@ -2614,7 +2642,9 @@ export const register: Register = (on) => {
   // A subagent's is its answer: its loop is done, and what it stored goes. A teammate's is one of many, as main's.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (recallWindows.size) closeRecall($, loopOf(await $.session.id(), e.agentId).key)
+    const key = loopOf(await $.session.id(), e.agentId).key
+    saidBy.delete(key) // the next turn's searches start from its own text
+    if (recallWindows.size) closeRecall($, key)
     try {
       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
       const { loop, stamp } = await current($, e.agentId)
@@ -2638,6 +2668,7 @@ export const register: Register = (on) => {
     end(`${e.sessionId}/`)
     if (cleared) end(e.sessionId)
     transcripts.delete(e.sessionId)
+    for (const k of saidBy.keys()) if (k === e.sessionId || k.startsWith(`${e.sessionId}/`)) saidBy.delete(k)
     pendingTokens.delete(e.sessionId)
     uncarried.delete(e.sessionId)
     installed.delete(e.sessionId)

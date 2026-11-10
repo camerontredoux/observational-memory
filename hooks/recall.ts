@@ -68,7 +68,8 @@ export type RecallResult = { mode: Mode; text: string; matches: number; refs?: s
 export type Listed = { block: Block; brief: string; rank: number; thread?: string }
 // A search's answer in its parts, for the librarian: the lines before the hits, the hits in the order shown, the lines
 // after them; and the `candidates` it gives Ember, the hits of the same search over the subagents' transcripts too.
-export type Hits = { query: string; need?: string; head: string[]; hits: Listed[]; notes: string[]; candidates: Listed[] }
+// `said`, which the caller adds: the agent's newest text before the search call (see lastSaid).
+export type Hits = { query: string; need?: string; said?: string; head: string[]; hits: Listed[]; notes: string[]; candidates: Listed[] }
 // What answers a search in place of its excerpts, or undefined to keep them.
 export type Librarian = (hits: Hits) => Promise<{ text: string; refs: string[] } | undefined>
 
@@ -548,6 +549,21 @@ export async function refsOf(c: Corpus, rows: readonly SessionMessage[], agentId
     const m = rows[row]
     return m && m.text.trim() ? texts.get(`${m.role}\n${m.text.trim()}`) : undefined
   }
+}
+
+// The newest assistant text of the caller's thread (`agentId` names a subagent's) since its newest prompt, or ''.
+// The transcript file gains a message once its tool calls have run, so during an om_recall call it ends with the
+// message before the call's: register.ts takes the call's own message's text as it streams, and this is its fallback.
+export async function lastSaid(c: Corpus, agentId?: string) {
+  const t = agentId === undefined ? c.main : c.subagents.find((s) => s.tag === tagFor(agentId))
+  if (!t) return ''
+  await c.load(t)
+  for (let i = t.blocks.length - 1; i >= 0; i--) {
+    const b = t.blocks[i]!
+    if (b.kind !== 'assistant' && b.kind !== 'call' && b.kind !== 'result' && !b.meta) return '' // a prompt, or a compaction
+    if (b.kind === 'assistant' && b.text.trim()) return b.text.trim()
+  }
+  return ''
 }
 
 // ---- Addressing -------------------------------------------------------------------------------------------------
