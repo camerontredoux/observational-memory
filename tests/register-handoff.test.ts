@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import { COMPACTION_BRIEFING, FLOOR_NOTE } from '../hooks/prompts'
-import { turn, CHUNK, world, pi, work, recordIn, WHERE, briefIn, constraining } from './harness'
+import { turn, CHUNK, world, ember, work, recordIn, WHERE, briefIn, constraining } from './harness'
 import type { Run } from './harness'
 
 // The handoff: the session is briefed on compaction in its system prompt before any happens, and the continuation
@@ -42,7 +42,7 @@ describe('the handoff', () => {
   test("the Observer's next steps and what the user was told are rendered in the record, and the reminder sends the model to them", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: constraining({}, {
         fix: 'Active: fixing the refresh bug\nNext steps: 1) run npm test -- src/auth; 2) commit as "fix(auth): check expiry"\nTold the user: the expiry check is in src/auth/refresh.ts:45',
       }),
@@ -65,7 +65,7 @@ describe('the handoff', () => {
     world(on)
     const steps = 'Next steps: 1) rename store.ts; 2) update the imports'
     const told = 'Told the user: the store is renamed in three places'
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: constraining({}, {
         two: `Active: renaming the session store\n${steps}\n${told}`,
         three: 'Active: updating the imports',
@@ -87,7 +87,7 @@ describe('the handoff', () => {
   test('a carried next steps or told-the-user field is bounded, however long the Observer writes it', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: constraining({}, { two: `Active: a\nNext steps: ${'step; '.repeat(2_000)}\nTold the user: ${'said; '.repeat(2_000)}` }) })
+    ember(on, { reply: constraining({}, { two: `Active: a\nNext steps: ${'step; '.repeat(2_000)}\nTold the user: ${'said; '.repeat(2_000)}` }) })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
 
@@ -104,7 +104,7 @@ describe('the handoff', () => {
     world(on)
     const changed = Array.from({ length: 25 }, (_, i) => ` M hooks/file-${i}.ts`)
     let files = changed
-    const seen = pi(on, { reply: constraining({}, { two: 'Active: renaming the session store' }), git: (argv) => repo(files)(argv) })
+    const seen = ember(on, { reply: constraining({}, { two: 'Active: renaming the session store' }), git: (argv) => repo(files)(argv) })
 
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
 
@@ -137,7 +137,7 @@ describe('the handoff', () => {
     mock.clock(on)
     world(on)
     let git: (argv: readonly string[]) => Run | undefined = () => undefined // outside a repository
-    pi(on, { reply: constraining({}, { two: 'Active: a' }), git: (argv) => git(argv) })
+    ember(on, { reply: constraining({}, { two: 'Active: a' }), git: (argv) => git(argv) })
     const messages = [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)]
 
     const outside = (await $.session.compact({ trigger: 'manual', messages })).messages?.[0]?.text ?? ''
@@ -156,7 +156,7 @@ describe('the handoff', () => {
   test("the floor's memory, compiled with no model, carries the environment too", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, { git: repo(['?? notes.txt']) })
+    const seen = ember(on, { git: repo(['?? notes.txt']) })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100), ...turn('c', 'c', 100)] })
 

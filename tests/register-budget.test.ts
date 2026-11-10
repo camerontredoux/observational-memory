@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On, Register, SessionMessage } from 'claude-code'
 import { FLOOR_NOTE, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES } from '../hooks/prompts'
 import { planBudget } from '../hooks/register'
-import { originals, turn, OBSERVER_SESSION, piSessionOf, CHUNK, at, world, pi, live, gates, work, nextStepIn, recordIn, WHERE, correctionsIn, withObservations, observationsIn, userMessagesIn, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, overloaded } from './harness'
+import { originals, turn, CHUNK, at, world, ember, live, gates, work, nextStepIn, recordIn, WHERE, correctionsIn, withObservations, observationsIn, userMessagesIn, briefIn, skillsIn, FINISHED, steps, call, agentCall, readsIn, readers, SUMMARY, overloaded } from './harness'
 import type { Ledger } from './harness'
 
 // Subagents side by side, the memory budget and the fallbacks.
@@ -11,7 +11,7 @@ describe('register: budget', () => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const seen = ember(on, { hold: (n) => gate(n), reply: readsIn })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     await clock.set(at(23, 9, 0))
@@ -41,7 +41,7 @@ describe('register: budget', () => {
 
     expect(seen.maxInFlight).toBe(4)
     // The subagents' Observer calls are the session's piece of work too: one cache key for all of them.
-    expect(new Set(seen.calls.map((c) => piSessionOf(c.argv)))).toEqual(new Set([OBSERVER_SESSION]))
+    expect(new Set(seen.cacheKeys)).toEqual(new Set(['om-observer']))
     // Every call read one loop's rows, and a loop left short of a slot got the next one free.
     for (const prompt of seen.prompts) expect(readers(prompt).size).toBe(1)
     // Every loop's observations go to the debug log, none to the chat: the band above the prompt shows them.
@@ -70,7 +70,7 @@ describe('register: budget', () => {
   test("a subagent's compaction cuts at its own background watermark with no Observer call, its brief quoted, counted as a subagent's", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored, files } = world(on)
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     const step = steps(on)
     const brief = 'Prototype the change in the worktree, then report back.'
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: brief, toolUses: [] }])
@@ -117,7 +117,7 @@ describe('register: budget', () => {
   test('a newest tool result past the raw tail budget, with nothing observed yet, stays raw with its call and the rest is observed', async ($, on) => {
     mock.clock(on)
     const { history, agents } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     // The newest row, a 36 KB read (~9k tokens), is more than the raw tail's 6k on its own. Turn b is short of a chunk
     // so the kept tail is just the call and its result: with a full-size b, b's closing reply stays raw too.
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000), ...call(1, 36_000))
@@ -135,7 +135,7 @@ describe('register: budget', () => {
   test('a newest call and result past RAW_MAX_TOKENS on their own are observed too, and nothing stays raw', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     history.push(...turn('a', 'a', CHUNK), ...call(1, 200_000)) // a 50k-token result
 
     const result = await $.session.compact({ trigger: 'auto', messages: [...history] })
@@ -149,7 +149,7 @@ describe('register: budget', () => {
     mock.clock(on, { now: at(22, 9, 0) })
     world(on)
     const correction = '🔴 User: "Keep the public API unchanged"'
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]
         return `${name === 'a' ? `<corrections>\n* ${correction}\n</corrections>\n` : ''}<observations>\n* 🔴 User: "${name}"\n</observations>\n<continuation>\nActive: ${name}\n</continuation>`
@@ -178,7 +178,7 @@ describe('register: budget', () => {
   test('a memory over its budget with source ranges and within it without leaves them out of that message only, before touching skills or user messages', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 ${prompt.includes(']: a\n') ? '14:30 read a file' : '15:30 read c'}\n</observations>` })
+    const seen = ember(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 ${prompt.includes(']: a\n') ? '14:30 read a file' : '15:30 read c'}\n</observations>` })
     let window = 200_000
     on('session.usage', () => ({ value: { context: { window }, rateLimits: [] } }) as never)
     const runTurn = live(on, clock, history)
@@ -221,7 +221,7 @@ describe('register: budget', () => {
   test('a plugin-started compaction is skipped where another would fall back to the built-in compactor', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    ember(on)
     let builtin = 0
     on('session.compact', () => (builtin++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     history.push(...turn('a', 'a', CHUNK))
@@ -240,7 +240,7 @@ describe('register: budget', () => {
     const { gate, open } = gates()
     const correction = '🔴 2026-09-22 14:30 User: "Keep the public API unchanged"'
     const big = `<corrections>\n* ${correction}\n</corrections>\n<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(8_000)}</observations>`
-    const seen = pi(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
+    const seen = ember(on, { reply: () => big, reflect: () => big, hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(0) : undefined) })
     // A 50k window leaves a 15k budget: the memory, even trimmed to its cap, is over it at every cut.
     on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
@@ -265,7 +265,7 @@ describe('register: budget', () => {
   test('a memory over its budget with chunks observed on the spot falls back and stores them committed, not installed', async ($, on) => {
     mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_000)}</observations>` })
+    const seen = ember(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_000)}</observations>` })
     // A 15k-token budget, under the ~20k of observations the two chunks bring even with the skills and prompts cut.
     on('session.usage', () => ({ value: { context: { window: 50_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
@@ -291,7 +291,7 @@ describe('register: budget', () => {
     const clock = mock.clock(on)
     const { history, stored, files } = world(on)
     const { gate } = gates()
-    const seen = pi(on, { hold: (n) => (n === 3 ? gate(3) : undefined) })
+    const seen = ember(on, { hold: (n) => (n === 3 ? gate(3) : undefined) })
     const runTurn = live(on, clock, history)
     let builtIn = 0
     on('session.compact', () => (builtIn++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
@@ -324,7 +324,7 @@ describe('register: budget', () => {
     mock.clock(on)
     const { history, stored } = world(on)
     const corrections = Array.from({ length: 600 }, (_, i) => `🔴 User: "Leave module ${i} as it is"`)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) =>
         `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n${'* 🟡 read a file with a long name\n'.repeat(250)}</observations>`,
     })
@@ -350,7 +350,7 @@ describe('register: budget', () => {
     const long = (i: number) => `🔴 User: "Leave module ${i} as it is, ${'and do not touch its tests or its fixtures '.repeat(9)}"`
     const named = '🔴 User: "Keep src/widget_registry.ts as it is: widget_registry is public"'
     const corrections = [named, ...Array.from({ length: 100 }, (_, i) => long(i))]
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) => `${prompt.includes(']: a\n') ? `<corrections>\n${corrections.map((c) => `* ${c}\n`).join('')}</corrections>\n` : ''}<observations>\n* 🔴 Saw\n</observations>`,
     })
     // The default 90k-token budget holds the ~10k the corrections take whole; their 8k-token cap does not.
@@ -376,7 +376,7 @@ describe('register: budget', () => {
   test("the budget is half the room below the auto-compaction threshold, less the overhead the session's breakdown lists", async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(2_000)}</observations>` })
+    const seen = ember(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(2_000)}</observations>` })
     // (100k to auto-compaction - 20k - 10k of a loaded MCP tool - 10k of memory files) / 2: a 30k-token budget,
     // under the ~34k of observations the two chunks bring. A deferred tool is outside the window.
     const breakdown = {
@@ -427,7 +427,7 @@ describe('register: budget', () => {
   test('a subagent whose every read passes the raw tail budget is observed in the background and compacts at its watermark', async ($, on) => {
     const clock = mock.clock(on)
     const { agents } = world(on)
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     const step = steps(on)
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'Read the chapters in order.', toolUses: [] }])
     // As run 1 of the subagent smoke: each step starts on a 36 KB read, the newest row.
@@ -459,7 +459,7 @@ describe('register: budget', () => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on)
     let failing = true
-    const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    const seen = ember(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
     window(on, () => failing)
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
@@ -505,7 +505,7 @@ describe('register: budget', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let failing = true
-    const seen = pi(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
+    const seen = ember(on, { reply: readsIn, fail: () => (failing ? overloaded() : undefined) })
     window(on, () => failing)
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -548,7 +548,7 @@ describe('register: budget', () => {
     const { agents, stored } = world(on)
     const { gate, open } = gates()
     let failing = true
-    const seen = pi(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
+    const seen = ember(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     let builtin = 0
@@ -557,7 +557,7 @@ describe('register: budget', () => {
     let context = () => [...rows]
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, 0) + (n + 1) * 10_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
+        await clock.set(at(23, 9, 0) + (n + 1) * 6_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
         rows.push(...agentCall('one', n, 16_000))
         await step($, 's', n, rows.length, 'agent-1')
         await clock.settle()
@@ -602,14 +602,14 @@ describe('register: budget', () => {
     const { history } = world(on)
     const { gate, open } = gates()
     let failing = true
-    const seen = pi(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
+    const seen = ember(on, { reply: readsIn, hold: (n) => (n === 1 ? gate(1) : undefined), fail: () => (failing ? overloaded() : undefined) })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     let builtin = 0
     on('session.compact', () => (builtin++, { messages: [SUMMARY] }))
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, 0) + (n + 1) * 10_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
+        await clock.set(at(23, 9, 0) + (n + 1) * 6_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
         history.push(...agentCall('main', n, 16_000))
         await step($, 't', n + 1, history.length)
         await clock.settle()

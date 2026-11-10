@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
-import { turn, COMPOSER, CHUNK, at, world, pi, nearTarget, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
+import { turn, COMPOSER, CHUNK, at, world, ember, nearTarget, live, gates, observationsIn, steps, call, agentCall, readsIn, readers, SUMMARY, USAGE } from './harness'
 import type { Ledger } from './harness'
 import { TURN_END_NOTE } from '../hooks/prompts'
 
@@ -10,7 +10,7 @@ describe('register: lifecycle', () => {
   test('a compaction request with explicit instructions delegates to the built-in compactor unchanged, and a later compaction still finds the live context', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     let received: SessionCompactInput | undefined
     on('session.compact', ($, e) => ((received = e), { messages: [SUMMARY, ...e.messages.slice(-2)] }))
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -39,7 +39,7 @@ describe('register: lifecycle', () => {
   test('stats: the first main request after a compaction counts what the prompt cache served of it, by compactor', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    pi(on)
+    ember(on)
     on('session.compact', ($, e) => ({ messages: [SUMMARY, ...e.messages.slice(-2)] }))
     let cache = { cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     on('turn.step', async function* ($, e) {
@@ -74,7 +74,7 @@ describe('register: lifecycle', () => {
   test('a compaction request with blank instructions is treated as ordinary compaction, not delegated', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     let builtinCalls = 0
     on('session.compact', () => (builtinCalls++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
 
@@ -88,7 +88,7 @@ describe('register: lifecycle', () => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? undefined : gate(n)), reply: readsIn })
+    const seen = ember(on, { hold: (n) => (n === 1 ? undefined : gate(n)), reply: readsIn })
     const step = steps(on)
     const runTurn = live(on, clock, history)
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0))
@@ -128,7 +128,7 @@ describe('register: lifecycle', () => {
     const clock = mock.clock(on)
     const { gate, open } = gates()
     const { agents, stored } = world(on, { holdGet: (key) => (key === 'ledger:session-1/agent-1' ? gate(1) : undefined) })
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -155,7 +155,7 @@ describe('register: lifecycle', () => {
       holdGet: (key) => (key === 'ledger:session-1/agent-1' && reflected && !held ? ((held = true), gate(1)) : undefined),
     })
     const big = `<observations>\n${'* 🟡 2026-09-23 10:00 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, { reply: () => big, reflect: (n, prompt) => ((reflected = true), nearTarget(prompt, '* 🟡 2026-09-23 10:00 Condensed')) })
+    const seen = ember(on, { reply: () => big, reflect: (n, prompt) => ((reflected = true), nearTarget(prompt, '* 🟡 2026-09-23 10:00 Condensed')) })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -182,7 +182,7 @@ describe('register: lifecycle', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, { hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined), reply: () => big, reflect: () => big })
+    const seen = ember(on, { hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined), reply: () => big, reflect: () => big })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -202,7 +202,7 @@ describe('register: lifecycle', () => {
     const clock = mock.clock(on)
     const { history, agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const seen = ember(on, { hold: (n) => gate(n), reply: readsIn })
     const step = steps(on)
     const runTurn = live(on, clock, history)
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -242,7 +242,7 @@ describe('register: lifecycle', () => {
     const { gate, open } = gates()
     let lists = 0
     const { agents, stored } = world(on, { holdList: () => (++lists === 1 ? gate(1) : undefined) })
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -266,7 +266,7 @@ describe('register: lifecycle', () => {
     const { agents, stored } = world(on, {
       holdGet: (key) => (key === 'ledger:session-1/agent-1' && observed && !held ? ((held = true), gate(1)) : undefined),
     })
-    const seen = pi(on, { reply: (prompt) => ((observed = true), readsIn(prompt)) })
+    const seen = ember(on, { reply: (prompt) => ((observed = true), readsIn(prompt)) })
     const step = steps(on)
     on('turn.complete', () => ({ text: '' }))
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
@@ -290,7 +290,7 @@ describe('register: lifecycle', () => {
     const clock = mock.clock(on)
     const { gate, open } = gates()
     const { agents, stored } = world(on, { holdGet: (key) => (key === 'ledger:session-1/agent-1' ? gate(1) : undefined) })
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     on('session.end', ($, e) => ({ sessionId: e.sessionId }))
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }])
     for (let n = 0; n < 10; n++) rows.push(...agentCall('one', n, 16_000))
@@ -314,7 +314,7 @@ describe('register: lifecycle', () => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n), reply: readsIn })
+    const seen = ember(on, { hold: (n) => gate(n), reply: readsIn })
     on('session.end', ($, e) => ({ sessionId: e.sessionId }))
     const rows: SessionMessage[] = (agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }])
     for (let n = 0; n < 10; n++) rows.push(...agentCall('one', n, 16_000))
@@ -333,7 +333,7 @@ describe('register: lifecycle', () => {
   test("a teammate's turn.complete is one of many: its keys stay, and a pass runs as main's does", async ($, on) => {
     const clock = mock.clock(on)
     const { agents, stored } = world(on, { teammates: ['mate-1'] })
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     on('turn.complete', () => ({ text: '' }))
     agents['mate-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
     for (let n = 0; n < 4; n++) agents['mate-1'].push(...agentCall('one', n, 16_000))
@@ -348,7 +348,7 @@ describe('register: lifecycle', () => {
   test("the steps' times and the turn's start are held and written together a moment later, at once at the turn's end, and a prune by another process stays done", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored, writes } = world(on)
-    pi(on)
+    ember(on)
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     on('turn.complete', () => ({ text: '' }))
@@ -386,7 +386,7 @@ describe('register: lifecycle', () => {
   test('a scheduling pass that changes nothing in the ledger does not write it again', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored, writes } = world(on)
-    pi(on)
+    ember(on)
     const runTurn = live(on, clock, history)
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0))
     await clock.settle()
@@ -428,7 +428,7 @@ describe('register: compaction at a turn end', () => {
   function session($: Engine, on: On, rejects = false) {
     const clock = mock.clock(on)
     const w = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const compactions: SessionCompactResult[] = []
     let refused = 0
     let context = 0

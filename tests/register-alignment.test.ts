@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import { originalId } from '../hooks/recall'
-import { originals, turn, COMPOSER, CHUNK, at, world, pi, live, observationsIn, call } from './harness'
+import { originals, turn, COMPOSER, CHUNK, at, world, ember, live, observationsIn, call } from './harness'
 import type { Ledger } from './harness'
 
 // Grouped calls, the raw tail, matching a context to its history, and the stats.
@@ -20,7 +20,7 @@ describe('register: alignment', () => {
   test('a context that groups parallel tool calls under the watermark still cuts there with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
     const block = parallel('a', 4, 10_000)
     const answer = { role: 'assistant' as const, text: 'a done', toolUses: [] }
@@ -46,7 +46,7 @@ describe('register: alignment', () => {
   test('a context that groups parallel tool calls in the raw tail, at the same length as the history, is persistent', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -70,7 +70,7 @@ describe('register: alignment', () => {
   test('after a compaction, a context that groups parallel tool calls matches the tail of the longer history', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -99,7 +99,7 @@ describe('register: alignment', () => {
   test('an older wrapper row in the raw tail keeps only the lines a newer one does not repeat, and reads whole again after the compaction', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
     const notice = (id: string) => `<task-notification>\n<task-id>${id}</task-id>\nThe watcher woke: read the inbox, act on each new file, then reply to the lead with what changed.\n</task-notification>`
 
@@ -132,7 +132,7 @@ describe('register: alignment', () => {
   test('an older tool input and result the raw tail cut read whole again after the compaction', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
     const script = `cat <<'EOF' > notes.txt\n${'a heredoc line\n'.repeat(300)}EOF`
     const output = `BEGIN build\n${'compiled module\n'.repeat(300)}END: build passed`
@@ -183,7 +183,7 @@ describe('register: alignment', () => {
   test('a parallel block a compaction wrote back grouped, under the watermark, still cuts there with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -213,7 +213,7 @@ describe('register: alignment', () => {
   test('a compaction finds its context when the history holds rows past it (the /compact command) and keeps the ledger', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -234,7 +234,7 @@ describe('register: alignment', () => {
   test('a main compaction whose context does not match the history says why, once, and counts it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
 
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000))
@@ -256,7 +256,7 @@ describe('register: alignment', () => {
   test('a context that differs from the history past the watermark keeps the ledger up to it and counts how it differs', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files, stored } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -291,7 +291,7 @@ describe('register: alignment', () => {
   test('a context that differs from the history under the watermark only in a tool result keeps the ledger, checked against the history', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files, stored } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -320,7 +320,7 @@ describe('register: alignment', () => {
   test('stats: background calls and a compaction land in the session file, and om_stats and /om-stats report them', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    pi(on)
+    ember(on)
     on('session.usage', () => ({ value: { context: { tokens: 90_000, window: 200_000 }, rateLimits: [] } }) as never) // the fields the hook reads
     const runTurn = live(on, clock, history)
 
@@ -333,10 +333,10 @@ describe('register: alignment', () => {
     const file = JSON.parse(files['/stats/session-1.json']!) as { cwd: string; metrics: Record<string, { count: number; sum: number }> }
     expect(file.cwd).toBe('/work/project')
     expect(file.metrics['observer.background.ms']?.count).toBe(2)
-    expect(Math.round(file.metrics['observer.background.cost']!.sum * 1e7)).toBe(50_216)
+    expect(Math.round(file.metrics['observer.background.cost']!.sum * 1e7)).toBe(24_238) // 2 × (9,206 × .sum * 1e7)).toBe(50_216).10 + 3,072 × .sum * 1e7)).toBe(50_216).004 + 558 × .sum * 1e7)).toBe(50_216).50) per million
     expect(file.metrics['observer.background.in']?.sum).toBe(18_412)
-    expect(file.metrics['observer.background.cacheRead']?.sum).toBe(6_144) // pi's prompt-cache hits, apart from its input
-    expect(file.metrics['observer.background.cacheWrite']?.sum).toBe(0)
+    expect(file.metrics['observer.background.cacheRead']?.sum).toBe(6_144) // Ember's prompt-cache hits, apart from its input
+    expect(file.metrics['observer.background.cacheWrite']).toBeUndefined() // Ember charges no cache writes
     expect(file.metrics['observer.background.observations']?.sum).toBe(2)
     expect(file.metrics['observer.compaction.ms']?.count).toBeGreaterThan(0)
     expect(file.metrics['compaction.manual.syncCalls']?.sum).toBe(file.metrics['observer.compaction.ms']?.count)
@@ -349,7 +349,7 @@ describe('register: alignment', () => {
     expect(summary).toMatch(/^Background   2 calls,/m)
     const tool = String((await $.tool.call({ tool: 'mcp__observational-memory__om_stats', full: true })).result)
     expect(tool).toContain('## observational-memory stats, session session-1 (/work/project)')
-    expect(tool).toMatch(/1 compaction\(s\), \d+ Luna call\(s\) \(0 failed\)/)
+    expect(tool).toMatch(/1 compaction\(s\), \d+ model call\(s\) \(0 failed\)/)
     expect(tool).toMatch(/\| observer\.background\.ms \| 2 \|/)
     files['/stats/other.json'] = JSON.stringify({ version: 1, sessionId: 'other', firstSeen: 0, lastSeen: 0, counts: {}, metrics: { 'observer.background.ms': { count: 1, sum: 5, min: 5, max: 5, recent: [[0, 5]] } } })
     expect((await $.command.run({ command: 'om-stats', args: 'all', ...COMPOSER })).text).toStartWith('all sessions (2) · ')
@@ -364,7 +364,7 @@ describe('register: alignment', () => {
   test('stats: a failed stats write is logged once and compaction and observation carry on', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on, { failWrites: true })
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(22, 14, 30))

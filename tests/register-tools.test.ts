@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import { FLOOR_NOTE } from '../hooks/prompts'
 import { MEMORY_MAX_TOKENS } from '../hooks/register'
-import { originals, turn, CHUNK, at, world, pi, live, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, observationsIn, briefIn, steps, SUMMARY, USAGE, ran } from './harness'
+import { originals, turn, CHUNK, at, world, ember, live, recallOnlyHooks, deferredByEngine, RECALL_DESCRIBE, COMPACT_START, work, observationsIn, briefIn, steps, SUMMARY, USAGE, ran } from './harness'
 
 // Om_recall registration, gauges, /clear and subagent windows.
 describe('register: tools', () => {
@@ -82,7 +82,7 @@ describe('register: tools', () => {
   test('the cache time is written as each main request starts, not a subagent one, and as null once a compaction installs', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    pi(on)
+    ember(on)
     on('turn.step', async function* ($, e) {
       return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { ...USAGE, model: 'claude' } }
     })
@@ -107,7 +107,7 @@ describe('register: tools', () => {
   test("once a compaction installs, the gauges' context is the count of the context the engine swapped in", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    pi(on)
+    ember(on)
     let swapped = false
     on('session.usage', () => ({ value: { context: swapped ? { window: 200_000, breakdown: { totalTokens: 61_000 } } : { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [SUMMARY] }))
@@ -121,7 +121,7 @@ describe('register: tools', () => {
   test("once a compaction installs and the engine shows no swap, the gauges' context is its estimate, not the usage from before it", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    pi(on)
+    ember(on)
     on('session.usage', () => ({ value: { context: { tokens: 150_000, window: 200_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [SUMMARY] }))
     const context = () => JSON.parse(files['/gauges/session-1.json'] ?? '{}').context
@@ -234,7 +234,7 @@ describe('register: tools', () => {
   test('the recall-only eval plugin also puts om_recall in the tool list after the first compaction', async ($, on) => {
     mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    ember(on)
     const evalHooks = recallOnlyHooks()
     const invalidated: string[] = []
     const evalWorld = { session: { id: async () => 'session-1', messages: async () => history }, ui: { invalidate: (event: string) => void invalidated.push(event) } }
@@ -279,7 +279,7 @@ describe('register: tools', () => {
   test('/clear drops the cleared session\'s ledger, times, skills, Session line and seen stamp, its subagents\' too', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on)
+    ember(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
     const runTurn = live(on, clock, history)
 
@@ -298,7 +298,7 @@ describe('register: tools', () => {
   test('a rewound transcript restarts the ledger from the memory message', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -315,7 +315,7 @@ describe('register: tools', () => {
   test('a subagent whose history the session cannot read is observed at compaction from its context alone, and its steps store nothing', async ($, on) => {
     const clock = mock.clock(on)
     const { stored } = world(on, { unreadable: ['agent-1'] })
-    const seen = pi(on)
+    const seen = ember(on)
     const step = steps(on)
 
     await step($, 's', 0, 3, 'agent-1')
@@ -335,7 +335,7 @@ describe('register: tools', () => {
   test("an unreadable subagent history gets one round of Observer calls, a failed chunk briefed rather than observed again, and is counted", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on, { unreadable: ['agent-1'] })
-    const seen = pi(on, { fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = ember(on, { fail: (n) => (n === 1 ? new Error('network down') : undefined) })
 
     const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
 
@@ -353,7 +353,7 @@ describe('register: tools', () => {
   test("a subagent's memory with ~100k tokens of observations is trimmed to the memory's cap and stands, under the main model's million", async ($, on) => {
     mock.clock(on)
     world(on, { unreadable: ['agent-1'] })
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(6_000)}</observations>` })
+    const seen = ember(on, { reply: () => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(6_000)}</observations>` })
     on('session.usage', () => ({ value: { context: { window: 1_000_000 }, rateLimits: [] } }) as never)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...work('w', 8_000)]

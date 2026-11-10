@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, BRIEF_REF_NOTE, FLOOR_NOTE } from '../hooks/prompts'
-import { originals, turn, CHUNK, at, world, pi, live, observationsIn, userMessagesIn, briefIn } from './harness'
+import { originals, turn, CHUNK, at, world, ember, live, observationsIn, userMessagesIn, briefIn } from './harness'
 
 // The floor: where the Observer's memory cannot stand, the rows leaving context are compiled by code into the session
 // brief (hooks/vcc.ts) rather than handed to the built-in compaction.
@@ -11,7 +11,7 @@ describe('the floor', () => {
   test('on a short conversation with nothing to observe before the raw tail, the floor briefs the turns before the newest, with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', 100), ...turn('b', 'b', 100), ...turn('c', 'c', 100)]
 
@@ -37,7 +37,7 @@ describe('the floor', () => {
   test('a manual compaction with less than a chunk unobserved briefs it by code, with no Observer call', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
 
     const result = await $.session.compact({ trigger: 'manual', messages: SHORT })
     await clock.advance(5_000)
@@ -55,7 +55,7 @@ describe('the floor', () => {
   test("a local slash command's rows stay out of the kept tail; a prompt command's echo, with no output after it, stays", async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    ember(on)
     const user = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
     const effort = [
       user('<local-command-caveat>Caveat: the command below was run directly.</local-command-caveat>'),
@@ -73,7 +73,7 @@ describe('the floor', () => {
   test('a reply that was thinking alone stays out of the kept tail', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    ember(on)
     const empty = (text: string): SessionMessage => ({ role: 'assistant', text, toolUses: [] })
     const messages = [...SHORT.slice(0, 4), empty(''), empty('(no content)'), ...SHORT.slice(4)]
 
@@ -85,7 +85,7 @@ describe('the floor', () => {
   test('an auto compaction with less than a chunk unobserved still observes it on the spot', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
 
     const result = await $.session.compact({ trigger: 'auto', messages: SHORT })
 
@@ -97,7 +97,7 @@ describe('the floor', () => {
   test('a manual compaction with background observations since the last one cuts at the watermark, as before', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -116,7 +116,7 @@ describe('the floor', () => {
   test('a context that is the memory message alone leaves the floor nothing to compile: the built-in compaction runs, saying why', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100)] })
 
@@ -130,7 +130,7 @@ describe('the floor', () => {
   test("a floor's brief is carried by later compactions: merged with the next floor's, kept whole once the Observer's memory stands again", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', 100), ...turn('b', 'b', 100)] })
     const second = await $.session.compact({ trigger: 'manual', messages: [...first.messages!, ...turn('c', 'c', 100)] })
     const briefed = briefIn(second.messages![0]!.text)
@@ -146,7 +146,7 @@ describe('the floor', () => {
   test('an observed memory has no session brief', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    ember(on)
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
     expect(observationsIn(result.messages![0]!.text)).toContain('User: "a"')
     expect(result.messages![0]!.text).not.toContain('<session-brief>')
@@ -155,7 +155,7 @@ describe('the floor', () => {
   test('the files the observed rows changed are listed in the brief, and nothing else of those rows', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    ember(on)
     const edit = (s: SessionMessage): SessionMessage => ({ ...s, toolUses: s.toolUses.map((u) => ({ ...u, tool: 'Edit' })) })
     const [prompt, call, result, done] = turn('a', 'a', CHUNK)
     const messages = [prompt!, edit(call!), result!, done!, ...turn('b', 'b', 8_000)]
@@ -169,7 +169,7 @@ describe('the floor', () => {
   test("the brief's lines name the om_recall block they came from when the transcript is known and the model can call om_recall", async ($, on) => {
     mock.clock(on)
     const { files } = world(on)
-    pi(on)
+    ember(on)
     on('classic.Stop', () => ({}))
     let tools = [{ name: 'mcp__observational-memory__om_recall', description: 'Searches', mcp: true }]
     on('tool.list', () => ({ value: tools }))

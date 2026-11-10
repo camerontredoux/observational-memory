@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { turn, CHUNK, at, world, ran, pi, live, gates, nextStepIn, userMessagesIn, stampOf, steps, call, readsIn } from './harness'
+import { turn, CHUNK, at, world, ran, ember, live, gates, nextStepIn, userMessagesIn, stampOf, steps, call, readsIn } from './harness'
 import type { Ledger } from './harness'
 
 // Om_recall over the transcript, mid-turn observation and launch briefs.
@@ -117,7 +117,7 @@ describe('register: recall', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     await clock.set(at(23, 9, 0))
@@ -153,7 +153,7 @@ describe('register: recall', () => {
   test('past the 4096 rows the history reads as, a long turn still observes in the background mid-turn', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on, { rowsCap: 4096 })
-    const seen = pi(on, { reply: readsIn })
+    const seen = ember(on, { reply: readsIn })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
     await clock.set(at(23, 9, 0))
@@ -178,7 +178,7 @@ describe('register: recall', () => {
   test("a crewmate's launch brief, its only prompt, is quoted in full across compactions and never offered as the next step", async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    const seen = ember(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const brief = `FIRSTMATE_OP: v1 launch-brief: ${'Do the work on your own. '.repeat(600)}`.trim()
     const messages = [{ role: 'user' as const, text: brief, toolUses: [] }, ...call(0, CHUNK), ...call(1, CHUNK), ...call(2, 8_000)]
 
@@ -198,7 +198,7 @@ describe('register: recall', () => {
   test('a short first prompt quotes across compactions the files it names that its turn read, and no other', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const prompt = "Operational input waiting: read '/state/inbox/b.msg' and handle its contents."
     const brief = 'Stay on branch fix-1. Never push.'
     const messages: SessionMessage[] = [
@@ -222,7 +222,7 @@ describe('register: recall', () => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))

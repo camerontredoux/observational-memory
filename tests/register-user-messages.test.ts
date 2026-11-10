@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { turn, CHUNK, world, pi, work, nextStepIn, observationsIn, userMessagesIn } from './harness'
+import { turn, CHUNK, world, ember, work, nextStepIn, observationsIn, userMessagesIn } from './harness'
 import { MEMORY_MAX_TOKENS } from '../hooks/register'
 
 // Prompts and the user messages section.
@@ -8,7 +8,7 @@ describe('register: user-messages', () => {
   test('a genuine prompt that happens to start with a tag is told apart from a named injected wrapper by name, not by shape', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    ember(on)
     const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
     const messages = [
       ...turn('a', 'a', CHUNK),
@@ -34,7 +34,7 @@ describe('register: user-messages', () => {
   test('a prompt typed after pasted images is kept with their markers; an image note with no text is not a prompt', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on)
+    ember(on)
     const row = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
     const messages = [
       ...turn('a', 'a', CHUNK),
@@ -54,7 +54,7 @@ describe('register: user-messages', () => {
   test('the memory message opens with the built-in wrapper and carries every real user prompt verbatim, no model call', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
     on('classic.SessionStart', ($, e) => ({}))
     await $.classic.SessionStart({ source: 'startup', session_id: 'session-1', transcript_path: '/home/u/.claude/projects/p/session-1.jsonl' })
@@ -97,7 +97,7 @@ describe('register: user-messages', () => {
   test('the user messages section keeps the brief, the newest prompts within its cap and the last three whole', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const long = (n: number) => `${n} ${'w'.repeat(4_000)}`
     const brief = `brief ${'b'.repeat(14_600)}`
     const messages = [...turn(brief, 'r', 2_000), ...Array.from({ length: 30 }, (_, i) => turn(long(i), 'r', 2_000)).flat(), ...turn('last', 'r', 8_000)]
@@ -136,7 +136,7 @@ describe('register: user-messages', () => {
   test('short prompts past the cap stay whole, in order, with the long ones between counted', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const long = (n: number) => `${n} ${'w'.repeat(8_000)}`
     const prompts = Array.from({ length: 12 }, (_, i) => (i % 3 === 0 ? `no, use option ${i} instead` : long(i)))
     const messages = [...turn('brief', 'r', 2_000), ...prompts.flatMap((p) => turn(p, 'r', 2_000)), ...turn('last', 'r', 8_000)]
@@ -160,7 +160,7 @@ describe('register: user-messages', () => {
   test('an oversized brief is cut short of the cap, so the newest prompt keeps a reserve and stays the next step', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(50_000)}`
     const newest = `newest ${'n'.repeat(50_000)}`
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn('mid', 'r', 2_000), ...turn(newest, 'r', CHUNK), ...work('w', 8_000)] })
@@ -183,7 +183,7 @@ describe('register: user-messages', () => {
   test('the newest prompt is the next step only when it leaves context, never when the raw tail keeps it', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const kept = await $.session.compact({ trigger: 'manual', messages: [...turn('first', 'r', CHUNK), ...turn('second', 'r', CHUNK), ...turn('in the tail', 'r', 2_000)] })
     expect(kept.messages?.slice(1).some((m) => m.text === 'in the tail')).toBe(true)
     expect(nextStepIn(kept.messages?.[0]?.text)).toBeUndefined()
@@ -195,7 +195,7 @@ describe('register: user-messages', () => {
   test('the next step after a compaction of [brief, (n omitted), x] with no new prompt is x', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(14_600)}`
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn(`mid ${'m'.repeat(30_000)}`, 'r', 2_000), ...turn('do the thing', 'r', CHUNK), ...work('w', 8_000)] })
     expect(userMessagesIn(result.messages?.[0]?.text)).toEqual([brief, '(1 omitted)', 'do the thing'])
@@ -208,7 +208,7 @@ describe('register: user-messages', () => {
   test('an oversized brief keeps its head and its last lines with a marker counting the omission, and is not cut again', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const body = Array.from({ length: 1_000 }, (_, i) => `step ${i}: ${'b'.repeat(60)}`).join('\n')
     const rules = 'Report: the head commit and the test results.\nAcceptance: every test passes; no push.'
     const brief = `Goal: rename the store.\n${body}\n${rules}`
@@ -233,7 +233,7 @@ describe('register: user-messages', () => {
   test('a brief within the cap stays whole and a newest prompt over the remainder is cut', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(14_600)}`
     const newest = `newest ${'n'.repeat(40_000)}`
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn(brief, 'r', CHUNK), ...turn(newest, 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
@@ -249,7 +249,7 @@ describe('register: user-messages', () => {
   test('a single-prompt session keeps that prompt once', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     const brief = `brief ${'b'.repeat(50_000)}`
     const messages: SessionMessage[] = [...turn(brief, 'r', CHUNK), ...turn('tail', 'r', 8_000)]
     const result = await $.session.compact({ trigger: 'manual', messages })
@@ -262,7 +262,7 @@ describe('register: user-messages', () => {
   test('only 🔴 corrections are quoted; the observer reserves 🔴 for the user\'s constraints', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () => '<corrections>\n* 🔴 User: "use pnpm, never npm"\n* 🟡 User: "I meant the other file"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
     })
 
@@ -284,7 +284,7 @@ describe('register: user-messages', () => {
     mock.clock(on)
     world(on, { unreadable: ['agent-1'] })
     // ~12k tokens of observations per chunk, six chunks: well past the cap.
-    const seen = pi(on, { reply: (prompt) => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_500)}* 🟡 saw ${prompt.match(/^\[User[^\]]*\]: (p\d)/m)?.[1]}\n</observations>` })
+    const seen = ember(on, { reply: (prompt) => `<observations>\n${'* 🟡 read a file with a long name\n'.repeat(1_500)}* 🟡 saw ${prompt.match(/^\[User[^\]]*\]: (p\d)/m)?.[1]}\n</observations>` })
     const task = 'p0 Build the parser. Keep the CLI flags exactly as they are.'
     const asks = ['p3 Force the overlay into dark mode', 'p4 not the issue im encountering: switching platform keeps the old layout', 'p5 now rerun the tests']
     const prompts = [task, 'p1 also look at the lexer', 'p2 '.padEnd(3_000, 'long paste '), ...asks]
@@ -308,7 +308,7 @@ describe('register: user-messages', () => {
   test('a memory under its cap is left as it was: no trimmed line, every observation kept', async ($, on) => {
     mock.clock(on)
     world(on, { unreadable: ['agent-1'] })
-    pi(on, { reply: () => '<observations>\n* 🟡 read a file\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 read a file\n</observations>' })
     const messages = [...turn('a', 'r', CHUNK), ...turn('b', 'r', CHUNK), ...work('w', 8_000)]
 
     const result = await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages })

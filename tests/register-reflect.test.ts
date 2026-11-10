@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import { turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, CHUNK, at, world, pi, nearTarget, isFiller, tokensOf, live, gates, observationsIn } from './harness'
+import { turn, emberResponse, CHUNK, at, world, ember, nearTarget, isFiller, tokensOf, live, gates, observationsIn } from './harness'
 import type { Ledger } from './harness'
 
 // Reflection.
@@ -10,7 +10,7 @@ describe('register: reflect', () => {
       const clock = mock.clock(on)
       const { history } = world(on)
       const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(6_000)}</observations>`
-      const seen = pi(on, { reply: () => big, reflect: (n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module') })
+      const seen = ember(on, { reply: () => big, reflect: (n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module') })
       history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000))
 
       const result = await $.session.compact({ trigger, messages: [...history] })
@@ -26,7 +26,7 @@ describe('register: reflect', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, {
+    const seen = ember(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(100 + n) : undefined),
       reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🔴 2026-09-22 14:39 User: "b"\n</observations>`),
       reflect: (n, prompt) => (n === 1 ? big : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module')),
@@ -58,13 +58,12 @@ describe('register: reflect', () => {
     expect(seen.systems.at(-1)).toContain('reflection agent for a coding assistant')
     const entries = (stored['ledger:session-1'] as Ledger).entries
     expect(seen.screen).toContain(`Condensed memory in 9m 0s · 4,001 → ${entries.length.toLocaleString('en-US')} notes`)
-    expect(seen.calls.at(-1)!.argv).toEqual([...PI_ARGV, seen.systems.at(-1), ...PI_FLAGS, '--session-id', 'om-reflect-736a51cd-4000'])
-    // Both attempts are one pi session, named by the ledger's seq at the snapshot, so the second reads the observations
-    // they both send first from the provider's cache. The Observer's calls keep the session's own.
-    const ids = seen.calls.map((c) => piSessionOf(c.argv))
+    // Every Reflector call shares one cache key, so a retry reads the observations both attempts send first from
+    // the prompt cache; the Observer's calls share their own.
+    const ids = seen.calls.map((c) => String(c.body.prompt_cache_key))
     const isReflection = (_: string, i: number) => seen.prompts[i]!.startsWith('## OBSERVATIONS')
-    expect(ids.filter(isReflection)).toEqual(['om-reflect-736a51cd-4000', 'om-reflect-736a51cd-4000'])
-    expect(new Set(ids.filter((id, i) => !isReflection(id, i)))).toEqual(new Set([OBSERVER_SESSION]))
+    expect(ids.filter(isReflection)).toEqual(['om-reflector', 'om-reflector'])
+    expect(new Set(ids.filter((id, i) => !isReflection(id, i)))).toEqual(new Set(['om-observer']))
     expect(entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
       '🟡 2026-09-22 14:30 Explored the auth module',
       '🔴 2026-09-22 14:39 User: "b"',
@@ -86,7 +85,7 @@ describe('register: reflect', () => {
     const { history, stored } = world(on)
     const { gate, open } = gates()
     const lines = (time: string, what: string, n: number) => `<observations>\n${Array.from({ length: n }, (_, i) => `* 🟡 ${time} ${what} ${i}`).join('\n')}\n</observations>`
-    const seen = pi(on, {
+    const seen = ember(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a') ? lines('2026-09-22 14:30', 'read an old file with a long name', 1_200) : lines('2026-09-22 15:00', 'recent step', 700),
@@ -117,7 +116,7 @@ describe('register: reflect', () => {
   test('a reflection far under its target is not installed: the next attempt asks for more detail, and one near the target is', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => (n === 1 ? '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>' : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Read the auth module')),
     })
@@ -140,7 +139,7 @@ describe('register: reflect', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const notes = (time: string) => `<observations>\n${`* 🟡 ${time} read a file with a long name\n`.repeat(4_000)}</observations>`
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) => notes(prompt.includes('[User @ 2026-09-22 14:30]: a') ? '2026-09-22 14:30' : '2026-09-22 15:00'),
       reflect: (n, prompt) => nearTarget(prompt, `* 🟡 ${n === 1 ? '2026-09-22 14:30 First condensed' : '2026-09-22 15:00 Second condensed'}`),
     })
@@ -164,7 +163,7 @@ describe('register: reflect', () => {
   test('a path the condensed notes name and the reflection drops comes back as the clause that named it, at its time', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const pi_ = pi(on, {
+    const pi_ = ember(on, {
       reply: () =>
         `<observations>\n* 🟡 2026-09-22 14:30 Assistant read the plan. Assistant fixed the totals in \`hooks/stats.ts\`.\n* 🟡 2026-09-22 14:30 Assistant pruned \`hooks/prune.ts\`.\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (_n, prompt) => nearTarget(prompt, '* 🟡 2026-09-22 14:30 Assistant pruned sessions in `hooks/prune.ts`'),
@@ -184,7 +183,7 @@ describe('register: reflect', () => {
   test("a reply's sentences are carried one a reply, and a chunk's lines are kept oldest first", async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:31 Assistant replied\n* 🟡 2026-09-22 14:30 Report arrived\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:31 Assistant replied\n* 🟡 2026-09-22 14:30 Report arrived\n</observations>' })
     const runTurn = live(on, clock, history)
     const [ask, read, result] = turn('a', 'a', CHUNK)
     const reply = 'The totals moved into `hooks/stats.ts` for the new report. The cap is now 40% of `hooks/prune.ts` because sessions grew.'
@@ -202,7 +201,7 @@ describe('register: reflect', () => {
     const { history, stored } = world(on)
     const line = '🟡 2026-09-22 14:30 read a file with a long name'
     let observed = 0
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () => (observed++ ? '<observations>\n* 🟡 2026-09-22 15:00 Looked again\n</observations>' : `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`),
       reflect: () => '<observations>\n* 🟡 2026-09-22 14:30 Read files\n</observations>',
     })
@@ -235,7 +234,7 @@ describe('register: reflect', () => {
       for (let i = 0, chars = head.length; chars < share * floor * 4; i++) lines.push(`* 🟢 2026-09-22 14:30 detail ${i}`), (chars += 32)
       return `<observations>\n${lines.join('\n')}\n</observations>`
     }
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => underFloor(prompt, n === 1 ? 0.8 : 0.9, n === 1 ? '* 🟡 2026-09-22 14:30 First try' : '* 🟡 2026-09-22 14:30 Second try'),
     })
@@ -258,7 +257,7 @@ describe('register: reflect', () => {
     const table = '🔴 2026-09-22 15:00 User wants the detailed table behind an `all` mode'
     const many = (time: string) => `* 🟡 ${time} read a file with a long name\n`.repeat(1_000)
     const { gate, open } = gates()
-    const seen = pi(on, {
+    const seen = ember(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
@@ -291,7 +290,7 @@ describe('register: reflect', () => {
     const { history, stored } = world(on)
     const red = (i: number) => `🔴 2026-09-22 14:30 User required that module ${i} keep ${'its public interface and its tests unchanged, '.repeat(8)}always`
     const { gate, open } = gates()
-    const seen = pi(on, {
+    const seen = ember(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(n) : undefined),
       reply: () => `<observations>\n${Array.from({ length: 350 }, (_, i) => `* ${red(i)}`).join('\n')}\n</observations>`,
       reflect: (n, prompt) => nearTarget(prompt),
@@ -336,7 +335,7 @@ describe('register: reflect', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const many = (time: string) => `<observations>\n${`* 🟡 ${time} read a file with a long name\n`.repeat(1_000)}</observations>`
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) => many(prompt.includes('[User @ 2026-09-22 14:30]: a') ? '2026-09-22 14:30' : '2026-09-22 15:00'),
       reflect: (n, prompt) =>
         nearTarget(
@@ -375,7 +374,7 @@ describe('register: reflect', () => {
     const clock = mock.clock(on, { now: at(22, 14, 0) })
     const { history, stored } = world(on)
     const many = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(2_000)}</observations>`
-    pi(on, {
+    ember(on, {
       reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: c') ? many : prompt.includes('[User]: a') ? '<observations>\n* 🟡 Saw a\n</observations>' : undefined),
       reflect: (n, prompt) =>
         nearTarget(
@@ -407,7 +406,7 @@ describe('register: reflect', () => {
   test('a reflection with no observations is tried again at the next level, which says so', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) =>
         n === 1 ? '<corrections>\n* 🔴 2026-09-22 14:30 User: "never npm"\n</corrections>\n<observations>\n</observations>' : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Read files'),
@@ -428,7 +427,7 @@ describe('register: reflect', () => {
   test('the observer and reflector are given the same priority markers', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, { reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>` })
+    const seen = ember(on, { reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>` })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -444,7 +443,7 @@ describe('register: reflect', () => {
   test('an unmarked line in a reflection continues the line before it, but after a 🔴 line stands as its own 🟡 line', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored, files } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => nearTarget(prompt, '* 🔴 2026-09-22 14:30 Use pnpm\nnever npm\n* 🟡 2026-09-22 14:30 Read files\nand a.ts'),
     })
@@ -471,7 +470,7 @@ describe('register: reflect', () => {
   test('a reflection in the older date-group form, which the prompts no longer ask for, is still read', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, {
+    ember(on, {
       reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
       reflect: (n, prompt) => nearTarget(prompt, 'Date: Sep 22, 2026\n* 🟡 (14:30) Read files'),
     })
@@ -488,7 +487,7 @@ describe('register: reflect', () => {
     const { history, stored } = world(on)
     const line = '🟡 2026-09-22 14:30 read a file with a long name'
     const big = `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`
-    const seen = pi(on, { reply: () => big, reflect: () => big.replace(/long name/g, 'longer name') })
+    const seen = ember(on, { reply: () => big, reflect: () => big.replace(/long name/g, 'longer name') })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -501,14 +500,14 @@ describe('register: reflect', () => {
     expect(ledger.entries).toHaveLength(4_000)
   })
 
-  test('a reflection pi did not finish replaces nothing, though what it holds parses under the target', async ($, on) => {
+  test('a reflection Ember did not complete replaces nothing, though what it holds parses under the target', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const line = '🟡 2026-09-22 14:30 read a file with a long name'
     const short = '<observations>\n* 🔴 2026-09-22 14:30 Reflected\n</observations>'
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () => `<observations>\n${`* ${line}\n`.repeat(4_000)}</observations>`,
-      fail: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? { exitCode: 0, stdout: piOutput('', short, { stopReason: 'length' }), stderr: '' } : undefined),
+      fail: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? emberResponse(short, { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }) : undefined),
     })
     const runTurn = live(on, clock, history)
 
@@ -516,7 +515,7 @@ describe('register: reflect', () => {
     await clock.settle()
 
     expect(seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))).toHaveLength(1)
-    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual(['reflection failed (pi exited 0, stopReason length: )'])
+    expect(seen.logs.filter((l) => l.startsWith('reflect'))).toEqual(['reflection failed (Ember ended incomplete: max_output_tokens)'])
     const ledger = stored['ledger:session-1'] as Ledger
     expect(new Set(ledger.entries.map((e) => e.line))).toEqual(new Set([line]))
     expect(ledger.entries).toHaveLength(4_000)

@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, COMPACT_WRAPPER, FLOOR_NOTE, MEMORY_HEADER } from '../hooks/prompts'
 import { originalId } from '../hooks/recall'
-import { originals, turn, PI_ARGV, PI_FLAGS, OBSERVER_SESSION, piSessionOf, piOutput, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, pi, live, gates, recordIn, WHERE, noReplies, repliesIn, correctionsIn, observationsIn, briefIn, constraining, work } from './harness'
+import { originals, turn, emberResponse, httpError, overloaded, CHUNK, TOOL_RESULT_MAX_CHARS, at, world, ember, live, gates, recordIn, WHERE, noReplies, repliesIn, correctionsIn, observationsIn, briefIn, constraining, work } from './harness'
 import type { Ledger } from './harness'
 
 // Observation at compaction and in the background.
@@ -10,7 +10,7 @@ describe('register: observe', () => {
   test('the kept calls come back under fresh ids, a call and its result alike, renamed from the original at each compaction', async ($, on) => {
     const clock = mock.clock(on, { now: at(23, 12, 0) })
     world(on)
-    pi(on)
+    ember(on)
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     const first = await $.session.compact({ trigger: 'manual', messages })
@@ -30,7 +30,7 @@ describe('register: observe', () => {
   test('a compaction handed the context the last one installed, local commands aside, is skipped; one with a new prompt runs', async ($, on) => {
     const clock = mock.clock(on, { now: at(23, 12, 0) })
     world(on)
-    pi(on)
+    ember(on)
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
     await clock.advance(60_000)
     // As the engine hands them over: no caveat, an isMeta row it leaves out, and no output for a command whose output
@@ -48,7 +48,7 @@ describe('register: observe', () => {
   test('with nothing observed yet, compaction observes the older history in parallel chunks and keeps the tail raw', async ($, on) => {
     mock.clock(on, { now: at(23, 12, 0) })
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     // The engine stamps a handle on each message it hands the hook; the kept ones must come back without it.
@@ -60,10 +60,11 @@ describe('register: observe', () => {
     expect(seen.prompts[1]).toContain('[User]: b')
     expect(seen.prompts[1]).not.toContain('User: "a"') // a pure mapper: no observations so far
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
-    expect(seen.calls[0]).toEqual({ argv: [...PI_ARGV, seen.systems[0], ...PI_FLAGS, '--session-id', OBSERVER_SESSION], cwd: '/tmp' })
-    expect(seen.calls.map((c) => piSessionOf(c.argv))).toEqual([OBSERVER_SESSION, OBSERVER_SESSION]) // the session's Observer calls share one cache key
+    expect(seen.calls[0]!.headers).toEqual({ Authorization: 'Bearer test-key', 'Content-Type': 'application/json', 'X-OM-Request': '1' }) // the key file's line, trimmed
+    expect(seen.calls[0]!.body).toEqual({ model: 'muse-ember-1.0', instructions: seen.systems[0], input: seen.prompts[0], reasoning: { effort: 'low' }, max_output_tokens: 32_000, store: false, prompt_cache_key: 'om-observer', prompt_cache_retention: '24h' })
+    expect(seen.cacheKeys).toEqual(['om-observer', 'om-observer']) // every Observer call shares one cache key
     expect(seen.modelCalls).toBe(0)
-    expect(seen.logs).toContain('Luna observer: 9206 in, 558 out, $0.0025, 0s (model 1.5s)')
+    expect(seen.logs).toContain('Ember observer: 9206 in, 3072 cached, 558 out, $0.0012, 0s')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     const text = result.messages?.[0]?.text ?? ''
     expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"') // untimed history: no invented times
@@ -78,7 +79,7 @@ describe('register: observe', () => {
   test('a precompute compaction observes on the spot and stores its chunks committed, not installed; the compaction after it cuts there with no Observer call', async ($, on) => {
     const clock = mock.clock(on, { now: at(23, 12, 0) })
     const { history, stored, files } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     history.push(...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000))
 
     const pre = await $.session.compact({ trigger: 'precompute', messages: [...history] })
@@ -104,7 +105,7 @@ describe('register: observe', () => {
   test('the Observer records what happened, never what a chunk lacks', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
 
     await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
 
@@ -116,7 +117,7 @@ describe('register: observe', () => {
   test('the Observer input marks a failed tool result and names the tool, and never marks a successful one as failed', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     // Same tool, same result text, isError flipped: otherwise identical results must still read distinguishably.
     const messages: SessionMessage[] = [
       { role: 'user', text: 'run the tests', toolUses: [] },
@@ -139,7 +140,7 @@ describe('register: observe', () => {
   test('a tool result with no text reaches the Observer as an image when Read stored one, and never as empty', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const messages: SessionMessage[] = [
       { role: 'user', text: 'look at the mockups', toolUses: [] },
       { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: '/m/mock.jpg' } }] },
@@ -162,7 +163,7 @@ describe('register: observe', () => {
   test('an interrupted turn reaches the Observer with its interruption row, which the Observer reads as unfinished work', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const messages: SessionMessage[] = [
       { role: 'user', text: 'migrate the schema', toolUses: [] },
       { role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Bash', input: { command: 'npm run migrate' } }] },
@@ -183,7 +184,7 @@ describe('register: observe', () => {
   test('an oversized tool result keeps a bounded beginning and ending for the Observer, the omission marked explicitly', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const big = `BEGIN-MARKER first line\n${'middle '.repeat(20_000)}\nEND-MARKER: 3 passed, 2 failed`
     const messages: SessionMessage[] = [
       { role: 'user', text: 'run the tests', toolUses: [] },
@@ -207,10 +208,10 @@ describe('register: observe', () => {
     expect(block!.length).toBeLessThan(TOOL_RESULT_MAX_CHARS + 200) // bounded to the excerpt limit plus the marker
   })
 
-  test('when pi fails at compaction with nothing observed, the floor compiles a brief by code of what leaves context', async ($, on) => {
+  test('when Ember fails at compaction with nothing observed, the floor compiles a brief by code of what leaves context', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on, { fail: () => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' }) })
+    const seen = ember(on, { fail: () => overloaded() })
     let builtin = 0
     on('session.compact', () => (builtin++, { messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK)]
@@ -234,14 +235,14 @@ describe('register: observe', () => {
     )
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
     expect(seen.logs.slice(-4)).toEqual([
-      'observation of rows 0-3 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
-      'observation of rows 3-7 at compaction failed (pi exited 0, stopReason error: Codex error: overloaded); left unobserved',
+      'observation of rows 0-3 at compaction failed (Ember HTTP 503: overloaded); left unobserved',
+      'observation of rows 3-7 at compaction failed (Ember HTTP 503: overloaded); left unobserved',
       expect.stringMatching(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, kept 1 raw messages \(~\d+ tokens\); memory ~\d+ tokens, 0 observations, 0 skill\(s\), brief ~\d+ tokens$/),
       expect.stringMatching(/^Compacted in .* · memory 0 notes · 7 messages in a brief compiled by code \(the Observer failed\)$/),
     ])
     expect(seen.screen).toEqual([
-      'Observation failed (pi stopped (error)) and put 3 messages in the session brief',
-      'Observation failed (pi stopped (error)) and put 4 messages in the session brief',
+      'Observation failed (Ember HTTP 503) and put 3 messages in the session brief',
+      'Observation failed (Ember HTTP 503) and put 4 messages in the session brief',
     ])
     await clock.advance(5_000)
     const stats = JSON.parse(files['/stats/session-1.json']!)
@@ -251,7 +252,7 @@ describe('register: observe', () => {
   })
 
   test("a subagent's or precompute's fallback does not depend on the session's id, messages or clock", async ($, on) => {
-    pi(on) // and no session.id, session.messages or clock: each call rejects
+    ember(on) // and no session.id, session.messages or clock: each call rejects
     const summary = { role: 'user' as const, text: 'built-in summary', toolUses: [] }
     on('session.compact', () => ({ messages: [summary] }))
 
@@ -261,11 +262,11 @@ describe('register: observe', () => {
     }
   })
 
-  test('when pi fails on a gap at compaction, the cut stays at the watermark and the gap is kept raw', async ($, on) => {
+  test('when Ember fails on a gap at compaction, the cut stays at the watermark and the gap is kept raw', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let failing = false
-    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = ember(on, { fail: () => (failing ? new Error('network down') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -277,22 +278,22 @@ describe('register: observe', () => {
 
     const failures = seen.logs.filter((l) => l.includes('at compaction failed'))
     expect(failures.length).toBeGreaterThan(0)
-    for (const line of failures) expect(line).toMatch(/^observation of rows (\d+)-\d+ at compaction failed \(pi exited 1: Error: network down\); left unobserved$/)
+    for (const line of failures) expect(line).toMatch(/^observation of rows (\d+)-\d+ at compaction failed \(Ember request failed: network down\); left unobserved$/)
     expect(failures[0]).toContain('rows 3-')
     expect(seen.screen.filter((l) => l.startsWith('Observation failed'))).toEqual(failures.map((l) => {
       const [, from, to] = l.match(/rows (\d+)-(\d+)/)!
-      return `Observation failed (pi exited 1) and kept ${Number(to) - Number(from)} messages in full`
+      return `Observation failed (Ember request failed: network down) and kept ${Number(to) - Number(from)} messages in full`
     }))
     expect(observationsIn(result.messages?.[0]?.text)).toBe('* 🔴 2026-09-22 14:30 User: "a" (source 2026-09-22 14:30 to 2026-09-22 14:31)')
     expect(originals(result.messages?.slice(1))).toEqual(history.slice(3))
     expect(seen.modelCalls).toBe(0)
   })
 
-  test('at compaction, a chunk pi answers without observations is observed again once before it stays raw', async ($, on) => {
+  test('at compaction, a chunk Ember answers without observations is observed again once before it stays raw', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let spoil = 0
-    const seen = pi(on, { reply: () => (spoil > 0 ? (spoil--, 'I cannot help with that.') : undefined) })
+    const seen = ember(on, { reply: () => (spoil > 0 ? (spoil--, 'I cannot help with that.') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -313,7 +314,7 @@ describe('register: observe', () => {
   test('a reply that leaves <observations> unclosed before its next section is observed, the section kept apart', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
         return `<corrections>\n* 🔴 User: "${name}"\n</corrections>\n<observations>\n* 🔴 User: "${name}"\n<continuation>\nActive: ${name}\n</continuation>`
@@ -332,7 +333,7 @@ describe('register: observe', () => {
   test('a reply with no tags at all is observed from its marked lines; unclosed sections still keep apart', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
         return name === 'a'
@@ -353,7 +354,7 @@ describe('register: observe', () => {
   test('an unmarked line continues the observation before it, but after a 🔴 line stands as its own 🟡 line; each is logged and counted', async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "use pnpm, never npm"\nUser: "and keep the lockfile"\n</corrections>\n' +
         '<observations>\n* 🔴 User: "a"\nUser asked for b\n* 🟡 Read a.ts\n  and found the bug\n</observations>',
@@ -380,7 +381,7 @@ describe('register: observe', () => {
     const { files } = world(on)
     // A worker's state file read in the chunk, which the Observer took for the user's.
     const state = 'Production remains read-only. The leaked production database password should be rotated and the 595 MB dump deleted after testing.'
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "Production stays read-only, don\'t write to it"\n* 🔴 User: "Rotate the leaked database password and delete the dump"\n</corrections>\n' +
         '<observations>\n* 🔴 User said the production database must stay read only\n' +
@@ -413,7 +414,7 @@ describe('register: observe', () => {
   test('a quote the chunk relays as the user\'s verbatim words is grounded; one it only mentions is not', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, {
+    ember(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "You never merge for me. Ever."\n* 🔴 User: "Always squash before merging"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
     })
@@ -430,7 +431,7 @@ describe('register: observe', () => {
   test('a grounded correction that replaces a constraint in force still replaces it; an ungrounded one leaves it standing', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on, {
+    ember(on, {
       reply: constraining({
         setup: { quote: 'Use pnpm, never npm' },
         invented: { quote: 'npm is fine now', replaces: 'Use pnpm' },
@@ -464,7 +465,7 @@ describe('register: observe', () => {
   test('a correction copying a constraint in force the user did not say again is dropped, logged and counted; one the user says again moves to then', async ($, on) => {
     const clock = mock.clock(on)
     const { history, files } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: constraining({
         setup: { quote: 'Use pnpm, never npm' },
         other: { quote: 'Keep every commit small' },
@@ -506,7 +507,7 @@ describe('register: observe', () => {
   test("a 🔴 correction whose quote runs over several lines stays one line; after its closing quote an unmarked line is its own 🟡 line", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: () =>
         '<corrections>\n* 🔴 User: "Go a bit deeper yes please.\nI want you to compare them\nside by side." (replaces k1)\nUser asked for a table\n</corrections>\n' +
         '<observations>\n* 🟡 Saw a\n</observations>',
@@ -531,7 +532,7 @@ describe('register: observe', () => {
   test('at compaction, a gap with nothing to show (thinking-only rows) is observed with no Observer call', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const thought = { role: 'assistant' as const, text: '', toolUses: [] }
     // Chunks cut before a row that would pass 10k tokens: [0, 3) is a, [3, 5) the two empty rows; the tail starts at y.
     const messages = [...turn('a', 'a', CHUNK).slice(0, 3), thought, thought, { role: 'user' as const, text: 'y'.repeat(CHUNK), toolUses: [] }, ...turn('c', 'c', 8_000)]
@@ -555,7 +556,7 @@ describe('register: observe', () => {
       b: `<corrections>\n* ${correction}\n</corrections>\n<observations>\n</observations>`,
       c: '<observations>\n* 🔴\n* 🟡 2026-09-22 14:30\n</observations>',
     }
-    const seen = pi(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)/m)![1]!] })
+    const seen = ember(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)/m)![1]!] })
     const messages = [...turn('a', 'a', CHUNK), ...turn('b: Never touch the migrations folder', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)]
 
     const result = await $.session.compact({ trigger: 'manual', messages })
@@ -570,7 +571,7 @@ describe('register: observe', () => {
   test('the reply ending each turn that left context is quoted before the observations, carried forward, the newest within its cap', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 14:30 Saw ${prompt.match(/^\[User\]: (\w+)$/m)?.[1]}\n</observations>` })
+    ember(on, { reply: (prompt) => `<observations>\n* 🟡 2026-09-22 14:30 Saw ${prompt.match(/^\[User\]: (\w+)$/m)?.[1]}\n</observations>` })
     const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'c', 8_000)]
 
     const first = await $.session.compact({ trigger: 'manual', messages })
@@ -597,7 +598,7 @@ describe('register: observe', () => {
     mock.clock(on)
     const { stored, history } = world(on)
     // Each chunk: a quote of its own closing reply, in other case and spacing, and a quote no reply holds.
-    pi(on, {
+    ember(on, {
       reply: (prompt) => {
         const p = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
         return `<observations>\n* 🟡 2026-09-22 14:30 Assistant said: "found  the bug in \`${p}.ts\` today"\n* 🟡 2026-09-22 14:31 Assistant said: "Nothing is deleted from ${p} anywhere"\n</observations>`
@@ -630,7 +631,7 @@ describe('register: observe', () => {
   test('the replies take only the room the compacted context leaves below REPLIES_ROOM_TOKENS', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw it\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw it\n</observations>' })
     // A newest reply, kept raw, that alone nearly fills the room: nothing is quoted.
     const messages = [...turn('a', 'Found the bug in a.', CHUNK), ...turn('b', 'Fixed b.', CHUNK), ...turn('c', 'z'.repeat(39_500 * 4))]
 
@@ -646,7 +647,7 @@ describe('register: observe', () => {
     mock.clock(on)
     world(on)
     const reply = `<observations>\nNothing worth noting.\n${'x'.repeat(600)}`
-    const seen = pi(on, { reply: () => reply })
+    const seen = ember(on, { reply: () => reply })
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)]
 
@@ -661,11 +662,11 @@ describe('register: observe', () => {
     expect(rejected[0]).toBe(`observer reply without observations (${reply.length} chars), began: ${JSON.stringify(reply.slice(0, 500))}`)
   })
 
-  test('at compaction, a chunk whose pi call timed out is not observed again', async ($, on) => {
+  test('at compaction, a chunk whose Ember call timed out is not observed again', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     let failing = false
-    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: request timed out' } : undefined) })
+    const seen = ember(on, { fail: () => (failing ? new Error('request timed out') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -686,7 +687,7 @@ describe('register: observe', () => {
     const clock = mock.clock(on)
     const { files } = world(on)
     const { gate } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
     const compacting = $.session.compact({ trigger: 'manual', messages })
@@ -712,16 +713,16 @@ describe('register: observe', () => {
     const clock = mock.clock(on)
     world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined), fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined), fail: (n) => (n === 1 ? new Error('network down') : undefined) })
 
     const compacting = $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
-    await clock.advance(16_000)
+    await clock.advance(26_000) // past the deadline less a call's 5 s
     open(1)
     await compacting
 
     expect(seen.prompts).toHaveLength(2)
     expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
-    expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (pi exited 1: Error: network down); left unobserved')
+    expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (Ember request failed: network down); left unobserved')
   })
 
   // The hook's budget runs on through a wait that is not a `$` call: a compaction that waited on the background call
@@ -730,7 +731,7 @@ describe('register: observe', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n, prompt) => (n === 2 || (n > 2 && prompt.includes(']: b\n')) ? gate(n) : undefined) })
+    const seen = ember(on, { hold: (n, prompt) => (n === 2 || (n > 2 && prompt.includes(']: b\n')) ? gate(n) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -754,42 +755,42 @@ describe('register: observe', () => {
     expect(seen.logs.at(-1)).toMatch(/^Compacted in 10.0 s · observed \d+ messages on the spot · memory \d+ notes$/)
   })
 
-  test('a background pi call still running at its timeout on the clock is killed, and a later pass retries its chunk', async ($, on) => {
+  test('a background Ember call still running at its timeout on the clock is dropped, and a later pass retries its chunk', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const { gate } = gates()
-    const seen = pi(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
+    const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', 8_000), at(22, 14, 31))
     await clock.settle()
     expect(seen.inFlight).toBe(1) // since turn a ended, a minute ago
-    await clock.advance(59_000)
+    await clock.advance(29_000)
     expect([seen.inFlight, seen.stopped]).toEqual([1, 0])
     await clock.advance(1_000)
 
     expect([seen.inFlight, seen.stopped]).toEqual([0, 1])
-    expect(seen.logs).toContain('background observation of rows 0-3 failed (pi timed out after 120000 ms); it will be retried')
+    expect(seen.logs).toContain('background observation of rows 0-3 failed (Ember timed out after 90000 ms); it will be retried')
     // A timeout goes on screen, not to the debug log alone.
-    expect(seen.screen).toContain('Observation failed (timeout after 2m) and will retry')
+    expect(seen.screen).toContain('Observation failed (timeout after 1m 30s) and will retry')
     await clock.advance(60_000)
     expect(seen.prompts).toHaveLength(2)
     expect(seen.logs).toContainEqual(expect.stringMatching(/^observed rows 0-3 in the background/))
   })
 
-  test('a failed pi call in the background leaves its chunk unobserved, logged once, and a later pass retries it', async ($, on) => {
+  test('a failed Ember call in the background leaves its chunk unobserved, logged once, and a later pass retries it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, { fail: (n) => (n === 1 ? { exitCode: 1, stdout: '', stderr: 'pi: 401 Unauthorized\n' } : undefined) })
+    const seen = ember(on, { fail: (n) => (n === 1 ? httpError(401, 'unauthorized') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await clock.settle()
 
-    const failures = seen.logs.filter((l) => l.includes('failed'))
-    expect(failures).toEqual(['background observation of rows 0-3 failed (pi exited 1: pi: 401 Unauthorized); it will be retried'])
-    expect(seen.screen).toEqual(['Observation failed (pi exited 1) and will retry'])
+    const failures = seen.logs.filter((l) => l.includes('failed') && !l.startsWith('Ember '))
+    expect(failures).toEqual(['background observation of rows 0-3 failed (Ember HTTP 401: unauthorized); it will be retried'])
+    expect(seen.screen).toEqual(['Observation failed (Ember HTTP 401) and will retry'])
     expect(seen.prompts).toHaveLength(1)
     expect(seen.modelCalls).toBe(0)
     let ledger = stored['ledger:session-1'] as Ledger
@@ -804,22 +805,22 @@ describe('register: observe', () => {
     expect(seen.modelCalls).toBe(0)
   })
 
-  test('a reply pi did not finish (token-limited, or ending in a way pi does not name) leaves its chunk unobserved', async ($, on) => {
+  test('a reply Ember did not complete (token-limited, or failed) leaves its chunk unobserved', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const partial = '<observations>\n* 🔴 2026-09-22 14:30 User: "a"\n* 🟡 2026-09-22 14:31 Read /src/a.ts and fou'
-    const ends = [{ stopReason: 'length' }, {}]
-    const seen = pi(on, { fail: (n) => (n <= ends.length ? { exitCode: 0, stdout: piOutput('', partial, ends[n - 1]), stderr: '' } : undefined) })
+    const ends = [{ status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }, { status: 'failed' }]
+    const seen = ember(on, { fail: (n) => (n <= ends.length ? emberResponse(partial, ends[n - 1]) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await clock.settle()
-    await clock.advance(5_000) // its back-off over, the loop calls pi again
+    await clock.advance(5_000) // its back-off over, the loop calls Ember again
     await clock.settle()
 
     expect(seen.logs.filter((l) => l.startsWith('background observation'))).toEqual([
-      'background observation of rows 0-3 failed (pi exited 0, stopReason length: ); it will be retried',
-      'background observation of rows 0-3 failed (pi exited 0, stopReason none: ); it will be retried',
+      'background observation of rows 0-3 failed (Ember ended incomplete: max_output_tokens); it will be retried',
+      'background observation of rows 0-3 failed (Ember ended failed: ); it will be retried',
     ])
     const ledger = stored['ledger:session-1'] as Ledger
     expect([ledger.watermark.to, ledger.entries, ledger.chunks]).toEqual([0, [], []])
@@ -828,7 +829,7 @@ describe('register: observe', () => {
   test('observes in the background after turn.complete, off the dispatch, with real timestamps checked against the chunk', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
           ? '<observations>\n* 🔴 2026-09-22 14:30 User said "a"\n* 🟡 2019-01-01 00:00 Too early\n* 🟢 2026-02-30 10:00 Not a date\n* ✅ Untimed\n  * -> a detail\n</observations>'
@@ -863,7 +864,7 @@ describe('register: observe', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => gate(n) })
+    const seen = ember(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
@@ -881,11 +882,11 @@ describe('register: observe', () => {
     expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23) // the last ~6k tokens left raw
   })
 
-  test('a failing pi with more chunks than slots is called again only as each back-off ends, doubling, and the chunks land once it answers', async ($, on) => {
+  test('a failing Ember with more chunks than slots is called again only as each back-off ends, doubling, and the chunks land once it answers', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     let failing = true
-    const seen = pi(on, { fail: () => (failing ? { exitCode: 1, stdout: '', stderr: 'Error: network down' } : undefined) })
+    const seen = ember(on, { fail: () => (failing ? new Error('network down') : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK)], at(22, 14, 30))
@@ -917,7 +918,7 @@ describe('register: observe', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    pi(on, { hold: (n) => gate(n) })
+    ember(on, { hold: (n) => gate(n) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)], at(22, 14, 30))
@@ -937,11 +938,11 @@ describe('register: observe', () => {
     expect(ledger.entries.map((e) => e.line)).toEqual(['🔴 2026-09-22 14:30 User: "a"', '🔴 2026-09-22 14:30 User: "b"'])
   })
 
-  test('compaction cuts at the watermark at once while a pi call is in flight; the chunk lands afterwards in the new context', async ($, on) => {
+  test('compaction cuts at the watermark at once while an Ember call is in flight; the chunk lands afterwards in the new context', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     const { gate, open } = gates()
-    const seen = pi(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
+    const seen = ember(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -975,16 +976,16 @@ describe('register: observe', () => {
   test("a subagent's Observer timeout at compaction goes on screen, named as the subagent's; its other failures stay in the debug log", async ($, on) => {
     mock.clock(on)
     world(on, { unreadable: ['agent-1', 'agent-2'] })
-    const seen = pi(on, {
+    const seen = ember(on, {
       fail: (n, prompt) =>
-        prompt.includes(']: slow') ? { exitCode: 1, stdout: '', stderr: 'request timed out\n' } : prompt.includes(']: bad') ? { exitCode: 1, stdout: '', stderr: 'pi: 401 Unauthorized\n' } : undefined,
+        prompt.includes(']: slow') ? new Error('request timed out') : prompt.includes(']: bad') ? httpError(401, 'unauthorized') : undefined,
     })
 
     await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: [...turn('slow', 'r', CHUNK), ...turn('b', 'r', CHUNK), ...work('w', 8_000)] })
     await $.session.compact({ trigger: 'auto', agentId: 'agent-2', messages: [...turn('bad', 'r', CHUNK), ...turn('c', 'r', CHUNK), ...work('w', 8_000)] })
 
     expect(seen.screen.filter((l) => l.startsWith('Subagent: Observation failed (timeout'))).toHaveLength(1)
-    expect(seen.screen.filter((l) => l.includes('pi exited 1'))).toEqual([])
-    expect(seen.logs.filter((l) => l.includes('at compaction failed (pi exited 1: pi: 401 Unauthorized)'))).toHaveLength(1)
+    expect(seen.screen.filter((l) => l.includes('Ember HTTP 401'))).toEqual([])
+    expect(seen.logs.filter((l) => l.includes('at compaction failed (Ember HTTP 401: unauthorized)'))).toHaveLength(1)
   })
 })

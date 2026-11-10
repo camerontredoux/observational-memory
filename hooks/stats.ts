@@ -10,6 +10,8 @@ const READ_COST = 0.05
 const WRITE_COST = 2
 const INPUT_DOLLARS_PER_MTOK = 4 // Opus 5.5's input price, for a rough figure in dollars
 const DEFAULT_DIR = '.claude/plugins/data/observational-memory/stats' // under $HOME; OM_STATS_DIR overrides it
+// The stats of the GPT-6 Luna era, kept apart once the plugin moved to Ember: beside DEFAULT_DIR, read by `historical`.
+const HISTORICAL_SUFFIX = '-luna'
 
 export type Sample = [at: number, value: number]
 export type Metric = { count: number; sum: number; min: number; max: number; recent: Sample[] }
@@ -23,7 +25,7 @@ export type SessionStats = {
   counts: Record<string, number> // events without a value: failures by class, fallbacks, recall hits from the file
   metrics: Record<string, Metric>
 }
-export type LunaCall = {
+export type ModelCall = {
   kind: 'observer' | 'reflector' | 'session'
   phase: 'background' | 'compaction'
   ok: boolean
@@ -31,7 +33,7 @@ export type LunaCall = {
   ms: number
   input?: number
   output?: number
-  cacheRead?: number // input tokens pi's provider read from its prompt cache, apart from `input`
+  cacheRead?: number // input tokens Ember read from its prompt cache, apart from `input`
   cacheWrite?: number
   cost?: number
   chunkTokens?: number
@@ -84,18 +86,20 @@ export function add(s: SessionStats, name: string, value: number | undefined, at
 }
 export const count = (s: SessionStats, name: string, by = 1) => void (s.counts[name] = (s.counts[name] ?? 0) + by)
 
-// A failure's class: how pi ended, never what it said.
+// A failure's class: how the Ember call ended, never what it said.
 export function failureClass(message: string) {
   if (/timed? ?out|timeout/i.test(message)) return 'timeout'
-  const exit = message.match(/^pi exited (\d+)(?:, stopReason (\w+))?/)
-  if (exit?.[2]) return `stop-${exit[2]}`
-  if (exit && exit[1] !== '0') return `exit-${exit[1]}`
-  if (message.includes('no assistant message')) return 'no-message'
+  const http = message.match(/^Ember HTTP (\d+)/)
+  if (http) return `http-${http[1]}`
+  const ended = message.match(/^Ember ended (\w+)/)
+  if (ended) return `stop-${ended[1]}`
+  if (message.startsWith('Ember has no API key')) return 'no-key'
+  if (message.includes('with no message')) return 'no-message'
   if (message.includes('<observations>')) return 'no-observations'
   return 'error'
 }
 
-export function addLuna(s: SessionStats, c: LunaCall, at: number) {
+export function addCall(s: SessionStats, c: ModelCall, at: number) {
   const key = `${c.kind}.${c.phase}`
   if (!c.ok) {
     add(s, `${key}.failed.ms`, c.ms, at)
@@ -237,7 +241,7 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const lines = [
     `## ${title}`,
     '',
-    `${sessions} session(s), ${when(s.firstSeen)} to ${when(s.lastSeen)} UTC. ${compactions} compaction(s), ${calls} Luna call(s) ` +
+    `${sessions} session(s), ${when(s.firstSeen)} to ${when(s.lastSeen)} UTC. ${compactions} compaction(s), ${calls} model call(s) ` +
       `(${failed} failed), ${dollars(sumOf(s, '.cost'))}, ${grouped(sumOf(s, '.in'))} tokens in, ${grouped(sumOf(s, '.out'))} out.`,
     '',
     '| metric | count | sum | mean | median | p90 | min | max |',
@@ -382,7 +386,7 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   if (recall) row('Recall', plural(recall, 'search', 'searches'))
   if (approximate) lines.push('', `Splits and medians come from the newest ${SAMPLES} samples per metric per session.`)
   const again = (w: string) => `/om-stats ${[words, w].filter(Boolean).join(' ')}`
-  lines.push('', `${again('full')} for every metric${words.split(' ').includes('all') ? '' : ' · /om-stats all for every session'}`)
+  lines.push('', `${again('full')} for every metric${words.split(' ').some((w) => w === 'all' || w === 'historical') ? '' : ' · /om-stats all for every session'}`)
   return lines.join('\n')
 }
 
@@ -453,7 +457,7 @@ export function record(io: Io, sessionId: string, fn: (s: SessionStats, at: numb
   })().catch((e) => warn(io, e))
 }
 
-// What Luna has cost a session, as /om-stats totals it: the stats this process holds for it, else its file.
+// What Ember has cost a session, as /om-stats totals it: the stats this process holds for it, else its file.
 export async function costOf(io: Io, sessionId: string) {
   return sumOf(await (live.get(sessionId) ?? load(io, sessionId)), '.cost')
 }
@@ -469,17 +473,17 @@ export async function report(io: Io, args: Args) {
   const since = args.since ? parseSince(args.since, now) : undefined
   if (args.since && since === undefined) return `om_stats: cannot read since "${args.since}" (try 7d, 12h or 2026-09-01).`
   await flush(io, current)
-  const dir = await statsDir(io)
+  const dir = `${await statsDir(io)}${args.historical ? HISTORICAL_SUFFIX : ''}`
   const read = (name: string) => io.read(`${dir}/${name}`).then(parse, () => undefined)
   let files: SessionStats[]
   let title: string
   let head: string
   const id = args.sessionId || current
-  if (args.scope === 'all') {
+  if (args.scope === 'all' || args.historical) {
     const names = (await io.list(dir).catch(() => [])).filter((e) => e.kind === 'file' && e.name.endsWith('.json')).map((e) => e.name)
     files = (await Promise.all(names.map(read))).filter((f): f is SessionStats => f?.version === 1)
-    title = 'observational-memory stats, all sessions'
-    head = 'all sessions'
+    title = `observational-memory stats, all sessions${args.historical ? ' of the Luna era (historical)' : ''}`
+    head = args.historical ? 'Luna era (historical), all sessions' : 'all sessions'
   } else {
     const f = (await live.get(id)?.catch(() => undefined)) ?? (await read(`${id}.json`))
     files = f ? [f] : []
@@ -488,7 +492,7 @@ export async function report(io: Io, args: Args) {
     head = `${id === current ? 'this session' : `session ${id}`}${cwd}`
   }
   const merged = merge(files, since)
-  if (args.scope === 'all') head += ` (${merged.sessions})`
+  if (args.scope === 'all' || args.historical) head += ` (${merged.sessions})`
   if (since !== undefined) {
     const after = ` since ${new Date(since).toISOString().slice(0, 16).replace('T', ' ')} UTC`
     title += after
@@ -496,11 +500,11 @@ export async function report(io: Io, args: Args) {
   }
   if (args.full) return formatReport(title, merged)
   if (args.cost) return formatCost(head, merged)
-  const words = [args.scope === 'all' ? 'all' : id === current ? '' : id, args.since ?? ''].filter(Boolean).join(' ')
+  const words = [args.historical ? 'historical' : args.scope === 'all' ? 'all' : id === current ? '' : id, args.since ?? ''].filter(Boolean).join(' ')
   return formatSummary(head, merged, words)
 }
 
-export type Args = { scope?: string; sessionId?: string; since?: string; full?: boolean; cost?: boolean }
+export type Args = { scope?: string; sessionId?: string; since?: string; full?: boolean; cost?: boolean; historical?: boolean }
 
 export function parseArgs(text: string) {
   const out: Args = {}
@@ -508,6 +512,7 @@ export function parseArgs(text: string) {
     if (word === 'all' || word === 'session') out.scope = word
     else if (word === 'full') out.full = true
     else if (word === 'cost') out.cost = true
+    else if (word === 'historical') out.historical = true
     else if (/^\d+(?:\.\d+)?[mhdw]$/.test(word) || /^\d{4}-\d{2}-\d{2}/.test(word)) out.since = word
     else out.sessionId = word
   }

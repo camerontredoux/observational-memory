@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { add, addCacheUse, addCompaction, addRequest, addLuna, addRecall, count, emptyStats, failureClass, formatCost, formatReport, formatSummary, merge, parseArgs, parseSince, percentile, report } from '../hooks/stats'
+import { add, addCacheUse, addCompaction, addRequest, addCall, addRecall, count, emptyStats, failureClass, formatCost, formatReport, formatSummary, merge, parseArgs, parseSince, percentile, report } from '../hooks/stats'
 import type { Io, SessionStats } from '../hooks/stats'
 
 const T0 = Date.UTC(2026, 8, 20, 12, 0)
@@ -29,7 +29,7 @@ function busy() {
 
 function session(id: string, at: number, calls: [ms: number, cost: number][]) {
   const s = emptyStats(id, at)
-  for (const [ms, cost] of calls) addLuna(s, { kind: 'observer', phase: 'background', ok: true, ms, input: 10_000, output: 500, cost, chunkTokens: 9_000 }, at)
+  for (const [ms, cost] of calls) addCall(s, { kind: 'observer', phase: 'background', ok: true, ms, input: 10_000, output: 500, cost, chunkTokens: 9_000 }, at)
   return s
 }
 
@@ -44,7 +44,7 @@ describe('stats', () => {
 
   test('a metric aggregates every value and keeps only the newest 200 samples', () => {
     const s = emptyStats('s', T0)
-    for (let i = 1; i <= 250; i++) addLuna(s, { kind: 'observer', phase: 'background', ok: true, ms: i }, T0 + i)
+    for (let i = 1; i <= 250; i++) addCall(s, { kind: 'observer', phase: 'background', ok: true, ms: i }, T0 + i)
     const m = s.metrics['observer.background.ms']!
     expect([m.count, m.sum, m.min, m.max, m.recent.length]).toEqual([250, 31_375, 1, 250, 200])
     expect(m.recent[0]).toEqual([T0 + 51, 51])
@@ -53,11 +53,13 @@ describe('stats', () => {
 
   test('a failed call counts its class and its time, not its tokens', () => {
     const s = emptyStats('s', T0)
-    addLuna(s, { kind: 'observer', phase: 'compaction', ok: false, failure: failureClass('pi exited 1: network down'), ms: 900 }, T0)
-    expect(s.counts).toEqual({ 'observer.compaction.failed.exit-1': 1 })
+    addCall(s, { kind: 'observer', phase: 'compaction', ok: false, failure: failureClass('Ember request failed: network down'), ms: 900 }, T0)
+    expect(s.counts).toEqual({ 'observer.compaction.failed.error': 1 })
     expect(Object.keys(s.metrics)).toEqual(['observer.compaction.failed.ms'])
-    expect(failureClass('pi exited 0, stopReason error: overloaded')).toBe('stop-error')
-    expect(failureClass('pi exited 0 with no assistant message')).toBe('no-message')
+    expect(failureClass('Ember ended incomplete: max_output_tokens')).toBe('stop-incomplete')
+    expect(failureClass('Ember HTTP 429: rate_limit_exceeded')).toBe('http-429')
+    expect(failureClass('Ember completed with no message')).toBe('no-message')
+    expect(failureClass('Ember has no API key: write it to ~/.config/observational-memory/muse-api-key')).toBe('no-key')
     expect(failureClass('observer answered without an <observations> block')).toBe('no-observations')
     expect(failureClass('process timed out after 120000ms')).toBe('timeout')
   })
@@ -75,7 +77,7 @@ describe('stats', () => {
   test('since drops sessions last seen before it and rebuilds metrics from the samples after it', () => {
     const a = session('a', T0, [[10_000, 0.002]])
     const b = session('b', T0 + 2 * DAY, [[30_000, 0.004]])
-    addLuna(b, { kind: 'observer', phase: 'background', ok: true, ms: 5_000 }, T0 - DAY) // an old sample in a recent session
+    addCall(b, { kind: 'observer', phase: 'background', ok: true, ms: 5_000 }, T0 - DAY) // an old sample in a recent session
     const now = T0 + 3 * DAY
     const since = parseSince('2d', now)!
     expect(since).toBe(T0 + DAY)
@@ -90,10 +92,10 @@ describe('stats', () => {
     const s = session('a', T0, [[10_000, 0.002], [20_000, 0.003], [30_000, 0.004]])
     addCompaction(s, { trigger: 'manual', ms: 250, fellBack: false, tokensBefore: 120_000, tokensAfter: 14_000, syncCalls: 0, syncMs: 0 }, T0)
     addCompaction(s, { trigger: 'auto', ms: 40_000, fellBack: true }, T0)
-    addLuna(s, { kind: 'reflector', phase: 'background', ok: false, failure: 'timeout', ms: 600_000 }, T0)
+    addCall(s, { kind: 'reflector', phase: 'background', ok: false, failure: 'timeout', ms: 600_000 }, T0)
     const text = formatReport('stats, session a', merge([s]))
     expect(text).toContain('## stats, session a')
-    expect(text).toContain('1 session(s), 2026-09-20 12:00 to 2026-09-20 12:00 UTC. 2 compaction(s), 4 Luna call(s) (1 failed), $0.0090, 30,000 tokens in, 1,500 out.')
+    expect(text).toContain('1 session(s), 2026-09-20 12:00 to 2026-09-20 12:00 UTC. 2 compaction(s), 4 model call(s) (1 failed), $0.0090, 30,000 tokens in, 1,500 out.')
     expect(text).toContain('| observer.background.ms | 3 | 1m 0s | 20.0 s | 20.0 s | 30.0 s | 10.0 s | 30.0 s |')
     expect(text).toContain('| observer.background.cost | 3 | $0.0090 | $0.0030 | $0.0030 | $0.0040 | $0.0020 | $0.0040 |')
     expect(text).toContain('| compaction.manual.ms | 1 | 250 ms |')
@@ -175,7 +177,7 @@ describe('stats', () => {
     expect(s.metrics['afterCompaction.om.uncachedTokens']).toMatchObject({ count: 2, sum: 8 })
     const text = formatSummary('this session', merge([s]), '')
     expect(text).toContain('Cache        the first request after a main compaction (median): om ~18,000 read, ~26,000 written (2); built-in ~0 read, ~60,000 written (1)')
-    expect(formatReport('t', merge([s]))).toContain('0 tokens in, 0 out.') // the main model's tokens, not Luna's
+    expect(formatReport('t', merge([s]))).toContain('0 tokens in, 0 out.') // the main model's tokens, not Ember's
   })
 
   test('each main request records its cost and growth, and cost gives the cheapest compaction point from them', () => {
@@ -218,6 +220,25 @@ describe('stats', () => {
     expect(summary).not.toContain('|')
     expect(await report(io, { scope: 'all' })).toStartWith('observational-memory · all sessions (1) · ')
     expect(await report(io, { sessionId: 'b' })).toBe('observational-memory · session b: no stats recorded yet.')
+  })
+
+  test('historical reports every session of the Luna era from its own folder, and the live reports never read it', async () => {
+    const file = JSON.stringify(busy())
+    const io = {
+      now: async () => T0 + DAY,
+      sessionId: async () => 'new',
+      home: async () => '/home/u',
+      dir: async () => '/stats',
+      read: async (path: string) => {
+        if (path === '/stats-luna/old.json') return file
+        throw new Error('missing')
+      },
+      list: async (dir: string) => (dir === '/stats-luna' ? [{ name: 'old.json', kind: 'file' }] : []),
+    } as unknown as Io
+    expect(await report(io, { historical: true })).toStartWith('observational-memory · Luna era (historical), all sessions (1) · ')
+    expect(await report(io, { historical: true, full: true })).toContain('## observational-memory stats, all sessions of the Luna era (historical)')
+    expect(await report(io, { scope: 'all' })).not.toContain('(1)')
+    expect(parseArgs('historical full')).toEqual({ historical: true, full: true })
   })
 
   test('command arguments combine all, full, a since and a session id in any order', () => {

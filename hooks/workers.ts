@@ -76,5 +76,5 @@ export const registerWorkers = (on: On) => {
 
 // The footer's figures, which register.ts writes for the status line script: O is the history waiting for an Observer
 // call against a chunk, R the observations against a reflection, C the context against auto-compaction, and the
-// dollars what Luna has cost; compactions counts the main conversation's compactions, om's and the built-in's alike.
+// dollars what Ember has cost; compactions counts the main conversation's compactions, om's and the built-in's alike.
 export type Gauges = { pending: number; chunk: number; ledger: number; reflectAt: number; context?: number; compactAt?: number; cost: number; compactions: number }

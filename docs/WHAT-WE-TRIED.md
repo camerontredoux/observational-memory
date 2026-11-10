@@ -33,6 +33,7 @@ Scores are from `scripts/bench-compact.ts` unless the row says otherwise. "Main"
 | Code-built file and command manifest in the session brief | parked | Main 83.4 → 83.2, long 62.5 → 61.6, about +550 tokens per cut. | tag `archive/file-manifest` (`30eb005`) |
 | ACON: Observer prompt tuned from mined failures | parked | Main +2.0, holdout −1.6. Invented a commit hash on the holdout. | `results/acon-2026-10.md`; tag `archive/observer-acon` (`0764dcf`) |
 | Haiku as the Observer, with its own prompt rules | failed | Blind-graded against Luna on 20 chunks: did not beat it. | tag `archive/haiku-observer` (`93080a2`) |
+| Muse Ember in place of GPT-6 Luna for every model call | landed | v1.17.0. About 5× faster (3.0 s against 16.8 s mean), about 17% more per call, comparable observations. | `docs/research/2026-11-09-ember-observer.md` |
 | Web research on untried ideas | inconclusive | Published compaction gaps are about as small as our noise. Next-action check was the top pick (see above). | `docs/plans/web-research-2026-10.md` |
 | **After v1.4.0 (2026-09-25 to 10-01)** | | | |
 | Session line: goal and role lead the continuation record (sessw6) | landed | v1.5.0. Purpose probe 21/24. On the long chain a role carries into the next session at 21 of 80 cuts. | `results/0252-sessw6.md`, `results/0424-v150-land.md` |

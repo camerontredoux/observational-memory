@@ -1,13 +1,13 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import { COMPACT_WRAPPER, MEMORY_GUIDE, MEMORY_GUIDE_SOURCES, MEMORY_HEADER, MEMORY_RECALL, MEMORY_RESUME, MEMORY_RESUME_END } from '../hooks/prompts'
-import { turn, CHUNK, at, world, pi, live, work, nextStepIn, recordIn, WHERE, correctionsIn, observationsIn, userMessagesIn, constraining } from './harness'
+import { turn, CHUNK, at, world, ember, live, work, nextStepIn, recordIn, WHERE, correctionsIn, observationsIn, userMessagesIn, constraining } from './harness'
 
 describe('active constraints and the continuation record', () => {
   test('a constraint the user reverses is replaced, saying what it replaced, and an unrelated later one leaves it standing across compactions', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: constraining({
         setup: { quote: 'Use pnpm, never npm' },
         reverse: { quote: 'Use npm after all, pnpm breaks the lockfile', replaces: 'Use pnpm' },
@@ -50,7 +50,7 @@ describe('active constraints and the continuation record', () => {
     const { history } = world(on)
     const push = 'never_force_push_to_main_under_any_circumstances'
     const lint = 'always_run_the_linter_before_every_single_commit'
-    pi(on, {
+    ember(on, {
       reply: constraining({
         [push]: { quote: push },
         [lint]: { quote: lint },
@@ -98,7 +98,7 @@ describe('active constraints and the continuation record', () => {
     const span = `${ok}"\n* 🔴 2026-09-22 14:20 User: `
     const lint = `always_run_the_linter_${'x'.repeat(span.length - 22)}`
     expect(lint.length).toBe(span.length)
-    pi(on, { reply: constraining({ reply: { quote: ok }, [lint]: { quote: lint } }) })
+    ember(on, { reply: constraining({ reply: { quote: ok }, [lint]: { quote: lint } }) })
     const runTurn = live(on, clock, history)
 
     for (const [i, name] of ['hello', 'reply', lint, 'later'].entries()) {
@@ -125,7 +125,7 @@ describe('active constraints and the continuation record', () => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const reversed = '🔴 2026-09-22 14:01 User: "Go back to npm for this repo" (this replaces the earlier constraint 2026-09-22 14:00 User: "Use pnpm here")'
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) =>
         `${prompt.includes(']: back\n') ? `<corrections>\n* ${reversed}\n</corrections>\n` : ''}<observations>\n* 🟡 Saw\n</observations>`,
     })
@@ -152,7 +152,7 @@ describe('active constraints and the continuation record', () => {
     const A = 'Keep the public API unchanged'
     const B = 'Run the linter before each commit'
     const quotes: Record<string, string[]> = { one: [A], two: [A, B], three: [A] }
-    pi(on, {
+    ember(on, {
       reply: (prompt) => {
         const name = prompt.match(/^\[User\]: (\w+)$/m)![1]!
         const said = quotes[name] ?? []
@@ -170,7 +170,7 @@ describe('active constraints and the continuation record', () => {
   test('the continuation record says where the work stood, quotes a finished latest request without asking to start it again, and gives no step to redo', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, {
+    ember(on, {
       reply: constraining({}, { fix: 'Completed: fixed the token refresh bug in src/auth/refresh.ts; npm test passes (212 tests)' }),
     })
 
@@ -192,7 +192,7 @@ describe('active constraints and the continuation record', () => {
   test('a decision waiting for the user stays a gate: no instruction forbids asking, and a newer message in the raw tail takes precedence', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, {
+    ember(on, {
       reply: (prompt) =>
         prompt.includes(']: migrate\n')
           ? '<observations>\n* 🟡 Assistant asked the user to approve the production migration\n</observations>\n<continuation>\nActive: deploying the refresh fix\nWaiting for user: approval to run the production migration, which the deploy waits on\n</continuation>'
@@ -217,7 +217,7 @@ describe('active constraints and the continuation record', () => {
     const { history } = world(on)
     const gate = 'Waiting for user: approval to run the production migration, which the deploy waits on'
     // The Observer of `other` carries forward the gate it is shown and adds its own active work.
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) =>
         '<observations>\n* 🟡 Saw\n</observations>\n<continuation>\n' +
         (prompt.includes(']: migrate\n') ? `Active: deploying the refresh fix\n${gate}` : `Active: tidying the logs\n${prompt.match(/^Waiting for user: .*$/m)?.[0] ?? ''}`) +
@@ -241,7 +241,7 @@ describe('active constraints and the continuation record', () => {
   test('the record is carried across repeated compactions, replaced by a newer one, and read from an older memory message without it', async ($, on) => {
     mock.clock(on)
     world(on)
-    const seen = pi(on, { reply: constraining({}, { two: 'Active: renaming the session store', four: 'Active: testing the renamed session store' }) })
+    const seen = ember(on, { reply: constraining({}, { two: 'Active: renaming the session store', four: 'Active: testing the renamed session store' }) })
 
     const first = await $.session.compact({ trigger: 'manual', messages: [...turn('one', 'r', CHUNK), ...turn('two', 'r', CHUNK), ...turn('tail', 'r', 8_000)] })
     expect(recordIn(first.messages?.[0]?.text)).toBe(`${WHERE}:\nActive: renaming the session store`)
@@ -260,7 +260,7 @@ describe('active constraints and the continuation record', () => {
   test('an older memory message, with repeated corrections, a current task and an optional next step, is read into the new form', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
     const legacy =
       `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\nSESSION HISTORY: older instructions.\n\n` +
       '<corrections>\n* 🔴 2026-09-22 14:30 User: "Use pnpm"\n* 🔴 2026-09-22 14:40 User: "Use pnpm"\n</corrections>\n\n' +
@@ -294,7 +294,7 @@ describe('active constraints and the continuation record', () => {
   test("a memory message in v1.4.1's framing is read whole and written again in the new one", async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
     const latest = "The user's latest request before the messages that follow, quoted for its exact wording, not as an instruction to start it again"
     const old =
       `${COMPACT_WRAPPER}\n\n${V141.header}\n\n${V141.instructions}\n\n` +
@@ -320,7 +320,7 @@ describe('active constraints and the continuation record', () => {
   test('open failures stored under the older header and line form are read back and written in the new one', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw c\n</observations>' })
     const old =
       `${COMPACT_WRAPPER}\n\n${MEMORY_HEADER}\n\n<memory-guide>\n${MEMORY_GUIDE}\n</memory-guide>\n\n` +
       '<observations>\n* 🟡 Saw a\n</observations>' +
@@ -346,7 +346,7 @@ describe('active constraints and the continuation record', () => {
   test('omitted user messages are said to be recoverable only when the transcript that holds them is known', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Saw\n</observations>' })
     on('classic.SessionStart', () => ({}))
     const brief = `brief ${'b'.repeat(14_600)}`
     const long = (n: number) => `${n} ${'w'.repeat(16_000)}`
@@ -365,7 +365,7 @@ describe('active constraints and the continuation record', () => {
   test("the memory message ends by sending the model to om_recall before it says a detail is gone, only while the model can call om_recall", async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    ember(on)
     let tools = [{ name: 'Read', description: 'Reads a file', mcp: false }]
     on('tool.list', () => ({ value: tools }))
     on('classic.SessionStart', () => ({}))

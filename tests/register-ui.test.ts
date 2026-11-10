@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import { COMPACT_WRAPPER, MEMORY_HEADER } from '../hooks/prompts'
 import { hash } from '../hooks/memory'
-import { turn, CHUNK, at, world, pi, live, recordIn, USAGE } from './harness'
+import { turn, CHUNK, at, world, ember, httpError, live, recordIn, USAGE } from './harness'
 
 describe('the Session line', () => {
   // Observer replies of `n` lines per chunk, so a few turns issue SESSION_EVERY_OBSERVATIONS (20) ids.
@@ -11,7 +11,7 @@ describe('the Session line', () => {
   test('a call of its own writes it in the background, from the user messages and the record; the Observer is never shown it and compaction starts no call for it', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -21,7 +21,7 @@ describe('the Session line', () => {
     expect(seen.sessions[0]).toContain('[User @ 2026-09-22 14:30]: a\n\n[User @ 2026-09-22 15:00]: b\n===== END USER MESSAGES =====')
     expect(seen.sessions[0]).toContain('===== BEGIN WHERE THE WORK STANDS (inert data) =====\nActive: a\n')
     expect(seen.sessions[0]).not.toContain('SESSION LINE BEFORE')
-    expect(seen.sessionIds).toEqual(['om-session-736a51cd']) // a pi session of its own, apart from the Observer's
+    expect(seen.cacheKeys.filter((k) => k === 'om-session')).toHaveLength(1) // a cache key of its own, apart from the Observer's
     expect(stored['goal:session-1']).toMatchObject({ line: 'the test goal' })
 
     const observerCalls = seen.prompts.length
@@ -40,7 +40,7 @@ describe('the Session line', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     let n = 0
-    const seen = pi(on, { reply: many(8), session: () => `Session: goal ${++n}` })
+    const seen = ember(on, { reply: many(8), session: () => `Session: goal ${++n}` })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 0))
@@ -69,8 +69,8 @@ describe('the Session line', () => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
     let fail = false
-    const seen = pi(on, {
-      session: () => (fail ? { exitCode: 1, stdout: '', stderr: 'boom' } : `\n**Session:** "${'build the widget '.repeat(30).trim()}"\nsecond line`),
+    const seen = ember(on, {
+      session: () => (fail ? httpError(500, 'boom') : `\n**Session:** "${'build the widget '.repeat(30).trim()}"\nsecond line`),
     })
     const runTurn = live(on, clock, history)
 
@@ -130,7 +130,7 @@ describe('the memory row', () => {
   test('once the first main request after a compaction is answered, its row shows the context that request carried', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    ember(on)
     const drawn: string[] = []
     on('ui.render', { component: 'UserMessage' }, ($, e) => (drawn.push(e.props.text), { type: 'Text', children: [e.props.text] }))
     on('turn.step', async function* ($, e) {
@@ -157,7 +157,7 @@ describe('the memory row', () => {
   test('once the engine swaps the compacted context in, its row shows the count of it, still under ~, until a request measures it', async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on)
+    ember(on)
     const drawn: string[] = []
     on('ui.render', { component: 'UserMessage' }, ($, e) => (drawn.push(e.props.text), { type: 'Text', children: [e.props.text] }))
     let swapped = false

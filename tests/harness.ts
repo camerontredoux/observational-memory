@@ -1,7 +1,7 @@
-// Helpers the test files share: a session world, the pi stub, transcripts and the memory message's parts.
+// Helpers the test files share: a session world, the Ember stub, transcripts and the memory message's parts.
 import { describe, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, ProcessRunResult, SessionMessage } from 'claude-code'
+import type { HttpResponse, On, ProcessRunResult, SessionMessage } from 'claude-code'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 import { originalId } from '../hooks/recall'
 import type { RecallIo } from '../hooks/recall'
@@ -24,50 +24,34 @@ export const turn = (prompt: string, reply: string, size = 0): SessionMessage[] 
 ]
 
 export const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
-export const PI_USAGE = { input: 9206, output: 558, cacheRead: 3072, cacheWrite: 0, reasoning: 31, totalTokens: 9764, cost: { input: 0.0023, output: 0.0002, cacheRead: 0, cacheWrite: 0, total: 0.0025108 } }
-export const PI_ARGV = ['pi', '-p', '--model', 'openai-codex/gpt-6-luna', '--thinking', 'low', '--system-prompt']
-export const PI_FLAGS = ['--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-session', '--mode', 'json', '--append-system-prompt', '']
-// pi's session id for one piece of work, which its codex provider sends as the prompt cache key. The hash is FNV-1a
-// of 'session-1'. pi rejects an id outside its characters, and the provider cuts one past 64 characters.
-export const OBSERVER_SESSION = 'om-obs-736a51cd'
-export const PI_SESSION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
-export const piSessionOf = (argv: readonly string[]) => {
-  const id = argv[argv.indexOf('--session-id') + 1] ?? ''
-  if (!argv.includes('--session-id') || !PI_SESSION_ID.test(id) || id.length > 64) throw new Error(`no valid pi session id in ${JSON.stringify(argv.slice(-2))}`)
-  return id
-}
-
-// What pi 0.85.1 prints with `--mode json` for one answer: one event per line, the prompt echoed, the answer
-// streamed, then the final assistant message with its usage (as /tmp/obs-bench/pi1.jsonl, abridged).
-export function piOutput(prompt: string, text: string, end: { stopReason?: string; errorMessage?: string } = { stopReason: 'stop' }) {
-  const user = { role: 'user', content: [{ type: 'text', text: prompt }], timestamp: 0 }
-  const assistant = {
-    role: 'assistant',
-    content: [{ type: 'thinking', thinking: '', thinkingSignature: '{}' }, { type: 'text', text }],
-    api: 'openai-codex-responses',
-    provider: 'openai-codex',
-    model: 'gpt-5.6-luna',
-    usage: PI_USAGE,
-    durationMs: 1500,
+export const EMBER_URL = 'https://api.meta.ai/v1/responses'
+export const EMBER_KEY_PATH = '/home/u/.config/observational-memory/muse-api-key'
+export const EMBER_USAGE = { input_tokens: 12278, input_tokens_details: { cached_tokens: 3072 }, output_tokens: 558, output_tokens_details: { reasoning_tokens: 31 }, total_tokens: 12836 }
+// What Ember's Responses API answers for one completed reply (as a live muse-ember-1.0 response, abridged).
+export function emberResponse(text: string, end: { status?: string; incomplete_details?: { reason: string } } = {}): HttpResponse {
+  const body = {
+    id: 'resp_1',
+    object: 'response',
+    model: 'muse-ember-1.0',
+    status: 'completed',
+    incomplete_details: null,
+    error: null,
+    output: [
+      { type: 'reasoning', id: 'rs_1', summary: [], status: 'completed' },
+      { type: 'message', id: 'msg_1', role: 'assistant', content: [{ type: 'output_text', text, annotations: [], logprobs: [] }], status: 'completed' },
+    ],
+    usage: EMBER_USAGE,
     ...end,
-    timestamp: 0,
   }
-  return [
-    { type: 'session', version: 3, id: 'pi-session', timestamp: '2026-09-23T03:51:47.144Z', cwd: '/tmp' },
-    { type: 'agent_start' },
-    { type: 'turn_start' },
-    { type: 'message_start', message: user },
-    { type: 'message_end', message: user },
-    { type: 'message_start', message: { ...assistant, content: [] } },
-    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 1, delta: text.slice(0, 20) } },
-    { type: 'message_end', message: assistant },
-    { type: 'turn_end', message: assistant, toolResults: [] },
-    { type: 'agent_end', messages: [user, assistant] },
-    { type: 'agent_settled' },
-  ]
-    .map((event) => JSON.stringify(event))
-    .join('\n')
+  return { status: 200, ok: true, headers: { 'content-type': 'application/json' }, text: JSON.stringify(body) }
 }
+// An error reply from the API, as it answers one: `{ error: { code, message, type } }`.
+export const httpError = (status: number, code: string): HttpResponse => ({
+  status,
+  ok: false,
+  headers: { 'content-type': 'application/json' },
+  text: JSON.stringify({ error: { code, message: code, param: null, type: 'server_error' } }),
+})
 export const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
 export const CHUNK = 40_000 // characters of tool result that make one turn a whole 10k-token chunk
 export const TOOL_RESULT_MAX_CHARS = 5_000 * 4 // TOOL_RESULT_MAX_TOKENS * 4 in hooks/register.ts
@@ -114,7 +98,7 @@ export function world(
   on('store.set', ($, e) => (writes.push(e.key), (stored[e.key] = JSON.parse(JSON.stringify(e.value))), { value: undefined }))
   on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
   // The stats files, in memory under OM_STATS_DIR.
-  const files: Record<string, string> = {}
+  const files: Record<string, string> = { [EMBER_KEY_PATH]: 'test-key\n' }
   mock.env(on, { OM_STATS_DIR: '/stats', HOME: '/home/u', ...options.env })
   const reads: string[] = []
   on('fs.read', ($, e) => {
@@ -138,73 +122,78 @@ export function world(
 }
 
 export type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
-export type PiCall = { argv: readonly string[]; cwd?: string }
+export type EmberCall = { body: Record<string, unknown>; headers: Record<string, string> }
 
 // git outside a repository, as the plugin's environment read meets it by default.
-// pi's or git's exit code and output, as a fake answers them; `ran` adds what `$.process.run` also reports.
+// git's exit code and output, as a fake answers them; `ran` adds what `$.process.run` also reports.
 export type Run = Pick<ProcessRunResult, 'exitCode' | 'stdout' | 'stderr'>
 export const ran = (r: Run): ProcessRunResult => ({ ...r, isStdoutTruncated: false, isStderrTruncated: false })
 
 export const NOT_A_REPO: Run = { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }
 
-// pi on the host, as `$.process.spawn` runs it: it observes by naming the prompts of its chunk, each at the time
-// its block shows; the reflector answers `reflect(n, prompt)` for its nth call, by default a reflection near its target. `hold` delays the nth call's answer, `fail`
-// answers it with a failed run instead; `stopped` counts the calls killed before they answered. git, through
-// `$.process.run`, is answered by `git`, else as outside a repository, and is no pi call.
-// `$.model.complete` is counted, and answers nothing.
-export function pi(
+// Ember through `$.http.fetch`: it observes by naming the prompts of its chunk, each at the time its block shows;
+// the reflector answers `reflect(n, prompt)` for its nth call, by default a reflection near its target. `hold` delays
+// the nth call's answer, `fail` answers it with an error reply, or fails the request with an Error; `stopped` counts the calls the plugin gave up
+// on (a loop that ended, a deadline) before they answered: their answers, once they come, are dropped. git, through
+// `$.process.run`, is answered by `git`, else as outside a repository. `$.model.complete` is counted, and answers nothing.
+export function ember(
   on: On,
   options: {
     hold?: (n: number, prompt: string) => Promise<void> | undefined
-    fail?: (n: number, prompt: string) => Run | undefined
+    fail?: (n: number, prompt: string) => HttpResponse | Error | undefined
     reflect?: (n: number, prompt: string) => string
     reply?: (prompt: string) => string | undefined
     git?: (argv: readonly string[]) => Run | undefined
-    session?: (prompt: string) => string | Run
+    session?: (prompt: string) => string | HttpResponse
   } = {},
 ) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as PiCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], sessionIds: [] as string[] }
+  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as EmberCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], cacheKeys: [] as string[] }
   let reflections = 0
   on('process.run', ($, e) => {
     if (e.argv[0] !== 'git') return { value: ran({ exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` }) }
     return seen.git.push(e.argv), { value: ran(options.git?.(e.argv) ?? NOT_A_REPO) }
   })
-  // What pi prints comes in pieces, the middle of a line ending one, as a child writes it. A call killed while held
-  // stops holding at once.
-  on('process.spawn', async function* ($, e, next) {
-    if (e.argv[0] !== 'pi') return yield* next(e)
-    const killed = new Promise<never>((_, reject) => next.signal.addEventListener('abort', () => reject(next.signal.reason), { once: true }))
-    killed.catch(() => {})
-    let answered = false
-    try {
-      const r = await answer(e.argv, e.cwd, e.input ?? '', killed)
-      answered = true
-      const half = Math.floor(r.stdout.length / 2)
-      for (const [stream, text] of [['stdout', r.stdout.slice(0, half)], ['stdout', r.stdout.slice(half)], ['stderr', r.stderr]] as const) if (text) yield { stream, text }
-      return { value: { code: r.exitCode, signal: null } }
-    } finally {
-      if (!answered) seen.stopped++
-    }
+  on('http.fetch', async ($, e, next) => {
+    if (e.url !== EMBER_URL) return next(e)
+    const body = JSON.parse(e.init?.body ?? '{}') as Record<string, unknown>
+    // A request that fails outright (`fail` gave an Error) rejects the plugin's call, as a network failure does.
+    return answer(body, e.init?.headers ?? {}).then((value) => ({ value }), (error: Error) => ({ deny: error.message }))
   })
-  async function answer(argv: readonly string[], cwd: string | undefined, prompt: string, killed: Promise<never>): Promise<Run> {
-    if (argv[argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT) {
+  // `$.http.fetch` takes no signal: a call the plugin gives up on (stopped or timed out) shows only in the debug line
+  // it logs, naming the request by the number its `X-OM-Request` header carries. That request's hold ends: as the
+  // plugin sees it, it is no longer in flight.
+  const held = new Map<number, () => void>()
+  const gaveUp = (text: string) => {
+    const m = /^Ember \S+ #(\d+) failed \((stopped|timeout)\)/.exec(text)
+    if (m) held.get(Number(m[1]))?.()
+  }
+  async function answer(body: Record<string, unknown>, headers: Record<string, string>): Promise<HttpResponse> {
+    const id = Number(headers['X-OM-Request'])
+    const [system, prompt] = [String(body.instructions ?? ''), String(body.input ?? '')]
+    seen.cacheKeys.push(String(body.prompt_cache_key))
+    if (system === SESSION_SYSTEM_PROMPT) {
       seen.sessions.push(prompt)
-      seen.sessionIds.push(piSessionOf(argv))
       const r = options.session?.(prompt) ?? 'Session: the test goal'
-      return typeof r === 'string' ? { exitCode: 0, stdout: piOutput(prompt, r), stderr: '' } : r
+      return typeof r === 'string' ? emberResponse(r) : r
     }
     seen.prompts.push(prompt)
-    seen.systems.push(argv[argv.indexOf('--system-prompt') + 1] ?? '')
-    seen.calls.push({ argv, cwd })
+    seen.systems.push(system)
+    seen.calls.push({ body, headers })
     const n = seen.prompts.length
     seen.inFlight++
     seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight)
+    const abandoned = new Promise<'abandoned'>((resolve) => held.set(id, () => resolve('abandoned')))
     try {
-      await Promise.race([options.hold?.(n, prompt), killed])
+      if ((await Promise.race([options.hold?.(n, prompt), abandoned])) === 'abandoned') {
+        seen.stopped++
+        return httpError(499, 'abandoned') // read by no one: the plugin gave up on it
+      }
     } finally {
       seen.inFlight--
+      held.delete(id)
     }
     const failed = options.fail?.(n, prompt)
+    if (failed instanceof Error) throw failed // the request itself failed: no reply
     if (failed) return failed
     let text: string
     if (prompt.startsWith('## OBSERVATIONS TO REFLECT ON')) {
@@ -215,10 +204,10 @@ export function pi(
         options.reply?.(prompt) ??
         `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
         `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
-    return { exitCode: 0, stdout: piOutput(prompt, text), stderr: '' }
+    return emberResponse(text)
   }
   on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
-  on('ui.log', ($, e) => ((e.to === 'debug' ? seen.logs : seen.screen).push(e.text), { value: undefined }))
+  on('ui.log', ($, e) => ((e.to === 'debug' ? (seen.logs.push(e.text), gaveUp(e.text)) : seen.screen.push(e.text)), { value: undefined }))
   return seen
 }
 
@@ -336,7 +325,7 @@ export const FINISHED = '(finished; invoke it again to reread its text, or om_re
 export async function fourTurns($: Engine, on: On) {
   const clock = mock.clock(on)
   const { history, stored } = world(on)
-  const seen = pi(on)
+  const seen = ember(on)
   on('skill.prompt', ($, e) => ({ text: e.text }))
   const runTurn = live(on, clock, history)
   await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 0))
@@ -388,7 +377,7 @@ export const SUMMARY: SessionMessage = {
   text: 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. Primary Request and Intent: read the files.',
   toolUses: [],
 }
-export const overloaded = (): Run => ({ exitCode: 0, stdout: piOutput('', '', { stopReason: 'error', errorMessage: 'Codex error: overloaded' }), stderr: '' })
+export const overloaded = (): HttpResponse => httpError(503, 'overloaded')
 
 // A transcript directory in memory for the om_recall helpers, recording which files they read.
 export function memoryIo(files: Record<string, string>): RecallIo & { reads: string[] } {

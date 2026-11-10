@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { turn, CHUNK, at, world, pi, nearTarget, live, recordIn, WHERE, noReplies, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, skillsIn, FINISHED, fourTurns } from './harness'
+import { turn, CHUNK, at, world, ember, nearTarget, live, recordIn, WHERE, noReplies, renderedObservationsIn, withObservations, observationsIn, userMessagesIn, skillsIn, FINISHED, fourTurns } from './harness'
 import type { Ledger } from './harness'
 
 // The memory message: corrections, sources, dates and skills.
@@ -10,7 +10,7 @@ describe('register: memory', () => {
     const { history, stored } = world(on)
     const correction = '🔴 2026-09-22 14:30 User: "Sorry, I meant the refresh endpoint, not login — ignore what I said about login"'
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
           ? `<corrections>\n* ${correction}\n</corrections>\n${big}\n<continuation>\nActive: fixing the refresh endpoint\n</continuation>`
@@ -41,7 +41,7 @@ describe('register: memory', () => {
   test('a memory mixing lines with and without a source reads back as it was written: rendered, carried forward and rendered again, it is the same', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw a\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 2026-09-22 14:30 Saw a\n</observations>' })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
@@ -67,7 +67,7 @@ describe('register: memory', () => {
   test('an observation carries the span of transcript times it came from, never a range the Observer wrote, and keeps it through the memory message', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    const seen = pi(on, {
+    const seen = ember(on, {
       reply: (prompt) => {
         const [, time, name] = prompt.match(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/m)!
         // The Observer is given no ranges: one it writes is invented.
@@ -100,7 +100,7 @@ describe('register: memory', () => {
   test('the memory writes each day once, on a line before its first observation and its first user message, and reads the dates back', async ($, on) => {
     const clock = mock.clock(on)
     const { history, stored } = world(on)
-    pi(on, {
+    ember(on, {
       reply: (prompt) => {
         const [, time, name] = prompt.match(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/m)!
         return `<observations>\n* 🟡 ${time ?? ''} Read ${name}\n</observations>`
@@ -130,7 +130,7 @@ describe('register: memory', () => {
   test('an observation that ends in a parenthetical that is not a source range keeps it', async ($, on) => {
     mock.clock(on)
     world(on)
-    pi(on, { reply: () => '<observations>\n* 🟡 Read config.ts (source of truth for ports)\n* 🟡 Cited the RFC (source: IETF)\n</observations>' })
+    ember(on, { reply: () => '<observations>\n* 🟡 Read config.ts (source of truth for ports)\n* 🟡 Cited the RFC (source: IETF)\n</observations>' })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
@@ -142,7 +142,7 @@ describe('register: memory', () => {
   test("an observation's source range, given to om_recall as from and to, finds the rows it was observed from", async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
-    pi(on, { reply: (prompt) => `<observations>\n* 🟡 ${prompt.match(/^\[User @ ([\d-]+ [\d:]+)\]: \w+$/m)![1]} Read ${prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]}\n</observations>` })
+    ember(on, { reply: (prompt) => `<observations>\n* 🟡 ${prompt.match(/^\[User @ ([\d-]+ [\d:]+)\]: \w+$/m)![1]} Read ${prompt.match(/^\[User[^\]]*\]: (\w+)$/m)![1]}\n</observations>` })
     const runTurn = live(on, clock, history)
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
@@ -161,7 +161,7 @@ describe('register: memory', () => {
   test('keeps every recorded skill not in the raw tail, most recent first, within the token cap, and logs what it drops', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     world(on)
-    const seen = pi(on)
+    const seen = ember(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'old deploy steps' })
@@ -183,7 +183,7 @@ describe('register: memory', () => {
   test('skills carry forward through the memory message when the store has none', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     const { stored } = world(on)
-    pi(on)
+    ember(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps\n</skill> mid-text stays' })
@@ -224,7 +224,7 @@ describe('register: memory', () => {
   test('a memory message from before skill times still parses: its skills become lines, but stay whole in a subagent', async ($, on) => {
     mock.clock(on, { now: at(22, 9, 0) })
     const { stored } = world(on)
-    pi(on)
+    ember(on)
     on('skill.prompt', ($, e) => ({ text: e.text }))
 
     await $.skill.prompt({ skill: 'deploy', text: 'Deploy steps' })

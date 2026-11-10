@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
+import { EMBER_KEY_PATH, EMBER_URL, emberResponse } from './harness'
 import {
   chainSpec,
   chainTranscripts,
@@ -150,7 +151,7 @@ describe('the chain', () => {
 })
 
 describe('the om chain through hooks/register.ts', () => {
-  // The plugin under test at every boundary, driven as `bench-replay.ts om` drives it (hookDriver), with pi answering
+  // The plugin under test at every boundary, driven as `bench-replay.ts om` drives it (hookDriver), with Ember answering
   // each Observer chunk by naming its user prompts. Each span is a turn with a 10k-token tool result, so compaction
   // has older history to observe and a tail to keep raw.
   function chained() {
@@ -176,6 +177,7 @@ describe('the om chain through hooks/register.ts', () => {
     on('store.set', ($, e) => ((stored[e.key] = structuredClone(e.value)), { value: undefined }))
     on('store.delete', ($, e) => (delete stored[e.key], { value: undefined }))
     on('fs.read', ($, e) => {
+      if (e.path === EMBER_KEY_PATH) return { value: 'test-key\n' }
       throw new Error(`ENOENT: ${e.path}`)
     })
     on('fs.write', () => ({ value: undefined }))
@@ -190,16 +192,15 @@ describe('the om chain through hooks/register.ts', () => {
     on('skill.prompt', ($, e) => ({ text: e.text }))
     const observed: string[][] = []
     on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n', isStdoutTruncated: false, isStderrTruncated: false } })) // git, outside a repository
-    on('process.spawn', async function* ($, e, next) {
-      if (e.argv[0] !== 'pi') return yield* next(e)
-      const prompt = e.input ?? ''
-      const session = e.argv[e.argv.indexOf('--system-prompt') + 1] === SESSION_SYSTEM_PROMPT // the Session line's writer
+    on('http.fetch', async ($, e, next) => {
+      if (e.url !== EMBER_URL) return next(e)
+      const body = JSON.parse(e.init?.body ?? '{}') as { instructions?: string; input?: string }
+      const prompt = body.input ?? ''
+      const session = body.instructions === SESSION_SYSTEM_PROMPT // the Session line's writer
       const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
       if (!session) observed.push(words)
       const text = session ? 'Session: replay goal' : `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
-      const message = { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop', usage: { input: 1, output: 1, cost: { total: 0 } } }
-      yield { stream: 'stdout' as const, text: JSON.stringify({ type: 'message_end', message }) }
-      return { value: { code: 0, signal: null } }
+      return { value: emberResponse(text) }
     })
 
     const inputs: string[][] = []
