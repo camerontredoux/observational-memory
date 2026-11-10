@@ -89,6 +89,16 @@ describe('stats', () => {
     expect(parseSince('soon', now)).toBeUndefined()
   })
 
+  test('until drops sessions first seen after it; a session wholly within the range merges whole, past its capped samples', () => {
+    const inside = session('in', T0 + DAY, [[10_000, 0.002], [20_000, 0.003]])
+    inside.metrics['observer.background.ms']!.count = 500 // more than its samples kept
+    inside.metrics['observer.background.ms']!.sum = 5_000_000
+    const later = session('later', T0 + 3 * DAY, [[30_000, 0.004]])
+    const m = merge([inside, later], T0, T0 + 2 * DAY)
+    expect(m.sessions).toBe(1)
+    expect(m.stats.metrics['observer.background.ms']).toMatchObject({ count: 500, sum: 5_000_000 })
+  })
+
   test('the report gives totals and a row per metric with count, sum, mean, median, p90, min and max', () => {
     const s = session('a', T0, [[10_000, 0.002], [20_000, 0.003], [30_000, 0.004]])
     addCompaction(s, { trigger: 'manual', ms: 250, fellBack: false, tokensBefore: 120_000, tokensAfter: 14_000, syncCalls: 0, syncMs: 0 }, T0)
@@ -240,6 +250,24 @@ describe('stats', () => {
     expect(await report(io, { historical: true, full: true })).toContain('## observational-memory stats, all sessions of the Luna era (historical)')
     expect(await report(io, { scope: 'all' })).not.toContain('(1)')
     expect(parseArgs('historical full')).toEqual({ historical: true, full: true })
+  })
+
+  test('transcripts reports every session-day from its own folder, and a second date bounds it as until', async () => {
+    const file = JSON.stringify(busy())
+    const io = {
+      now: async () => T0 + DAY,
+      sessionId: async () => 'new',
+      home: async () => '/home/u',
+      dir: async () => '/stats',
+      read: async (path: string) => {
+        if (path === '/stats-transcripts/a.2026-09-20.json') return file
+        throw new Error('missing')
+      },
+      list: async (dir: string) => (dir === '/stats-transcripts' ? [{ name: 'a.2026-09-20.json', kind: 'file' }] : []),
+    } as unknown as Io
+    expect(parseArgs('transcripts cost 2026-09-01 2026-10-01')).toEqual({ transcripts: true, cost: true, since: '2026-09-01', until: '2026-10-01' })
+    expect(await report(io, { transcripts: true })).toStartWith('observational-memory · archived transcripts, all session-days (1) · ')
+    expect(await report(io, { transcripts: true, until: '2026-09-01' })).toContain('(0) until ')
   })
 
   test('command arguments combine all, full, a since and a session id in any order', () => {

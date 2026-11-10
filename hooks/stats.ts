@@ -12,6 +12,9 @@ const INPUT_DOLLARS_PER_MTOK = 4 // Opus 5.5's input price, for a rough figure i
 const DEFAULT_DIR = '.claude/plugins/data/observational-memory/stats' // under $HOME; OM_STATS_DIR overrides it
 // The stats of the GPT-6 Luna era, kept apart once the plugin moved to Ember: beside DEFAULT_DIR, read by `historical`.
 const HISTORICAL_SUFFIX = '-luna'
+// The stats scripts/stats-from-transcripts.ts builds from archived transcripts, one file per session and day: beside
+// DEFAULT_DIR, read by `transcripts`.
+const TRANSCRIPTS_SUFFIX = '-transcripts'
 
 export type Sample = [at: number, value: number]
 export type Metric = { count: number; sum: number; min: number; max: number; recent: Sample[] }
@@ -175,23 +178,25 @@ export function parseSince(text: string, now: number) {
   return Number.isNaN(t) ? undefined : t
 }
 
-// Several sessions as one. Past `since`, a metric is rebuilt from the samples at or after it, and a session's
-// counts stand whole when it was seen after `since`. `approximate` when any samples were capped.
-export function merge(files: readonly SessionStats[], since?: number) {
+// Several sessions as one, those seen within `since` and `until`. A session wholly within them merges whole; one that
+// straddles either has its metrics rebuilt from the samples within them, and its counts stand whole. `approximate`
+// when any samples were capped.
+export function merge(files: readonly SessionStats[], since?: number, until?: number) {
+  const within = (at: number) => (since === undefined || at >= since) && (until === undefined || at < until)
   const out = emptyStats('merged', Infinity)
   out.lastSeen = -Infinity
   let approximate = false
   let sessions = 0
   for (const f of files) {
-    if (since !== undefined && f.lastSeen < since) continue
+    if ((since !== undefined && f.lastSeen < since) || (until !== undefined && f.firstSeen >= until)) continue
     sessions++
     out.firstSeen = Math.min(out.firstSeen, f.firstSeen)
     out.lastSeen = Math.max(out.lastSeen, f.lastSeen)
     for (const [k, n] of Object.entries(f.counts)) count(out, k, n)
     for (const [k, m] of Object.entries(f.metrics)) {
       if (m.count > m.recent.length) approximate = true
-      if (since !== undefined) {
-        for (const [at, v] of m.recent) if (at >= since) add(out, k, v, at)
+      if (!within(f.firstSeen) || !within(f.lastSeen) || !m.recent.every(([at]) => within(at))) {
+        for (const [at, v] of m.recent) if (within(at)) add(out, k, v, at)
         continue
       }
       const o = (out.metrics[k] ??= { count: 0, sum: 0, min: m.min, max: m.max, recent: [] })
@@ -381,7 +386,7 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   if (recall) row('Recall', plural(recall, 'search', 'searches'))
   if (approximate) lines.push('', `Splits and medians come from the newest ${SAMPLES} samples per metric per session.`)
   const again = (w: string) => `/om-stats ${[words, w].filter(Boolean).join(' ')}`
-  lines.push('', `${again('full')} for every metric${words.split(' ').some((w) => w === 'all' || w === 'historical') ? '' : ' · /om-stats all for every session'}`)
+  lines.push('', `${again('full')} for every metric${words.split(' ').some((w) => w === 'all' || w === 'historical' || w === 'transcripts') ? '' : ' · /om-stats all for every session'}`)
   return lines.join('\n')
 }
 
@@ -467,18 +472,21 @@ export async function report(io: Io, args: Args) {
   const [current, now] = await Promise.all([io.sessionId(), io.now()])
   const since = args.since ? parseSince(args.since, now) : undefined
   if (args.since && since === undefined) return `om_stats: cannot read since "${args.since}" (try 7d, 12h or 2026-09-01).`
+  const until = args.until ? parseSince(args.until, now) : undefined
+  if (args.until && until === undefined) return `om_stats: cannot read until "${args.until}" (try 7d, 12h or 2026-09-01).`
   await flush(io, current)
-  const dir = `${await statsDir(io)}${args.historical ? HISTORICAL_SUFFIX : ''}`
+  const every = args.scope === 'all' || args.historical || args.transcripts
+  const dir = `${await statsDir(io)}${args.historical ? HISTORICAL_SUFFIX : args.transcripts ? TRANSCRIPTS_SUFFIX : ''}`
   const read = (name: string) => io.read(`${dir}/${name}`).then(parse, () => undefined)
   let files: SessionStats[]
   let title: string
   let head: string
   const id = args.sessionId || current
-  if (args.scope === 'all' || args.historical) {
+  if (every) {
     const names = (await io.list(dir).catch(() => [])).filter((e) => e.kind === 'file' && e.name.endsWith('.json')).map((e) => e.name)
     files = (await Promise.all(names.map(read))).filter((f): f is SessionStats => f?.version === 1)
-    title = `observational-memory stats, all sessions${args.historical ? ' of the Luna era (historical)' : ''}`
-    head = args.historical ? 'Luna era (historical), all sessions' : 'all sessions'
+    title = `observational-memory stats, all sessions${args.historical ? ' of the Luna era (historical)' : args.transcripts ? ' from the archived transcripts' : ''}`
+    head = args.historical ? 'Luna era (historical), all sessions' : args.transcripts ? 'archived transcripts, all session-days' : 'all sessions'
   } else {
     const f = (await live.get(id)?.catch(() => undefined)) ?? (await read(`${id}.json`))
     files = f ? [f] : []
@@ -486,20 +494,18 @@ export async function report(io: Io, args: Args) {
     title = `observational-memory stats, session ${id}${cwd}`
     head = `${id === current ? 'this session' : `session ${id}`}${cwd}`
   }
-  const merged = merge(files, since)
-  if (args.scope === 'all' || args.historical) head += ` (${merged.sessions})`
-  if (since !== undefined) {
-    const after = ` since ${stamp(since)} ${zone(since)}`
-    title += after
-    head += after
-  }
+  const merged = merge(files, since, until)
+  if (every) head += ` (${merged.sessions})`
+  const range = [since !== undefined && ` since ${stamp(since)} ${zone(since)}`, until !== undefined && ` until ${stamp(until)} ${zone(until)}`].filter(Boolean).join('')
+  title += range
+  head += range
   if (args.full) return formatReport(title, merged)
   if (args.cost) return formatCost(head, merged)
-  const words = [args.historical ? 'historical' : args.scope === 'all' ? 'all' : id === current ? '' : id, args.since ?? ''].filter(Boolean).join(' ')
+  const words = [args.historical ? 'historical' : args.transcripts ? 'transcripts' : args.scope === 'all' ? 'all' : id === current ? '' : id, args.since ?? '', args.until ?? ''].filter(Boolean).join(' ')
   return formatSummary(head, merged, words)
 }
 
-export type Args = { scope?: string; sessionId?: string; since?: string; full?: boolean; cost?: boolean; historical?: boolean }
+export type Args = { scope?: string; sessionId?: string; since?: string; until?: string; full?: boolean; cost?: boolean; historical?: boolean; transcripts?: boolean }
 
 export function parseArgs(text: string) {
   const out: Args = {}
@@ -508,7 +514,9 @@ export function parseArgs(text: string) {
     else if (word === 'full') out.full = true
     else if (word === 'cost') out.cost = true
     else if (word === 'historical') out.historical = true
-    else if (/^\d+(?:\.\d+)?[mhdw]$/.test(word) || /^\d{4}-\d{2}-\d{2}/.test(word)) out.since = word
+    else if (word === 'transcripts') out.transcripts = true
+    // The first time is since, a second until.
+    else if (/^\d+(?:\.\d+)?[mhdw]$/.test(word) || /^\d{4}-\d{2}-\d{2}/.test(word)) out[out.since ? 'until' : 'since'] = word
     else out.sessionId = word
   }
   return out

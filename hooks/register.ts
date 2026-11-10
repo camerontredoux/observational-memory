@@ -2472,13 +2472,15 @@ export const register: Register = (on) => {
             scope: { type: 'string', enum: ['session', 'all'], description: 'This session (default) or every session' },
             sessionId: { type: 'string', description: 'Another session to report on' },
             since: { type: 'string', description: 'Only what happened after this: 7d, 12h, or an ISO date' },
+            until: { type: 'string', description: 'Only what happened before this: 7d, 12h, or an ISO date' },
             full: { type: 'boolean', description: 'Every metric in a table instead of the summary (default false)' },
             cost: { type: 'boolean', description: "The main conversation's prompt-cache cost and the auto-compaction point that would cost least" },
             historical: { type: 'boolean', description: 'Every session of the GPT-6 Luna era, before the plugin moved to Muse Ember (default false)' },
+            transcripts: { type: 'boolean', description: "Every session-day of the archived transcripts, the main requests' cache cost and the compactions, built daily by scripts/stats-from-transcripts.ts; the record from before the plugin measured them (default false)" },
           },
         },
       }),
-      $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|historical|<session id>] [full|cost] [7d|<ISO date>]' }),
+      $.command.register({ name: 'om-stats', description: 'observational-memory usage summary (full for every metric)', argumentHint: '[all|historical|transcripts|<session id>] [full|cost] [7d|<ISO date> [until]]' }),
     ])).catch((error) => {
       log($, `could not register the stats tool and command (${errorText(error)})`)
       showUnavailable($, `Setup failed (${clipLine(errorText(error))}). ${STATS_TOOL} and /om-stats are unavailable this session`)
