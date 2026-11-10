@@ -175,7 +175,7 @@ export function world(
   return { history, agents, stored, files, reads, writes, asked }
 }
 
-export type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[] }
+export type Ledger = { entries: { id: string; line: string; source?: { from: number; to: number } }[]; corrections: string[]; watermark: { from: number; to: number }; chunks: { from: number; to: number }[]; anchor?: string; currentTask?: string }
 export type EmberCall = { body: Record<string, unknown>; headers: Record<string, string> }
 
 // git outside a repository, as the plugin's environment read meets it by default.
@@ -197,7 +197,7 @@ export function ember(
     fail?: (n: number, prompt: string) => HttpResponse | Error | undefined
     reflect?: (n: number, prompt: string) => string
     reply?: (prompt: string) => string | undefined
-    git?: (argv: readonly string[]) => Run | undefined
+    git?: (argv: readonly string[]) => Run | undefined | Promise<Run | undefined>
     session?: (prompt: string) => string | HttpResponse
   } = {},
 ) {
@@ -205,7 +205,9 @@ export function ember(
   let reflections = 0
   on('process.run', ($, e) => {
     if (e.argv[0] !== 'git') return { value: ran({ exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` }) }
-    return seen.git.push(e.argv), { value: ran(options.git?.(e.argv) ?? NOT_A_REPO) }
+    seen.git.push(e.argv)
+    const run = options.git?.(e.argv)
+    return run instanceof Promise ? run.then((r) => ({ value: ran(r ?? NOT_A_REPO) })) : { value: ran(run ?? NOT_A_REPO) }
   })
   on('http.fetch', async ($, e, next) => {
     if (e.url !== EMBER_URL) return next(e)
@@ -287,14 +289,15 @@ export function live(on: On, clock: MockClock, history: SessionMessage[]) {
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
-  return async ($: Engine, messages: SessionMessage[], startAt: number) => {
+  // A turn takes a minute unless `ms` says otherwise: a shorter one keeps a call held across it within its timeout.
+  return async ($: Engine, messages: SessionMessage[], startAt: number, ms = 60_000) => {
     const turnId = `turn-${history.length}`
     await clock.set(startAt)
     history.push(messages[0]!)
     await $.turn.start({ text: messages[0]!.text, turnId })
-    await clock.advance(60_000)
+    await clock.advance(ms)
     history.push(...messages.slice(1))
-    await $.turn.complete({ answer: '', durationMs: 60_000, isAborted: false, turnId, reason: 'answer' })
+    await $.turn.complete({ answer: '', durationMs: ms, isAborted: false, turnId, reason: 'answer' })
   }
 }
 

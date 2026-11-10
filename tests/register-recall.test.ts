@@ -120,14 +120,15 @@ describe('register: recall', () => {
     const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined), reply: () => '<observations>\n* 🟡 Read a file\n</observations>' })
     const step = steps(on)
     on('turn.start', ($, e) => ({ turnId: e.turnId }))
-    await clock.set(at(23, 9, 0))
+    const start = at(23, 9, 0) - 10_000
+    await clock.set(start)
     history.push({ role: 'user', text: 'brief', toolUses: [] })
     await $.turn.start({ text: 'brief', turnId: 't' })
     await step($, 't', 0, history.length)
 
     // Each step resolves with the first Observer call still held: nothing waits on it.
     for (let n = 0; n < 8; n++) {
-      await clock.set(at(23, 9, 0) + (n + 1) * 14_000) // the held call stays within its timeout
+      await clock.set(start + (n + 1) * 2_000) // the held call stays within its timeout
       history.push(...call(n, 16_000))
       await step($, 't', n + 1, history.length)
       await clock.settle()
@@ -147,7 +148,7 @@ describe('register: recall', () => {
       'Observed 7 messages · +1 note · memory 2 notes',
     ])
     // The rows' times come from the steps that brought them, not only the prompt's.
-    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 09:00 Read a file', '🟡 2026-09-23 09:01 Read a file'])
+    expect(ledger.entries.map((e) => e.line)).toEqual(['🟡 2026-09-23 08:59 Read a file', '🟡 2026-09-23 09:00 Read a file'])
   })
 
   test('past the 4096 rows the history reads as, a long turn still observes in the background mid-turn', async ($, on) => {
@@ -226,7 +227,7 @@ describe('register: recall', () => {
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await runTurn($, turn('b', 'b', 8_000), at(22, 14, 31)) // within the held call's timeout
+    await runTurn($, turn('b', 'b', 8_000), at(22, 14, 31), 10_000) // within the held call's timeout
     await clock.settle() // [0, 4) in flight, held
     history.splice(0, history.length, ...turn('z', 'z', CHUNK), ...turn('b', 'b', 8_000)) // rewound
     open(1)
