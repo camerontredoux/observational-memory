@@ -51,7 +51,8 @@ export const OBSERVER_FORMAT = {
   }),
 } as const
 
-export type Format = typeof OBSERVER_FORMAT
+// A structured reply's format: the Observer's here, the librarian's in librarian.ts.
+export type Format = { readonly type: 'json_schema'; readonly name: string; readonly strict: true; readonly schema: object }
 
 export type Observation = { priority: string; time: string | null; text: string }
 export type Correction = { time: string | null; quote: string; replaces: string | null; replaces_earlier: string | null }
@@ -66,7 +67,7 @@ export const RECORD_FIELDS = [
 ] as const
 export type Continuation = Record<(typeof RECORD_FIELDS)[number][0], string | null>
 
-function parsed(text: string): Record<string, unknown> {
+export function parsed(text: string): Record<string, unknown> {
   try {
     const value = JSON.parse(text) as unknown
     if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>

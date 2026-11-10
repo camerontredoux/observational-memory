@@ -1,5 +1,7 @@
 // Evaluation only: the builtin+recall configuration of `scripts/bench-replay.ts questions`. The om_recall tool of hooks/register.ts and nothing else:
-// no compaction, observation, stats or pruning hook, so the host's built-in compaction runs as with no plugin.
+// no compaction, observation, stats or pruning hook, so the host's built-in compaction runs as with no plugin. Nor
+// its librarian, which needs the Ember transport: a search here answers with its hits' excerpts, as one whose
+// librarian stands aside does.
 // scripts/bench-replay.ts copies this directory into a run's sandbox with the checkout's own recall.ts and
 // prompts.ts beside it. Kept in step with hooks/register.ts's `session.start` registration (tests/register-tools.test.ts checks
 // they register the same om_recall), its `tool.call` handler, and its om_recall `tool.describe` and
@@ -51,14 +53,15 @@ export const register: Register = (on) => {
           "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
           'what compaction removed from context and the transcripts this session was resumed or moved from, optionally its ' +
           'subagents. Search first, with 2 to 4 rare terms: a path, an identifier, a command, a piece of an error; quote a ' +
-          'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. The ' +
-          'best match comes first; a short block shows whole, a long one its best lines, which usually answer. It names ' +
+          'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. It ' +
+          'pastes the lines of the best hits that answer, whole, else shows each hit\'s best lines, and lists the rest. It names ' +
           'query terms that occur nowhere, so do not search again to confirm an absence. Read a block only when its excerpt ' +
           'is not enough, and only the lines you need. Outline only to orient, one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
             query: { type: 'string', maxLength: 500, description: '2 to 4 rare words or "quoted phrases", each matched as a case-insensitive substring: blocks holding all come first, then the best holding some, marked partial; or /regex/flags. E.g. a file name, an identifier, a piece of an error; with files, part of a path' },
+            need: { type: 'string', maxLength: 500, description: 'What you will do with the result, e.g. "re-run the brief command with the same flags" (search)' },
             mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query; read with a ref alone, like a79f045b:2133: a block, a page of lines at a time; else outline: a line per message or tool call. files: the files the session read, edited or wrote, each with the blocks that touched it' },
             ref: { type: 'string', description: 'A block reference from a search or outline, like a79f045b:2133, to read; a subagent tag alone, like a1b2c3d4, to outline its transcript' },
             lines: { type: 'string', description: 'Lines of the block to read, e.g. "1-200" or "201-" (read)' },

@@ -58,12 +58,22 @@ export type RecallInput = {
   from?: unknown
   to?: unknown
   subagents?: unknown
+  need?: unknown
 }
 export type Mode = 'search' | 'read' | 'outline' | 'files'
-export type RecallResult = { mode: Mode; text: string; matches: number }
+// `refs`: the blocks a search's answer names, its hits and any lines pasted from their calls or results.
+export type RecallResult = { mode: Mode; text: string; matches: number; refs?: string[]; hits?: Hits }
+// A search's hit as the librarian (librarian.ts) gets it: its block, the head of its excerpt with the excerpt's best
+// line, its place by score among the hits shown, and a subagent's block's thread, as `subagent <tag> (<what it did>)`.
+export type Listed = { block: Block; brief: string; rank: number; thread?: string }
+// A search's answer in its parts, for the librarian: the lines before the hits, the hits in the order shown, the lines
+// after them; and the `candidates` it gives Ember, the hits of the same search over the subagents' transcripts too.
+export type Hits = { query: string; need?: string; head: string[]; hits: Listed[]; notes: string[]; candidates: Listed[] }
+// What answers a search in place of its excerpts, or undefined to keep them.
+export type Librarian = (hits: Hits) => Promise<{ text: string; refs: string[] } | undefined>
 
 type Kind = 'user' | 'assistant' | 'call' | 'result' | 'memory' | 'summary'
-type Block = {
+export type Block = {
   ref: string
   kind: Kind
   text: string
@@ -139,7 +149,7 @@ function splitLines(text: string) {
   }
   return { lines, starts }
 }
-function linesOf(text: string) {
+export function linesOf(text: string) {
   return splitLines(text).lines
 }
 
@@ -1080,27 +1090,49 @@ async function search(c: Corpus, input: Input): Promise<RecallResult> {
           (stopped.left ? `, with ${plural(stopped.left, 'subagent transcript')} not searched` : '') +
           `: simplify the pattern, or search one transcript at a time, without "subagents": "from": "${stopped.b.ref}" searches the rest of this one`) +
     '.'
-  const out = [head]
+  const opening = [head]
   // Terms no block holds, whole or (a compound) by parts found anywhere: absent, so not worth searching for again.
   const absent = m.terms.filter((t, k) => !pool.some((h) => h.held[k]) && !(t.parts.length && t.parts.every((p) => pool.some((h) => flatOf(h.b).includes(p)))))
   if (absent.length) {
     const scope = input.from || input.to ? 'this range' : c.note ? 'the readable history' : c.subagents.length && !input.subagents ? 'the main transcript' : 'this session'
     const named = absent.slice(0, ABSENT_MAX).map((t) => (t.word.includes(' ') ? `"${t.word}"` : t.word))
-    out.push(`No occurrences in ${scope} of: ${named.join(', ')}${absent.length > ABSENT_MAX ? `, and ${absent.length - ABSENT_MAX} more` : ''}.`)
+    opening.push(`No occurrences in ${scope} of: ${named.join(', ')}${absent.length > ABSENT_MAX ? `, and ${absent.length - ABSENT_MAX} more` : ''}.`)
   }
-  out.push(...inOrder.map((h) => h.x!.text))
+  const notes: string[] = []
   if (rest.length)
-    out.push(
+    notes.push(
       older
         ? `${plural(rest.length, 'older match', 'older matches')} not shown; only if none above answers, repeat with "to": "${before!.ref}".`
         : `${plural(rest.length, 'more match', 'more matches')} not shown; only if none above answers, narrow the query or give "from" or "to".`,
     )
-  if (!input.subagents && c.subagents.length) out.push(`${plural(c.subagents.length, 'subagent transcript')} not searched: repeat with "subagents": true.`)
+  if (!input.subagents && c.subagents.length) notes.push(`${plural(c.subagents.length, 'subagent transcript')} not searched: repeat with "subagents": true.`)
+  const out = [...opening, ...inOrder.map((h) => h.x!.text), ...notes]
   if (lead && lead.x!.lines > 1 && lead.b.text.length > SEARCH_WHOLE_CHARS) {
     const n = lead.x!.lead + 1
     out.push(`Only if an excerpt is not enough, read just the lines you need: {"mode": "read", "ref": "${lead.b.ref}", "lines": "${Math.max(1, n - 10)}-${Math.min(lead.x!.lines, n + 10)}"}.`)
   }
-  return { mode: 'search', text: out.join('\n'), matches: count }
+  const listed = inOrder.map(
+    (h): Listed => ({ block: h.b, brief: briefOf(h.x!), rank: shown.indexOf(h), ...(h.t === c.main ? {} : { thread: threadOf(h.t) }) }),
+  )
+  return {
+    mode: 'search',
+    text: out.join('\n'),
+    matches: count,
+    refs: listed.map((h) => h.block.ref),
+    hits: { query: input.query!, ...(input.need ? { need: input.need } : {}), head: opening, hits: listed, notes, candidates: listed },
+  }
+}
+
+const threadOf = (t: Thread) => {
+  const what = t.label.replace(/^subagent /, '')
+  return `subagent ${t.tag}${what && !what.startsWith(t.tag) ? ` (${what})` : ''}`
+}
+
+// A hit in two lines: its excerpt's head and its best line.
+function briefOf(x: Excerpt) {
+  const [head, ...rows] = x.text.split('\n')
+  const best = rows.find((r) => r.startsWith(`  ${x.lead + 1}:`) || r.startsWith(`  ${x.lead + 1}-`)) ?? rows[0]
+  return best ? `${head}\n${best}` : head!
 }
 
 // ---- Read -------------------------------------------------------------------------------------------------------
@@ -1291,7 +1323,7 @@ async function files(c: Corpus, input: Input): Promise<RecallResult> {
 
 // ---- Entry ------------------------------------------------------------------------------------------------------
 
-type Input = { mode: Mode; query?: string; limit?: number; ref?: string; lines?: string; before?: number; after?: number; from?: string; to?: string; subagents: boolean }
+type Input = { mode: Mode; query?: string; need?: string; limit?: number; ref?: string; lines?: string; before?: number; after?: number; from?: string; to?: string; subagents: boolean }
 
 const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : typeof v === 'number' ? String(v) : undefined)
 const num = (v: unknown) => {
@@ -1301,7 +1333,7 @@ const num = (v: unknown) => {
 
 // The tool's input, loosely typed as a model sends it. A query alone searches, a ref alone reads, nothing outlines.
 export function parseInput(e: RecallInput): Input | string {
-  for (const key of ['query', 'mode', 'ref', 'lines', 'from', 'to'] as const) {
+  for (const key of ['query', 'need', 'mode', 'ref', 'lines', 'from', 'to'] as const) {
     const v = str(e[key])
     if (v && v.length > ARG_MAX_CHARS) return `om_recall: ${key} is at most ${ARG_MAX_CHARS} characters${key === 'query' ? '; search for its rarest words' : ''}.`
   }
@@ -1316,6 +1348,7 @@ export function parseInput(e: RecallInput): Input | string {
   return {
     mode,
     query,
+    need: str(e.need),
     limit: limit === undefined || limit < 1 ? undefined : Math.min(limit, SEARCH_MAX_HITS),
     ref,
     lines: str(e.lines),
@@ -1333,13 +1366,21 @@ function answeredThisTurn(t: Thread) {
   return asked < 0 ? 0 : t.blocks.slice(asked).filter((b) => b.own && b.kind === 'call' && b.pair).length
 }
 
-export async function recall(c: Corpus, e: RecallInput): Promise<RecallResult> {
+// With a `librarian`, what it answers a search with stands in for the hits' excerpts, unless it answers nothing. It
+// gets the hits of the same search over the subagents' transcripts too, which the excerpts leave out unless asked.
+export async function recall(c: Corpus, e: RecallInput, librarian?: Librarian): Promise<RecallResult> {
   const input = parseInput(e)
   if (typeof input === 'string') {
     const asked = str(e.mode)
     return { mode: asked === 'read' || asked === 'outline' || asked === 'files' ? asked : 'search', text: input, matches: 0 }
   }
-  const found = await (input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : input.mode === 'files' ? files(c, input) : outline(c, input))
+  let found = await (input.mode === 'search' ? search(c, input) : input.mode === 'read' ? read(c, input) : input.mode === 'files' ? files(c, input) : outline(c, input))
+  if (librarian && found.hits) {
+    const wide = !input.subagents && c.subagents.length ? (await search(c, { ...input, subagents: true })).hits : undefined
+    const hits = { ...found.hits, candidates: wide?.hits ?? found.hits.hits }
+    const pasted = hits.candidates.length ? await librarian(hits) : undefined
+    if (pasted) found = { ...found, ...pasted }
+  }
   const calls = answeredThisTurn(c.main)
   const nudge = calls >= TURN_CALLS ? `\nThis is om_recall call ${calls + 1} this turn: answer from what you have found unless a specific fact is still missing.` : ''
   // Each mode keeps under the cap; this holds it whatever the input.

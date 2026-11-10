@@ -1,6 +1,6 @@
 import type { EngineInterface, Hook, Register, SessionCompactInput, SessionCompactResult, SessionMessage, SessionUsage, ToolGroupCall, ToolResultSummary, TurnUsage } from 'claude-code'
 import { COMPACT_WRAPPER, COMPACTION_BRIEFING, OBSERVER_SYSTEM_PROMPT, observationsTrimmedLine, SESSION_SYSTEM_PROMPT, trimmedNote, TURN_END_NOTE } from './prompts'
-import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addCall, addRecall, duration, failureClass, flush, parseArgs, plural, record, report, statsDir } from './stats'
+import { add, addCacheUse, addCompaction, addRequest, clipLine, costOf, count, addCall, addRecall, duration, failureClass, flush, parseArgs, plural, record, RECALL_FOLLOW_CALLS, report, statsDir } from './stats'
 import type { Io, ModelCall } from './stats'
 import { errorText, key, KINDS, registerPrune } from './prune'
 import { registerNotes } from './notes'
@@ -8,8 +8,10 @@ import { atom, update } from 'claude-code'
 import { newWorker, registerWorkers, settled, started as startedWorker } from './workers'
 import type { Gauges } from './workers'
 import type { Worker } from '../types'
-import { COPY_ID, isMemoryText, liveTranscript, loadTranscript, recall, RECALL_TOOL, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
-import type { RecallIo, TranscriptCache } from './recall'
+import { COPY_ID, isMemoryText, liveTranscript, loadTranscript, parseInput, recall, RECALL_TOOL, originalId, refsOf, SEARCH_MAX_HITS, typedText } from './recall'
+import type { Hits, RecallInput, RecallIo, TranscriptCache } from './recall'
+import { librarian, LIBRARIAN_FORMAT, readLibrarianReply } from './librarian'
+import type { LibrarianReply } from './librarian'
 import { hashIndex, queryOf, suggest } from './hash-recall'
 import { withConstraints } from './spawn'
 import type { HashIndex } from './hash-recall'
@@ -112,6 +114,10 @@ const SESSION_MESSAGE_TOKENS = 300
 const SESSION_USER_TOKENS = 3_000
 const SESSION_MAX_CHARS = 300 // the line as stored, whatever the writer returns
 const SESSION_TIMEOUT_MS = 20_000 // a short reply from the user's messages: Ember takes ~1 s
+// om_recall's librarian: the agent waits on it. Over 25 replayed searches it took 0.7 to 3.4 s, 1.75 s at the median:
+// this lets one twice as slow as the slowest seen land, and holds what a call that never lands adds to a search
+// (which then answers with its excerpts) to a few seconds.
+const LIBRARIAN_TIMEOUT_MS = 8_000
 const REGISTER_WAIT_MS = 1_000 // how long session.start waits for om_recall to list; it takes ~50 ms
 const GIT_TIMEOUT_MS = 5_000 // each git call that reads the environment at compaction
 const GAUGES_RM_TIMEOUT_MS = 5_000 // the `rm` of an ended session's footer files, which session.end waits on
@@ -760,7 +766,7 @@ async function complete<T>($: EngineInterface, role: string, system: string, pro
 async function complete<T>($: EngineInterface, role: string, system: string, prompt: string, timeoutMs: number, call: Call, signal?: AbortSignal, structured?: Structured<T>) {
   let sent = 0
   const started = await $.clock.now()
-  const kind = role === 'session' ? 'session' : 'observer'
+  const kind = role === 'session' || role === 'librarian' ? role : 'observer'
   const note = (c: Partial<ModelCall>) =>
     recordStat($, (s, at) => addCall(s, { kind, ok: true, ms: at - started, ...call, ...c }, at))
   // Every failure, counted (with what it cost, once Ember answered) and logged, then thrown by the caller.
@@ -778,6 +784,7 @@ async function complete<T>($: EngineInterface, role: string, system: string, pro
   let r: EmberResponse
   try {
     if (signal?.aborted) throw signal.reason
+    // A missing key fails as itself (`no-key`); only the fetch's own failure is a network one.
     const request = emberKey($).then((key) => {
       if (signal?.aborted) throw signal.reason
       sent = ++emberRequests
@@ -795,10 +802,10 @@ async function complete<T>($: EngineInterface, role: string, system: string, pro
           prompt_cache_retention: '24h',
           ...(structured ? { text: { format: structured.format } } : {}),
         }),
+      }).catch((error) => {
+        if (signal?.aborted) throw error
+        throw new Error(`Ember request failed: ${errorText(error).replace(/^.*\$\.http\.fetch: /, '')}`) // a network failure, no reply
       })
-    }).catch((error) => {
-      if (signal?.aborted) throw error
-      throw new Error(`Ember request failed: ${errorText(error).replace(/^.*\$\.http\.fetch: /, '')}`) // a network failure, no reply
     })
     const res = await Promise.race([request, stopped])
     try {
@@ -833,6 +840,52 @@ async function complete<T>($: EngineInterface, role: string, system: string, pro
 }
 
 const OBSERVER_REPLY: Structured<ObserverReply> = { format: OBSERVER_FORMAT, read: readObserverReply }
+const LIBRARIAN_REPLY: Structured<LibrarianReply> = { format: LIBRARIAN_FORMAT, read: readLibrarianReply }
+
+// om_recall's librarian over a search's hits, its Ember call the `librarian` role's. When the call fails (complete()
+// logs and counts it), or the reply pastes nothing, the search answers with its excerpts as it would without it.
+async function librarianFor($: EngineInterface, hits: Hits) {
+  let failed = false
+  const ask = (system: string, input: string) =>
+    complete($, 'librarian', system, input, LIBRARIAN_TIMEOUT_MS, { phase: 'search' }, undefined, LIBRARIAN_REPLY).catch((error) => {
+      failed = true
+      throw error
+    })
+  try {
+    const r = await librarian(hits, ask)
+    if ('text' in r) return r
+    log($, `Ember librarian: nothing pasted (${r.fallback}); the search answers with its excerpts`)
+    recordStat($, (s) => count(s, `librarian.search.fallback.${r.fallback}`))
+  } catch (error) {
+    if (!failed) log($, `Ember librarian: ${errorText(error)}; the search answers with its excerpts`)
+  }
+  return undefined
+}
+
+// Whether a search is followed by a read of a block it named, within the loop's next RECALL_FOLLOW_CALLS tool calls,
+// as each request's tool calls show them (turn.step). A loop's searches are watched from their answer on, in memory:
+// those whose window a reload or the session's end cuts short go uncounted, and a turn's end closes the rest unread.
+const recallWindows = new Map<string, { refs: Set<string>; left: number }[]>()
+const noteFollow = ($: EngineInterface, read: boolean) => recordStat($, (s, at) => add(s, 'recall.readAfter', read ? 1 : 0, at))
+function followRecall($: EngineInterface, key: string, uses: readonly { name: string; input: unknown }[]) {
+  const open = recallWindows.get(key)
+  if (!open) return
+  for (const u of uses) {
+    const input = u.name === RECALL_TOOL_NAME ? parseInput((u.input ?? {}) as RecallInput) : undefined
+    const ref = typeof input === 'object' && input.mode === 'read' ? input.ref : undefined
+    for (const w of [...open]) {
+      const read = !!ref && w.refs.has(ref)
+      if (!read && --w.left > 0) continue
+      open.splice(open.indexOf(w), 1)
+      noteFollow($, read)
+    }
+  }
+  if (!open.length) recallWindows.delete(key)
+}
+function closeRecall($: EngineInterface, key: string) {
+  for (const _ of recallWindows.get(key) ?? []) noteFollow($, false)
+  recallWindows.delete(key)
+}
 
 type Call = { phase: ModelCall['phase']; chunkTokens?: number }
 
@@ -1604,9 +1657,8 @@ const transcripts = new Map<string, TranscriptCache>()
 const SESSION_START_SPINNER = 'Running SessionStart hooks'
 const staleSpinners = new Set<string>()
 
-function noteRecall($: EngineInterface, sessionId: string, result: string, fromFile: boolean) {
-  record(statsIo($), sessionId, (s, at) => addRecall(s, Number(result.match(/^(\d+) match/)?.[1] ?? 0), fromFile, at))
-  return result
+function noteRecall($: EngineInterface, sessionId: string, matches: number, fromFile: boolean) {
+  record(statsIo($), sessionId, (s, at) => addRecall(s, matches, fromFile, at))
 }
 
 // The transcript path this process last recorded per session: a turn's end records it again only when it changed.
@@ -2428,14 +2480,15 @@ export const register: Register = (on) => {
           "searches, reads and outlines this session's full transcript, which keeps every message and tool output whole: " +
           'what compaction removed from context and the transcripts this session was resumed or moved from, optionally its ' +
           'subagents. Search first, with 2 to 4 rare terms: a path, an identifier, a command, a piece of an error; quote a ' +
-          'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. The ' +
-          'best match comes first; a short block shows whole, a long one its best lines, which usually answer. It names ' +
+          'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. It ' +
+          'pastes the lines of the best hits that answer, whole, else shows each hit\'s best lines, and lists the rest. It names ' +
           'query terms that occur nowhere, so do not search again to confirm an absence. Read a block only when its excerpt ' +
           'is not enough, and only the lines you need. Outline only to orient, one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
             query: { type: 'string', maxLength: 500, description: '2 to 4 rare words or "quoted phrases", each matched as a case-insensitive substring: blocks holding all come first, then the best holding some, marked partial; or /regex/flags. E.g. a file name, an identifier, a piece of an error; with files, part of a path' },
+            need: { type: 'string', maxLength: 500, description: 'What you will do with the result, e.g. "re-run the brief command with the same flags" (search)' },
             mode: { type: 'string', enum: ['search', 'read', 'outline', 'files'], description: 'Default: search with a query; read with a ref alone, like a79f045b:2133: a block, a page of lines at a time; else outline: a line per message or tool call. files: the files the session read, edited or wrote, each with the blocks that touched it' },
             ref: { type: 'string', description: 'A block reference from a search or outline, like a79f045b:2133, to read; a subagent tag alone, like a1b2c3d4, to outline its transcript' },
             lines: { type: 'string', description: 'Lines of the block to read, e.g. "1-200" or "201-" (read)' },
@@ -2510,8 +2563,14 @@ export const register: Register = (on) => {
     }
     const fromFile = !!corpus?.main.blocks.length
     const rows = fromFile ? [] : await $.session.messages()
-    const found = await recall(fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, loopOf(sessionId)), 0).at, rows.length >= ROWS_CAP, () => $.clock.now()), e)
-    return { result: noteRecall($, sessionId, found.text, fromFile) }
+    const corpusNow = fromFile ? corpus! : liveTranscript(rows, view(rows, await loadMarks($, loopOf(sessionId)), 0).at, rows.length >= ROWS_CAP, () => $.clock.now())
+    const found = await recall(corpusNow, e, (hits) => librarianFor($, hits))
+    noteRecall($, sessionId, found.matches, fromFile)
+    if (found.mode === 'search' && found.refs?.length) {
+      const key = loopOf(sessionId, e.agentId).key
+      recallWindows.set(key, [...(recallWindows.get(key) ?? []), { refs: new Set(found.refs), left: RECALL_FOLLOW_CALLS }])
+    }
+    return { result: found.text }
   })
 
   on('tool.call', { tool: 'mcp__observational-memory__om_stats' }, async ($, e) => ({ result: await report(statsIo($), e) }))
@@ -2546,6 +2605,7 @@ export const register: Register = (on) => {
       $.clock.after(0, () => void noteCacheAt($, at))
     }
     const r = yield* next(e)
+    if (recallWindows.size) followRecall($, loopOf(await $.session.id(), e.agentId).key, r.toolUses)
     const usage = r.usage
     if (e.agentId === undefined && usage) $.clock.after(0, () => void noteCacheUse($, usage).catch((error) => log($, errorText(error))))
     return r
@@ -2554,6 +2614,7 @@ export const register: Register = (on) => {
   // A subagent's is its answer: its loop is done, and what it stored goes. A teammate's is one of many, as main's.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    if (recallWindows.size) closeRecall($, loopOf(await $.session.id(), e.agentId).key)
     try {
       const teammate = e.agentId !== undefined && (await $.agent.list()).some((a) => a.id === e.agentId && a.type === 'teammate')
       const { loop, stamp } = await current($, e.agentId)

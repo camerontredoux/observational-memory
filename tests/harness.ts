@@ -4,6 +4,7 @@ import type { Engine, MockClock } from 'claude-code/testing'
 import type { HttpResponse, On, ProcessRunResult, SessionMessage } from 'claude-code'
 import { SESSION_SYSTEM_PROMPT } from '../hooks/prompts'
 import { OBSERVER_FORMAT } from '../hooks/reply'
+import { LIBRARIAN_FORMAT } from '../hooks/librarian'
 import { originalId } from '../hooks/recall'
 import type { RecallIo } from '../hooks/recall'
 import { register as recallOnly } from './eval/recall-plugin/hooks/register'
@@ -50,7 +51,7 @@ export function emberResponse(text: string, end: { status?: string; incomplete_d
 // never answers outside its schema, so a test reply that does could not happen.
 function breaks(value: unknown, schema: Record<string, any>, at = 'reply'): string | undefined {
   if (schema.anyOf) return (schema.anyOf as Record<string, any>[]).every((s) => breaks(value, s, at)) ? `${at} matches no anyOf branch` : undefined
-  const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+  const type = value === null ? 'null' : Array.isArray(value) ? 'array' : Number.isInteger(value) && [schema.type].flat().includes('integer') ? 'integer' : typeof value
   if (![schema.type].flat().includes(type)) return `${at} is ${type}, not ${schema.type}`
   if (schema.enum && !schema.enum.includes(value)) return `${at} is ${JSON.stringify(value)}, not one of ${schema.enum.join(' ')}`
   if (schema.pattern && type === 'string' && !new RegExp(schema.pattern).test(value as string)) return `${at} ${JSON.stringify(value)} breaks ${schema.pattern}`
@@ -69,7 +70,7 @@ function breaks(value: unknown, schema: Record<string, any>, at = 'reply'): stri
   }
   return undefined
 }
-const SCHEMAS: Record<string, Record<string, any>> = { [OBSERVER_FORMAT.name]: OBSERVER_FORMAT.schema }
+const SCHEMAS: Record<string, Record<string, any>> = { [OBSERVER_FORMAT.name]: OBSERVER_FORMAT.schema, [LIBRARIAN_FORMAT.name]: LIBRARIAN_FORMAT.schema }
 
 // A test's reply written in the line format the plugin renders, as the JSON Ember answers to the request's schema
 // (`observer_reply`), so tests read as the memory they make. A section's unmarked line joins the
@@ -130,6 +131,8 @@ function asJson(text: string, schema: string | undefined) {
   }
   return JSON.stringify({ corrections, observations, continuation })
 }
+
+const ABANDONED = Symbol('abandoned')
 
 // An error reply from the API, as it answers one: `{ error: { code, message, type } }`.
 export const httpError = (status: number, code: string): HttpResponse => ({
@@ -222,6 +225,9 @@ export const NOT_A_REPO: Run = { exitCode: 128, stdout: '', stderr: 'fatal: not 
 // `stopped` counts the calls the plugin gave up on (a loop that ended, a deadline) before they answered: their
 // answers, once they come, are dropped. git, through `$.process.run`, is answered by `git`, else as outside a
 // repository. `$.model.complete` is counted, and answers nothing.
+// om_recall's librarian (its `librarian` schema) is answered by `librarian`: its reply as JSON or broken text, an
+// error reply, an Error for a request that fails, or a promise that never settles for a call the plugin gives up on.
+// By default it finds nothing, so a search answers with its excerpts. Its prompts go to `librarian`, apart.
 export function ember(
   on: On,
   options: {
@@ -230,9 +236,10 @@ export function ember(
     reply?: (prompt: string) => string | undefined
     git?: (argv: readonly string[]) => Run | undefined | Promise<Run | undefined>
     session?: (prompt: string) => string | HttpResponse
+    librarian?: (prompt: string) => string | HttpResponse | Error | Promise<never>
   } = {},
 ) {
-  const seen = { prompts: [] as string[], systems: [] as string[], calls: [] as EmberCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], cacheKeys: [] as string[] }
+  const seen = { librarian: [] as string[], librarianCalls: [] as EmberCall[], prompts: [] as string[], systems: [] as string[], calls: [] as EmberCall[], logs: [] as string[], screen: [] as string[], inFlight: 0, maxInFlight: 0, stopped: 0, modelCalls: 0, git: [] as (readonly string[])[], sessions: [] as string[], cacheKeys: [] as string[] }
   on('process.run', ($, e) => {
     if (e.argv[0] !== 'git') return { value: ran({ exitCode: 127, stdout: '', stderr: `${e.argv[0]}: not faked\n` }) }
     seen.git.push(e.argv)
@@ -262,6 +269,19 @@ export function ember(
       seen.sessions.push(prompt)
       const r = options.session?.(prompt) ?? 'Session: the test goal'
       return typeof r === 'string' ? emberResponse(r) : r
+    }
+    if (schema === LIBRARIAN_FORMAT.name) {
+      seen.librarian.push(prompt)
+      seen.librarianCalls.push({ body, headers })
+      const abandoned = new Promise<typeof ABANDONED>((resolve) => held.set(id, () => resolve(ABANDONED)))
+      try {
+        const r = await Promise.race([options.librarian?.(prompt) ?? JSON.stringify({ found: false, answer: 'Nothing here answers it.', ranges: [] }), abandoned])
+        if (r === ABANDONED) return seen.stopped++, httpError(499, 'abandoned')
+        if (r instanceof Error) throw r
+        return typeof r === 'string' ? emberResponse(structured(r, schema)) : r
+      } finally {
+        held.delete(id)
+      }
     }
     seen.prompts.push(prompt)
     seen.systems.push(system)

@@ -17,6 +17,8 @@ const HISTORICAL_SUFFIX = '-luna'
 const TRANSCRIPTS_SUFFIX = '-transcripts'
 
 export type Sample = [at: number, value: number]
+// The tool calls after an om_recall search watched for a read of a block it named (`recall.readAfter`).
+export const RECALL_FOLLOW_CALLS = 3
 export type Metric = { count: number; sum: number; min: number; max: number; recent: Sample[] }
 export type SessionStats = {
   version: 1
@@ -29,8 +31,8 @@ export type SessionStats = {
   metrics: Record<string, Metric>
 }
 export type ModelCall = {
-  kind: 'observer' | 'session'
-  phase: 'background' | 'compaction'
+  kind: 'observer' | 'session' | 'librarian'
+  phase: 'background' | 'compaction' | 'search'
   ok: boolean
   failure?: string
   ms: number
@@ -237,7 +239,7 @@ export function formatReport(title: string, merged: ReturnType<typeof merge>) {
   const { stats: s, sessions, approximate } = merged
   if (!sessions) return `${title}: no stats recorded yet.`
   // `reflector`: the removed Reflector's calls, as the stats written while it ran keep them.
-  const calls = countOf(s, /^(observer|reflector)\.\w+\.(failed\.)?ms$/)
+  const calls = countOf(s, /^(observer|reflector|librarian)\.\w+\.(failed\.)?ms$/)
   const failed = countOf(s, /\.failed\.ms$/)
   const compactions = countOf(s, /^compaction\.[\w-]+\.ms$/)
   const lines = [
@@ -325,7 +327,8 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const row = (label: string, text: string) => lines.push(`${label.padEnd(13)}${text}`)
   // Successful calls alone, unlike formatReport's total: a failed call records no cost, and the failures get their own row.
   const calls = countOf(s, /^(observer|reflector)\.\w+\.ms$/)
-  const cost = sumOf(s, '.cost')
+  const librarian = s.metrics['librarian.search.ms']
+  const cost = sumOf(s, '.cost') - (s.metrics['librarian.search.cost']?.sum ?? 0)
   if (calls) {
     const who = countOf(s, /^reflector\.\w+\.ms$/) ? 'observer and reflector call' : 'observer call'
     row('Cost', `${dollars(cost)} across ${plural(calls, who)} (about ${dollars(cost / calls)} each)`)
@@ -384,6 +387,19 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   if (problems.length) row('Problems', problems.join('; '))
   const recall = s.metrics['recall.matches']?.count
   if (recall) row('Recall', plural(recall, 'search', 'searches'))
+  // The librarian's calls that failed, and those whose reply pasted nothing: either way the search showed its excerpts.
+  const librarianBack = Object.entries(s.counts).flatMap(([k, n]) => {
+    const c = k.match(/^librarian\.search\.(?:failed|fallback)\.(.+)$/)?.[1]
+    return c ? [[c, n] as const] : []
+  })
+  const asked = (librarian?.count ?? 0) + (s.metrics['librarian.search.failed.ms']?.count ?? 0)
+  if (asked) {
+    const back = librarianBack.reduce((t, [, n]) => t + n, 0)
+    const spent = librarian ? `, ${dollars(s.metrics['librarian.search.cost']?.sum ?? 0)} in all, median ${duration(median(values(librarian)))}` : ''
+    row('  Librarian', `pasted lines for ${grouped(asked - back)} of ${plural(asked, 'search', 'searches')}${spent}${back ? `; fell back on ${grouped(back)} (${librarianBack.map(([c, n]) => `${c} ${n}`).join(', ')})` : ''}`)
+  }
+  const after = s.metrics['recall.readAfter']
+  if (after) row('  Read after', `${grouped(after.sum)} of ${plural(after.count, 'search', 'searches')} (${Math.round((after.sum / after.count) * 100)}%) followed within ${RECALL_FOLLOW_CALLS} tool calls by a read of a block it named`)
   if (approximate) lines.push('', `Splits and medians come from the newest ${SAMPLES} samples per metric per session.`)
   const again = (w: string) => `/om-stats ${[words, w].filter(Boolean).join(' ')}`
   lines.push('', `${again('full')} for every metric${words.split(' ').some((w) => w === 'all' || w === 'historical' || w === 'transcripts') ? '' : ' · /om-stats all for every session'}`)
