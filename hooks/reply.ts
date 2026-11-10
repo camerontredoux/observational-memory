@@ -100,7 +100,11 @@ export function readObserverReply(text: string): ObserverReply {
       (c.replaces?.trim() ? ` (replaces ${c.replaces.trim()})` : c.replaces_earlier?.trim() ? ` (this replaces the earlier constraint ${flat(c.replaces_earlier)})` : ''),
   )
   const state = reply.continuation as Continuation | null | undefined
-  const fields = state ? FIELDS.flatMap(([key, name]) => (state[key]?.trim() ? [`${name}: ${flat(state[key]!)}`] : [])) : []
+  // A null next_steps means the steps are done or dropped, so it is written as "none", which ends the ones carried from
+  // the record before. Any other null field is left out, and told_the_user carries from the record before.
+  const fields = state
+    ? FIELDS.flatMap(([key, name]) => (state[key]?.trim() ? [`${name}: ${flat(state[key]!)}`] : key === 'next_steps' ? [`${name}: none`] : []))
+    : []
   return { corrections, observations: list<Observation>(reply.observations).map(lineOf), ...(fields.length ? { continuation: fields.join('\n') } : {}) }
 }
 
