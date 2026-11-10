@@ -2624,16 +2624,17 @@ export const register: Register = (on) => {
       const at = await $.clock.now()
       $.clock.after(0, () => void noteCacheAt($, at))
     }
-    const key = loopOf(await $.session.id(), e.agentId).key
+    // A failed lookup must not stop the request: its text then goes unkept, and the librarian reads the transcript.
+    const key = await $.session.id().then((id) => loopOf(id, e.agentId).key, () => undefined)
     let text = ''
     let block = -1
     const r = yield* tap(next(e), (c) => {
       if (c.kind !== 'text') return
       text += (block >= 0 && c.index !== block ? '\n\n' : '') + c.text
       block = c.index
-      saidBy.set(key, text)
+      if (key !== undefined) saidBy.set(key, text)
     })
-    if (recallWindows.size) followRecall($, key, r.toolUses)
+    if (key !== undefined && recallWindows.size) followRecall($, key, r.toolUses)
     const usage = r.usage
     if (e.agentId === undefined && usage) $.clock.after(0, () => void noteCacheUse($, usage).catch((error) => log($, errorText(error))))
     return r
