@@ -54,8 +54,8 @@ describe('the handoff', () => {
     expect(recordIn(text)).toBe(
       `${WHERE}:\nActive: fixing the refresh bug\nNext steps: 1) run npm test -- src/auth; 2) commit as "fix(auth): check expiry"\nTold the user: the expiry check is in src/auth/refresh.ts:45`,
     )
-    expect(seen.systems[0]).toContain('\nNext steps: ')
-    expect(seen.systems[0]).toContain('\nTold the user: ')
+    expect(seen.systems[0]).toContain('\nnext_steps: ')
+    expect(seen.systems[0]).toContain('\ntold_the_user: ')
     expect(text).toContain("- Resume the record's active work from its next steps, in order.")
     expect(text).toContain('- Do not repeat or contradict what it says you told the user.')
   })

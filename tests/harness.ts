@@ -45,6 +45,60 @@ export function emberResponse(text: string, end: { status?: string; incomplete_d
   }
   return { status: 200, ok: true, headers: { 'content-type': 'application/json' }, text: JSON.stringify(body) }
 }
+// A test's reply written in the line format the plugin renders, as the JSON Ember answers to the request's schema
+// (`observer_reply` or `reflector_reply`), so tests read as the memory they make. A section's unmarked line joins the
+// line before. A reply with no section tag and no marked line stays as written: text that is not JSON, as a broken
+// reply would be. One already JSON is sent as it is.
+const SECTION = /^[ \t]*<(\/?)(observations|corrections|continuation|current-task)>[ \t]*$/i
+const MARKED = /^[ \t]*(?:[-*][ \t]*)?(🔴|🟡|🟢|✅)[ \t]*(\d{4}-\d\d-\d\d \d\d:\d\d)?[ \t]*(.*)$/u
+const STATE_FIELDS: Record<string, string> = { active: 'active', completed: 'completed', 'next steps': 'next_steps', 'told the user': 'told_the_user', blocked: 'blocked', 'waiting for user': 'waiting_for_user' }
+export function structured(text: string, schema: string | undefined) {
+  if (!schema || text.trimStart().startsWith('{')) return text
+  const by: Record<string, string[]> = {}
+  let at = ''
+  for (const line of text.split('\n')) {
+    const t = line.match(SECTION)
+    if (t) at = t[1] ? '' : t[2]!.toLowerCase()
+    else if (line.trim()) (by[at] ??= []).push(line)
+  }
+  const tagged = SECTION.test(text) || text.split('\n').some((l) => SECTION.test(l))
+  const marked = (lines: string[] = []) => {
+    const out: { priority: string; time: string | null; text: string }[] = []
+    for (const line of lines) {
+      const m = line.match(MARKED)
+      if (m) out.push({ priority: m[1]!, time: m[2] ?? null, text: m[3]!.trim() })
+      else if (out.length) out.at(-1)!.text += ` ${line.trim()}`
+      else out.push({ priority: '', time: null, text: line.trim() }) // an unmarked first line, as Ember never writes
+    }
+    return out
+  }
+  const observations = marked(by.observations ?? (by.observations === undefined && !text.match(/<observations>/i) ? by[''] : []))
+  if (!tagged && !observations.some((o) => o.priority)) return text
+  if (schema === 'reflector_reply')
+    return JSON.stringify({
+      observations: observations.map(({ text, ...o }) => {
+        const m = text.match(/^(.*?)\s*\(source ([^)]*)\)$/)
+        return { ...o, text: m ? m[1]! : text, source: m ? m[2]! : null }
+      }),
+    })
+  const corrections = marked(by.corrections).map((c) => {
+    const m = c.text.match(/^User:\s*"(.*)"\s*(?:\(replaces (\S+?)\)|\(this replaces the earlier constraint (.*)\))?$/)
+    return { time: c.time, quote: m ? m[1]! : c.text, replaces: m?.[2] ?? null, replaces_earlier: m?.[3] ?? null }
+  })
+  const state = by.continuation ?? by['current-task']
+  let continuation: Record<string, string | null> | null = null
+  if (state) {
+    continuation = Object.fromEntries(Object.values(STATE_FIELDS).map((k) => [k, null]))
+    let last = 'active'
+    for (const line of state) {
+      const m = line.match(/^[ \t]*(?:[-*][ \t]+)?(active|completed|blocked|waiting for user|next steps|told the user)[ \t]*:(.*)$/i)
+      if (m) continuation[(last = STATE_FIELDS[m[1]!.toLowerCase()]!)] = m[2]!.trim()
+      else continuation[last] = `${continuation[last] ?? ''} ${line.trim()}`.trim()
+    }
+  }
+  return JSON.stringify({ corrections, observations, continuation })
+}
+
 // An error reply from the API, as it answers one: `{ error: { code, message, type } }`.
 export const httpError = (status: number, code: string): HttpResponse => ({
   status,
@@ -171,6 +225,7 @@ export function ember(
     const id = Number(headers['X-OM-Request'])
     const [system, prompt] = [String(body.instructions ?? ''), String(body.input ?? '')]
     seen.cacheKeys.push(String(body.prompt_cache_key))
+    const schema = (body.text as { format?: { name?: string } } | undefined)?.format?.name
     if (system === SESSION_SYSTEM_PROMPT) {
       seen.sessions.push(prompt)
       const r = options.session?.(prompt) ?? 'Session: the test goal'
@@ -204,7 +259,7 @@ export function ember(
         options.reply?.(prompt) ??
         `<observations>\n${[...prompt.matchAll(/^\[User(?: @ ([\d-]+ [\d:]+))?\]: (\w+)$/gm)].map((m) => `* 🔴 ${m[1] ?? ''} User: "${m[2]}"`).join('\n')}\n</observations>\n` +
         `<continuation>\nActive: ${[...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].at(-1)?.[1]}\n</continuation>`
-    return emberResponse(text)
+    return emberResponse(structured(text, schema))
   }
   on('model.complete', () => (seen.modelCalls++, { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }))
   on('ui.log', ($, e) => ((e.to === 'debug' ? (seen.logs.push(e.text), gaveUp(e.text)) : seen.screen.push(e.text)), { value: undefined }))

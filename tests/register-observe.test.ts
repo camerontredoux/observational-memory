@@ -1,3 +1,4 @@
+import { OBSERVER_FORMAT } from '../hooks/reply'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 import { BRIEF_NOTE, BRIEF_RECALL_NOTE, COMPACT_WRAPPER, FLOOR_NOTE, MEMORY_HEADER } from '../hooks/prompts'
@@ -61,7 +62,7 @@ describe('register: observe', () => {
     expect(seen.prompts[1]).not.toContain('User: "a"') // a pure mapper: no observations so far
     expect(seen.systems[0]).toContain('pure mapper over this chunk')
     expect(seen.calls[0]!.headers).toEqual({ Authorization: 'Bearer test-key', 'Content-Type': 'application/json', 'X-OM-Request': '1' }) // the key file's line, trimmed
-    expect(seen.calls[0]!.body).toEqual({ model: 'muse-ember-1.0', instructions: seen.systems[0], input: seen.prompts[0], reasoning: { effort: 'low' }, max_output_tokens: 32_000, store: false, prompt_cache_key: 'om-observer', prompt_cache_retention: '24h' })
+    expect(seen.calls[0]!.body).toEqual({ model: 'muse-ember-1.0', instructions: seen.systems[0], input: seen.prompts[0], reasoning: { effort: 'low' }, max_output_tokens: 32_000, store: false, prompt_cache_key: 'om-observer', prompt_cache_retention: '24h', text: { format: OBSERVER_FORMAT } })
     expect(seen.cacheKeys).toEqual(['om-observer', 'om-observer']) // every Observer call shares one cache key
     expect(seen.modelCalls).toBe(0)
     expect(seen.logs).toContain('Ember observer: 9206 in, 3072 cached, 558 out, $0.0012, 0s')
@@ -330,52 +331,6 @@ describe('register: observe', () => {
     expect(correctionsIn(text)).toBe('* 🔴 User: "a"\n* 🔴 User: "b"')
   })
 
-  test('a reply with no tags at all is observed from its marked lines; unclosed sections still keep apart', async ($, on) => {
-    mock.clock(on)
-    world(on)
-    const seen = ember(on, {
-      reply: (prompt) => {
-        const name = prompt.match(/^\[User\]: (\w+)$/m)?.[1]
-        return name === 'a'
-          ? `Here are the observations:\n* 🟡 Saw a\n  * -> read a.ts`
-          : `<corrections>\n* 🔴 User: "b"\n<observations>\n* 🔴 User: "b"\n<continuation>\nActive: b`
-      },
-    })
-
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
-
-    expect(seen.prompts).toHaveLength(2)
-    const text = result.messages?.[0]?.text ?? ''
-    expect(observationsIn(text)).toBe('* 🟡 Saw a; read a.ts\n* 🔴 User: "b"')
-    expect(correctionsIn(text)).toBe('* 🔴 User: "b"')
-    expect(text).not.toContain('"b"; ')
-  })
-
-  test('an unmarked line continues the observation before it, but after a 🔴 line stands as its own 🟡 line; each is logged and counted', async ($, on) => {
-    const clock = mock.clock(on)
-    const { files } = world(on)
-    const seen = ember(on, {
-      reply: () =>
-        '<corrections>\n* 🔴 User: "use pnpm, never npm"\nUser: "and keep the lockfile"\n</corrections>\n' +
-        '<observations>\n* 🔴 User: "a"\nUser asked for b\n* 🟡 Read a.ts\n  and found the bug\n</observations>',
-    })
-
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a: use pnpm, never npm', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
-
-    const text = result.messages?.[0]?.text
-    expect(correctionsIn(text)).toBe('* 🔴 User: "use pnpm, never npm"')
-    expect(observationsIn(text)).toBe('* 🔴 User: "a"\n* 🟡 User asked for b\n* 🟡 Read a.ts; and found the bug\n* 🟡 User: "and keep the lockfile"')
-    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
-      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User: \\"and keep the lockfile\\""',
-      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User asked for b"',
-      'an unmarked line in the observer reply for rows 0-3 joined the line before it: "and found the bug"',
-    ])
-    await clock.advance(5_000)
-    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
-    expect(stats.counts['observer.compaction.merged']).toBe(1)
-    expect(stats.counts['observer.compaction.orphaned']).toBe(2)
-  })
-
   test("a 🔴 line is kept when the user said it, quoted or in other words, and kept as 🟡 when no user message bears it out; each is logged and counted", async ($, on) => {
     const clock = mock.clock(on)
     const { files } = world(on)
@@ -504,31 +459,6 @@ describe('register: observe', () => {
     expect(Object.entries(stats.counts).filter(([k]) => k.endsWith('.restated'))).toEqual([['observer.background.restated', 1]])
   })
 
-  test("a 🔴 correction whose quote runs over several lines stays one line; after its closing quote an unmarked line is its own 🟡 line", async ($, on) => {
-    const clock = mock.clock(on)
-    const { files } = world(on)
-    const seen = ember(on, {
-      reply: () =>
-        '<corrections>\n* 🔴 User: "Go a bit deeper yes please.\nI want you to compare them\nside by side." (replaces k1)\nUser asked for a table\n</corrections>\n' +
-        '<observations>\n* 🟡 Saw a\n</observations>',
-    })
-
-    const result = await $.session.compact({ trigger: 'manual', messages: [...turn('Go a bit deeper yes please.\nI want you to compare them\nside by side.', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
-
-    const text = result.messages?.[0]?.text
-    expect(correctionsIn(text)).toBe('* 🔴 User: "Go a bit deeper yes please.; I want you to compare them; side by side."')
-    expect(observationsIn(text)).toBe('* 🟡 Saw a\n* 🟡 User asked for a table')
-    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
-      'an unmarked line in the observer reply for rows 0-3 continued the open quote of the 🔴 line before it: "I want you to compare them"',
-      'an unmarked line in the observer reply for rows 0-3 continued the open quote of the 🔴 line before it: "side by side.\\" (replaces k1)"',
-      'an unmarked line in the observer reply for rows 0-3 followed a 🔴 line; kept as its own 🟡 line: "User asked for a table"',
-    ])
-    await clock.advance(5_000)
-    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
-    expect(stats.counts['observer.compaction.merged']).toBe(2)
-    expect(stats.counts['observer.compaction.orphaned']).toBe(1)
-  })
-
   test('at compaction, a gap with nothing to show (thinking-only rows) is observed with no Observer call', async ($, on) => {
     mock.clock(on)
     world(on)
@@ -547,25 +477,24 @@ describe('register: observe', () => {
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(5))
   })
 
-  test('an empty <observations> block and corrections alone are valid replies; marker-only and timestamp-only lines are not', async ($, on) => {
+  test('an empty observations list, corrections alone, and observations with no text are valid replies with nothing new', async ($, on) => {
     mock.clock(on)
     world(on)
     const correction = '🔴 User: "Never touch the migrations folder"'
     const replies: Record<string, string> = {
-      a: '<observations></observations>',
-      b: `<corrections>\n* ${correction}\n</corrections>\n<observations>\n</observations>`,
-      c: '<observations>\n* 🔴\n* 🟡 2026-09-22 14:30\n</observations>',
+      a: JSON.stringify({ corrections: [], observations: [], continuation: null }),
+      b: JSON.stringify({ corrections: [{ time: null, quote: 'Never touch the migrations folder', replaces: null, replaces_earlier: null }], observations: [], continuation: null }),
+      c: JSON.stringify({ corrections: [], observations: [{ priority: '🟡', time: null, text: ' ' }, { priority: '🟡', time: '2026-09-22 14:30', text: '' }], continuation: null }),
     }
     const seen = ember(on, { reply: (prompt) => replies[prompt.match(/^\[User\]: (\w+)/m)![1]!] })
     const messages = [...turn('a', 'a', CHUNK), ...turn('b: Never touch the migrations folder', 'b', CHUNK), ...turn('c', 'c', CHUNK), ...turn('d', 'd', 8_000)]
 
     const result = await $.session.compact({ trigger: 'manual', messages })
 
-    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([expect.stringMatching(/^retrying rows 7-11 /)])
-    expect(seen.logs).toContain('observation of rows 7-11 at compaction failed (observer answered without an <observations> block); left unobserved')
+    expect(seen.logs.filter((l) => l.startsWith('retrying rows') || l.includes('failed'))).toEqual([])
     const text = noReplies(result.messages?.[0]?.text)
     expect(text).toContain(`<corrections>\n* ${correction}\n</corrections>\n\n<observations>\n\n</observations>`)
-    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(7))
+    expect(originals(result.messages?.slice(1))).toEqual(messages.slice(11))
   })
 
   test('the reply ending each turn that left context is quoted before the observations, carried forward, the newest within its cap', async ($, on) => {
@@ -643,10 +572,10 @@ describe('register: observe', () => {
     expect(text).not.toContain('<your-replies>')
   })
 
-  test('a reply with no observations stays rejected, and the debug log keeps how it began', async ($, on) => {
+  test('a reply that is not the JSON its schema asks for fails its call, and the debug log keeps how it began', async ($, on) => {
     mock.clock(on)
     world(on)
-    const reply = `<observations>\nNothing worth noting.\n${'x'.repeat(600)}`
+    const reply = `Nothing worth noting.\n${'x'.repeat(600)}`
     const seen = ember(on, { reply: () => reply })
     on('session.compact', () => ({ messages: [{ role: 'user' as const, text: 'built-in summary', toolUses: [] }] }))
     const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)]
@@ -657,9 +586,8 @@ describe('register: observe', () => {
     expect(observationsIn(result.messages![0]!.text)).toBe('')
     expect(briefIn(result.messages![0]!.text)).toContain('\n- said: a')
     expect(originals(result.messages?.slice(1))).toEqual(messages.slice(3))
-    const rejected = seen.logs.filter((l) => l.startsWith('observer reply without observations'))
-    expect(rejected).toHaveLength(2) // the call and its retry
-    expect(rejected[0]).toBe(`observer reply without observations (${reply.length} chars), began: ${JSON.stringify(reply.slice(0, 500))}`)
+    expect(seen.logs.filter((l) => /^Ember observer #\d+ failed \(bad-json\)/.test(l)).length).toBeGreaterThan(0)
+    expect(seen.logs).toContainEqual(expect.stringContaining(`Ember reply was not the JSON its schema asks for: ${JSON.stringify(reply.slice(0, 80))}`))
   })
 
   test('at compaction, a chunk whose Ember call timed out is not observed again', async ($, on) => {
@@ -832,7 +760,7 @@ describe('register: observe', () => {
     const seen = ember(on, {
       reply: (prompt) =>
         prompt.includes('[User @ 2026-09-22 14:30]: a')
-          ? '<observations>\n* 🔴 2026-09-22 14:30 User said "a"\n* 🟡 2019-01-01 00:00 Too early\n* 🟢 2026-02-30 10:00 Not a date\n* ✅ Untimed\n  * -> a detail\n</observations>'
+          ? '<observations>\n* 🔴 2026-09-22 14:30 User said "a"\n* 🟡 2019-01-01 00:00 Too early\n* 🟢 2026-02-30 10:00 Not a date\n* ✅ Untimed; a detail\n</observations>'
           : '<observations>\n</observations>',
     })
     const runTurn = live(on, clock, history)

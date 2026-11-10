@@ -259,22 +259,21 @@ describe('register: user-messages', () => {
     expect(kept[0]!.startsWith('brief ')).toBe(true)
   })
 
-  test('only 🔴 corrections are quoted; the observer reserves 🔴 for the user\'s constraints', async ($, on) => {
+  test('corrections are quoted as 🔴 lines; the observer reserves 🔴 for the user\'s constraints', async ($, on) => {
     mock.clock(on)
     world(on)
     const seen = ember(on, {
-      reply: () => '<corrections>\n* 🔴 User: "use pnpm, never npm"\n* 🟡 User: "I meant the other file"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
+      reply: () => '<corrections>\n* 🔴 User: "use pnpm, never npm"\n</corrections>\n<observations>\n* 🟡 Saw\n</observations>',
     })
 
     const result = await $.session.compact({ trigger: 'manual', messages: [...turn('a\nuse pnpm, never npm', 'a', CHUNK), ...turn('b', 'b', 8_000)] })
 
     expect(result.messages?.[0]?.text).toContain('<corrections>\n* 🔴 User: "use pnpm, never npm"\n</corrections>')
-    expect(result.messages?.[0]?.text).not.toContain('I meant the other file')
     expect(seen.systems[0]).toContain("🔴 The user's standing constraints: a rule, preference, prohibition or scope limit the user set that stays in force, or the user's correction of their own earlier instruction. A one-time go-ahead for one action is not one, nor a report that something does not work, nor a correction of a fact the assistant got wrong.")
     expect(seen.systems[0]).toContain('A report of a problem ("that didn\'t work", "I still see the old rows", "now it shows twice") is not a correction either')
     expect(seen.systems[0]).toContain('A one-time go-ahead or approval of one action ("go for it", "yes do it", "ok", "push it", "run the tests", "kill those processes") is not a correction')
     expect(seen.systems[0]).toContain('A one-time approval or go-ahead ("yes, push it") never replaces, retracts or relaxes a listed constraint')
-    expect(seen.systems[0]).toContain('* 🟡 2026-09-23 14:36 User approved adding the expiry check the assistant proposed for refreshToken()')
+    expect(seen.systems[0]).toContain('{"priority": "🟡", "time": "2026-09-23 14:36", "text": "User approved adding the expiry check the assistant proposed for refreshToken()"}')
     expect(seen.systems[0]).not.toContain('suggested-response')
   })
 

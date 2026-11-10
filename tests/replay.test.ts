@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
-import { EMBER_KEY_PATH, EMBER_URL, emberResponse } from './harness'
+import { EMBER_KEY_PATH, EMBER_URL, emberResponse, structured } from './harness'
 import {
   chainSpec,
   chainTranscripts,
@@ -200,7 +200,7 @@ describe('the om chain through hooks/register.ts', () => {
       const words = [...prompt.matchAll(/^\[User[^\]]*\]: (\w+)$/gm)].map((m) => m[1]!)
       if (!session) observed.push(words)
       const text = session ? 'Session: replay goal' : `<observations>\n${words.map((w) => `* 🔴 Saw ${w}`).join('\n') || '* 🟡 Nothing'}\n</observations>\n<continuation>\nActive: ${words.at(-1)}\n</continuation>`
-      return { value: emberResponse(text) }
+      return { value: emberResponse(structured(text, (body as { text?: { format?: { name?: string } } }).text?.format?.name)) }
     })
 
     const inputs: string[][] = []

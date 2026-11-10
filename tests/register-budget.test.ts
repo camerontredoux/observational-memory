@@ -347,7 +347,7 @@ describe('register: budget', () => {
   test("constraints over their own cap shorten, the oldest first, to om_recall index lines: one the work in view names, and the newest that fit, stay whole; the ledger keeps every one whole", async ($, on) => {
     mock.clock(on)
     const { history, stored } = world(on)
-    const long = (i: number) => `🔴 User: "Leave module ${i} as it is, ${'and do not touch its tests or its fixtures '.repeat(9)}"`
+    const long = (i: number) => `🔴 User: "Leave module ${i} as it is, ${'and do not touch its tests or its fixtures '.repeat(9).trim()}"`
     const named = '🔴 User: "Keep src/widget_registry.ts as it is: widget_registry is public"'
     const corrections = [named, ...Array.from({ length: 100 }, (_, i) => long(i))]
     const seen = ember(on, {

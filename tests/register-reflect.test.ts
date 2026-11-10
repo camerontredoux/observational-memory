@@ -418,7 +418,7 @@ describe('register: reflect', () => {
 
     const reflections = seen.prompts.filter((p) => p.startsWith('## OBSERVATIONS'))
     expect(reflections).toHaveLength(2)
-    expect(reflections[1]).toContain('The previous reply had no usable <observations> block.')
+    expect(reflections[1]).toContain('The previous reply had no observations.')
     const ledger = stored['ledger:session-1'] as Ledger
     expect(ledger.entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual(['🟡 2026-09-22 14:30 Read files'])
     expect(ledger.corrections).toEqual([]) // the Reflector's is not the user's
@@ -438,33 +438,6 @@ describe('register: reflect', () => {
     expect(reflector).toContain('You are the reflection agent')
     expect(markers(reflector)).toHaveLength(4)
     expect(markers(reflector)).toEqual(markers(observer))
-  })
-
-  test('an unmarked line in a reflection continues the line before it, but after a 🔴 line stands as its own 🟡 line', async ($, on) => {
-    const clock = mock.clock(on)
-    const { history, stored, files } = world(on)
-    const seen = ember(on, {
-      reply: () => `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`,
-      reflect: (n, prompt) => nearTarget(prompt, '* 🔴 2026-09-22 14:30 Use pnpm\nnever npm\n* 🟡 2026-09-22 14:30 Read files\nand a.ts'),
-    })
-    const runTurn = live(on, clock, history)
-
-    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await clock.settle()
-
-    expect((stored['ledger:session-1'] as Ledger).entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
-      '🟡 2026-09-22 14:30 Use pnpm',
-      '🟡 2026-09-22 14:30 never npm',
-      '🟡 2026-09-22 14:30 Read files; and a.ts',
-    ])
-    expect(seen.logs.filter((l) => l.startsWith('an unmarked line'))).toEqual([
-      'an unmarked line in the reflector reply at level 1 followed a 🔴 line; kept as its own 🟡 line: "never npm"',
-      'an unmarked line in the reflector reply at level 1 joined the line before it: "and a.ts"',
-    ])
-    await clock.advance(5_000)
-    const stats = JSON.parse(files['/stats/session-1.json']!) as { counts: Record<string, number> }
-    expect(stats.counts['reflector.background.merged']).toBe(1)
-    expect(stats.counts['reflector.background.orphaned']).toBe(1)
   })
 
   test('a reflection in the older date-group form, which the prompts no longer ask for, is still read', async ($, on) => {

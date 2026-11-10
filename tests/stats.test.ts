@@ -60,7 +60,7 @@ describe('stats', () => {
     expect(failureClass('Ember HTTP 429: rate_limit_exceeded')).toBe('http-429')
     expect(failureClass('Ember completed with no message')).toBe('no-message')
     expect(failureClass('Ember has no API key: write it to ~/.config/observational-memory/muse-api-key')).toBe('no-key')
-    expect(failureClass('observer answered without an <observations> block')).toBe('no-observations')
+    expect(failureClass('Ember reply was not the JSON its schema asks for: "<observations>"')).toBe('bad-json')
     expect(failureClass('process timed out after 120000ms')).toBe('timeout')
   })
 

@@ -95,7 +95,7 @@ export function failureClass(message: string) {
   if (ended) return `stop-${ended[1]}`
   if (message.startsWith('Ember has no API key')) return 'no-key'
   if (message.includes('with no message')) return 'no-message'
-  if (message.includes('<observations>')) return 'no-observations'
+  if (message.includes('not the JSON its schema asks for')) return 'bad-json'
   return 'error'
 }
 
