@@ -65,7 +65,9 @@ workflow agent's id.
 
 A subagent that reads fast fills its window before background chunks land. For example, Explore `a1a60770` grew
 from 16k to 152k tokens in 65 s. At its compaction more than `RAW_MAX_TOKENS` was unobserved, so it observed on the
-spot. `MAX_PARALLEL` is shared across the main loop and every subagent. Two changes could help, each with a cost:
+spot. `MAX_PARALLEL` is shared across the main loop and every subagent. A subagent is now observed in the background
+only once its context is within `SUBAGENT_OBSERVE_TOKENS` of its compaction point (most answer before compacting),
+so a fast one observes more on the spot. Two changes could help, each with a cost:
 
 - Let the raw tail grow to what the budget leaves after the memory message. The compacted context is then larger,
   and the next compaction comes sooner.

@@ -598,97 +598,109 @@ describe('register: observe', () => {
     expect(seen.logs).toContainEqual(expect.stringContaining(`Ember reply was not the JSON its schema asks for: ${JSON.stringify(reply.slice(0, 80))}`))
   })
 
-  test('at compaction, a chunk whose Ember call timed out is not observed again', async ($, on) => {
+  test('at compaction, a chunk whose Ember call timed out is observed again once, inside the deadline', async ($, on) => {
     const clock = mock.clock(on)
-    const { history } = world(on)
-    let failing = false
-    const seen = ember(on, { fail: () => (failing ? new Error('request timed out') : undefined) })
-    const runTurn = live(on, clock, history)
-
-    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await runTurn($, turn('b', 'b', 8_000), at(22, 15, 0))
-    await clock.settle()
-    const before = seen.prompts.length
-    failing = true
-    history.push(...turn('c', 'c', CHUNK * 4), ...turn('d', 'd', 8_000))
-    await $.session.compact({ trigger: 'manual', messages: [...history] })
-
-    const failures = seen.logs.filter((l) => l.includes('at compaction failed'))
-    expect(failures.length).toBeGreaterThan(0)
-    expect(seen.prompts.length - before).toBe(failures.length)
-    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
-  })
-
-  test('observation at compaction ends by its deadline: a call still running is killed and its rows briefed, and a chunk waiting behind it is not counted as observed', async ($, on) => {
-    const clock = mock.clock(on)
-    const { files } = world(on)
+    world(on)
     const { gate } = gates()
     const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined) })
-    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
-    const compacting = $.session.compact({ trigger: 'manual', messages })
-    await clock.advance(29_999)
+    const compacting = $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
+    await clock.advance(9_999)
     expect([seen.prompts.length, seen.inFlight]).toEqual([2, 1]) // rows 3-7 answered, rows 0-3 held
     await clock.advance(1)
     const result = await compacting
 
-    expect(seen.stopped).toBe(1)
-    expect(seen.logs).toContain("observation of rows 0-3 at compaction failed (the compaction's 30s deadline passed); left unobserved")
-    expect(seen.logs.at(-2)).toMatch(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, /)
-    expect(seen.logs.at(-1)).toBe('Compacted in 30.0 s · memory 0 notes · 7 messages in a brief compiled by code (the Observer failed)')
-    expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
-    expect(seen.screen).toEqual(["Observation failed (the compaction's 30s deadline passed) and put 3 messages in the session brief"])
-    await clock.advance(5_000)
-    const stats = JSON.parse(files['/stats/session-1.json']!)
-    expect(stats.counts['compaction.manual.deadlineHit']).toBe(1)
-    expect([stats.metrics['compaction.manual.rowsObservedNow'].sum, stats.metrics['compaction.manual.rowsObservedBefore'].sum]).toEqual([0, 0])
-    expect(stats.metrics['compaction.manual.syncMs'].sum).toBe(30_000)
+    expect(seen.prompts).toHaveLength(3)
+    expect(seen.logs).toContain('retrying rows 0-3 at compaction once (Ember timed out after 10000 ms)')
+    expect(seen.logs.filter((l) => l.includes('at compaction failed'))).toEqual([])
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "a"')
+    expect(seen.logs.at(-1)).toMatch(/^Compacted in 10.0 s · observed 7 messages on the spot/)
   })
 
-  test('at compaction, a chunk that fails with less time left than a call takes is not observed again', async ($, on) => {
+  test('at compaction, a chunk whose call and its one retry both time out is briefed by code, well inside the deadline', async ($, on) => {
     const clock = mock.clock(on)
-    world(on)
-    const { gate, open } = gates()
-    const seen = ember(on, { hold: (n) => (n === 1 ? gate(1) : undefined), fail: (n) => (n === 1 ? new Error('network down') : undefined) })
+    const { files } = world(on)
+    const { gate } = gates()
+    const seen = ember(on, { hold: (n, prompt) => (prompt.includes(']: a\n') ? gate(n) : undefined) })
+    const messages = [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)]
 
-    const compacting = $.session.compact({ trigger: 'manual', messages: [...turn('a', 'a', CHUNK), ...turn('b', 'b', CHUNK), ...turn('c', 'c', 8_000)] })
-    await clock.advance(26_000) // past the deadline less a call's 5 s
-    open(1)
-    await compacting
+    const compacting = $.session.compact({ trigger: 'manual', messages })
+    await clock.advance(10_000)
+    expect([seen.prompts.length, seen.inFlight]).toEqual([3, 1]) // rows 3-7 answered, rows 0-3 sent again and held
+    await clock.advance(10_000)
+    const result = await compacting
 
-    expect(seen.prompts).toHaveLength(2)
-    expect(seen.logs.filter((l) => l.startsWith('retrying rows'))).toEqual([])
-    expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (Ember request failed: network down); left unobserved')
+    expect(seen.stopped).toBe(2)
+    expect(seen.logs).toContain('observation of rows 0-3 at compaction failed (Ember timed out after 10000 ms); left unobserved')
+    expect(seen.logs.at(-2)).toMatch(/^the floor \(the Observer failed\): 7 rows compiled into the session brief, /)
+    expect(seen.logs.at(-1)).toBe('Compacted in 20.0 s · memory 0 notes · 7 messages in a brief compiled by code (the Observer failed)')
+    expect(briefIn(result.messages![0]!.text)).toStartWith(FLOOR_NOTE)
+    expect(seen.screen).toEqual(['Observation failed (timeout after 10.0 s) and put 3 messages in the session brief'])
+    await clock.advance(5_000)
+    const stats = JSON.parse(files['/stats/session-1.json']!)
+    expect(stats.counts['compaction.manual.deadlineHit']).toBeUndefined()
+    expect(stats.metrics['compaction.manual.syncMs'].sum).toBe(20_000)
   })
 
   // The hook's budget runs on through a wait that is not a `$` call: a compaction that waited on the background call
   // alone outran it and fell back to the built-in compaction.
-  test('compaction observes the rows of a background call in flight itself, and a background call that lands first stops its own', async ($, on) => {
+  test("compaction waits a call's time on a background call in flight over its rows, then observes them itself, and a background call that lands first stops its own", async ($, on) => {
     const clock = mock.clock(on)
     const { history } = world(on)
     const { gate, open } = gates()
     const seen = ember(on, { hold: (n, prompt) => (n === 2 || (n > 2 && prompt.includes(']: b\n')) ? gate(n) : undefined) })
     const runTurn = live(on, clock, history)
+    const reading = (name: string) => seen.prompts.filter((p) => p.includes(`]: ${name}\n`)).length
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
     await clock.settle() // [0, 3) observed
-    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 1))
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 1), 0)
     await clock.settle() // [3, 7) in flight, held
     history.push(...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK), ...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000))
     const compacting = $.session.compact({ trigger: 'manual', messages: [...history] })
-    await clock.advance(10_000)
-    expect(seen.inFlight).toBe(2) // the background call and the compaction's own over rows 3-7, both held
+    await clock.advance(4_999)
+    expect([reading('b'), seen.inFlight]).toEqual([1, 1]) // the background call alone over rows 3-7
+    await clock.advance(1)
+    expect([reading('b'), seen.inFlight]).toEqual([2, 2]) // and the compaction's own, both held
     open(2)
     const result = await compacting
+    await clock.settle()
 
     expect(seen.stopped).toBe(1)
     expect(seen.logs).toContain('observed rows 3-7 in the background, 1 observations; watermark 7, 0 chunk(s) waiting on a gap')
     expect(seen.logs.filter((l) => l.includes('at compaction failed'))).toEqual([])
     expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "b"')
     expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "g"')
+    // The pass the background call's landing starts leaves the rows the compaction observes to it.
+    expect(['d', 'e', 'f', 'g'].map(reading)).toEqual([1, 1, 1, 1])
     expect(seen.logs.filter((l) => l.includes('deadline'))).toEqual([])
-    expect(seen.logs.at(-1)).toMatch(/^Compacted in 10.0 s · observed \d+ messages on the spot · memory \d+ notes$/)
+    expect(seen.logs.at(-1)).toMatch(/^Compacted in 5.0 s · observed \d+ messages on the spot · memory \d+ notes$/)
+  })
+
+  test("a background call over the rows a compaction must observe that lands within a call's time is not made again", async ($, on) => {
+    const clock = mock.clock(on)
+    const { history } = world(on)
+    const { gate, open } = gates()
+    const seen = ember(on, { hold: (n) => (n === 2 ? gate(2) : undefined) })
+    const runTurn = live(on, clock, history)
+
+    await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
+    await clock.settle() // [0, 3) observed
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 1), 0)
+    await clock.settle() // [3, 7) in flight, held
+    history.push(...turn('d', 'd', CHUNK), ...turn('e', 'e', CHUNK), ...turn('f', 'f', CHUNK), ...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000))
+    const compacting = $.session.compact({ trigger: 'manual', messages: [...history] })
+    await clock.advance(2_000)
+    open(2)
+    const result = await compacting
+
+    expect(seen.prompts.filter((p) => p.includes(']: b\n'))).toHaveLength(1)
+    expect(seen.stopped).toBe(0)
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "b"')
+    expect(observationsIn(result.messages?.[0]?.text)).toContain('User: "d"')
+    expect(seen.logs.at(-1)).toMatch(/^Compacted in 2.0 s · observed \d+ messages on the spot · memory \d+ notes$/)
   })
 
   test('a background Ember call still running at its timeout on the clock is dropped, and a later pass retries its chunk', async ($, on) => {
@@ -699,17 +711,17 @@ describe('register: observe', () => {
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await runTurn($, turn('b', 'b', 8_000), at(22, 14, 31))
+    await runTurn($, turn('b', 'b', 8_000), at(22, 14, 31), 10_000)
     await clock.settle()
-    expect(seen.inFlight).toBe(1) // since turn a ended, a minute ago
-    await clock.advance(29_000)
+    expect(seen.inFlight).toBe(1) // since turn a ended, 10 s ago
+    await clock.advance(9_000)
     expect([seen.inFlight, seen.stopped]).toEqual([1, 0])
     await clock.advance(1_000)
 
     expect([seen.inFlight, seen.stopped]).toEqual([0, 1])
-    expect(seen.logs).toContain('background observation of rows 0-3 failed (Ember timed out after 90000 ms); it will be retried')
+    expect(seen.logs).toContain('background observation of rows 0-3 failed (Ember timed out after 20000 ms); it will be retried')
     // A timeout goes on screen, not to the debug log alone.
-    expect(seen.screen).toContain('Observation failed (timeout after 1m 30s) and will retry')
+    expect(seen.screen).toContain('Observation failed (timeout after 20.0 s) and will retry')
     await clock.advance(60_000)
     expect(seen.prompts).toHaveLength(2)
     expect(seen.logs).toContainEqual(expect.stringMatching(/^observed rows 0-3 in the background/))
@@ -836,11 +848,14 @@ describe('register: observe', () => {
     expect(seen.prompts).toHaveLength(8)
     await clock.advance(1)
     expect(seen.prompts).toHaveLength(12)
+    expect(seen.logs).toContain('rows 0-3 failed 3 times in the background; left to the next compaction')
     failing = false
     await clock.advance(20_000)
 
-    expect(seen.prompts).toHaveLength(18)
-    expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(23)
+    // The four ranges that failed three times wait for the compaction; the two never tried land.
+    expect(seen.prompts).toHaveLength(14)
+    expect((stored['ledger:session-1'] as Ledger).watermark.to).toBe(0)
+    expect((stored['ledger:session-1'] as Ledger).chunks).toHaveLength(2)
     // Landed, the loop is back to no back-off: a failure now waits the first 5 s again.
     failing = true
     await runTurn($, [...turn('g', 'g', CHUNK), ...turn('h', 'h', 8_000)], at(22, 15, 0))
@@ -884,7 +899,7 @@ describe('register: observe', () => {
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
     await runTurn($, turn('b', 'b', CHUNK), at(22, 15, 0))
     await clock.settle() // [0, 4) observed
-    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 1)) // within the held call's timeout
+    await runTurn($, turn('c', 'c', 8_000), at(22, 15, 1), 10_000) // within the held call's timeout
     await clock.settle() // [4, 8) in flight, held
     expect(seen.prompts).toHaveLength(2)
     const messages = [...history]

@@ -68,3 +68,23 @@ per 1,400 (~9 to ~7 lines per 10k chunk). The analysis of 34.7k stored lines fou
 lines, which folding removes, and put the saving from ~9 to ~7 lines per 10k at 9.9% of stored tokens. 1,400 takes
 that step and no further, since agents go back after compaction for exact commands, paths and subagent outcomes.
 Status: landed, untested on bench.
+
+## Scheduling, compaction and recall fixes (v1.19.0)
+
+A code review after the move to Ember found these, all fixed in v1.19.0:
+
+- **Timeouts sized for Ember.** Observer 20 s in the background and 10 s at compaction, with one retry inside the 30 s deadline. Reflector 90 s, Session line 20 s. Measured from 67 Ember calls: median 2.8 s, worst 12.3 s.
+- **No duplicate calls at compaction.** Compaction waits up to 5 s for a background call already running over its rows before sending its own, and `schedule` skips the rows a compaction is observing.
+- **The install window.** A background landing between a compaction storing its ledger and the history showing the new memory message no longer rebuilds the ledger from the old memory.
+- **Chunks observed together.** A continuation field an earlier chunk of the batch set carries on where a later chunk, never shown it, doesn't give it. A chunk with its own corrections that was shown out-of-date constraints is observed again.
+- **Subagents.** These are observed in the background only within 30k tokens of their compaction point. Most answer before they compact, and their ledger goes with them.
+- **Retries and locks.** A range that fails 3 times waits for compaction. Each loop has its own lock.
+- **om_recall:**
+  - A bare `HH:MM` is the newest day it fits.
+  - Regexes with repeated alternatives are refused.
+  - Paths are searched as words.
+  - Tool results are searched and labelled with their command or path.
+  - Short blocks show whole.
+  - Results are ranked by a score that weights rare terms and whole words.
+
+The cache write after a compaction (~47k tokens median) was traced to Claude Code, not the plugin. About 16.5k of it is the session's own system prompt and tools, rewritten after any compaction because plugins can't place a cache marker. About 19.6k is the memory message and raw tail. The plugin injects nothing that misses the cache twice.

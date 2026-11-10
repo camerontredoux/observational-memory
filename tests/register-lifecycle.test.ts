@@ -95,7 +95,7 @@ describe('register: lifecycle', () => {
     await clock.settle()
     agents['agent-1'] = [{ role: 'user', text: 'brief', toolUses: [] }]
     for (let n = 0; n < 10; n++) {
-      await clock.set(at(23, 10, 0) + n * 10_000) // the held calls stay within their timeout
+      await clock.set(at(23, 10, 0) + n * 1_500) // the held calls stay within their timeout
       agents['agent-1'].push(...agentCall('one', n, 16_000))
       await step($, 's', n, agents['agent-1'].length, 'agent-1')
       await clock.settle()
@@ -213,7 +213,7 @@ describe('register: lifecycle', () => {
     await step($, 's', 0, agents['agent-1'].length, 'agent-1')
     await clock.settle()
     expect(seen.inFlight).toBe(4)
-    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0)) // no slot: main waits
+    await runTurn($, [...turn('a', 'a', CHUNK), ...turn('b', 'b', 8_000)], at(23, 9, 0), 10_000) // no slot: main waits; the held calls stay within their timeout
     await step($, 's2', 0, agents['agent-2'].length, 'agent-2') // and so does the sibling
     await clock.settle()
     expect(seen.prompts).toHaveLength(4)

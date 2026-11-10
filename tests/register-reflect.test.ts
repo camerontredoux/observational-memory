@@ -38,17 +38,17 @@ describe('register: reflect', () => {
     const big = `<observations>\n${'* 🟡 2026-09-22 14:30 read a file with a long name\n'.repeat(4_000)}</observations>`
     const seen = ember(on, {
       hold: (n, prompt) => (prompt.startsWith('## OBSERVATIONS') ? gate(100 + n) : undefined),
-      reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🟡 2026-09-22 14:39 User: "b"\n</observations>`),
+      reply: (prompt) => (prompt.includes('[User @ 2026-09-22 14:30]: a') ? big : `<observations>\n* 🟡 2026-09-22 14:33 User: "b"\n</observations>`),
       reflect: (n, prompt) => (n === 1 ? big : nearTarget(prompt, '* 🟡 2026-09-22 14:30 Explored the auth module')),
     })
     const runTurn = live(on, clock, history)
 
     await runTurn($, turn('a', 'a', CHUNK), at(22, 14, 30))
-    await runTurn($, turn('b', 'b', CHUNK), at(22, 14, 39)) // within the held reflection's timeout
+    await runTurn($, turn('b', 'b', CHUNK), at(22, 14, 31)) // within the held reflection's timeout
     await clock.settle() // chunk a's 4000 entries start a reflection, held; chunk b lands meanwhile
     const reflectAt = seen.prompts.findIndex((p) => p.startsWith('## OBSERVATIONS')) + 1
     expect(reflectAt).toBeGreaterThan(0)
-    expect((stored['ledger:session-1'] as Ledger).entries.at(-1)?.line).toBe('🟡 2026-09-22 14:39 User: "b"')
+    expect((stored['ledger:session-1'] as Ledger).entries.at(-1)?.line).toBe('🟡 2026-09-22 14:33 User: "b"')
     open(100 + reflectAt)
     await clock.settle()
     open(100 + seen.prompts.length)
@@ -67,7 +67,7 @@ describe('register: reflect', () => {
     expect(reflections[0]).not.toContain('User: "b"')
     expect(seen.systems.at(-1)).toContain('reflection agent for a coding assistant')
     const entries = (stored['ledger:session-1'] as Ledger).entries
-    expect(seen.screen).toContain(`Condensed memory in 9m 0s · 4,001 → ${entries.length.toLocaleString('en-US')} notes`)
+    expect(seen.screen).toContain(`Condensed memory in 1m 0s · 4,001 → ${entries.length.toLocaleString('en-US')} notes`)
     // Every Reflector call shares one cache key, so a retry reads the observations both attempts send first from
     // the prompt cache; the Observer's calls share their own.
     const ids = seen.calls.map((c) => String(c.body.prompt_cache_key))
@@ -76,7 +76,7 @@ describe('register: reflect', () => {
     expect(new Set(ids.filter((id, i) => !isReflection(id, i)))).toEqual(new Set(['om-observer']))
     expect(entries.map((e) => e.line).filter((l) => !isFiller(l) && !l.includes('long name'))).toEqual([
       '🟡 2026-09-22 14:30 Explored the auth module',
-      '🟡 2026-09-22 14:39 User: "b"',
+      '🟡 2026-09-22 14:33 User: "b"',
     ])
     // The snapshot as the Reflector read it, the newest left out: each line with its source range.
     const line = '* 🟡 2026-09-22 14:30 read a file with a long name (source 2026-09-22 14:30 to 2026-09-22 14:31)'

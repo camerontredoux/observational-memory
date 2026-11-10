@@ -137,7 +137,7 @@ describe('stats', () => {
         '  Main       2 of 3 instant (median 70 ms); 1 waited 15.9 s to observe 147 messages on the spot',
         '  Subagent   2 of 2 instant (median 50 ms)',
         '  Fallbacks  1 used the built-in compaction',
-        'Context      after a main compaction: ~27,000 tokens (median), ~236 notes',
+        'Context      after a main compaction: ~27,000 tokens of messages (median; the system prompt and tools come on top), ~236 notes',
         'Memory       largest message ~5,000 tokens; the Reflector condenses the observations at 40,000: never run',
         'Background   3 calls, median 20.0 s each, ~9 notes each',
         'Problems     2 observer replies had no notes; 1 context/history mismatch; 4 unmarked lines joined the line before; 1 unmarked line after a 🔴 line kept as its own 🟡 line',

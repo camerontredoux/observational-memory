@@ -353,7 +353,7 @@ export function formatSummary(head: string, merged: ReturnType<typeof merge>, wo
   const briefed = triggers.reduce((t, k) => t + (s.metrics[`compaction.${k}.rowsBriefed`]?.sum ?? 0), 0)
   if (floor) row('  Floor', `${grouped(floor)} compiled a brief by code of ${plural(briefed, 'message')} the Observer had not observed`)
   if (main.context.length)
-    row('Context', `after a main compaction: ~${grouped(median(main.context))} tokens (median)${main.notes.length ? `, ~${plural(median(main.notes), 'note')}` : ''}`)
+    row('Context', `after a main compaction: ~${grouped(median(main.context))} tokens of messages (median; the system prompt and tools come on top)${main.notes.length ? `, ~${plural(median(main.notes), 'note')}` : ''}`)
   const largest = Math.max(0, ...Object.entries(s.metrics).flatMap(([k, m]) => (/^compaction\.[\w-]+\.memoryTokens$/.test(k) ? m.max : [])))
   const reflections = s.metrics['reflection.ms']?.count ?? 0
   if (largest)

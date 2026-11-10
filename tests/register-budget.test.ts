@@ -21,7 +21,7 @@ describe('register: budget', () => {
     agents['agent-2'] = [{ role: 'user', text: 'second brief', toolUses: [] }]
 
     for (let n = 0; n < 10; n++) {
-      await clock.set(at(23, 9, 0) + (n + 1) * 10_000) // the held calls stay within their timeout
+      await clock.set(at(23, 9, 0) + (n + 1) * 1_500) // the held calls stay within their timeout
       history.push(...agentCall('main', n, 16_000))
       await step($, 't', n, history.length)
       agents['agent-1'].push(...agentCall('one', n, 16_000))
@@ -557,7 +557,7 @@ describe('register: budget', () => {
     let context = () => [...rows]
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, 0) + (n + 1) * 6_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
+        await clock.set(at(23, 9, 0) + (n + 1) * 1_500 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
         rows.push(...agentCall('one', n, 16_000))
         await step($, 's', n, rows.length, 'agent-1')
         await clock.settle()
@@ -609,7 +609,7 @@ describe('register: budget', () => {
     on('session.compact', () => (builtin++, { messages: [SUMMARY] }))
     const run = async (from: number, to: number) => {
       for (let n = from; n < to; n++) {
-        await clock.set(at(23, 9, 0) + (n + 1) * 6_000 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
+        await clock.set(at(23, 9, 0) + (n + 1) * 1_500 + (n < 10 ? 0 : 30_000)) // the held call stays within its timeout; then the deadline passed
         history.push(...agentCall('main', n, 16_000))
         await step($, 't', n + 1, history.length)
         await clock.settle()
@@ -622,7 +622,7 @@ describe('register: budget', () => {
     await run(0, 10)
     expect([seen.inFlight, seen.prompts[0]]).toEqual([1, expect.stringContaining('/src/main-0.ts')]) // the first chunk, held
     const compacting = $.session.compact({ trigger: 'auto', messages: [...history] })
-    await clock.advance(30_000) // the deadline, the held call still in flight
+    await clock.advance(5_000) // the wait on the call in flight before it is made again: the copy fails too
     const first = await compacting
     expect(builtin).toBe(0)
     expect(briefIn(first.messages![0]!.text)).toStartWith(FLOOR_NOTE)

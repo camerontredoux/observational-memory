@@ -209,7 +209,7 @@ describe('the memory row', () => {
       next: await user('66666666', 'next prompt'),
     }
 
-    const nothing = { type: 'Box' }
+    const nothing = { type: 'Box', part: { plugin: 'observational-memory' } } // an empty Box, the engine's mark of who drew it aside
     expect(drawn.copy).toEqual(nothing)
     expect(drawn.copiedCall).toEqual(nothing)
     expect(drawn.original).not.toEqual(nothing)
@@ -236,7 +236,7 @@ describe('the memory row', () => {
       $.ui.render({ surface: 'terminal', component: 'ToolGroup', requestId, props: { calls: ids.map(call), isActive: true, isExpanded: false } })
 
     await $.ui.render({ surface: 'terminal', component: 'UserMessage', requestId: '11111111-0000-4000-8000-000000000000', props: { text: memory, origin: { kind: 'unclassified' }, isExpanded: false } })
-    const nothing = { type: 'Box' }
+    const nothing = { type: 'Box', part: { plugin: 'observational-memory' } } // an empty Box, the engine's mark of who drew it aside
     expect(await group('t-c__om1', ['t-c__om1'])).toEqual(nothing)
     expect(await group('t-c__om1', ['t-c__om1', 't-new'])).not.toEqual(nothing)
   })

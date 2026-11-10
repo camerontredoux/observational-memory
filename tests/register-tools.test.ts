@@ -393,7 +393,8 @@ describe('register: tools', () => {
     const props = { hasSurvey: false, isWorking: true, maxRows: 10, columns: 120 } as never
     const band = await $.ui.render({ surface: 'terminal', component: 'AbovePrompt', requestId: 'band', props })
 
-    expect(band).toEqual({ type: 'Text', children: ['engine band'] })
+    // The engine marks a node with the plugin that drew it: the band is the engine's own, from the hook above.
+    expect(band).toEqual({ type: 'Text', children: ['engine band'], part: { plugin: 'test' } })
     expect(logs).toEqual([expect.stringMatching(/^the workers band could not draw \(.*the hooks worker is restarting.*\)$/)])
   })
 })
