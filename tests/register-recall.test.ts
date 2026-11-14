@@ -36,6 +36,26 @@ describe('register: recall', () => {
     )
   })
 
+  test("om_recall's read of a block holding an image answers with its text and the image; with no transcript file, text alone", async ($, on) => {
+    mock.clock(on)
+    const { history, files } = world(on)
+    on('classic.Stop', () => ({}))
+    const source = { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' }
+    const ask = (input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__observational-memory__om_recall', ...input }).then((r) => r.result)
+    history.push({ role: 'user', text: 'the WREN logo: [Image #1]', toolUses: [] })
+    // No file known yet: the live history, which holds no image data.
+    expect(await ask({ ref: '#0' })).toBe('[#0 · user] lines 1-1 of 1\n   1 | the WREN logo: [Image #1]')
+
+    files['/t/session-1.jsonl'] = JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'the WREN logo: [Image #1]' }, { type: 'image', source }] } }) + '\n' +
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'what colour was it?' } })
+    await $.classic.Stop({ session_id: 'session-1', transcript_path: '/t/session-1.jsonl', stop_hook_active: false })
+    expect(await ask({ query: 'WREN' })).toContain('[Image: read session-1:1 to see it]')
+    expect(await ask({ ref: 'session-1:1' })).toEqual([
+      { type: 'text', text: '[session-1:1 · user] lines 1-2 of 2\n   1 | [Image: read session-1:1 to see it]\n   2 | the WREN logo: [Image #1]' },
+      { type: 'image', source },
+    ])
+  })
+
   test('om_recall reads a moved session from both its files, a file over the fs limit through cat, and counts the calls', async ($, on) => {
     const clock = mock.clock(on)
     const { files, reads } = world(on)

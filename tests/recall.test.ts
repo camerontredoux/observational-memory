@@ -19,7 +19,8 @@ let uuid = 0
 const msg = (type: 'user' | 'assistant', m: number, content: unknown, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type, uuid: `u-${++uuid}`, timestamp: T(m), message: { role: type, content }, ...extra })
 const BIG = Array.from({ length: 301 }, (_, i) => (i === 249 ? 'row 250 has the NEEDLE-42 marker' : `row ${i + 1}`)).join('\n')
-const call = { type: 'tool_use', id: 'u1', name: 'Bash', input: { command: 'cat big.txt' }, caller: { type: 'direct' } }
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' // 1x1
+const call = { type: 'tool_use', id: 'u1',name: 'Bash', input: { command: 'cat big.txt' }, caller: { type: 'direct' } }
 
 // The old file: a long tool result, an om_recall call, a compaction whose kept rows are written again without their
 // call metadata, then the move to the new file.
@@ -683,6 +684,36 @@ describe('recall', () => {
     const paged = await run({ mode: 'outline' }, memoryIo({ [`${DIR}/${NEW}.jsonl`]: many }))
     expect(paged.split('\n')).toHaveLength(1 + 120 + 1)
     expect(paged.split('\n').at(-1)).toBe('31 more entries; only if you still need them: {"mode": "outline", "from": "bbbbbbbb:120"}.')
+  })
+
+  test("an image is a pointer in search and outline; read sends the block's images after its text, a few at most, none over the API's limit", async () => {
+    const png = (n: number) => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: `${PNG}${'A'.repeat(n)}` } })
+    const rows = [
+      msg('assistant', 1, [{ type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: '/shot.png' } }]),
+      msg('user', 1, [{ type: 'tool_result', tool_use_id: 'r1', content: [png(0)] }]),
+      msg('user', 2, [{ type: 'text', text: 'the HERON logo: [Image #1]' }, png(1)]),
+      msg('user', 3, [{ type: 'text', text: 'five TERN shots' }, png(1), png(2), { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(5 * 1024 * 1024 + 1) } }, png(3), png(4)]),
+      msg('user', 4, 'what was in them?'),
+    ]
+    const c = await loadTranscript(memoryIo({ [`${DIR}/${NEW}.jsonl`]: rows.join('\n') }), `${DIR}/${NEW}.jsonl`, { asking: true })
+    const go = (input: RecallInput) => recall(c, input)
+
+    const search = await go({ query: 'HERON' })
+    expect(search.text).toContain('  1: [Image: read bbbbbbbb:3 to see it]\n  2: the HERON logo: [Image #1]')
+    expect(search.images).toBeUndefined()
+    const outline = (await go({ mode: 'outline' })).text
+    expect(outline).toContain('Read: /shot.png → bbbbbbbb:2 (1 line) [Image: read bbbbbbbb:2 to see it]')
+    expect(outline).toContain('USER: [Image: read bbbbbbbb:3 to see it] the HERON logo')
+
+    const result = await go({ ref: 'bbbbbbbb:2' })
+    expect(result.text).toBe(`[bbbbbbbb:2 · 2026-09-22 ${hm(1)} · Read result /shot.png] lines 1-1 of 1 (call: bbbbbbbb:1)\n   1 | [Image: read bbbbbbbb:2 to see it]`)
+    expect(result.images).toEqual([png(0).source])
+    // Five images: the one over 5 MB is left out, then the first three of the rest are sent, each left out one named.
+    const five = await go({ ref: 'bbbbbbbb:4' })
+    expect(five.images?.map((x) => x.data)).toEqual([png(1), png(2), png(3)].map((x) => x.source.data))
+    expect(five.text.split('\n').slice(-2)).toEqual(["(1 image not sent: over the API's 5 MB limit)", '(1 more image not sent: at most 3 a call)'])
+    // A later page of the block is for its text alone.
+    expect((await go({ ref: 'bbbbbbbb:4', lines: '6' })).images).toBeUndefined()
   })
 
   test('subagent transcripts: listed, searched with the flag, outlined by their tag', async () => {

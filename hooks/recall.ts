@@ -36,6 +36,11 @@ const ARG_MAX_CHARS = 500
 const TURN_CALLS = 3 // om_recall calls in one turn before a reminder to answer
 const CHAIN_MAX_FILES = 20
 const TAG = 8 // characters of a session or agent id naming its file in a reference
+// Images one read sends back. Each costs the model about 1.6k tokens at full size, past a call's 4k of text: a few at
+// most, the rest named so the agent knows they are there.
+const READ_MAX_IMAGES = 3
+// The API refuses an image whose base64 passes 5 MB.
+const IMAGE_MAX_BASE64 = 5 * 1024 * 1024
 
 export type RecallIo = {
   read: (path: string) => Promise<string>
@@ -62,7 +67,8 @@ export type RecallInput = {
 }
 export type Mode = 'search' | 'read' | 'outline' | 'files'
 // `refs`: the blocks a search's answer names, its hits and any lines pasted from their calls or results.
-export type RecallResult = { mode: Mode; text: string; matches: number; refs?: string[]; hits?: Hits }
+// `images`: those of the block a read shows, to send after its text.
+export type RecallResult = { mode: Mode; text: string; matches: number; refs?: string[]; hits?: Hits; images?: ImageSource[] }
 // A search's hit as the librarian (librarian.ts) gets it: its block, the head of its excerpt with the excerpt's best
 // line, its place by score among the hits shown, and a subagent's block's thread, as `subagent <tag> (<what it did>)`.
 export type Listed = { block: Block; brief: string; rank: number; thread?: string }
@@ -89,7 +95,18 @@ export type Block = {
   pair?: Block // a call's result, a result's call
   agent?: string // the tag of the subagent a call started
   flat?: string // what search matches, lowercased, each run of whitespace one space: kept with a cached parse
+  images?: ImageSource[] // a pasted image's or a Read result's, as the transcript keeps it: read gives them back
 }
+// An image as the API takes it, and as the transcript keeps it.
+export type ImageSource = { type: 'base64'; media_type: string; data: string }
+const isImage = (s: unknown): s is ImageSource => {
+  const x = s as Partial<ImageSource> | undefined
+  return x?.type === 'base64' && typeof x.media_type === 'string' && typeof x.data === 'string'
+}
+// Where an image stood in a block's text, until the block has its reference (addParts), then a pointer to read it.
+const IMAGE_SLOT = '\u0000image\u0000'
+const imagePointer = (ref: string) => `[Image: read ${ref} to see it]`
+const IMAGE_POINTERS = /^(?:\[Image: read \S+ to see it\]\n?)+/
 type Thread = { tag: string; label: string; blocks: Block[]; path?: string; loaded: boolean }
 type Corpus = { main: Thread; files: string[]; subagents: Thread[]; live: boolean; note?: string; load: (t: Thread) => Promise<void>; now: () => Promise<number> }
 
@@ -165,12 +182,17 @@ function renderInput(input: unknown) {
 // Terminal colour and cursor codes in a command's output: noise to read, and they split the words a search looks for.
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 
-function resultText(content: unknown): string {
+// A result's text; each image it holds goes to `images`, an IMAGE_SLOT in its place.
+function resultText(content: unknown, images: ImageSource[]): string {
   if (typeof content === 'string') return content.replace(ANSI, '')
   if (Array.isArray(content))
     return content
-      .map((b: { type?: string; text?: string; tool_name?: string }) =>
-        b.type === 'text' ? (b.text ?? '').replace(ANSI, '') : b.type === 'image' ? '[image]' : b.type === 'tool_reference' ? `[tool ${b.tool_name ?? ''}]` : `[${b.type ?? 'block'}]`,
+      .map((b: { type?: string; text?: string; tool_name?: string; source?: unknown }) =>
+        b.type === 'text'
+          ? (b.text ?? '').replace(ANSI, '')
+          : b.type === 'image'
+            ? isImage(b.source) ? (images.push(b.source), IMAGE_SLOT) : '[image]'
+            : b.type === 'tool_reference' ? `[tool ${b.tool_name ?? ''}]` : `[${b.type ?? 'block'}]`,
       )
       .join('\n')
   return content && typeof content === 'object' ? '[redacted]' : ''
@@ -187,7 +209,7 @@ type Row = {
   continuedInSessionId?: string
   message?: { content?: string | Content[] }
 }
-type Content = { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean }
+type Content = { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: unknown }
 // What the files of one thread share while they are read in order: the rows seen, the calls awaiting results, and
 // the content kept in the model's context, matched to recognize a compaction's copy of it. `replay` is what a
 // boundary may copy (the content before it, still in context); `seg` is what has been seen since, itself replayable
@@ -220,6 +242,7 @@ const callBlock = (base: Partial<Block>, tool: string, input: unknown, callId?: 
 function addParts(ref: string, parts: readonly Part[], seen: Seen, out: Block[]) {
   parts.forEach(({ b, callId, resultOf }, k) => {
     const block: Block = { ref: parts.length > 1 ? `${ref}.${k + 1}` : ref, ...b }
+    if (block.images) block.text = block.text.replaceAll(IMAGE_SLOT, imagePointer(block.ref))
     if (callId) seen.calls.set(callId, block)
     if (resultOf) pairUp(seen, block, resultOf)
     out.push(block)
@@ -274,13 +297,25 @@ function parseFile(tag: string, text: string, seen: Seen, sidechain: boolean, fr
     const time = r.timestamp ? Date.parse(r.timestamp) : NaN
     const base = { ...(Number.isNaN(time) ? {} : { time }), ...(r.isMeta ? { meta: true } : {}) }
     const made: Part[] = []
+    const pasted: ImageSource[] = []
     for (const p of parts) {
-      if (p.type === 'text' && p.text) {
+      if (p.type === 'image' && isImage(p.source)) pasted.push(p.source)
+      else if (p.type === 'text' && p.text) {
         const kind: Kind = r.type === 'assistant' ? 'assistant' : isMemoryText(p.text) ? 'memory' : summary || r.isCompactSummary ? 'summary' : 'user'
         made.push({ b: { ...base, kind, text: p.text } })
       } else if (p.type === 'tool_use' || p.type === 'server_tool_use') made.push({ b: callBlock(base, p.name ?? 'tool', p.input, p.id && originalId(p.id)), callId: p.id && originalId(p.id) })
-      else if (p.type.endsWith('tool_result'))
-        made.push({ b: { ...base, kind: 'result', text: resultText(p.content), ...(p.is_error ? { error: true } : {}) }, resultOf: p.tool_use_id && originalId(p.tool_use_id) })
+      else if (p.type.endsWith('tool_result')) {
+        const images: ImageSource[] = []
+        const text = resultText(p.content, images)
+        made.push({ b: { ...base, kind: 'result', text, ...(images.length ? { images } : {}), ...(p.is_error ? { error: true } : {}) }, resultOf: p.tool_use_id && originalId(p.tool_use_id) })
+      }
+    }
+    // A pasted image goes with its row's last block, its pointer first, or alone in a block of its own: a block more in
+    // a row that has one would renumber the references to it.
+    if (pasted.length) {
+      const host = made.at(-1)?.b ?? (made.push({ b: { ...base, kind: r.type === 'assistant' ? 'assistant' : 'user', text: '' } }), made[0]!.b)
+      host.images = [...pasted, ...(host.images ?? [])]
+      host.text = [...pasted.map(() => IMAGE_SLOT), ...(host.text ? [host.text] : [])].join('\n')
     }
     addParts(`${tag}:${from.line + n + 1}`, made, seen, blocks)
   }
@@ -543,7 +578,7 @@ export async function refsOf(c: Corpus, rows: readonly SessionMessage[], agentId
   const texts = new Map<string, string>()
   for (const b of t.blocks)
     if (b.kind === 'call' && b.callId) calls.set(b.callId, b.ref)
-    else if (b.kind === 'user' || b.kind === 'assistant') texts.set(`${b.kind}\n${b.text.trim()}`, b.ref)
+    else if (b.kind === 'user' || b.kind === 'assistant') texts.set(`${b.kind}\n${b.text.replace(IMAGE_POINTERS, '').trim()}`, b.ref)
   return (row, callId) => {
     if (callId !== undefined) return calls.get(originalId(callId))
     const m = rows[row]
@@ -992,6 +1027,7 @@ function blockExcerpt(b: Block, m: Matcher, note: string): Excerpt {
     }
   const more = pool.filter((s) => !shownLines.has(s.i)).length
   if (more) out.push(`  … ${plural(more, 'more matching line')}`)
+  if (b.images && !out.some((l) => l.includes(imagePointer(b.ref)))) out.push(`  ${imagePointer(b.ref)}`)
   return { text: `[${label(b)}] ${plural(lines.length, 'line')}${note}\n${out.join('\n')}`, whole: Math.max(0, ...pool.map((s) => s.whole)), lead, lines: lines.length }
 }
 
@@ -1216,7 +1252,22 @@ async function read(c: Corpus, input: Input): Promise<RecallResult> {
   const around = [...before, ...after].reduce((n, x) => n + neighbor(x).length + 2, 0)
   // The neighbours asked for share the response's cap with the page, which shrinks to fit: its tail says what is left.
   const shown = page(b, input.lines, Math.min(READ_MAX_CHARS, RESPONSE_MAX_CHARS - around - 1_000))
-  return { mode: 'read', text: [...before.map(neighbor), shown, ...after.map(neighbor)].join('\n\n'), matches: 0 }
+  // The block's images go with its first page: a later page asks only for more of its text.
+  const { images, notes } = input.lines ? { images: [], notes: [] } : imagesOf(b)
+  const text = [...before.map(neighbor), [shown, ...notes].join('\n'), ...after.map(neighbor)].join('\n\n')
+  return { mode: 'read', text, matches: 0, ...(images.length ? { images } : {}) }
+}
+
+// The images a read of `b` sends, at most READ_MAX_IMAGES, none the API would refuse; a note for each one left out.
+function imagesOf(b: Block) {
+  const all = b.images ?? []
+  const fits = all.filter((x) => x.data.length <= IMAGE_MAX_BASE64)
+  const images = fits.slice(0, READ_MAX_IMAGES)
+  const notes = [
+    all.length > fits.length && `(${plural(all.length - fits.length, 'image')} not sent: over the API's 5 MB limit)`,
+    fits.length > images.length && `(${plural(fits.length - images.length, 'more image')} not sent: at most ${READ_MAX_IMAGES} a call)`,
+  ].filter((x): x is string => !!x)
+  return { images, notes }
 }
 
 // ---- Outline ----------------------------------------------------------------------------------------------------
@@ -1230,7 +1281,7 @@ function outlineLine(b: Block) {
   if (b.kind === 'summary') return `${at} [compaction: summary]`
   if (b.kind === 'call') {
     const r = b.pair
-    const result = r ? ` → ${r.ref} (${plural(linesOf(r.text).length, 'line')}${r.error ? ', error' : ''})` : ''
+    const result = r ? ` → ${r.ref} (${plural(linesOf(r.text).length, 'line')}${r.error ? ', error' : ''})${r.images ? ` ${imagePointer(r.ref)}` : ''}` : ''
     return `${at} ${b.tool}: ${callSummary(b)}${result}${b.agent ? ` [subagent ${b.agent}]` : ''}`
   }
   return `${at} ${b.tool ?? 'tool'} result: ${oneLine(b.text, 120)}` // its call is not in the transcript

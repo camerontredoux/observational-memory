@@ -2597,7 +2597,8 @@ export const register: Register = (on) => {
           'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. It ' +
           'pastes the lines of the best hits that answer, whole, else shows each hit\'s best lines, and lists the rest. It names ' +
           'query terms that occur nowhere, so do not search again to confirm an absence. Read a block only when its excerpt ' +
-          'is not enough, and only the lines you need. Outline only to orient, one page. Stop as soon as you have the answer.',
+          'is not enough, and only the lines you need; reading a block that holds an image shows you the image. Outline only ' +
+          'to orient, one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2691,7 +2692,8 @@ export const register: Register = (on) => {
     if (found.mode === 'search' && found.refs?.length) {
       recallWindows.set(key, [...(recallWindows.get(key) ?? []), { refs: new Set(found.refs), left: RECALL_FOLLOW_CALLS }])
     }
-    return { result: found.text }
+    // A read's images go after its text, as the API's own blocks: the engine passes such an array on to the model.
+    return { result: found.images ? [{ type: 'text', text: found.text }, ...found.images.map((source) => ({ type: 'image', source }))] : found.text }
   })
 
   on('tool.call', { tool: 'mcp__observational-memory__om_stats' }, async ($, e) => ({ result: await report(statsIo($), e) }))

@@ -56,7 +56,8 @@ export const register: Register = (on) => {
           'phrase. Each term matches anywhere in a block, case-insensitively, a tool result with its command or path. It ' +
           'pastes the lines of the best hits that answer, whole, else shows each hit\'s best lines, and lists the rest. It names ' +
           'query terms that occur nowhere, so do not search again to confirm an absence. Read a block only when its excerpt ' +
-          'is not enough, and only the lines you need. Outline only to orient, one page. Stop as soon as you have the answer.',
+          'is not enough, and only the lines you need; reading a block that holds an image shows you the image. Outline only ' +
+          'to orient, one page. Stop as soon as you have the answer.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -85,7 +86,7 @@ export const register: Register = (on) => {
     let corpus: Awaited<ReturnType<typeof loadTranscript>> | undefined
     if (path) corpus = await loadTranscript(recallIo($), path, { asking: true }).catch((error) => (log($, `could not read ${path} (${errorText(error)})`), undefined))
     const found = await recall(corpus?.main.blocks.length ? corpus : liveTranscript(rows, rows.map(() => undefined), rows.length >= 4096, () => $.clock.now()), e)
-    return { result: found.text }
+    return { result: found.images ? [{ type: 'text', text: found.text }, ...found.images.map((source) => ({ type: 'image', source }))] : found.text }
   })
 
   // As hooks/register.ts's: om_recall joins the tool list once a compaction has run, and stays.
