@@ -312,15 +312,22 @@ async function search(dir: string, name: string, text: string, b: ReturnType<typ
   const io = { read: async (p: string) => readFileSync(p, 'utf8'), list: async (x: string) => (existsSync(x) ? readdirSync(x) : []), continuing: async () => undefined, now: async () => b.at }
   return (await recall(await loadTranscript(io, path), { query })).text
 }
-const recallMemo = new Map<string, Map<string, string>>()
-async function recallTexts(name: string, text: string, t: ReturnType<typeof parseTranscript>, rubric: RubricSpec | undefined, dir: string) {
+// The memo holds the promise, not the map it fills: two arms that ask at once both wait for every search.
+const recallMemo = new Map<string, Promise<Map<string, string>>>()
+function recallTexts(name: string, text: string, t: ReturnType<typeof parseTranscript>, rubric: RubricSpec | undefined, dir: string) {
   const k = `${name}\0${dir}`
-  if (recallMemo.has(k)) return recallMemo.get(k)!
-  const out = new Map<string, string>()
-  recallMemo.set(k, out)
-  for (const b of t.boundaries)
-    for (const q of rubric?.recall ?? []) if (q.from <= b.n && (q.to === undefined || b.n <= q.to)) out.set(`${q.id}@${b.n}`, await search(dir, name, text, b, q.query))
-  return out
+  let memo = recallMemo.get(k)
+  if (!memo)
+    recallMemo.set(
+      k,
+      (memo = (async () => {
+        const out = new Map<string, string>()
+        for (const b of t.boundaries)
+          for (const q of rubric?.recall ?? []) if (q.from <= b.n && (q.to === undefined || b.n <= q.to)) out.set(`${q.id}@${b.n}`, await search(dir, name, text, b, q.query))
+        return out
+      })()),
+    )
+  return memo
 }
 
 // ---- The behavior check (--behavior): Ember reads each context and answers probes; code grades the answers ----
